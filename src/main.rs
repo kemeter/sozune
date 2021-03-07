@@ -7,10 +7,24 @@ use std::env;
 use std::thread;
 use std::io::stdout;
 use sozu_command::proxy;
+use sozu_command::proxy::HttpFront;
+use sozu_command::proxy::Backend;
 use sozu_command::channel::Channel;
 use sozu_command::proxy::LoadBalancingParams;
 use sozu_command::logging::{Logger,LoggerBackend};
 use shiplift::Docker;
+use shiplift::rep::NetworkSettings;
+
+struct Config<'a> {
+    ip_address: &'a str,
+    name: &'a str,
+    host: &'a str
+}
+
+struct Stack {
+    frontend: HttpFront,
+    backend: Backend
+}
 
 #[tokio::main]
 async fn main() {
@@ -31,6 +45,7 @@ async fn main() {
     };
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
@@ -45,38 +60,25 @@ async fn main() {
                         let host = value;
                         match docker.containers().get(&container.id).inspect().await {
                             Ok(container) => {
-                                let mut ip_address = container.network_settings.ip_address;
-                                if "" == ip_address {
-                                    for (_, value) in container.network_settings.networks {
-                                        ip_address = value.ip_address
-                                    }
-                                }
+                                let ip_address  = get_ip_address(&container.network_settings);
                                 let  container_name = container.name.replace("/", "");
 
-                                info!("Registrer container {}. Host : {} ", container.id, host);
-                                let http_front = proxy::HttpFront {
-                                    app_id:     String::from(&container_name),
-                                    address:    "0.0.0.0:80".parse().unwrap(),
-                                    hostname:   String::from(host),
-                                    path_begin: String::from("/"),
-                                };
-                                let http_backend = proxy::Backend {
-                                    app_id:                    String::from(&container_name),
-                                    backend_id:                String::from("test-0"),
-                                    address:                   String::from(format!("{}:80", &ip_address)).parse().unwrap(),
-                                    load_balancing_parameters: Some(LoadBalancingParams::default()),
-                                    sticky_id:                 None,
-                                    backup:                    None,
-                                };
+                                info!("Register container {}. Host : {} ", container.id, host);
+                                let stack = register_container(Config {
+                                    ip_address: &ip_address,
+                                    name: &container_name,
+                                    host: &host
+                                });
+
 
                                 command.write_message(&proxy::ProxyRequest {
                                     id:    String::from("ID_ABCD"),
-                                    order: proxy::ProxyRequestData::AddHttpFront(http_front)
+                                    order: proxy::ProxyRequestData::AddHttpFront(stack.frontend)
                                 });
 
                                 command.write_message(&proxy::ProxyRequest {
                                     id:    String::from("ID_EFGH"),
-                                    order: proxy::ProxyRequestData::AddBackend(http_backend)
+                                    order: proxy::ProxyRequestData::AddBackend(stack.backend)
                                 });
 
                             }
@@ -91,3 +93,39 @@ async fn main() {
 
     let _ = jg.join();
 }
+
+fn get_ip_address(network: &NetworkSettings) -> String {
+    let mut ip_address = &network.ip_address;
+    if "" == ip_address {
+        for (_, value) in &network.networks {
+            ip_address = &value.ip_address;
+        }
+    }
+
+    return ip_address.to_string();
+}
+
+fn register_container(config: Config )-> Stack {
+    let http_front = HttpFront {
+        app_id:     (&config.name).to_string(),
+        address:    "0.0.0.0:80".parse().unwrap(),
+        hostname:   (&config.host).to_string(),
+        path_begin: String::from("/"),
+    };
+
+    let http_backend = Backend {
+        app_id:                    (&config.name).to_string(),
+        backend_id:                String::from("test-0"),
+        address:                   String::from(format!("{}:80", &config.ip_address)).parse().unwrap(),
+        load_balancing_parameters: Some(LoadBalancingParams::default()),
+        sticky_id:                 None,
+        backup:                    None,
+    };
+
+    return Stack {
+        frontend: http_front,
+        backend: http_backend
+    }
+}
+
+

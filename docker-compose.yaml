@@ -7,7 +7,7 @@ services:
   sozune:
     image: rust
     environment:
-      USER:
+      USER: root
     expose:
       - 80
       - 8000
