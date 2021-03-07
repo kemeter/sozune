@@ -1,0 +1,19 @@
+[package]
+name = "sozune"
+version = "0.1.0"
+authors = ["Nawo Mbechezi mlanawo@mbechezi.kemeter.io"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1.2", features = ["full"] }
+log = "0.4.0"
+env_logger = "0.8.3"
+shiplift = "0.7"
+serde_json = "1.0"
+sozu = "0.11.52"
+sozu-command-lib = "0.11.52"
+sozu-lib = "0.11.52"
+time = "0.2.25"
+clap = "2.33"

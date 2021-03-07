@@ -1,0 +1,30 @@
+version: "3.8"
+networks:
+  sozune:
+    external: true
+
+services:
+  sozune:
+    image: rust
+    environment:
+      USER:
+    expose:
+      - 80
+      - 8000
+    ports:
+      - "80:80"
+      - "8000:8000"
+    volumes:
+      - ./:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./registry:/usr/local/cargo/registry
+    working_dir: /app
+    networks:
+      - sozune
+
+  nginx_sozune:
+    image: nginx:1.9
+    labels:
+      - "sozune.host=sozune.localhost"
+    networks:
+      - sozune
