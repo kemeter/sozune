@@ -28,3 +28,10 @@ services:
       - "sozune.host=sozune.localhost"
     networks:
       - sozune
+
+  whoami:
+    image: traefik/whoami
+    labels:
+      - "sozune.host=whoami.localhost"
+    networks:
+      - sozune
