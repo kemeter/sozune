@@ -7,6 +7,7 @@ use shiplift::Docker;
 use shiplift::rep::NetworkSettings;
 use shiplift::rep::ContainerDetails;
 
+use std::collections::HashMap;
 
 use std::env;
 use std::thread;
@@ -69,9 +70,19 @@ async fn main() {
             Ok(event) => {
                 match docker.containers().get(&event.actor.id).inspect().await {
                     Ok(container) => {
-                        if "container" == event.typ && "start" == event.action {
-                            register_container(docker.clone(), &mut command, container).await
+
+                        if "container" == event.typ {
+                            println!("{:?}", event.action);
+
+                            if "start" == event.action {
+                                register_container(docker.clone(), &mut command, container.clone()).await
+                            }
+
+                            if "die" == event.action  {
+                                remove_container(docker.clone(), &mut command, container).await
+                            }
                         }
+
                     }
                     Err(e) => eprintln!("Error: {}", e),
                 }
@@ -83,56 +94,110 @@ async fn main() {
      let _ = jg.join();
 }
 
-async fn register_container(docker: Docker, command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
-    for labels in container.config.labels.into_iter() {
-        for (label, value) in labels {
-            if label == "sozune.host" {
-                let host = value;
-                let ip_address  = get_ip_address(&container.network_settings);
-                let container_name = container.name.replace("/", "");
-                let ip_address  = get_ip_address(&container.network_settings);
-                let container_name = container.name.replace("/", "");
-
-                let http_front = HttpFront {
-                    app_id:     container_name.to_string(),
-                    address:    "0.0.0.0:80".parse().unwrap(),
-                    hostname:   host.to_string(),
-                    path_begin: String::from("/"),
-                };
-
-                let http_backend = Backend {
-                    app_id:                    container_name.to_string(),
-                    backend_id:                String::from(format!("{}-backend", container_name.to_string())),
-                    address:                   String::from(format!("{}:80", ip_address)).parse().unwrap(),
-                    load_balancing_parameters: Some(LoadBalancingParams::default()),
-                    sticky_id:                 None,
-                    backup:                    None,
-                };
-
-                command.write_message(&proxy::ProxyRequest {
-                    id:    String::from("ID_ABCD"),
-                    order: proxy::ProxyRequestData::AddHttpFront(http_front)
-                });
-
-                command.write_message(&proxy::ProxyRequest {
-                    id:    String::from("ID_EFGH"),
-                    order: proxy::ProxyRequestData::AddBackend(http_backend)
-                });
-
-                info!("Register container {}. Host : {} ", container.id, host);
-            }
-        }
-    }
-}
-
 
 fn get_ip_address(network: &NetworkSettings) -> String {
     let mut ip_address = &network.ip_address;
+
     if "" == ip_address {
         for (_, value) in &network.networks {
             ip_address = &value.ip_address;
+            println!("{:?}", ip_address);
         }
     }
 
     return ip_address.to_string();
+}
+
+fn get_host(labels: Option<HashMap<String, String>>) -> String {
+     for labels in labels.into_iter() {
+         for (label, value) in labels {
+             if label == "sozune.host" {
+                return value;
+            }
+        }
+     }
+
+    return String::from("");
+}
+
+async fn register_container(docker: Docker, command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
+
+    let host = get_host(container.config.labels);
+
+    if host != "" {
+        let ip_address  = get_ip_address(&container.network_settings);
+        let container_name = container.name.replace("/", "");
+        let ip_address  = get_ip_address(&container.network_settings);
+        let container_name = container.name.replace("/", "");
+
+        let http_front = HttpFront {
+            app_id:     container_name.to_string(),
+            address:    "0.0.0.0:80".parse().unwrap(),
+            hostname:   host.to_string(),
+            path_begin: String::from("/"),
+        };
+
+        let http_backend = Backend {
+            app_id:                    container_name.to_string(),
+            backend_id:                String::from(format!("{}-backend", container_name.to_string())),
+            address:                   String::from(format!("{}:80", ip_address)).parse().unwrap(),
+            load_balancing_parameters: Some(LoadBalancingParams::default()),
+            sticky_id:                 None,
+            backup:                    None,
+        };
+
+        command.write_message(&proxy::ProxyRequest {
+            id:    String::from("ID_ABCD"),
+            order: proxy::ProxyRequestData::AddHttpFront(http_front)
+        });
+
+        command.write_message(&proxy::ProxyRequest {
+            id:    String::from("ID_EFGH"),
+            order: proxy::ProxyRequestData::AddBackend(http_backend)
+        });
+
+        info!("Register container {}. Host : {} ", container.id, host);
+    }
+}
+
+
+async fn remove_container(docker: Docker, command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
+    let host = get_host(container.config.labels);
+
+    if ("" != host){
+        info!("Remove container {}. Host : {} ", container.id, host);
+
+         let ip_address  = get_ip_address(&container.network_settings);
+        println!("{:?}", ip_address);
+
+         let container_name = container.name.replace("/", "");
+         let http_front = HttpFront {
+             app_id:     container_name.to_string(),
+             address:    "0.0.0.0:80".parse().unwrap(),
+             hostname:   host.to_string(),
+             path_begin: String::from("/"),
+         };
+
+         command.write_message(&proxy::ProxyRequest {
+             id:    String::from("ID_ABCD"),
+             order: proxy::ProxyRequestData::RemoveHttpFront(http_front)
+         });
+    }
+
+
+//
+//     let http_backend = Backend {
+//         app_id:                    container_name.to_string(),
+//         backend_id:                String::from(format!("{}-backend", container_name.to_string())),
+//         address:                   String::from(format!("{}:80", ip_address)).parse().unwrap(),
+//         load_balancing_parameters: Some(LoadBalancingParams::default()),
+//         sticky_id:                 None,
+//         backup:                    None,
+//     };
+//
+
+    //command.write_message(&proxy::ProxyRequest {
+    //    id:    String::from("ID_EFGH"),
+    //    order: proxy::ProxyRequestData::RemoveBackend(http_backend)
+    //});
 }
