@@ -6,6 +6,7 @@ use shiplift::rep::NetworkSettings;
 use shiplift::rep::ContainerDetails;
 
 use std::collections::HashMap;
+
 #[tokio::main]
 pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
     let docker = Docker::new();
@@ -24,14 +25,14 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
         Err(e) => eprintln!("Error: {}", e),
     }
         
-/*    while let Some(event_result) = docker.events(&Default::default()).next().await {
+    while let Some(event_result) = docker.events(&Default::default()).next().await {
         match event_result {
             Ok(event) => {
                 match docker.containers().get(&event.actor.id).inspect().await {
                     Ok(container) => {
 
                         if "container" == event.typ {
-                            println!("{:?}", event.action);
+                            info!("{:?}", event.action);
 
                             if "start" == event.action {
                                 register_container(storage, container.clone()).await
@@ -49,7 +50,8 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
             Err(e) => eprintln!("Error: {}", e),
         }
     }
-*/}
+
+}
 
 fn get_ip_address(network: &NetworkSettings) -> String {
     let mut ip_address = &network.ip_address;
@@ -77,7 +79,6 @@ fn get_host(labels: Option<HashMap<String, String>>) -> String {
 }
 
 async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerDetails ) {
-
     let host = get_host(container.config.labels);
 
     if host != "" {
@@ -85,7 +86,7 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
         let container_name = container.name.replace("/", "");
 
         let entrypoint = Entrypoint {
-            id: container.id,
+            id: container.id.clone(),
             ip: ip_address,
             name: container_name,
             hostname: host
@@ -93,7 +94,9 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
 
         storage.push(entrypoint.clone());
 
-        info!("Register container {}. Host : {} ", entrypoint.id, entrypoint.hostname);
+        info!("Register container {}. Host : {} ", container.id.clone(), entrypoint.hostname);
+    } else {
+        info!("container {} Host not found ", container.id.clone());
     }
 }
 

@@ -1,6 +1,8 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
-
 #[macro_use] extern crate sozu_command_lib as sozu_command;
+use std::io::stdout;
+use sozu_command::logging::{Logger,LoggerBackend};
+use std::env;
+use std::thread;
 
 mod providers {
     pub(crate) mod docker;
@@ -8,26 +10,27 @@ mod providers {
 }
 
 mod api {
-    pub(crate) mod entrypoint;
+    pub(crate) mod server;
 }
 
 use crate::providers::entrypoint::Entrypoint;
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    HttpServer::new( move || {
+fn main() {
+    env_logger::init();
 
+    if env::var("RUST_LOG").is_ok() {
+        Logger::init("".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()), None);
+    } else {
+        Logger::init("".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
+    }
+
+    thread::spawn(move || {
         let mut storage: Vec<Entrypoint>  = vec![];
-        crate::providers::docker::provide(&mut storage);
+        crate::providers::docker::provide(&mut storage.clone());
+    });
 
-        //let mut storage = vec![];
-        //storage.push(entrypoint);
+    let mut storage: Vec<Entrypoint>  = vec![];
 
-        App::new()
-            .data(storage)
-            .service(crate::api::entrypoint::list)
-    })
-        .bind("127.0.0.1:8080")?
-        .run()
-        .await
+    let server_address = "127.0.0.1:8080";
+    crate::api::server::start(server_address, storage);
 }

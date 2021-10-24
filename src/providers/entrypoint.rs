@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize}; 
+use serde::{Serialize, Deserialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Entrypoint {
     pub id: String,
     pub ip: String,
