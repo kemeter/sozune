@@ -6,10 +6,13 @@ use shiplift::rep::NetworkSettings;
 use shiplift::rep::ContainerDetails;
 
 use std::collections::HashMap;
+use sqlite::Connection;
+use sqlite::Value;
 
 #[tokio::main]
 pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
     let docker = Docker::new();
+    let connection = sqlite::open("sozune.db").unwrap();
 
     match docker.containers().list(&Default::default()).await {
         Ok(containers) => {
@@ -80,6 +83,7 @@ fn get_host(labels: Option<HashMap<String, String>>) -> String {
 
 async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerDetails ) {
     let host = get_host(container.config.labels);
+    let connection = Connection::open("sozune.db").expect("Could not test: DB not created");
 
     if host != "" {
         let ip_address  = get_ip_address(&container.network_settings);
@@ -89,8 +93,38 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
             id: container.id.clone(),
             ip: ip_address,
             name: container_name,
-            hostname: host
+            hostname: host.clone()
         };
+
+        let mut cursor = connection
+            .prepare("SELECT * FROM entrypoints WHERE hostname = ? ")
+            .unwrap()
+            .into_cursor();
+
+        cursor.bind(&[Value::String(entrypoint.id.clone())]).unwrap();
+        cursor.bind(&[Value::String(host.clone())]).unwrap();
+
+        let row = cursor.next().unwrap();
+
+        if None == row {
+            println!("coucouc");
+
+            let mut statement = connection
+                .prepare(
+                    "
+                INSERT INTO entrypoints (id, ip, name, hostname)
+                VALUES (?, ?, ?, ?);
+            ",
+                )
+                .unwrap();
+
+            statement.bind(1, string_to_static_str(entrypoint.id.clone().to_string())).unwrap();
+            statement.bind(2, string_to_static_str(entrypoint.ip.clone().to_string())).unwrap();
+            statement.bind(3, string_to_static_str(entrypoint.name.clone().to_string())).unwrap();
+            statement.bind(4, string_to_static_str(entrypoint.hostname.clone().to_string())).unwrap();
+            statement.next();
+        }
+
 
         storage.push(entrypoint.clone());
 
@@ -110,4 +144,8 @@ async fn remove_container(storage: &mut Vec<Entrypoint>, container: ContainerDet
 
         println!("{:?}", ip_address);
     }
+}
+
+fn string_to_static_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
 }

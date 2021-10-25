@@ -24,13 +24,26 @@ fn main() {
         Logger::init("".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
     }
 
+    let connection = sqlite::open("sozune.db").unwrap();
+    match connection
+        .execute(
+            "
+        CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT);
+        "
+        ) {
+        Ok(file) => {
+        },
+        Err(error) => {
+        }
+    }
+
     thread::spawn(move || {
         let mut storage: Vec<Entrypoint>  = vec![];
-        crate::providers::docker::provide(&mut storage.clone());
+        crate::providers::docker::provide(&mut storage);
     });
 
     let mut storage: Vec<Entrypoint>  = vec![];
-
     let server_address = "127.0.0.1:8080";
     crate::api::server::start(server_address, storage);
+
 }
