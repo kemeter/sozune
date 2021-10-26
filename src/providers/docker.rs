@@ -21,11 +21,11 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
                     Ok(container) => {
                         register_container(storage, container).await
                     },
-                    Err(e) => eprintln!("Error: {}", e),
+                    Err(e) => eprintln!("Error get container: {}", e),
                 }
             }
         },
-        Err(e) => eprintln!("Error: {}", e),
+        Err(e) => eprintln!("Error list container: {}", e),
     }
         
     while let Some(event_result) = docker.events(&Default::default()).next().await {
@@ -35,7 +35,7 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
                     Ok(container) => {
 
                         if "container" == event.typ {
-                            info!("{:?}", event.action);
+                            info!("Container event {:?}", event.action);
 
                             if "start" == event.action {
                                 register_container(storage, container.clone()).await
@@ -47,13 +47,12 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
                         }
 
                     }
-                    Err(e) => eprintln!("Error: {}", e),
+                    Err(e) => eprintln!("Error events get container: {}", e),
                 }
             },
-            Err(e) => eprintln!("Error: {}", e),
+            Err(e) => eprintln!("Error watch docker event: {}", e),
         }
     }
-
 }
 
 fn get_ip_address(network: &NetworkSettings) -> String {
@@ -62,7 +61,7 @@ fn get_ip_address(network: &NetworkSettings) -> String {
     if "" == ip_address {
         for (_, value) in &network.networks {
             ip_address = &value.ip_address;
-            println!("{:?}", ip_address);
+            debug!("container ip {}", ip_address);
         }
     }
 
@@ -107,7 +106,6 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
         let row = cursor.next().unwrap();
 
         if None == row {
-            println!("coucouc");
 
             let mut statement = connection
                 .prepare(
@@ -125,7 +123,6 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
             statement.next();
         }
 
-
         storage.push(entrypoint.clone());
 
         info!("Register container {}. Host : {} ", container.id.clone(), entrypoint.hostname);
@@ -142,7 +139,7 @@ async fn remove_container(storage: &mut Vec<Entrypoint>, container: ContainerDet
 
         let ip_address  = get_ip_address(&container.network_settings);
 
-        println!("{:?}", ip_address);
+        debug!("container ip {}", ip_address);
     }
 }
 

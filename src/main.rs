@@ -26,11 +26,7 @@ fn main() {
 
     let connection = sqlite::open("sozune.db").unwrap();
     match connection
-        .execute(
-            "
-        CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT);
-        "
-        ) {
+        .execute("CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT);") {
         Ok(file) => {
         },
         Err(error) => {
@@ -45,5 +41,4 @@ fn main() {
     let mut storage: Vec<Entrypoint>  = vec![];
     let server_address = "127.0.0.1:8080";
     crate::api::server::start(server_address, storage);
-
 }
