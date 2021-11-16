@@ -11,6 +11,8 @@ use sqlite::Value;
 
 #[tokio::main]
 pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
+    info!("Start docker provider");
+
     let docker = Docker::new();
     let connection = sqlite::open("sozune.db").unwrap();
 
@@ -31,10 +33,13 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
     while let Some(event_result) = docker.events(&Default::default()).next().await {
         match event_result {
             Ok(event) => {
-                match docker.containers().get(&event.actor.id).inspect().await {
-                    Ok(container) => {
+                // println!("{:?}", event);
+                info!("Container event {:?}", event.action);
+                if "container" == event.typ {
 
-                        if "container" == event.typ {
+                    match docker.containers().get(&event.actor.id).inspect().await {
+                        Ok(container) => {
+
                             info!("Container event {:?}", event.action);
 
                             if "start" == event.action {
@@ -44,11 +49,13 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
                             if "die" == event.action  {
                                 remove_container(storage, container).await
                             }
-                        }
 
+                        }
+                        Err(e) => eprintln!("Error events get container: {}", e),
                     }
-                    Err(e) => eprintln!("Error events get container: {}", e),
+
                 }
+
             },
             Err(e) => eprintln!("Error watch docker event: {}", e),
         }
@@ -81,6 +88,7 @@ fn get_host(labels: Option<HashMap<String, String>>) -> String {
 }
 
 async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerDetails ) {
+    println!("register container");
     let host = get_host(container.config.labels);
     let connection = Connection::open("sozune.db").expect("Could not test: DB not created");
 

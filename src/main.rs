@@ -28,17 +28,24 @@ fn main() {
     match connection
         .execute("CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT);") {
         Ok(file) => {
+            info!("Create table");
         },
         Err(error) => {
+            // info!("Unable to create tables {:?}", error);
         }
     }
 
-    thread::spawn(move || {
-        let mut storage: Vec<Entrypoint>  = vec![];
+    let provider = thread::spawn(move || {
+        let mut storage: Vec<Entrypoint> = vec![];
         crate::providers::docker::provide(&mut storage);
     });
 
-    let mut storage: Vec<Entrypoint>  = vec![];
-    let server_address = "127.0.0.1:8080";
-    crate::api::server::start(server_address, storage);
+    let api = thread::spawn(move || {
+        let mut storage: Vec<Entrypoint> = vec![];
+        let server_address = "127.0.0.1:8080";
+        crate::api::server::start(server_address, storage);
+    });
+
+    provider.join().unwrap();
+    api.join().unwrap();
 }
