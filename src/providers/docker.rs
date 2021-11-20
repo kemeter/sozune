@@ -1,18 +1,23 @@
 use crate::providers::entrypoint::Entrypoint;
+use crate::proxy::sozu;
 use futures::StreamExt;
 use shiplift::Docker;
 
 use shiplift::rep::NetworkSettings;
 use shiplift::rep::ContainerDetails;
+use sozu_command::proxy::ProxyResponse;
+use sozu_command::proxy::ProxyRequest;
+use sozu_command::channel::Channel;
 
 use std::collections::HashMap;
 use sqlite::Connection;
 use sqlite::Value;
 
 #[tokio::main]
-pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
+pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>) {
     info!("Start docker provider");
 
+    let mut storage: Vec<Entrypoint>  = vec![];
     let docker = Docker::new();
     let connection = sqlite::open("sozune.db").unwrap();
 
@@ -21,7 +26,7 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
             for container in containers {
                 match docker.containers().get(&container.id).inspect().await {
                     Ok(container) => {
-                        register_container(storage, container).await
+                        register_container(command, container).await
                     },
                     Err(e) => eprintln!("Error get container: {}", e),
                 }
@@ -43,11 +48,11 @@ pub(crate) async fn provide(storage: &mut Vec<Entrypoint>) {
                             info!("Container event {:?}", event.action);
 
                             if "start" == event.action {
-                                register_container(storage, container.clone()).await
+                                register_container(command, container.clone()).await
                             }
 
                             if "die" == event.action  {
-                                remove_container(storage, container).await
+                                remove_container(command, container).await
                             }
 
                         }
@@ -87,7 +92,7 @@ fn get_host(labels: Option<HashMap<String, String>>) -> String {
     return String::from("");
 }
 
-async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerDetails ) {
+async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
     println!("register container");
     let host = get_host(container.config.labels);
     let connection = Connection::open("sozune.db").expect("Could not test: DB not created");
@@ -131,7 +136,8 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
             statement.next();
         }
 
-        storage.push(entrypoint.clone());
+        // storage.push(entrypoint.clone());
+        sozu::register_front(command, entrypoint.clone());
 
         info!("Register container {}. Host : {} ", container.id.clone(), entrypoint.hostname);
     } else {
@@ -139,13 +145,22 @@ async fn register_container(storage: &mut Vec<Entrypoint>, container: ContainerD
     }
 }
 
-async fn remove_container(storage: &mut Vec<Entrypoint>, container: ContainerDetails ) {
+async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
     let host = get_host(container.config.labels);
 
     if "" != host {
         info!("Remove container {}. Host : {} ", container.id, host);
 
+        let container_name = container.name.replace("/", "");
         let ip_address  = get_ip_address(&container.network_settings);
+        let entrypoint = Entrypoint {
+            id: container.id.clone(),
+            ip: ip_address.clone(),
+            name: container_name,
+            hostname: host.clone()
+        };
+
+        sozu::remove_front(command, entrypoint);
 
         debug!("container ip {}", ip_address);
     }

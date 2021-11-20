@@ -1,8 +1,13 @@
+extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
+
 use std::io::stdout;
 use sozu_command::logging::{Logger,LoggerBackend};
 use std::env;
 use std::thread;
+
+use sozu_command::channel::Channel;
+use sozu_command::proxy::HttpFront;
 
 mod providers {
     pub(crate) mod docker;
@@ -11,6 +16,10 @@ mod providers {
 
 mod api {
     pub(crate) mod server;
+}
+
+mod proxy {
+    pub(crate) mod sozu;
 }
 
 use crate::providers::entrypoint::Entrypoint;
@@ -35,9 +44,17 @@ fn main() {
         }
     }
 
+    info!("starting up sozu proxy");
+
+    let config = sozu_command::proxy::HttpListener {
+        front: "0.0.0.0:80".parse().expect("could not parse address"),
+        ..Default::default()
+    };
+
+    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+
     let provider = thread::spawn(move || {
-        let mut storage: Vec<Entrypoint> = vec![];
-        crate::providers::docker::provide(&mut storage);
+        crate::providers::docker::provide(&mut command);
     });
 
     let api = thread::spawn(move || {
@@ -46,6 +63,16 @@ fn main() {
         crate::api::server::start(server_address, storage);
     });
 
+
+    let jg = thread::spawn(move || {
+        let max_buffers = 500;
+        let buffer_size = 16384;
+        sozu::http::start(config, channel, max_buffers, buffer_size);
+    });
+
+    println!("listening for events");
+
     provider.join().unwrap();
     api.join().unwrap();
+    jg.join();
 }
