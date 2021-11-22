@@ -67,12 +67,15 @@ pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>) 
     }
 }
 
-fn get_ip_address(network: &NetworkSettings) -> String {
+fn get_ip_address(network: &NetworkSettings, network_label: String) -> String {
     let mut ip_address = &network.ip_address;
 
     if "" == ip_address {
-        for (_, value) in &network.networks {
-            ip_address = &value.ip_address;
+        for (label, value) in &network.networks {
+            if network_label.eq(&network_label) {
+                ip_address = &value.ip_address;
+            }
+
             debug!("container ip {}", ip_address);
         }
     }
@@ -92,13 +95,26 @@ fn get_host(labels: Option<HashMap<String, String>>) -> String {
     return String::from("");
 }
 
+fn get_network(labels: Option<HashMap<String, String>>) -> String {
+    for labels in labels.into_iter() {
+        for (label, value) in labels {
+            if label == "sozune.docker.network" {
+                return value;
+            }
+        }
+    }
+
+    return String::from("");
+}
+
 async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
     println!("register container");
-    let host = get_host(container.config.labels);
+    let host = get_host(container.config.labels.clone());
     let connection = Connection::open("sozune.db").expect("Could not test: DB not created");
 
     if host != "" {
-        let ip_address  = get_ip_address(&container.network_settings);
+        let network = get_network(container.config.labels);
+        let ip_address = get_ip_address(&container.network_settings, network);
         let container_name = container.name.replace("/", "");
 
         let entrypoint = Entrypoint {
@@ -152,7 +168,7 @@ async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, co
         info!("Remove container {}. Host : {} ", container.id, host);
 
         let container_name = container.name.replace("/", "");
-        let ip_address  = get_ip_address(&container.network_settings);
+        let ip_address = get_ip_address(&container.network_settings, String::from(""));
         let entrypoint = Entrypoint {
             id: container.id.clone(),
             ip: ip_address.clone(),

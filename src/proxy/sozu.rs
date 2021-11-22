@@ -40,7 +40,6 @@ pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entryp
 
 pub fn remove_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entrypoint: Entrypoint) {
 
-    let container_name = entrypoint.name.replace("/", "");
     let http_front = HttpFront {
         app_id:     entrypoint.name.to_string(),
         address:    "0.0.0.0:80".parse().unwrap(),
