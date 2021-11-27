@@ -38,7 +38,6 @@ pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>) 
     while let Some(event_result) = docker.events(&Default::default()).next().await {
         match event_result {
             Ok(event) => {
-                // println!("{:?}", event);
                 info!("Container event {:?}", event.action);
                 if "container" == event.typ {
 
@@ -107,21 +106,35 @@ fn get_network(labels: Option<HashMap<String, String>>) -> String {
     return String::from("");
 }
 
+fn get_port(labels: Option<HashMap<String, String>>) -> String {
+    for labels in labels.into_iter() {
+        for (label, value) in labels {
+            if label == "sozune.port" {
+                return value;
+            }
+        }
+    }
+
+    return String::from("80");
+}
+
 async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
     println!("register container");
     let host = get_host(container.config.labels.clone());
     let connection = Connection::open("sozune.db").expect("Could not test: DB not created");
 
     if host != "" {
-        let network = get_network(container.config.labels);
+        let network = get_network(container.config.labels.clone());
         let ip_address = get_ip_address(&container.network_settings, network);
+        let port = get_port(container.config.labels);
         let container_name = container.name.replace("/", "");
 
         let entrypoint = Entrypoint {
             id: container.id.clone(),
             ip: ip_address,
             name: container_name,
-            hostname: host.clone()
+            hostname: host.clone(),
+            port: port.clone()
         };
 
         let mut cursor = connection
@@ -139,8 +152,8 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
             let mut statement = connection
                 .prepare(
                     "
-                INSERT INTO entrypoints (id, ip, name, hostname)
-                VALUES (?, ?, ?, ?);
+                INSERT INTO entrypoints (id, ip, name, hostname, port)
+                VALUES (?, ?, ?, ?, ?);
             ",
                 )
                 .unwrap();
@@ -149,6 +162,7 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
             statement.bind(2, string_to_static_str(entrypoint.ip.clone().to_string())).unwrap();
             statement.bind(3, string_to_static_str(entrypoint.name.clone().to_string())).unwrap();
             statement.bind(4, string_to_static_str(entrypoint.hostname.clone().to_string())).unwrap();
+            statement.bind(5, string_to_static_str(entrypoint.port.clone().to_string())).unwrap();
             statement.next();
         }
 
@@ -162,18 +176,20 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
 }
 
 async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
-    let host = get_host(container.config.labels);
+    let host = get_host(container.config.labels.clone());
 
     if "" != host {
         info!("Remove container {}. Host : {} ", container.id, host);
 
         let container_name = container.name.replace("/", "");
         let ip_address = get_ip_address(&container.network_settings, String::from(""));
+        let port = get_port(container.config.labels);
         let entrypoint = Entrypoint {
             id: container.id.clone(),
             ip: ip_address.clone(),
             name: container_name,
-            hostname: host.clone()
+            hostname: host.clone(),
+            port: port.clone()
         };
 
         sozu::remove_front(command, entrypoint);
