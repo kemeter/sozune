@@ -6,5 +6,6 @@ pub struct Entrypoint {
     pub ip: String,
     pub name: String,
     pub hostname: String,
-    pub port: String
+    pub port: String,
+    pub protocol: String
 }

@@ -118,6 +118,18 @@ fn get_port(labels: Option<HashMap<String, String>>) -> String {
     return String::from("80");
 }
 
+fn get_frontend_protocol(labels: Option<HashMap<String, String>>) -> String {
+    for labels in labels.into_iter() {
+        for (label, value) in labels {
+            if label == "sozune.frontend.protocol" {
+                return value;
+            }
+        }
+    }
+
+    return String::from("http");
+}
+
 async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
     println!("register container");
     let host = get_host(container.config.labels.clone());
@@ -126,7 +138,8 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
     if host != "" {
         let network = get_network(container.config.labels.clone());
         let ip_address = get_ip_address(&container.network_settings, network);
-        let port = get_port(container.config.labels);
+        let port = get_port(container.config.labels.clone());
+        let protocol = get_frontend_protocol(container.config.labels.clone());
         let container_name = container.name.replace("/", "");
 
         let entrypoint = Entrypoint {
@@ -134,7 +147,8 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
             ip: ip_address,
             name: container_name,
             hostname: host.clone(),
-            port: port.clone()
+            port: port.clone(),
+            protocol: protocol.clone()
         };
 
         let mut cursor = connection
@@ -152,8 +166,8 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
             let mut statement = connection
                 .prepare(
                     "
-                INSERT INTO entrypoints (id, ip, name, hostname, port)
-                VALUES (?, ?, ?, ?, ?);
+                INSERT INTO entrypoints (id, ip, name, hostname, port, protocol)
+                VALUES (?, ?, ?, ?, ?, ?);
             ",
                 )
                 .unwrap();
@@ -183,13 +197,15 @@ async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, co
 
         let container_name = container.name.replace("/", "");
         let ip_address = get_ip_address(&container.network_settings, String::from(""));
-        let port = get_port(container.config.labels);
+        let port = get_port(container.config.labels.clone());
+        let protocol = get_frontend_protocol(container.config.labels);
         let entrypoint = Entrypoint {
             id: container.id.clone(),
             ip: ip_address.clone(),
             name: container_name,
             hostname: host.clone(),
-            port: port.clone()
+            port: port.clone(),
+            protocol: protocol.clone()
         };
 
         sozu::remove_front(command, entrypoint);

@@ -35,7 +35,7 @@ fn main() {
 
     let connection = sqlite::open("sozune.db").unwrap();
     match connection
-        .execute("CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT, port TEXT);") {
+        .execute("CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT, port TEXT, protocol VARCHAR(3));") {
         Ok(file) => {
             info!("Create table");
         },
