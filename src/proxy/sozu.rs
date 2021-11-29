@@ -7,15 +7,9 @@ use sozu_command::proxy::ProxyRequest;
 use sozu_command::proxy::LoadBalancingParams;
 use sozu_command::proxy;
 use sozu_command::proxy::HttpFront;
+use sozu_command::proxy::TcpFront;
 
 pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entrypoint: Entrypoint) {
-
-    let http_front = HttpFront {
-        app_id:     entrypoint.name.to_string(),
-        address:    "0.0.0.0:80".parse().unwrap(),
-        hostname:   entrypoint.hostname.to_string(),
-        path_begin: String::from("/"),
-    };
 
     let http_backend = Backend {
         app_id:                    entrypoint.name.to_string(),
@@ -26,10 +20,31 @@ pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entryp
         backup:                    None,
     };
 
-    command.write_message(&proxy::ProxyRequest {
-        id:    String::from("ID_ABCD"),
-        order: proxy::ProxyRequestData::AddHttpFront(http_front)
-    });
+    if "http" == entrypoint.protocol {
+        let front = HttpFront {
+            app_id:     entrypoint.name.to_string(),
+            address:    "0.0.0.0:80".parse().unwrap(),
+            hostname:   entrypoint.hostname.to_string(),
+            path_begin: String::from("/"),
+        };
+
+        command.write_message(&proxy::ProxyRequest {
+            id:    String::from("ID_ABCD"),
+            order: proxy::ProxyRequestData::AddHttpFront(front)
+        });
+    } else {
+        debug!("Run {} in tcp", entrypoint.name.to_string());
+
+        let front = TcpFront {
+            app_id:  String::from("test"),
+            address: "127.0.0.1:5432".parse().unwrap(),
+        };
+
+        command.write_message(&proxy::ProxyRequest {
+            id:    String::from("ID_ABCD"),
+            order: proxy::ProxyRequestData::AddTcpFront(front)
+        });
+    }
 
     command.write_message(&proxy::ProxyRequest {
         id:    String::from("ID_EFGH"),

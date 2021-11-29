@@ -27,6 +27,7 @@ pub(crate) async fn start(server_address: &str, storage: Vec<Entrypoint>)
                     name: row[2].as_string().unwrap().to_string(),
                     hostname: row[3].as_string().unwrap().to_string(),
                     port: row[4].as_string().unwrap().to_string(),
+                    protocol: row[5].as_string().unwrap().to_string(),
                 };
 
                 entrypoints.push(entrypoint)

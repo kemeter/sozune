@@ -26,6 +26,8 @@ services:
     image: nginx:1.9
     labels:
       - "sozune.host=sozune.localhost"
+      - "sozune.port=80"
+      - "sozune.frontend.protocol=http"
     networks:
       - sozune
 
