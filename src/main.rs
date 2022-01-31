@@ -23,26 +23,11 @@ mod proxy {
 }
 
 use crate::providers::entrypoint::Entrypoint;
+use std::collections::HashMap;
+use std::sync::{Mutex, Arc};
 
 fn main() {
     env_logger::init();
-
-    if env::var("RUST_LOG").is_ok() {
-        Logger::init("".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()), None);
-    } else {
-        Logger::init("".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
-    }
-
-    let connection = sqlite::open("sozune.db").unwrap();
-    match connection
-        .execute("CREATE TABLE entrypoints (id TEXT, ip TEXT, name TEXT, hostname TEXT, port TEXT);") {
-        Ok(file) => {
-            info!("Create table");
-        },
-        Err(error) => {
-            // info!("Unable to create tables {:?}", error);
-        }
-    }
 
     info!("starting up sozu proxy");
 
@@ -50,19 +35,21 @@ fn main() {
         front: "0.0.0.0:80".parse().expect("could not parse address"),
         ..Default::default()
     };
-
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+    let storage:HashMap<String, Entrypoint> = HashMap::new();
+
+    let storage_arc = Arc::new(Mutex::new(storage));
+    let docker_storage = storage_arc.clone();
+    let api_storage = storage_arc.clone();
 
     let provider = thread::spawn(move || {
-        crate::providers::docker::provide(&mut command);
+        crate::providers::docker::provide(&mut command, docker_storage);
     });
 
     let api = thread::spawn(move || {
-        let mut storage: Vec<Entrypoint> = vec![];
         let server_address = "127.0.0.1:8080";
-        crate::api::server::start(server_address, storage);
+        crate::api::server::start(server_address, api_storage);
     });
-
 
     let jg = thread::spawn(move || {
         let max_buffers = 500;
