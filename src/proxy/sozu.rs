@@ -17,24 +17,26 @@ pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entryp
         path_begin: String::from("/"),
     };
 
-    let http_backend = Backend {
-        app_id:                    entrypoint.name.to_string(),
-        backend_id:                String::from(format!("{}-backend", entrypoint.name.to_string())),
-        address:                   String::from(format!("{}:{}", entrypoint.ip, entrypoint.port)).parse().unwrap(),
-        load_balancing_parameters: Some(LoadBalancingParams::default()),
-        sticky_id:                 None,
-        backup:                    None,
-    };
-
     command.write_message(&proxy::ProxyRequest {
         id:    String::from("ID_ABCD"),
         order: proxy::ProxyRequestData::AddHttpFront(http_front)
     });
+    
+    for ip in entrypoint.backends {
+        let http_backend = Backend {
+            app_id:                    entrypoint.name.to_string(),
+            backend_id:                String::from(format!("{}-backend", entrypoint.name.to_string())),
+            address:                   String::from(format!("{}:{}", ip, entrypoint.port)).parse().unwrap(),
+            load_balancing_parameters: Some(LoadBalancingParams::default()),
+            sticky_id:                 None,
+            backup:                    None,
+        };
 
-    command.write_message(&proxy::ProxyRequest {
-        id:    String::from("ID_EFGH"),
-        order: proxy::ProxyRequestData::AddBackend(http_backend)
-    });
+        command.write_message(&proxy::ProxyRequest {
+            id:    String::from("ID_EFGH"),
+            order: proxy::ProxyRequestData::AddBackend(http_backend)
+        });
+    }
 }
 
 pub fn remove_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entrypoint: Entrypoint) {
