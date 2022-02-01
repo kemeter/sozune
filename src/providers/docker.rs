@@ -25,11 +25,11 @@ pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>, 
                     Ok(container) => {
                         register_container(command, &storage, container).await
                     },
-                    Err(e) => eprintln!("Error get container: {}", e),
+                    Err(e) => debug!("Error get container: {}", e),
                 }
             }
         },
-        Err(e) => eprintln!("Error list container: {}", e),
+        Err(e) => debug!("Error list container: {}", e),
     }
         
     while let Some(event_result) = docker.events(&Default::default()).next().await {
@@ -52,13 +52,13 @@ pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>, 
                             }
 
                         }
-                        Err(e) => eprintln!("Error events get container: {}", e),
+                        Err(e) => debug!("Error events get container: {}", e),
                     }
 
                 }
 
             },
-            Err(e) => eprintln!("Error watch docker event: {}", e),
+            Err(e) => debug!("Error watch docker event: {}", e),
         }
     }
 }
@@ -116,7 +116,7 @@ fn get_port(labels: Option<HashMap<String, String>>) -> String {
 }
 
 async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
-    println!("register container {:?}", container.id);
+    debug!("register container {:?}", container.id);
     let host = get_host(container.config.labels.clone());
 
     if host != "" {
@@ -133,7 +133,7 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
 
             guard.insert(host.clone(), entrypoint.clone());
 
-            println!("update container {:?}", entrypoint);
+            debug!("update container {:?}", entrypoint);
 
             sozu::register_front(command, entrypoint.clone());
 

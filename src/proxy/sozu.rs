@@ -21,9 +21,7 @@ pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entryp
         id:    String::from("ID_ABCD"),
         order: proxy::ProxyRequestData::AddHttpFront(http_front)
     });
-
-    print!("sdfnsdfndsfnsdnf {:?}", entrypoint.backends);
-
+    
     for ip in entrypoint.backends {
         let http_backend = Backend {
             app_id:                    entrypoint.name.to_string(),

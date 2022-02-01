@@ -57,7 +57,7 @@ fn main() {
         sozu::http::start(config, channel, max_buffers, buffer_size);
     });
 
-    println!("listening for events");
+    debug!("listening for events");
 
     provider.join().unwrap();
     api.join().unwrap();
