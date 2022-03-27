@@ -11,6 +11,7 @@ use sozu_command::channel::Channel;
 
 use std::collections::HashMap;
 use std::sync::{Mutex, Arc};
+use log::{info, debug};
 
 #[tokio::main]
 pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: Arc<Mutex<HashMap<String, Entrypoint>>>) {
@@ -67,7 +68,7 @@ fn get_ip_address(network: &NetworkSettings, network_label: String) -> String {
     let mut ip_address = &network.ip_address;
 
     if "" == ip_address {
-        for (label, value) in &network.networks {
+        for (_label, value) in &network.networks {
             if network_label.eq(&network_label) {
                 ip_address = &value.ip_address;
             }

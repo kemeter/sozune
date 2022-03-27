@@ -1,13 +1,9 @@
 extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
-use std::io::stdout;
-use sozu_command::logging::{Logger,LoggerBackend};
-use std::env;
 use std::thread;
-
+use log::{info, debug};
 use sozu_command::channel::Channel;
-use sozu_command::proxy::HttpFront;
 
 mod providers {
     pub(crate) mod docker;
@@ -61,5 +57,5 @@ fn main() {
 
     provider.join().unwrap();
     api.join().unwrap();
-    jg.join();
+    jg.join().unwrap();
 }
