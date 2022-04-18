@@ -8,16 +8,23 @@ use shiplift::rep::ContainerDetails;
 use sozu_command::proxy::ProxyResponse;
 use sozu_command::proxy::ProxyRequest;
 use sozu_command::channel::Channel;
-
 use std::collections::HashMap;
+
 use std::sync::{Mutex, Arc};
 use log::{info, debug};
 
+use crate::config::config::Config;
+
 #[tokio::main]
-pub(crate) async fn provide(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: Arc<Mutex<HashMap<String, Entrypoint>>>) {
+pub(crate) async fn provide(
+    configuration: Config,
+    command: &mut Channel<ProxyRequest,
+    ProxyResponse>,
+    storage: Arc<Mutex<HashMap<String, Entrypoint>>>
+) {
     info!("Start docker provider");
 
-    let docker = Docker::new();
+    let docker = Docker::unix(configuration.docker.endpoint.clone());
 
     match docker.containers().list(&Default::default()).await {
         Ok(containers) => {

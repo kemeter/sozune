@@ -1,11 +1,13 @@
-use crate::providers::entrypoint::Entrypoint;
 use std::sync::{Mutex, Arc};
 use std::collections::HashMap;
-
 use warp::Filter;
+use std::net::IpAddr;
+
+use crate::config::config::Config;
+use crate::providers::entrypoint::Entrypoint;
 
 #[tokio::main]
-pub(crate) async fn start(server_address: &str, storage: Arc<Mutex<HashMap<String, Entrypoint>>>)
+pub(crate) async fn start(configuration: Config, storage: Arc<Mutex<HashMap<String, Entrypoint>>>)
 {
     let list = warp::get()
         .and(warp::path("entrypoints"))
@@ -17,5 +19,8 @@ pub(crate) async fn start(server_address: &str, storage: Arc<Mutex<HashMap<Strin
 
     let routes = list;
 
-    warp::serve(routes).run(([0,0,0,0], 3030)).await;
+    println!("Starting server {} on port {}", configuration.api.address, configuration.api.port);
+    let address: IpAddr = configuration.api.address.parse().unwrap();
+
+    warp::serve(routes).run((address, configuration.api.port)).await;
 }
