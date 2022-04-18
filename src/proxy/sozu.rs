@@ -18,7 +18,7 @@ pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entryp
     };
 
     command.write_message(&proxy::ProxyRequest {
-        id:    String::from("ID_ABCD"),
+        id:    entrypoint.id.to_string(),
         order: proxy::ProxyRequestData::AddHttpFront(http_front)
     });
     
