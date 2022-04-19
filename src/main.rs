@@ -5,6 +5,10 @@ use std::thread;
 use log::{info, debug};
 use sozu_command::channel::Channel;
 
+mod config {
+    pub(crate) mod config;
+}
+
 mod providers {
     pub(crate) mod docker;
     pub(crate) mod entrypoint;
@@ -27,7 +31,7 @@ fn main() {
 
     info!("starting up sozu proxy");
 
-    let config = sozu_command::proxy::HttpListener {
+    let sozu_config = sozu_command::proxy::HttpListener {
         front: "0.0.0.0:80".parse().expect("could not parse address"),
         ..Default::default()
     };
@@ -38,19 +42,21 @@ fn main() {
     let docker_storage = storage_arc.clone();
     let api_storage = storage_arc.clone();
 
+    let config = config::config::load_config();
+    let config_provider = config.clone();
+
     let provider = thread::spawn(move || {
-        crate::providers::docker::provide(&mut command, docker_storage);
+        crate::providers::docker::provide(config_provider, &mut command, docker_storage);
     });
 
     let api = thread::spawn(move || {
-        let server_address = "127.0.0.1:8080";
-        crate::api::server::start(server_address, api_storage);
+        crate::api::server::start(config.clone(), api_storage);
     });
 
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start(config, channel, max_buffers, buffer_size);
+        sozu::http::start(sozu_config, channel, max_buffers, buffer_size);
     });
 
     debug!("listening for events");
