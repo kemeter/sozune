@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
-use std::fs;
 use std::env;
+use std::path::Path;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone)]
@@ -22,18 +22,15 @@ pub(crate) struct ApiConfig {
 }
 
 pub(crate) fn load_config() -> Config {
-    let home_dir = env::var("HOME").unwrap();
-    let sozune_config_file = env::var("SOZUNE_CONFIG_FILE").unwrap_or("".to_string());
-    let file = if sozune_config_file.len() == 0 {
-        format!("{}/.config/kemeter/sozune/config.toml", home_dir)
-    }  else {
-        format!("{}/config.toml", sozune_config_file)
-    };
+    let config_file = env::var("SOZUNE_CONFIG_FILE").unwrap_or("/etc/sozune/config.toml".to_string());
 
-    debug!("Use config file : {}", file);
+    debug!("Use config file : {}", config_file);
+    println!("Use config file : {}", Path::new(&config_file).exists());
 
-    if fs::metadata(file.clone()).is_ok() {
-        let mut config = File::open(file).expect("Unable to open file");
+    if Path::new(&config_file).exists() {
+        debug!("Parse config file {}", &config_file);
+
+        let mut config = File::open(config_file).expect("Unable to open file");
         let mut contents = String::new();
 
         config.read_to_string(&mut contents).expect("Unable to read file");
@@ -43,12 +40,12 @@ pub(crate) fn load_config() -> Config {
         return config;
     }
 
-    debug!("No config file found, using default config file: {}", file);
+    debug!("No config file found, using default configuration");
 
     return Config {
         api: ApiConfig {
             address: "0.0.0.0".to_string(),
-            port: 3030
+            port: 3025
         },
         docker: DockerConfig {
             endpoint: "unix:///var/run/docker.sock".to_string()
