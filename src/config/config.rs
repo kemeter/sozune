@@ -12,6 +12,7 @@ pub(crate) struct Config {
 
 #[derive(Deserialize, Debug, Clone)]
 pub(crate) struct DockerConfig {
+    pub(crate) enabled: bool,
     pub(crate) endpoint: String
 }
 
@@ -25,7 +26,6 @@ pub(crate) fn load_config() -> Config {
     let config_file = env::var("SOZUNE_CONFIG_FILE").unwrap_or("/etc/sozune/config.toml".to_string());
 
     debug!("Use config file : {}", config_file);
-    println!("Use config file : {}", Path::new(&config_file).exists());
 
     if Path::new(&config_file).exists() {
         debug!("Parse config file {}", &config_file);
@@ -48,6 +48,7 @@ pub(crate) fn load_config() -> Config {
             port: 3025
         },
         docker: DockerConfig {
+            enabled: true,
             endpoint: "unix:///var/run/docker.sock".to_string()
         }
     }

@@ -19,7 +19,7 @@ pub(crate) async fn start(configuration: Config, storage: Arc<Mutex<HashMap<Stri
 
     let routes = list;
 
-    println!("Starting server {} on port {}", configuration.api.address, configuration.api.port);
+    println!("Starting api server {} on port {}", configuration.api.address, configuration.api.port);
     let address: IpAddr = configuration.api.address.parse().unwrap();
 
     warp::serve(routes).run((address, configuration.api.port)).await;

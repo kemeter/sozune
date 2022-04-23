@@ -28,6 +28,7 @@ use std::sync::{Mutex, Arc};
 
 fn main() {
     env_logger::init();
+    let config = config::config::load_config();
 
     info!("starting up sozu proxy");
 
@@ -42,11 +43,12 @@ fn main() {
     let docker_storage = storage_arc.clone();
     let api_storage = storage_arc.clone();
 
-    let config = config::config::load_config();
     let config_provider = config.clone();
 
     let provider = thread::spawn(move || {
-        crate::providers::docker::provide(config_provider, &mut command, docker_storage);
+        if config_provider.docker.enabled {
+            crate::providers::docker::provide(config_provider, &mut command, docker_storage);
+        }
     });
 
     let api = thread::spawn(move || {

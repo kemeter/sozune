@@ -4,3 +4,4 @@ port = 3025
 
 [docker]
 endpoint = "unix:///var/run/docker.sock"
+enabled = false
