@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use std::sync::{Mutex, Arc};
 use log::{info, debug};
+use std::env;
 
 use crate::config::config::Config;
 
@@ -24,7 +25,8 @@ pub(crate) async fn provide(
 ) {
     info!("Start docker provider");
 
-    let docker = Docker::unix(configuration.docker.endpoint.clone());
+    env::set_var("DOCKER_HOST", configuration.docker.endpoint.clone());
+    let docker = Docker::new();
 
     match docker.containers().list(&Default::default()).await {
         Ok(containers) => {
