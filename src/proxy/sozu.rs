@@ -14,7 +14,7 @@ pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entryp
         app_id:     entrypoint.name.to_string(),
         address:    "0.0.0.0:80".parse().unwrap(),
         hostname:   entrypoint.hostname.to_string(),
-        path_begin: String::from("/"),
+        path_begin: entrypoint.path.to_string(),
     };
 
     command.write_message(&proxy::ProxyRequest {
@@ -45,7 +45,7 @@ pub fn remove_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entrypoi
         app_id:     entrypoint.name.to_string(),
         address:    format!("0.0.0.0:{}", entrypoint.port.to_string()).parse().unwrap(),
         hostname:   entrypoint.hostname.to_string(),
-        path_begin: String::from("/"),
+        path_begin: entrypoint.path.to_string(),
     };
 
     command.write_message(&proxy::ProxyRequest {

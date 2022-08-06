@@ -6,5 +6,6 @@ pub struct Entrypoint {
     pub backends: Vec<String>,
     pub name: String,
     pub hostname: String,
-    pub port: String
+    pub port: String,
+    pub path: String,
 }

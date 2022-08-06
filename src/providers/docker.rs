@@ -125,6 +125,18 @@ fn get_port(labels: Option<HashMap<String, String>>) -> String {
     return String::from("80");
 }
 
+fn get_path(labels: Option<HashMap<String, String>>) -> String {
+    for labels in labels.into_iter() {
+        for (label, value) in labels {
+            if label == "sozune.path" {
+                return value;
+            }
+        }
+    }
+
+    return String::from("/");
+}
+
 async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
     debug!("register container {:?}", container.id);
     let host = get_host(container.config.labels.clone());
@@ -132,7 +144,8 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
     if host != "" {
         let network = get_network(container.config.labels.clone());
         let ip_address = get_ip_address(&container.network_settings, network);
-        let port = get_port(container.config.labels);
+        let port = get_port(container.config.labels.clone());
+        let path = get_path(container.config.labels);
         let container_name = container.name.replace("/", "");
 
         let mut guard = storage.lock().unwrap();
@@ -153,6 +166,7 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
                 name: container_name,
                 hostname: host.clone(),
                 port: port.clone(),
+                path: path,
                 backends: vec![ip_address.clone()],
             };
 
@@ -176,12 +190,14 @@ async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, co
 
         let container_name = container.name.replace("/", "");
         let ip_address = get_ip_address(&container.network_settings, String::from(""));
-        let port = get_port(container.config.labels);
+        let port = get_port(container.config.labels.clone());
+        let path = get_path(container.config.labels);
         let entrypoint = Entrypoint {
             id: container.id.clone(),
             backends: vec![ip_address.clone()],
             name: container_name,
             hostname: host.clone(),
+            path: path.clone(),
             port: port.clone()
         };
 
