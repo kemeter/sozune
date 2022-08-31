@@ -33,7 +33,9 @@ pub(crate) async fn provide(
             for container in containers {
                 match docker.containers().get(&container.id).inspect().await {
                     Ok(container) => {
-                        register_container(command, &storage, container).await
+                        if container.state.status == "running" {
+                            register_container(command, &storage, container).await
+                        }
                     },
                     Err(e) => debug!("Error get container: {}", e),
                 }
@@ -45,20 +47,19 @@ pub(crate) async fn provide(
     while let Some(event_result) = docker.events(&Default::default()).next().await {
         match event_result {
             Ok(event) => {
-                info!("Container event {:?}", event.action);
+                debug!("Container event {:?}", event.action);
                 if "container" == event.typ {
-
                     match docker.containers().get(&event.actor.id).inspect().await {
                         Ok(container) => {
 
-                            info!("Container event {:?}", event.action);
+                            debug!("Container event {:?}", event.action);
 
                             if "start" == event.action {
                                 register_container(command, &storage, container.clone()).await
                             }
 
                             if "die" == event.action  {
-                                remove_container(command, container).await
+                                remove_container(command, &storage, container).await
                             }
 
                         }
@@ -138,7 +139,7 @@ fn get_path(labels: Option<HashMap<String, String>>) -> String {
 }
 
 async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
-    debug!("register container {:?}", container.id);
+    debug!("test container {:?}", container.id);
     let host = get_host(container.config.labels.clone());
 
     if host != "" {
@@ -154,39 +155,41 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
             let mut entrypoint = guard.get(&host).clone().unwrap().clone();
             entrypoint.backends.push(ip_address);
 
-            guard.insert(host.clone(), entrypoint.clone());
+            guard.insert(host.to_string(), entrypoint.clone());
 
-            debug!("update container {:?}", entrypoint);
+            info!("update container {:?}", entrypoint);
 
             sozu::register_front(command, entrypoint.clone());
 
         } else {
             let entrypoint = Entrypoint {
-                id: container.id.clone(),
+                id: container.id.to_string(),
                 name: container_name,
-                hostname: host.clone(),
-                port: port.clone(),
+                hostname: host.to_string(),
+                port: port.to_string(),
                 path: path,
-                backends: vec![ip_address.clone()],
+                backends: vec![ip_address.to_string()],
             };
 
             guard.insert(host, entrypoint.clone());
 
             sozu::register_front(command, entrypoint.clone());
+
+            info!("Register container {}. Host : {} ", container.id.to_string(), entrypoint.hostname);
         };
 
-
-        // info!("Register container {}. Host : {} ", container.id.clone(), entrypoint.hostname);
     } else {
-        info!("container {} Host not found ", container.id.clone());
+        info!("Host not found for container {}  ", container.id.clone());
     }
 }
 
-async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
+async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
     let host = get_host(container.config.labels.clone());
 
     if "" != host {
         info!("Remove container {}. Host : {} ", container.id, host);
+
+        let mut guard = storage.lock().unwrap();
 
         let container_name = container.name.replace("/", "");
         let ip_address = get_ip_address(&container.network_settings, String::from(""));
@@ -201,6 +204,7 @@ async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, co
             port: port.clone()
         };
 
+        guard.remove(&*host);
         sozu::remove_front(command, entrypoint);
 
         debug!("container ip {}", ip_address);
