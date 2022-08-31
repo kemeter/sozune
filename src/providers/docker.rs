@@ -1,10 +1,11 @@
 use crate::providers::entrypoint::Entrypoint;
 use crate::proxy::sozu;
 use futures::StreamExt;
-use shiplift::Docker;
+use bollard::container::{Config, CreateContainerOptions, InspectContainerOptions, LogsOptions, StartContainerOptions};
+use bollard::Docker;
+use bollard::models::ContainerSummary;
+use bollard::models::NetworkSettings;
 
-use shiplift::rep::NetworkSettings;
-use shiplift::rep::ContainerDetails;
 use sozu_command::proxy::ProxyResponse;
 use sozu_command::proxy::ProxyRequest;
 use sozu_command::channel::Channel;
@@ -13,12 +14,15 @@ use std::collections::HashMap;
 use std::sync::{Mutex, Arc};
 use log::{info, debug};
 use std::env;
+use std::collections::hash_map::Iter;
 
-use crate::config::config::Config;
+use bollard::container::ListContainersOptions;
+
+use crate::config::config::{Config as SozuneConfig};
 
 #[tokio::main]
 pub(crate) async fn provide(
-    configuration: Config,
+    configuration: SozuneConfig,
     command: &mut Channel<ProxyRequest,
     ProxyResponse>,
     storage: Arc<Mutex<HashMap<String, Entrypoint>>>
@@ -26,187 +30,197 @@ pub(crate) async fn provide(
     info!("Start docker provider");
 
     env::set_var("DOCKER_HOST", configuration.docker.endpoint.clone());
-    let docker = Docker::new();
+    let docker = Docker::connect_with_socket_defaults().unwrap();
 
-    match docker.containers().list(&Default::default()).await {
-        Ok(containers) => {
-            for container in containers {
-                match docker.containers().get(&container.id).inspect().await {
-                    Ok(container) => {
-                        if container.state.status == "running" {
-                            register_container(command, &storage, container).await
-                        }
-                    },
-                    Err(e) => debug!("Error get container: {}", e),
-                }
-            }
-        },
-        Err(e) => debug!("Error list container: {}", e),
-    }
-        
-    while let Some(event_result) = docker.events(&Default::default()).next().await {
-        match event_result {
-            Ok(event) => {
-                debug!("Container event {:?}", event.action);
-                if "container" == event.typ {
-                    match docker.containers().get(&event.actor.id).inspect().await {
-                        Ok(container) => {
+    let mut list_container_filters = HashMap::new();
+    list_container_filters.insert("status", vec!["running"]);
 
-                            debug!("Container event {:?}", event.action);
+    let containers = &docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: list_container_filters,
+            ..Default::default()
+        }))
+        .await;
 
-                            if "start" == event.action {
-                                register_container(command, &storage, container.clone()).await
-                            }
+    for con in containers.iter() {
+        for container in con.iter() {
+            let labels = &container.labels.as_ref().unwrap();
 
-                            if "die" == event.action  {
-                                remove_container(command, &storage, container).await
-                            }
-
-                        }
-                        Err(e) => debug!("Error events get container: {}", e),
-                    }
-
-                }
-
-            },
-            Err(e) => debug!("Error watch docker event: {}", e),
-        }
-    }
-}
-
-fn get_ip_address(network: &NetworkSettings, network_label: String) -> String {
-    let mut ip_address = &network.ip_address;
-
-    if "" == ip_address {
-        for (_label, value) in &network.networks {
-            if network_label.eq(&network_label) {
-                ip_address = &value.ip_address;
-            }
-
-            debug!("container ip {}", ip_address);
+            register_container(command, &storage, container.clone()).await;
         }
     }
 
-    return ip_address.to_string();
+    //
+    // while let Some(event_result) = docker.events(&Default::default()).next().await {
+    //     match event_result {
+    //         Ok(event) => {
+    //             info!("Container event {:?}", event.action);
+    //             if "container" == event.typ {
+    //                 match docker.containers().get(&event.actor.id).inspect().await {
+    //                     Ok(container) => {
+    //
+    //                         debug!("Container event {:?}", event.action);
+    //
+    //                         if "start" == event.action {
+    //                             register_container(command, &storage, container.clone()).await
+    //                         }
+    //
+    //                         if "die" == event.action  {
+    //                             remove_container(command, &storage, container).await
+    //                         }
+    //
+    //                     }
+    //                     Err(e) => debug!("Error events get container: {}", e),
+    //                 }
+    //
+    //             }
+    //
+    //         },
+    //         Err(e) => debug!("Error watch docker event: {}", e),
+    //     }
+    // }
 }
 
-fn get_host(labels: Option<HashMap<String, String>>) -> String {
-    for labels in labels.into_iter() {
-        for (label, value) in labels {
-            if label == "sozune.host" {
-                return value;
-            }
+// fn get_ip_address(network: &NetworkSettings, network_label: String) -> String {
+//     dbg!(network.clone());
+//     let mut ip_address = &network.ip_address;
+//
+//     if "" == ip_address {
+//         for (_label, value) in &network.networks {
+//             if network_label.eq(&network_label) {
+//                 ip_address = &value.ip_address;
+//             }
+//
+//             debug!("container ip {}", ip_address);
+//         }
+//     }
+//
+//     return ip_address.to_string();
+// }
+//
+//             debug!("container ip {}", ip_address);
+//         }
+//     }
+//
+//     return ip_address.to_string();
+// }
+
+fn get_host(labels: Iter<String, String>) -> String {
+    for (label, value) in labels {
+        if label == "sozune.host" {
+            return value.to_string();
         }
     }
 
     return String::from("");
 }
 
-fn get_network(labels: Option<HashMap<String, String>>) -> String {
-    for labels in labels.into_iter() {
-        for (label, value) in labels {
-            if label == "sozune.docker.network" {
-                return value;
-            }
+fn get_network(labels: Iter<String, String>) -> String {
+    for (label, value) in labels {
+        if label == "sozune.docker.network" {
+            return value.to_string();
         }
     }
 
     return String::from("");
 }
 
-fn get_port(labels: Option<HashMap<String, String>>) -> String {
-    for labels in labels.into_iter() {
-        for (label, value) in labels {
-            if label == "sozune.port" {
-                return value;
-            }
+fn get_port(labels: Iter<String, String>) -> String {
+    for (label, value) in labels {
+        if label == "sozune.port" {
+            return value.to_string();
         }
     }
 
     return String::from("80");
 }
 
-fn get_path(labels: Option<HashMap<String, String>>) -> String {
-    for labels in labels.into_iter() {
-        for (label, value) in labels {
-            if label == "sozune.path" {
-                return value;
-            }
+fn get_path(labels: Iter<String, String>) -> String {
+    for (label, value) in labels {
+        if label == "sozune.path" {
+            return value.to_string();
         }
     }
 
     return String::from("/");
 }
 
-async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
+
+async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerSummary ) {
     debug!("test container {:?}", container.id);
-    let host = get_host(container.config.labels.clone());
-
+    let labels = &container.labels.as_ref().unwrap();
+    let host = get_host(labels.into_iter());
     if host != "" {
-        let network = get_network(container.config.labels.clone());
-        let ip_address = get_ip_address(&container.network_settings, network);
-        let port = get_port(container.config.labels.clone());
-        let path = get_path(container.config.labels);
-        let container_name = container.name.replace("/", "");
+        let network = get_network(labels.into_iter());
+        // let ip_address = get_ip_address(&container.network_settings, network);
+        let port = get_port(labels.into_iter());
+        let path = get_path(labels.into_iter());
+        let container_name = container.names.as_ref().unwrap()[0].replace("/", "");
 
-        let mut guard = storage.lock().unwrap();
-
-        if guard.contains_key(&host) {
-            let mut entrypoint = guard.get(&host).clone().unwrap().clone();
-            entrypoint.backends.push(ip_address);
-
-            guard.insert(host.to_string(), entrypoint.clone());
-
-            info!("update container {:?}", entrypoint);
-
-            sozu::register_front(command, entrypoint.clone());
-
-        } else {
-            let entrypoint = Entrypoint {
-                id: container.id.to_string(),
-                name: container_name,
-                hostname: host.to_string(),
-                port: port.to_string(),
-                path: path,
-                backends: vec![ip_address.to_string()],
-            };
-
-            guard.insert(host, entrypoint.clone());
-
-            sozu::register_front(command, entrypoint.clone());
-
-            info!("Register container {}. Host : {} ", container.id.to_string(), entrypoint.hostname);
-        };
-
+    //
+    //     let mut guard = storage.lock().unwrap();
+    //
+    //     if guard.contains_key(&host) {
+    //         let mut entrypoint = guard.get(&host).clone().unwrap().clone();
+    //         entrypoint.backends.push(ip_address);
+    //
+    //         guard.insert(host.to_string(), entrypoint.clone());
+    //
+    //         info!("update container {:?}", entrypoint);
+    //
+    //         sozu::register_front(command, entrypoint.clone());
+    //
+    //     } else {
+    //         let entrypoint = Entrypoint {
+    //             id: container.id.to_string(),
+    //             name: container_name,
+    //             hostname: host.to_string(),
+    //             port: port.to_string(),
+    //             path: path,
+    //             backends: vec![ip_address.to_string()],
+    //         };
+    //
+    //         guard.insert(host, entrypoint.clone());
+    //
+    //         sozu::register_front(command, entrypoint.clone());
+    //
+    //         info!("Register container {}. Host : {} ", container.id.to_string(), entrypoint.hostname);
+    //     };
+    //
     } else {
-        info!("Host not found for container {}  ", container.id.clone());
+        info!("Host not found for container {}  ", container.id.unwrap());
     }
 }
+//
+// async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
+//     let host = get_host(container.config.labels.clone());
+//     info!("process remove");
+//
+//     if "" != host {
+//         dbg!(container.clone());
+//         info!("Remove container {}. Host : {} ", container.id, host);
+//
+//         let mut guard = storage.lock().unwrap();
+//         let ip_address = get_ip_address(&container.network_settings, String::from("bridge"));
+//
+//         let mut entrypoint = guard.get(&*host).unwrap().clone();
+//         dbg!(entrypoint.clone());
+//
+//         let ip: &str = &ip_address;
+//
+//         let index = entrypoint.backends.iter().position(|r| r == ip);
+//         dbg!(index);
+//         // entrypoint.backends.remove(index);
+//
+//         // sozu::remove_front(command, entrypoint);
+//
+//         debug!("container ip {}", ip_address);
+//     }
+// }
 
-async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
-    let host = get_host(container.config.labels.clone());
-
-    if "" != host {
-        info!("Remove container {}. Host : {} ", container.id, host);
-
-        let mut guard = storage.lock().unwrap();
-
-        let container_name = container.name.replace("/", "");
-        let ip_address = get_ip_address(&container.network_settings, String::from(""));
-        let port = get_port(container.config.labels.clone());
-        let path = get_path(container.config.labels);
-        let entrypoint = Entrypoint {
-            id: container.id.clone(),
-            backends: vec![ip_address.clone()],
-            name: container_name,
-            hostname: host.clone(),
-            path: path.clone(),
-            port: port.clone()
-        };
-
-        guard.remove(&*host);
-        sozu::remove_front(command, entrypoint);
-
-        debug!("container ip {}", ip_address);
-    }
-}
+//
+// pub fn deserialize_labels(serialized: TypeName) -> HashMap<String, String> {
+//     let deserialized: HashMap<String, String> = serde_json::from_str(&serialized).unwrap();
+//     deserialized
+// }
