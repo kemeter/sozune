@@ -1,55 +1,76 @@
 use crate::providers::entrypoint::Entrypoint;
 
-use sozu_command::proxy::Backend;
-use sozu_command::channel::Channel;
-use sozu_command::proxy::ProxyResponse;
-use sozu_command::proxy::ProxyRequest;
-use sozu_command::proxy::LoadBalancingParams;
-use sozu_command::proxy;
-use sozu_command::proxy::HttpFront;
+use sozu_command_lib::{
+    channel::Channel,
+    proto::command::{
+        request::RequestType, AddBackend, LoadBalancingParams,
+        PathRule, RequestHttpFrontend, SocketAddress,
+        WorkerResponse, WorkerRequest,
+    },
+};
 
-pub fn register_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entrypoint: Entrypoint) {
+pub fn register_front(command: &mut Channel<WorkerRequest, WorkerResponse>, entrypoint: Entrypoint) {
 
-    let http_front = HttpFront {
-        app_id:     entrypoint.name.to_string(),
-        address:    "0.0.0.0:80".parse().unwrap(),
-        hostname:   entrypoint.hostname.to_string(),
-        path_begin: entrypoint.path.to_string(),
+    let http_front = RequestHttpFrontend {
+        cluster_id: Some("cluster_1".to_string()),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 80),
+        hostname: entrypoint.hostname.to_string(),
+        path: PathRule::prefix(entrypoint.path),
+        ..Default::default()
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    let _ = command.write_message(&WorkerRequest {
         id:    entrypoint.id.to_string(),
-        order: proxy::ProxyRequestData::AddHttpFront(http_front)
+        content: RequestType::AddHttpFrontend(http_front).into()
     });
     
     for ip in entrypoint.backends {
-        let http_backend = Backend {
-            app_id:                    entrypoint.name.to_string(),
-            backend_id:                String::from(format!("{}-backend", entrypoint.name.to_string())),
-            address:                   String::from(format!("{}:{}", ip, entrypoint.port)).parse().unwrap(),
+        let socket_address = parse_ip(entrypoint.port.clone(), &ip);
+
+        let http_backend = AddBackend {
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from(format!("{}-backend", entrypoint.name.to_string())),
+            address:  socket_address,
             load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id:                 None,
-            backup:                    None,
+            sticky_id: None,
+            backup: None,
         };
 
-        command.write_message(&proxy::ProxyRequest {
-            id:    String::from("ID_EFGH"),
-            order: proxy::ProxyRequestData::AddBackend(http_backend)
+        let _ = command.write_message(&WorkerRequest {
+            id: String::from("ID_EFGH"),
+            content: RequestType::AddBackend(http_backend).into()
         });
     }
 }
 
-pub fn remove_front(command: &mut Channel<ProxyRequest, ProxyResponse>, entrypoint: Entrypoint) {
+fn parse_ip(port: String, ip: &str) -> SocketAddress {
 
-    let http_front = HttpFront {
-        app_id:     entrypoint.name.to_string(),
-        address:    format!("0.0.0.0:{}", entrypoint.port.to_string()).parse().unwrap(),
-        hostname:   entrypoint.hostname.to_string(),
-        path_begin: entrypoint.path.to_string(),
+    let ip_segments: Vec<u8> = ip
+        .split('.')
+        .map(|s| s.parse::<u8>().expect("Parse error"))
+        .collect();
+
+    return SocketAddress::new_v4(
+        ip_segments[0],
+        ip_segments[1],
+        ip_segments[2],
+        ip_segments[3],
+        port.parse().unwrap()
+    );
+}
+
+pub fn remove_front(command: &mut Channel<WorkerRequest, WorkerResponse>, entrypoint: Entrypoint) {
+
+    let socket_address = parse_ip(entrypoint.port, "0.0.0.0");
+    let http_front = RequestHttpFrontend {
+        address: socket_address,
+        hostname: entrypoint.hostname.to_string(),
+        path: PathRule::prefix(entrypoint.path),
+        ..Default::default()
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    let _ = command.write_message(&WorkerRequest {
         id:    String::from("ID_ABCD"),
-        order: proxy::ProxyRequestData::RemoveHttpFront(http_front)
+        content: RequestType::RemoveHttpFrontend(http_front).into()
     });
 }

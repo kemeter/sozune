@@ -7,16 +7,17 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-futures = "0.3.1"
+futures = "0.3.30"
 tokio = { version = "1.20", features = ["full"] }
 log = "0.4.0"
-env_logger = "0.9.0"
+env_logger = "0.11.3"
+anyhow = "^1.0.79"
 shiplift = "0.7"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-sozu = "0.12.0"
-sozu-command-lib = "0.12.0"
-sozu-lib = "0.12.0"
+sozu = { version = "1.0.0-rc.1" }
+sozu-command-lib = { version = "1.0.0-rc.1" }
+sozu-lib = { version = "1.0.0-rc.1" }
 time = "0.3.12"
 warp = "0.3"
-toml = "0.5.8"
+toml = "0.8.12"

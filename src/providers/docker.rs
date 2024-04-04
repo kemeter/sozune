@@ -5,22 +5,21 @@ use shiplift::Docker;
 
 use shiplift::rep::NetworkSettings;
 use shiplift::rep::ContainerDetails;
-use sozu_command::proxy::ProxyResponse;
-use sozu_command::proxy::ProxyRequest;
-use sozu_command::channel::Channel;
 use std::collections::HashMap;
 
 use std::sync::{Mutex, Arc};
 use log::{info, debug};
 use std::env;
 
+
+use sozu_command_lib::channel::Channel;
+use sozu_command_lib::proto::command::{WorkerRequest, WorkerResponse};
 use crate::config::config::Config;
 
 #[tokio::main]
 pub(crate) async fn provide(
     configuration: Config,
-    command: &mut Channel<ProxyRequest,
-    ProxyResponse>,
+    command: &mut Channel<WorkerRequest, WorkerResponse>,
     storage: Arc<Mutex<HashMap<String, Entrypoint>>>
 ) {
     info!("Start docker provider");
@@ -137,11 +136,12 @@ fn get_path(labels: Option<HashMap<String, String>>) -> String {
     return String::from("/");
 }
 
-async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
+async fn register_container(command: &mut Channel<WorkerRequest, WorkerResponse>, storage: &Arc<Mutex<HashMap<String, Entrypoint>>>, container: ContainerDetails ) {
     debug!("register container {:?}", container.id);
     let host = get_host(container.config.labels.clone());
 
     if host != "" {
+        debug!("host found {:?}", host.clone());
         let network = get_network(container.config.labels.clone());
         let ip_address = get_ip_address(&container.network_settings, network);
         let port = get_port(container.config.labels.clone());
@@ -182,7 +182,7 @@ async fn register_container(command: &mut Channel<ProxyRequest, ProxyResponse>, 
     }
 }
 
-async fn remove_container(command: &mut Channel<ProxyRequest, ProxyResponse>, container: ContainerDetails ) {
+async fn remove_container(command: &mut Channel<WorkerRequest, WorkerResponse>, container: ContainerDetails ) {
     let host = get_host(container.config.labels.clone());
 
     if "" != host {
