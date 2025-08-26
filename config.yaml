@@ -1,0 +1,19 @@
+providers:
+  docker:
+    enabled: true
+    expose_by_default: false
+
+#  config_file:
+#    enabled: true
+#    path: "/etc/myapp/entrypoints.yaml"
+#    watch: true
+
+api:
+  enabled: true
+  listen_address: 0.0.0.0:3035
+
+proxy:
+  http:
+    listen_address: 80
+  https:
+    listen_address: 443

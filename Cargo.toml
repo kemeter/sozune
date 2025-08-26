@@ -1,23 +1,25 @@
 [package]
 name = "sozune"
-version = "0.1.0"
-authors = ["Nawo Mbechezi mlanawo@mbechezi.kemeter.io"]
-edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+version = "0.5.0"
+authors = ["mlanawo Mbechezi mlanawo.mbechezi@kemeter.io"]
+edition = "2024"
 
 [dependencies]
-futures = "0.3.30"
-tokio = { version = "1.20", features = ["full"] }
-log = "0.4.0"
-env_logger = "0.11.3"
-anyhow = "^1.0.79"
-shiplift = "0.7"
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-sozu = { version = "1.0.0-rc.1" }
-sozu-command-lib = { version = "1.0.0-rc.1" }
-sozu-lib = { version = "1.0.0-rc.1" }
-time = "0.3.12"
-warp = "0.3"
-toml = "0.8.12"
+tokio = { version = "1.47.1", features = ["full"] }
+axum = "0.8.4"
+axum-server = "0.7.2"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+
+sozu-command-lib = "1.0.6"
+sozu-lib = "1.0.6"
+anyhow = "1.0.99"
+bollard = "0.19.2"
+async-trait = "0.1.89"
+serde_yaml = "0.9.34+deprecated"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+futures-util = "0.3"
+notify = "8.2.0"

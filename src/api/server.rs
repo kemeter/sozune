@@ -1,26 +1,29 @@
-use std::sync::{Mutex, Arc};
-use std::collections::HashMap;
-use warp::Filter;
-use std::net::IpAddr;
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::sync::{Arc, RwLock};
+use axum::Router;
+use axum::routing::get;
+use crate::model::Entrypoint;
+use tracing::{info};
+use crate::config::ApiConfig;
 
-use crate::config::config::Config;
-use crate::providers::entrypoint::Entrypoint;
+pub async fn serve(config: ApiConfig, storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>) {
+    let app = Router::new()
+        .route("/entrypoints", get(move || {
+            let storage = storage.clone();
+            async move {
+                let storage_read = storage.read().unwrap();
+                (axum::http::StatusCode::OK,
+                 [(axum::http::header::CONTENT_TYPE, "application/json")],
+                 serde_json::to_string(&*storage_read).unwrap())
+            }
+        }));
+    let addr = SocketAddr::from_str(&*config.listen_address);
+    info!("Listening API server on {:?}", addr);
 
-#[tokio::main]
-pub(crate) async fn start(configuration: Config, storage: Arc<Mutex<HashMap<String, Entrypoint>>>)
-{
-    let list = warp::get()
-        .and(warp::path("entrypoints"))
-        .map(move || {
-            let entrypoints = storage.lock().unwrap().clone();
-
-            warp::reply::json(&entrypoints)
-        });
-
-    let routes = list;
-
-    println!("Starting api server {} on port {}", configuration.api.address, configuration.api.port);
-    let address: IpAddr = configuration.api.address.parse().unwrap();
-
-    warp::serve(routes).run((address, configuration.api.port)).await;
+    axum_server::bind(addr.expect("REASON"))
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }

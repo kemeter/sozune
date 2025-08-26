@@ -1,115 +1,140 @@
-extern crate sozu_lib as sozu;
-
-#[macro_use]
-extern crate sozu_command_lib;
-
-use sozu_command_lib::{
-    channel::Channel,
-    config::ListenerBuilder,
-    info,
-    debug,
-    logging::setup_logging,
-    proto::command::{
-        request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, RequestHttpFrontend, RulePosition, SocketAddress,
-    }
-};
-
+use std::sync::{Arc, RwLock};
 use anyhow::Context;
-use std::thread;
+use tracing::{info, warn, error, debug};
+use signal_hook_tokio::Signals;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use futures_util::stream::StreamExt;
+use tokio::sync::mpsc;
 
-mod config {
-    pub(crate) mod config;
-}
+use crate::config::AppConfig;
 
-mod providers {
-    pub(crate) mod docker;
-    pub(crate) mod entrypoint;
-}
+mod api;
+mod provider;
+mod proxy;
+mod config;
+mod model;
 
-mod api {
-    pub(crate) mod server;
-}
+pub use model::*;
 
-mod proxy {
-    pub(crate) mod sozu;
-}
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("sozune=info".parse().unwrap()))
+        .init();
 
-use crate::providers::entrypoint::Entrypoint;
-use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
-use sozu::http::testing::start_http_worker;
-use sozu::https::testing::start_https_worker;
-use sozu_command_lib::proto::command::{WorkerRequest, WorkerResponse};
+    info!("Starting Sozune proxy");
 
-fn main() {
-    env_logger::init();
-    let config = config::config::load_config();
+    let config_path = std::env::var("CONFIG_PATH")
+        .unwrap_or_else(|_| "config.yaml".to_string());
 
-    info!("starting up sozu proxy");
+    let config = if tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
+        info!("Loading configuration from: {}", config_path);
+        let config_content = tokio::fs::read_to_string(&config_path).await
+            .context("Failed to read a config file")?;
+        
+        serde_yaml::from_str(&config_content)
+            .context("Failed to parse a config file")?
+    } else {
+        info!("Configuration file not found, using the default configuration");
+        AppConfig::default()
+    };
 
-    let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 80))
-        .to_http(None)
-        .expect("Could not create HTTP listener");
+    // Create empty storage - providers will populate it
+    let storage = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
+    let storage_proxy = Arc::clone(&storage);
 
-    let https_listener =
-        ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443))
-            .to_tls(None)
-            .expect("Could not create HTTPS listener");
+    // Create a channel for reload signals
+    let (reload_tx, reload_rx) = mpsc::unbounded_channel();
 
-    let (mut command_channel, proxy_channel): (
-        Channel<WorkerRequest, WorkerResponse>,
-        Channel<WorkerResponse, WorkerRequest>,
-    ) = Channel::generate(1000, 10000).unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let proxy_config = config.proxy.clone();
+    let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        proxy::backend::init_proxy(storage_proxy, &proxy_config, shutdown_rx, reload_rx)
+    });
 
-    let storage:HashMap<String, Entrypoint> = HashMap::new();
-    let storage_arc = Arc::new(Mutex::new(storage));
-    let docker_storage = storage_arc.clone();
-    let api_storage = storage_arc.clone();
-
-    let config_provider = config.clone();
-
-    let provider = thread::spawn(move || {
-        if config_provider.docker.enabled {
-            crate::providers::docker::provide(config_provider, &mut command_channel, docker_storage);
+    // Start provider services (Docker, etc.)
+    let provider_task = tokio::spawn({
+        let storage_providers = Arc::clone(&storage);
+        let reload_tx_providers = reload_tx.clone();
+        let config = config.clone();
+        
+        async move {
+            provider::factory::start_services(&config, storage_providers, reload_tx_providers).await
         }
     });
 
-    let api = thread::spawn(move || {
-        crate::api::server::start(config.clone(), api_storage);
+    let storage_server = storage.clone();
+    let api_config = config.api.clone();
+    let api_task = tokio::spawn(async move {
+        if api_config.enabled {
+            info!("Starting API server");
+            api::server::serve(api_config, storage_server).await;
+        }
+
+        Ok::<(), anyhow::Error>(())
     });
 
-    let jg = thread::spawn(move || {
-        let max_buffers = 500;
-        let buffer_size = 16384;
+    info!("Starting all servers...");
 
-        start_http_worker(
-            http_listener,
-            proxy_channel,
-            max_buffers,
-            buffer_size,
-        ).expect("The worker could not be started, or shut down");
+    // Signal handling for graceful shutdown
+    let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
+    let signal_handle = signals.handle();
+
+    let signal_task = tokio::spawn(async move {
+        while let Some(signal) = signals.next().await {
+            match signal {
+                SIGINT => {
+                    debug!("Received SIGINT, initiating graceful shutdown...");
+                    break;
+                }
+                SIGTERM => {
+                    debug!("Received SIGTERM, initiating graceful shutdown...");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
     });
 
-    let (mut command_channel2, proxy_channel2): (
-        Channel<WorkerRequest, WorkerResponse>,
-        Channel<WorkerResponse, WorkerRequest>,
-    ) = Channel::generate(1000, 10000).unwrap();
+    let tasks_future = async {
+        tokio::try_join!(proxy_task, api_task, provider_task)
+    };
+    
+    tokio::select! {
+        result = tasks_future => {
+            signal_handle.close();
+            let (proxy_result, api_result, provider_result) = result?;
+            
+            match proxy_result {
+                Ok(_) => debug!("Proxy task completed successfully"),
+                Err(e) => error!("Proxy task failed: {}", e),
+            }
 
-    let jq2 = thread::spawn(move || {
-        let max_buffers = 500;
-        let buffer_size = 16384;
-        start_https_worker(
-            https_listener,
-            proxy_channel2,
-            max_buffers,
-            buffer_size,
-        )
-    });
+            match api_result {
+                Ok(_) => debug!("API task completed successfully"),
+                Err(e) => error!("API task failed: {}", e),
+            }
 
-    debug!("listening for events");
+            match provider_result {
+                Ok(_) => info!("Provider services completed successfully"),
+                Err(e) => error!("Provider services failed: {}", e),
+            }
+        },
+        _ = signal_task => {
+            info!("Shutdown signal received, stopping servers...");
+            signal_handle.close();
+            let _ = shutdown_tx.send(());
+            
+            // Force exit after short delay
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            warn!("Forcing shutdown");
+            std::process::exit(0);
+        }
+    }
 
-    provider.join().unwrap();
-    api.join().unwrap();
-    jg.join().unwrap();
+    debug!("All tasks completed");
+    Ok(())
 }
+
+

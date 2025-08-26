@@ -1,0 +1,21 @@
+services:
+    backend1:
+        image: traefik/whoami
+        labels:
+            - "sozune.enable=true"
+            - "sozune.http.backend1.host=backend1.localhost"
+            - "sozune.network=sozune_default"
+
+    backend2:
+        image: traefik/whoami
+        labels:
+            - "sozune.enable=true"
+            - "sozune.http.backend2.host=backend2.localhost"
+            - "sozune.network=sozune_default"
+
+    backend3:
+        image: traefik/whoami
+        labels:
+            - "sozune.enable=true"
+            - "sozune.http.backend3.host=backend3.localhost"
+            - "sozune.network=sozune_default"
