@@ -5,7 +5,7 @@ Sōzune (pronounce Sozuné) is a modern reverse proxy and load balancer that sim
 ## 🚀 Features
 
 - **Automatic discovery** of Docker containers via labels
-- **Hot reload** - real-time change detection (start/stop/update)
+- **Hot reload** - real-time change detection
 - **Wildcard support** - hostnames like `*.example.com`
 - **Multi-protocol** - HTTP, HTTPS, TCP, UDP
 - **Automatic load balancing** between multiple instances
