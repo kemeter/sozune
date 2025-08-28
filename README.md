@@ -147,13 +147,29 @@ proxy:
 ```
 
 Environment variables:
+
+**General**:
 - `SOZUNE_CONFIG_PATH` - Config file path (default: `config.yaml`)
+
+**Proxy configuration**:
 - `SOZUNE_HTTP_PORT` - HTTP port (default: 8080)
 - `SOZUNE_HTTPS_PORT` - HTTPS port (default: 8443)
+- `SOZUNE_PROXY_MAX_BUFFERS` - Maximum buffers (default: 500)
+- `SOZUNE_PROXY_BUFFER_SIZE` - Buffer size in bytes (default: 16384)
+- `SOZUNE_PROXY_STARTUP_DELAY_MS` - Startup delay in ms (default: 1000)
+- `SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS` - Cluster setup delay in ms (default: 500)
 
+**API configuration**:
+- `SOZUNE_API_ENABLED` - Enable REST API (default: false)
+- `SOZUNE_API_LISTEN_ADDRESS` - API listen address (default: `0.0.0.0:3035`)
 
-
-
+**Provider configuration**:
+- `SOZUNE_PROVIDER_DOCKER_ENABLED` - Enable Docker provider (default: false)
+- `SOZUNE_PROVIDER_DOCKER_ENDPOINT` - Docker socket path (default: `/var/run/docker.sock`)
+- `SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT` - Auto-expose containers (default: false)
+- `SOZUNE_PROVIDER_CONFIG_FILE_ENABLED` - Enable config file provider (default: false)
+- `SOZUNE_PROVIDER_CONFIG_FILE_PATH` - Config file path (default: `/etc/sozune/config.yaml`)
+- `SOZUNE_PROVIDER_CONFIG_FILE_WATCH` - Watch config file changes (default: true)
 
 ## 🌐 REST API
 

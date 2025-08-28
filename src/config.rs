@@ -15,24 +15,29 @@ pub struct ProvidersConfig {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct DockerConfig {
+    #[serde(default, deserialize_with = "deserialize_docker_enabled_with_env")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_docker_endpoint_with_env")]
     pub endpoint: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_docker_expose_by_default_with_env")]
     pub expose_by_default: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ApiConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_api_enabled_with_env")]
     pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_api_listen_address_with_env")]
     pub listen_address: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ConfigFileConfig {
+    #[serde(default, deserialize_with = "deserialize_config_file_enabled_with_env")]
     pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_config_file_path_with_env")]
     pub path: String,
+    #[serde(default, deserialize_with = "deserialize_config_file_watch_with_env")]
     pub watch: bool,
 }
 
@@ -40,13 +45,13 @@ pub struct ConfigFileConfig {
 pub struct ProxyConfig {
     pub http: HttpConfig,
     pub https: HttpsConfig,
-    #[serde(default = "default_max_buffers")]
+    #[serde(default = "default_max_buffers", deserialize_with = "deserialize_max_buffers_with_env")]
     pub max_buffers: usize,
-    #[serde(default = "default_buffer_size")]
+    #[serde(default = "default_buffer_size", deserialize_with = "deserialize_buffer_size_with_env")]
     pub buffer_size: usize,
-    #[serde(default = "default_startup_delay_ms")]
+    #[serde(default = "default_startup_delay_ms", deserialize_with = "deserialize_startup_delay_ms_with_env")]
     pub startup_delay_ms: u64,
-    #[serde(default = "default_cluster_setup_delay_ms")]
+    #[serde(default = "default_cluster_setup_delay_ms", deserialize_with = "deserialize_cluster_setup_delay_ms_with_env")]
     pub cluster_setup_delay_ms: u64,
 }
 
@@ -148,28 +153,106 @@ fn default_https_port() -> u16 {
     8443
 }
 
-fn get_env_port(var: &str, default: u16) -> u16 {
+fn get_env_with_parse<T: std::str::FromStr>(var: &str, default: T) -> T {
     std::env::var(var)
         .ok()
-        .and_then(|v| v.parse::<u16>().ok())
+        .and_then(|v| v.parse::<T>().ok())
         .unwrap_or(default)
 }
 
-fn deserialize_port_with_env<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let port = u16::deserialize(deserializer).unwrap_or(default_http_port());
-    Ok(get_env_port("SOZU_HTTP_PORT", port))
+// Macro pour générer les fonctions de désérialisation
+macro_rules! deserialize_with_env {
+    ($fn_name:ident, $env_var:expr, $type:ty, $default_fn:expr) => {
+        fn $fn_name<'de, D>(deserializer: D) -> Result<$type, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = <$type>::deserialize(deserializer).unwrap_or_else(|_| $default_fn());
+            Ok(get_env_with_parse($env_var, value))
+        }
+    };
+    ($fn_name:ident, $env_var:expr, $type:ty, $default_value:expr, literal) => {
+        fn $fn_name<'de, D>(deserializer: D) -> Result<$type, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = <$type>::deserialize(deserializer).unwrap_or($default_value);
+            Ok(get_env_with_parse($env_var, value))
+        }
+    };
 }
 
-fn deserialize_https_port_with_env<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let port = u16::deserialize(deserializer).unwrap_or(default_https_port());
-    Ok(get_env_port("SOZU_HTTPS_PORT", port))
+deserialize_with_env!(deserialize_port_with_env, "SOZUNE_HTTP_PORT", u16, default_http_port);
+deserialize_with_env!(deserialize_https_port_with_env, "SOZUNE_HTTPS_PORT", u16, default_https_port);
+
+// Fonction spécialisée pour les booléens
+fn get_env_bool(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
 }
+
+// Fonction spécialisée pour les String
+fn get_env_string(var: &str, default: String) -> String {
+    std::env::var(var).unwrap_or(default)
+}
+
+// Macro spécialisée pour les booléens
+macro_rules! deserialize_bool_with_env {
+    ($fn_name:ident, $env_var:expr, $default_value:expr) => {
+        fn $fn_name<'de, D>(deserializer: D) -> Result<bool, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = bool::deserialize(deserializer).unwrap_or($default_value);
+            Ok(get_env_bool($env_var, value))
+        }
+    };
+}
+
+// Macro spécialisée pour les String
+macro_rules! deserialize_string_with_env {
+    ($fn_name:ident, $env_var:expr, $default_fn:expr) => {
+        fn $fn_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer).unwrap_or_else(|_| $default_fn());
+            Ok(get_env_string($env_var, value))
+        }
+    };
+    ($fn_name:ident, $env_var:expr, $default_value:expr, literal) => {
+        fn $fn_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer).unwrap_or_else(|_| $default_value.to_string());
+            Ok(get_env_string($env_var, value))
+        }
+    };
+}
+
+// Génération de toutes les fonctions avec les macros
+deserialize_bool_with_env!(deserialize_docker_enabled_with_env, "SOZUNE_PROVIDER_DOCKER_ENABLED", false);
+deserialize_string_with_env!(deserialize_docker_endpoint_with_env, "SOZUNE_PROVIDER_DOCKER_ENDPOINT", "/var/run/docker.sock", literal);
+deserialize_bool_with_env!(deserialize_docker_expose_by_default_with_env, "SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT", false);
+
+deserialize_bool_with_env!(deserialize_config_file_enabled_with_env, "SOZUNE_PROVIDER_CONFIG_FILE_ENABLED", false);
+deserialize_string_with_env!(deserialize_config_file_path_with_env, "SOZUNE_PROVIDER_CONFIG_FILE_PATH", "/etc/sozune/config.yaml", literal);
+deserialize_bool_with_env!(deserialize_config_file_watch_with_env, "SOZUNE_PROVIDER_CONFIG_FILE_WATCH", true);
+
+deserialize_bool_with_env!(deserialize_api_enabled_with_env, "SOZUNE_API_ENABLED", false);
+deserialize_string_with_env!(deserialize_api_listen_address_with_env, "SOZUNE_API_LISTEN_ADDRESS", default_api_listen_address);
+
+deserialize_with_env!(deserialize_max_buffers_with_env, "SOZUNE_PROXY_MAX_BUFFERS", usize, default_max_buffers);
+deserialize_with_env!(deserialize_buffer_size_with_env, "SOZUNE_PROXY_BUFFER_SIZE", usize, default_buffer_size);
+deserialize_with_env!(deserialize_startup_delay_ms_with_env, "SOZUNE_PROXY_STARTUP_DELAY_MS", u64, default_startup_delay_ms);
+deserialize_with_env!(deserialize_cluster_setup_delay_ms_with_env, "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS", u64, default_cluster_setup_delay_ms);
 
 #[cfg(test)]
 mod tests {
