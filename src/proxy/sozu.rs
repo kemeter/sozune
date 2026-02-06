@@ -30,34 +30,38 @@ pub fn start_sozu_proxy(
     // HTTP Listener
     let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(0, 0, 0, 0, config.http.listen_address))
         .to_http(None)
-        .expect("Could not create an HTTP listener");
+        .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
 
     let https_listener = ListenerBuilder::new_https(SocketAddress::new_v4(0, 0, 0, 0, config.https.listen_address))
         .to_tls(None)
-        .expect("Could not create an HTTPS listener");
+        .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
 
     // Create communication channels
-    let (mut command_channel, proxy_channel) = 
-        Channel::generate(1000, 10000).expect("should create a channel");
-    let (mut command_channel_https, proxy_channel_https) = 
-        Channel::generate(1000, 10000).expect("should create a channel for HTTPS");
+    let (mut command_channel, proxy_channel) =
+        Channel::generate(1000, 10000).map_err(|e| anyhow::anyhow!("Could not create HTTP channel: {}", e))?;
+    let (mut command_channel_https, proxy_channel_https) =
+        Channel::generate(1000, 10000).map_err(|e| anyhow::anyhow!("Could not create HTTPS channel: {}", e))?;
 
     let worker_http_handle = thread::spawn(move || {
-        sozu_lib::http::testing::start_http_worker(
-            http_listener, 
-            proxy_channel, 
-            max_buffers, 
+        if let Err(e) = sozu_lib::http::testing::start_http_worker(
+            http_listener,
+            proxy_channel,
+            max_buffers,
             buffer_size
-        ).expect("could not start the HTTP server");
+        ) {
+            error!("HTTP server failed: {}", e);
+        }
     });
 
     let worker_https_handle = thread::spawn(move || {
-        sozu_lib::https::testing::start_https_worker(
-            https_listener, 
-            proxy_channel_https, 
-            max_buffers, 
+        if let Err(e) = sozu_lib::https::testing::start_https_worker(
+            https_listener,
+            proxy_channel_https,
+            max_buffers,
             buffer_size
-        ).expect("could not start the HTTPS server");
+        ) {
+            error!("HTTPS server failed: {}", e);
+        }
     });
 
     // Wait for workers to be ready
@@ -76,13 +80,25 @@ pub fn start_sozu_proxy(
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
 
     let reload_handle = thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("Failed to create tokio runtime for reload handler: {}", e);
+                return;
+            }
+        };
         rt.block_on(async {
             while let Some(_) = reload_rx.recv().await {
                 info!("Received configuration reload request");
-                
+
                 // Just reconfigure with the current storage state
-                let storage_read = storage_reload.read().unwrap();
+                let storage_read = match storage_reload.read() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        error!("Storage lock poisoned during reload: {}", e);
+                        continue;
+                    }
+                };
                 match configure_sozu_routing(&mut command_channel, &mut command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms) {
                     Ok(()) => {
                         info!("Configuration reloaded successfully");

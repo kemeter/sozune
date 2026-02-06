@@ -22,7 +22,13 @@ pub async fn start_services(
             
             match config_provider.provide().await {
                 Ok(entrypoints) => {
-                    let mut storage_write = storage.write().unwrap();
+                    let mut storage_write = match storage.write() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            error!("Storage lock poisoned in config file provider: {}", e);
+                            return Ok(());
+                        }
+                    };
                     for (id, mut entrypoint) in entrypoints {
                         if storage_write.contains_key(&id) {
                             warn!("Duplicate entrypoint ID {} from config file provider", id);

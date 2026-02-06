@@ -19,7 +19,7 @@ pub use model::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("sozune=info".parse().unwrap()))
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("sozune=info".parse().expect("valid log directive")))
         .init();
 
     info!("Starting Sozune proxy");
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
-            api::server::serve(api_config, storage_server).await;
+            api::server::serve(api_config, storage_server).await?;
         }
 
         Ok::<(), anyhow::Error>(())

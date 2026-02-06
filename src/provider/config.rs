@@ -89,7 +89,13 @@ impl ConfigProvider {
                 Ok(new_entrypoints) => {
                     // Replace config entrypoints in storage
                     {
-                        let mut storage_write = storage_clone.write().unwrap();
+                        let mut storage_write = match storage_clone.write() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                error!("Storage lock poisoned during config reload: {}", e);
+                                continue;
+                            }
+                        };
                         
                         // Remove existing config entrypoints
                         storage_write.retain(|_, entrypoint| {

@@ -57,7 +57,13 @@ impl DockerProvider {
             Ok(initial_entrypoints) => {
                 if !initial_entrypoints.is_empty() {
                     let mut storage_changed = false;
-                    let mut storage_write = storage.write().unwrap();
+                    let mut storage_write = match storage.write() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            error!("Storage lock poisoned during initial scan: {}", e);
+                            return Ok(());
+                        }
+                    };
                     
                     for (key, mut entrypoint) in initial_entrypoints {
                         entrypoint.source = Some("docker".to_string());
@@ -127,7 +133,13 @@ impl DockerProvider {
                                     "start" => {
                                         if let Ok(entrypoints) = self.get_container_entrypoints(container_id).await {
                                             if !entrypoints.is_empty() {
-                                                let mut storage_write = storage.write().unwrap();
+                                                let mut storage_write = match storage.write() {
+                                                    Ok(guard) => guard,
+                                                    Err(e) => {
+                                                        error!("Storage lock poisoned on container start: {}", e);
+                                                        continue;
+                                                    }
+                                                };
                                                 for (key, entrypoint) in entrypoints {
                                                     info!("Adding entrypoint from started container: {}", key);
                                                     if let Some(existing) = storage_write.get_mut(&key) {
@@ -150,7 +162,13 @@ impl DockerProvider {
                                     "stop" | "die" | "destroy" => {
                                         // Remove this container's entrypoints
                                         let container_ip = self.get_container_ip(container_id).await.unwrap_or_else(|| "127.0.0.1".to_string());
-                                        let mut storage_write = storage.write().unwrap();
+                                        let mut storage_write = match storage.write() {
+                                            Ok(guard) => guard,
+                                            Err(e) => {
+                                                error!("Storage lock poisoned on container stop: {}", e);
+                                                continue;
+                                            }
+                                        };
                                         
                                         let mut keys_to_remove = Vec::new();
                                         for (key, entrypoint) in storage_write.iter_mut() {
@@ -176,7 +194,13 @@ impl DockerProvider {
                                         // For updates, remove old and add new
                                         if let Ok(entrypoints) = self.get_container_entrypoints(container_id).await {
                                             let container_ip = self.get_container_ip(container_id).await.unwrap_or_else(|| "127.0.0.1".to_string());
-                                            let mut storage_write = storage.write().unwrap();
+                                            let mut storage_write = match storage.write() {
+                                                Ok(guard) => guard,
+                                                Err(e) => {
+                                                    error!("Storage lock poisoned on container update: {}", e);
+                                                    continue;
+                                                }
+                                            };
                                             
                                             // Remove old entries for this container
                                             let mut keys_to_remove = Vec::new();

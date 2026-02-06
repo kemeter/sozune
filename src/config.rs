@@ -153,7 +153,7 @@ fn default_https_port() -> u16 {
     8443
 }
 
-fn get_env_with_parse<T: std::str::FromStr>(var: &str, default: T) -> T {
+fn get_env_port<T: std::str::FromStr>(var: &str, default: T) -> T {
     std::env::var(var)
         .ok()
         .and_then(|v| v.parse::<T>().ok())
@@ -168,7 +168,7 @@ macro_rules! deserialize_with_env {
             D: serde::Deserializer<'de>,
         {
             let value = <$type>::deserialize(deserializer).unwrap_or_else(|_| $default_fn());
-            Ok(get_env_with_parse($env_var, value))
+            Ok(get_env_port($env_var, value))
         }
     };
     ($fn_name:ident, $env_var:expr, $type:ty, $default_value:expr, literal) => {
@@ -177,7 +177,7 @@ macro_rules! deserialize_with_env {
             D: serde::Deserializer<'de>,
         {
             let value = <$type>::deserialize(deserializer).unwrap_or($default_value);
-            Ok(get_env_with_parse($env_var, value))
+            Ok(get_env_port($env_var, value))
         }
     };
 }
