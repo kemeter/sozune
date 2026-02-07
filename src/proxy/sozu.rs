@@ -9,17 +9,21 @@ use sozu_command_lib::{
     proto::command::{
         SocketAddress, WorkerRequest, WorkerResponse, Request, request::RequestType,
         AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        RequestHttpFrontend, PathRule, RulePosition
+        RequestHttpFrontend, PathRule, RulePosition,
+        AddCertificate, CertificateAndKey, TlsVersion,
     },
 };
 use crate::model::{Entrypoint, Protocol, PathRuleType};
 use crate::config::ProxyConfig;
+use crate::acme::CertCommand;
 
 pub fn start_sozu_proxy(
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     config: &ProxyConfig,
     _shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     mut reload_rx: mpsc::UnboundedReceiver<()>,
+    mut cert_rx: mpsc::UnboundedReceiver<CertCommand>,
+    acme_challenge_port: Option<u16>,
 ) -> anyhow::Result<()> {
     info!("Starting Sōzu HTTP and HTTPS workers");
 
@@ -73,6 +77,13 @@ pub fn start_sozu_proxy(
     info!("Sōzu HTTP worker running on 0.0.0.0:{}", config.http.listen_address);
     info!("Sōzu HTTPS worker running on 0.0.0.0:{}", config.https.listen_address);
 
+    // Register ACME challenge cluster if enabled (routes added per-hostname during reload)
+    if let Some(challenge_port) = acme_challenge_port {
+        if let Err(e) = register_acme_challenge_cluster(&mut command_channel, challenge_port) {
+            error!("Failed to register ACME challenge cluster: {}", e);
+        }
+    }
+
     // Start configuration reload handler
     let storage_reload = Arc::clone(&storage);
     let http_port = config.http.listen_address;
@@ -88,23 +99,41 @@ pub fn start_sozu_proxy(
             }
         };
         rt.block_on(async {
-            while let Some(_) = reload_rx.recv().await {
-                info!("Received configuration reload request");
-
-                // Just reconfigure with the current storage state
-                let storage_read = match storage_reload.read() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        error!("Storage lock poisoned during reload: {}", e);
-                        continue;
+            let mut cert_rx_open = true;
+            loop {
+                if cert_rx_open {
+                    tokio::select! {
+                        reload = reload_rx.recv() => {
+                            match reload {
+                                Some(_) => handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port),
+                                None => {
+                                    debug!("Reload channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                        cert_cmd = cert_rx.recv() => {
+                            match cert_cmd {
+                                Some(cmd) => {
+                                    info!("Adding certificate for {}", cmd.hostname);
+                                    if let Err(e) = add_certificate(&mut command_channel_https, https_port, &cmd.cert_pem, &cmd.chain, &cmd.key_pem, &[cmd.hostname.clone()]) {
+                                        error!("Failed to add certificate for {}: {}", cmd.hostname, e);
+                                    }
+                                }
+                                None => {
+                                    debug!("Cert channel closed, falling back to reload-only mode");
+                                    cert_rx_open = false;
+                                }
+                            }
+                        }
                     }
-                };
-                match configure_sozu_routing(&mut command_channel, &mut command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms) {
-                    Ok(()) => {
-                        info!("Configuration reloaded successfully");
-                    }
-                    Err(e) => {
-                        error!("Failed to reload configuration: {}", e);
+                } else {
+                    match reload_rx.recv().await {
+                        Some(_) => handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port),
+                        None => {
+                            debug!("Reload channel closed");
+                            break;
+                        }
                     }
                 }
             }
@@ -130,6 +159,29 @@ pub fn start_sozu_proxy(
     Ok(())
 }
 
+fn handle_reload(
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    http_port: u16,
+    https_port: u16,
+    cluster_setup_delay_ms: u64,
+    acme_challenge_port: Option<u16>,
+) {
+    info!("Received configuration reload request");
+    let storage_read = match storage.read() {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("Storage lock poisoned during reload: {}", e);
+            return;
+        }
+    };
+    match configure_sozu_routing(command_channel, command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port) {
+        Ok(()) => info!("Configuration reloaded successfully"),
+        Err(e) => error!("Failed to reload configuration: {}", e),
+    }
+}
+
 fn configure_sozu_routing(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -137,14 +189,39 @@ fn configure_sozu_routing(
     http_port: u16,
     https_port: u16,
     cluster_setup_delay_ms: u64,
+    acme_challenge_port: Option<u16>,
 ) -> anyhow::Result<()> {
     info!("Applying Sōzu configuration for {} entrypoints", storage.len());
-    
+
     for (cluster_id, entrypoint) in storage.iter() {
         // Only process HTTP entrypoints for Sozu
         match entrypoint.protocol {
             Protocol::Http => {
                 debug!("Configuring HTTP cluster: {}", entrypoint.name);
+
+                // Register ACME challenge frontend BEFORE normal frontend
+                // Pre rules are checked in insertion order, so the more specific
+                // ACME path must be registered first to take priority over "/"
+                if acme_challenge_port.is_some() {
+                    for hostname in &entrypoint.config.hostnames {
+                        let acme_front = RequestHttpFrontend {
+                            cluster_id: Some("acme-challenge".to_string()),
+                            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+                            hostname: hostname.clone(),
+                            path: PathRule {
+                                value: "/.well-known/acme-challenge/".to_string(),
+                                kind: 1, // Prefix
+                            },
+                            method: None,
+                            position: RulePosition::Pre as i32,
+                            tags: BTreeMap::new(),
+                        };
+                        if let Err(e) = send_to_worker(command_channel, format!("add-frontend-acme-{}", hostname), RequestType::AddHttpFrontend(acme_front)) {
+                            debug!("Failed to add ACME frontend for {} (may already exist): {}", hostname, e);
+                        }
+                    }
+                }
+
                 configure_http_entrypoint(command_channel, command_channel_https, cluster_id, entrypoint, http_port, https_port)?;
             },
             Protocol::Tcp => {
@@ -286,6 +363,82 @@ fn send_to_worker(
     Ok(())
 }
 
+/// Register the ACME challenge cluster and backend (frontends are added per-hostname during reload)
+fn register_acme_challenge_cluster(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    challenge_port: u16,
+) -> anyhow::Result<()> {
+    let cluster_id = "acme-challenge".to_string();
+
+    let cluster = Cluster {
+        cluster_id: cluster_id.clone(),
+        sticky_session: false,
+        https_redirect: false,
+        proxy_protocol: None,
+        load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+        load_metric: None,
+        answer_503: None,
+    };
+
+    send_to_worker(
+        command_channel,
+        "add-cluster-acme-challenge".to_string(),
+        RequestType::AddCluster(cluster),
+    )?;
+
+    let backend = AddBackend {
+        cluster_id: cluster_id.clone(),
+        backend_id: "acme-challenge-backend-0".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, challenge_port),
+        load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
+        sticky_id: None,
+        backup: None,
+    };
+
+    send_to_worker(
+        command_channel,
+        "add-backend-acme-challenge".to_string(),
+        RequestType::AddBackend(backend),
+    )?;
+
+    info!("ACME challenge cluster registered -> 127.0.0.1:{}", challenge_port);
+    Ok(())
+}
+
+/// Send an AddCertificate command to the HTTPS worker
+fn add_certificate(
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    https_port: u16,
+    cert_pem: &str,
+    chain: &[String],
+    key_pem: &str,
+    names: &[String],
+) -> anyhow::Result<()> {
+    let cert = AddCertificate {
+        address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+        certificate: CertificateAndKey {
+            certificate: cert_pem.to_string(),
+            certificate_chain: chain.to_vec(),
+            key: key_pem.to_string(),
+            versions: vec![
+                TlsVersion::TlsV12 as i32,
+                TlsVersion::TlsV13 as i32,
+            ],
+            names: names.to_vec(),
+        },
+        expired_at: None,
+    };
+
+    send_to_worker(
+        command_channel_https,
+        format!("add-cert-{}", names.first().map(|s| s.as_str()).unwrap_or("unknown")),
+        RequestType::AddCertificate(cert),
+    )?;
+
+    info!("Certificate added for {:?}", names);
+    Ok(())
+}
+
 fn parse_backend_address(host: &str, port: u16) -> anyhow::Result<SocketAddress> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
     
@@ -308,7 +461,7 @@ mod tests {
     fn test_parse_backend_address_ipv4() {
         let result = parse_backend_address("192.168.1.100", 8080);
         assert!(result.is_ok(), "Failed to parse IPv4 address: {:?}", result);
-        // Pas besoin de tester le format exact, juste que ça parse
+        // No need to test exact format, just that it parses
     }
 
     #[test]
@@ -320,12 +473,11 @@ mod tests {
     #[test]
     fn test_parse_backend_address_hostname() {
         let result = parse_backend_address("localhost", 80);
-        // Localhost peut ne pas résoudre dans tous les environnements de test
-        // On vérifie juste qu'on a un résultat cohérent
+        // Localhost may not resolve in all test environments
+        // Just verify we get a consistent result
         match result {
-            Ok(_) => (), // OK si ça marche
+            Ok(_) => (),
             Err(e) => {
-                // OK si ça échoue pour des raisons de résolution DNS
                 println!("Hostname resolution failed (expected in some test environments): {}", e);
             }
         }
@@ -340,6 +492,6 @@ mod tests {
     #[test]
     fn test_parse_backend_address_invalid_port() {
         let result = parse_backend_address("127.0.0.1", 0);
-        assert!(result.is_ok()); // Port 0 est techniquement valide
+        assert!(result.is_ok()); // Port 0 is technically valid
     }
 }

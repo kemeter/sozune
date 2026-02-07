@@ -17,3 +17,8 @@ proxy:
     listen_address: 80
   https:
     listen_address: 443
+
+acme:
+  enabled: true
+  email: "test@test.com"
+  staging: true

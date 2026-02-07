@@ -5,6 +5,22 @@ pub struct AppConfig {
     pub providers: ProvidersConfig,
     pub api: ApiConfig,
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct AcmeConfig {
+    #[serde(default, deserialize_with = "deserialize_acme_enabled_with_env")]
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_acme_email_with_env")]
+    pub email: String,
+    #[serde(default = "default_acme_certs_dir", deserialize_with = "deserialize_acme_certs_dir_with_env")]
+    pub certs_dir: String,
+    #[serde(default = "default_acme_staging", deserialize_with = "deserialize_acme_staging_with_env")]
+    pub staging: bool,
+    #[serde(default = "default_acme_challenge_port", deserialize_with = "deserialize_acme_challenge_port_with_env")]
+    pub challenge_port: u16,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -121,6 +137,7 @@ impl Default for AppConfig {
             providers: Default::default(),
             api: Default::default(),
             proxy: Default::default(),
+            acme: None,
         }
     }
 }
@@ -143,6 +160,18 @@ fn default_cluster_setup_delay_ms() -> u64 {
 
 fn default_api_listen_address() -> String {
     "0.0.0.0:3035".to_string()
+}
+
+fn default_acme_certs_dir() -> String {
+    "/etc/sozune/certs".to_string()
+}
+
+fn default_acme_staging() -> bool {
+    true
+}
+
+fn default_acme_challenge_port() -> u16 {
+    3036
 }
 
 fn default_http_port() -> u16 {
@@ -253,6 +282,12 @@ deserialize_with_env!(deserialize_max_buffers_with_env, "SOZUNE_PROXY_MAX_BUFFER
 deserialize_with_env!(deserialize_buffer_size_with_env, "SOZUNE_PROXY_BUFFER_SIZE", usize, default_buffer_size);
 deserialize_with_env!(deserialize_startup_delay_ms_with_env, "SOZUNE_PROXY_STARTUP_DELAY_MS", u64, default_startup_delay_ms);
 deserialize_with_env!(deserialize_cluster_setup_delay_ms_with_env, "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS", u64, default_cluster_setup_delay_ms);
+
+deserialize_bool_with_env!(deserialize_acme_enabled_with_env, "SOZUNE_ACME_ENABLED", false);
+deserialize_string_with_env!(deserialize_acme_email_with_env, "SOZUNE_ACME_EMAIL", "", literal);
+deserialize_string_with_env!(deserialize_acme_certs_dir_with_env, "SOZUNE_ACME_CERTS_DIR", default_acme_certs_dir);
+deserialize_bool_with_env!(deserialize_acme_staging_with_env, "SOZUNE_ACME_STAGING", true);
+deserialize_with_env!(deserialize_acme_challenge_port_with_env, "SOZUNE_ACME_CHALLENGE_PORT", u16, default_acme_challenge_port);
 
 #[cfg(test)]
 mod tests {

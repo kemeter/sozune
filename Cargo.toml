@@ -23,3 +23,5 @@ signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 futures-util = "0.3"
 notify = "8.2.0"
+instant-acme = "0.7"
+rcgen = { version = "0.13", features = ["pem"] }
