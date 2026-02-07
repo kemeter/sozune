@@ -236,7 +236,13 @@ fn configure_sozu_routing(
 ) -> anyhow::Result<()> {
     info!("Applying Sōzu configuration for {} entrypoints", storage.len());
 
-    for (cluster_id, entrypoint) in storage.iter() {
+    // Sort entrypoints by priority descending (higher priority first).
+    // Since Sozu Pre rules are matched in insertion order, registering
+    // higher-priority routes first ensures they take precedence.
+    let mut sorted_entrypoints: Vec<(&String, &Entrypoint)> = storage.iter().collect();
+    sorted_entrypoints.sort_by(|a, b| b.1.config.priority.cmp(&a.1.config.priority));
+
+    for (cluster_id, entrypoint) in sorted_entrypoints {
         // Only process HTTP entrypoints for Sozu
         match entrypoint.protocol {
             Protocol::Http => {
