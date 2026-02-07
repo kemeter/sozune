@@ -12,6 +12,9 @@ use crate::config::DockerConfig;
 pub struct DockerProvider {
     docker: Docker,
     config: DockerConfig,
+    /// Tracks container_id -> IP so we can clean up when the container stops
+    /// (stopped containers no longer expose their network IP via inspect)
+    container_ips: std::sync::Mutex<HashMap<String, String>>,
 }
 
 #[async_trait]
@@ -40,7 +43,7 @@ impl DockerProvider {
         } else {
             Docker::connect_with_local_defaults()?
         };
-        Ok(Self { docker, config })
+        Ok(Self { docker, config, container_ips: std::sync::Mutex::new(HashMap::new()) })
     }
 
     /// Start Docker service: initial scan + event listening
@@ -131,6 +134,13 @@ impl DockerProvider {
                                 
                                 match action.as_str() {
                                     "start" => {
+                                        // Track the container IP for later cleanup
+                                        if let Some(ip) = self.get_container_ip(container_id).await {
+                                            if let Ok(mut ips) = self.container_ips.lock() {
+                                                ips.insert(container_id.to_string(), ip);
+                                            }
+                                        }
+
                                         if let Ok(entrypoints) = self.get_container_entrypoints(container_id).await {
                                             if !entrypoints.is_empty() {
                                                 let mut storage_write = match storage.write() {
@@ -160,8 +170,17 @@ impl DockerProvider {
                                         }
                                     }
                                     "stop" | "die" | "destroy" => {
-                                        // Remove this container's entrypoints
-                                        let container_ip = self.get_container_ip(container_id).await.unwrap_or_else(|| "127.0.0.1".to_string());
+                                        // Use tracked IP (stopped containers lose their network IP)
+                                        let container_ip = self.container_ips.lock().ok()
+                                            .and_then(|mut ips| ips.remove(container_id.as_str()))
+                                            .or_else(|| {
+                                                // Fallback: try inspect (may work for "stop" before network teardown)
+                                                None
+                                            })
+                                            .unwrap_or_else(|| {
+                                                warn!("No tracked IP for stopped container {}, cleanup may be incomplete", container_id);
+                                                "127.0.0.1".to_string()
+                                            });
                                         let mut storage_write = match storage.write() {
                                             Ok(guard) => guard,
                                             Err(e) => {
@@ -181,14 +200,12 @@ impl DockerProvider {
                                             }
                                         }
                                         
-                                        for key in keys_to_remove {
+                                        for key in &keys_to_remove {
                                             info!("Removing entrypoint with no backends: {}", key);
-                                            storage_write.remove(&key);
+                                            storage_write.remove(key);
                                         }
-                                        
-                                        if !storage_write.is_empty() {
-                                            storage_changed = true;
-                                        }
+
+                                        storage_changed = true;
                                     }
                                     "update" => {
                                         // For updates, remove old and add new
@@ -333,7 +350,12 @@ impl DockerProvider {
                 
                 // Get container IP address
                 let container_ip = self.get_container_ip(&container_id).await.unwrap_or_else(|| "127.0.0.1".to_string());
-                
+
+                // Track container IP for cleanup on stop
+                if let Ok(mut ips) = self.container_ips.lock() {
+                    ips.insert(container_id.clone(), container_ip.clone());
+                }
+
                 // Parse labels by protocol
                 for protocol in &["http", "tcp", "udp"] {
                     let protocol_entrypoints = self.parse_protocol_labels(&labels, protocol, &container_ip);
@@ -571,6 +593,7 @@ mod tests {
         let provider = DockerProvider {
             docker: Docker::connect_with_local_defaults().unwrap(),
             config: Default::default(),
+            container_ips: std::sync::Mutex::new(HashMap::new()),
         };
         let labels = create_test_labels();
         let container_ip = "192.168.1.100";
@@ -619,6 +642,7 @@ mod tests {
         let provider = DockerProvider {
             docker: Docker::connect_with_local_defaults().unwrap(),
             config: Default::default(),
+            container_ips: std::sync::Mutex::new(HashMap::new()),
         };
         let labels = create_test_labels();
         let container_ip = "192.168.1.100";
@@ -642,6 +666,7 @@ mod tests {
         let provider = DockerProvider {
             docker: Docker::connect_with_local_defaults().unwrap(),
             config: Default::default(),
+            container_ips: std::sync::Mutex::new(HashMap::new()),
         };
         let labels = create_test_labels();
         
@@ -660,6 +685,7 @@ mod tests {
         let provider = DockerProvider {
             docker: Docker::connect_with_local_defaults().unwrap(),
             config: Default::default(),
+            container_ips: std::sync::Mutex::new(HashMap::new()),
         };
         let labels = create_test_labels();
         
@@ -673,6 +699,7 @@ mod tests {
         let provider = DockerProvider {
             docker: Docker::connect_with_local_defaults().unwrap(),
             config: Default::default(),
+            container_ips: std::sync::Mutex::new(HashMap::new()),
         };
         let mut labels = HashMap::new();
         labels.insert("sozune.enable".to_string(), "false".to_string());
@@ -690,6 +717,7 @@ mod tests {
         let provider = DockerProvider {
             docker: Docker::connect_with_local_defaults().unwrap(),
             config: Default::default(),
+            container_ips: std::sync::Mutex::new(HashMap::new()),
         };
         let mut labels = HashMap::new();
         labels.insert("sozune.enable".to_string(), "true".to_string());

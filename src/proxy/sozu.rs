@@ -8,14 +8,44 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         SocketAddress, WorkerRequest, WorkerResponse, Request, request::RequestType,
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
+        AddBackend, RemoveBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
         RequestHttpFrontend, PathRule, RulePosition,
         AddCertificate, CertificateAndKey, TlsVersion,
     },
 };
-use crate::model::{Entrypoint, Protocol, PathRuleType};
+use crate::model::{Entrypoint, Protocol, PathConfig, PathRuleType};
 use crate::config::ProxyConfig;
 use crate::acme::CertCommand;
+
+#[derive(Debug, Clone, PartialEq)]
+struct EntrypointSnapshot {
+    hostnames: Vec<String>,
+    path: Option<PathConfig>,
+    tls: bool,
+    port: u16,
+    backends: Vec<String>,
+}
+
+type RoutingSnapshot = BTreeMap<String, EntrypointSnapshot>;
+
+fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
+    storage
+        .iter()
+        .filter(|(_, ep)| matches!(ep.protocol, Protocol::Http))
+        .map(|(id, ep)| {
+            (
+                id.clone(),
+                EntrypointSnapshot {
+                    hostnames: ep.config.hostnames.clone(),
+                    path: ep.config.path.clone(),
+                    tls: ep.config.tls,
+                    port: ep.config.port,
+                    backends: ep.backends.clone(),
+                },
+            )
+        })
+        .collect()
+}
 
 pub fn start_sozu_proxy(
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -100,12 +130,15 @@ pub fn start_sozu_proxy(
         };
         rt.block_on(async {
             let mut cert_rx_open = true;
+            let mut previous_snapshot: RoutingSnapshot = BTreeMap::new();
             loop {
                 if cert_rx_open {
                     tokio::select! {
                         reload = reload_rx.recv() => {
                             match reload {
-                                Some(_) => handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port),
+                                Some(_) => {
+                                    previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot);
+                                }
                                 None => {
                                     debug!("Reload channel closed");
                                     break;
@@ -129,7 +162,9 @@ pub fn start_sozu_proxy(
                     }
                 } else {
                     match reload_rx.recv().await {
-                        Some(_) => handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port),
+                        Some(_) => {
+                            previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot);
+                        }
                         None => {
                             debug!("Reload channel closed");
                             break;
@@ -167,19 +202,27 @@ fn handle_reload(
     https_port: u16,
     cluster_setup_delay_ms: u64,
     acme_challenge_port: Option<u16>,
-) {
+    previous_snapshot: &RoutingSnapshot,
+) -> RoutingSnapshot {
     info!("Received configuration reload request");
     let storage_read = match storage.read() {
         Ok(guard) => guard,
         Err(e) => {
             error!("Storage lock poisoned during reload: {}", e);
-            return;
+            return previous_snapshot.clone();
         }
     };
+
+    let current_snapshot = snapshot_from_storage(&*storage_read);
+
+    apply_routing_diff(previous_snapshot, &current_snapshot, command_channel, command_channel_https, http_port, https_port, acme_challenge_port);
+
     match configure_sozu_routing(command_channel, command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port) {
         Ok(()) => info!("Configuration reloaded successfully"),
         Err(e) => error!("Failed to reload configuration: {}", e),
     }
+
+    current_snapshot
 }
 
 fn configure_sozu_routing(
@@ -437,6 +480,172 @@ fn add_certificate(
 
     info!("Certificate added for {:?}", names);
     Ok(())
+}
+
+fn remove_http_frontends(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    snapshot: &EntrypointSnapshot,
+    http_port: u16,
+    https_port: u16,
+) {
+    let path_rule = if let Some(path_config) = &snapshot.path {
+        PathRule {
+            value: path_config.value.clone(),
+            kind: match path_config.rule_type {
+                PathRuleType::Exact => 0,
+                PathRuleType::Prefix => 1,
+            },
+        }
+    } else {
+        PathRule {
+            value: "/".to_string(),
+            kind: 1,
+        }
+    };
+
+    for hostname in &snapshot.hostnames {
+        let http_front = RequestHttpFrontend {
+            cluster_id: Some(cluster_id.to_string()),
+            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+            hostname: hostname.clone(),
+            path: path_rule.clone(),
+            method: None,
+            position: RulePosition::Pre as i32,
+            tags: BTreeMap::new(),
+        };
+
+        if let Err(e) = send_to_worker(command_channel, format!("rm-frontend-http-{}-{}", cluster_id, hostname), RequestType::RemoveHttpFrontend(http_front)) {
+            debug!("Failed to remove HTTP frontend for {}: {}", hostname, e);
+        }
+
+        if snapshot.tls {
+            let https_front = RequestHttpFrontend {
+                cluster_id: Some(cluster_id.to_string()),
+                address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                hostname: hostname.clone(),
+                path: path_rule.clone(),
+                method: None,
+                position: RulePosition::Pre as i32,
+                tags: BTreeMap::new(),
+            };
+
+            if let Err(e) = send_to_worker(command_channel_https, format!("rm-frontend-https-{}-{}", cluster_id, hostname), RequestType::RemoveHttpsFrontend(https_front)) {
+                debug!("Failed to remove HTTPS frontend for {}: {}", hostname, e);
+            }
+        }
+    }
+}
+
+fn remove_backends(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    snapshot: &EntrypointSnapshot,
+) {
+    for (i, backend_host) in snapshot.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_host, snapshot.port) {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!("Failed to parse backend address {}:{} for removal: {}", backend_host, snapshot.port, e);
+                continue;
+            }
+        };
+        let backend_id = format!("{}-backend-{}", cluster_id, i);
+        let remove = RemoveBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+        };
+
+        if let Err(e) = send_to_worker(command_channel, format!("rm-backend-http-{}-{}", cluster_id, i), RequestType::RemoveBackend(remove.clone())) {
+            debug!("Failed to remove HTTP backend {}: {}", backend_id, e);
+        }
+
+        if snapshot.tls {
+            if let Err(e) = send_to_worker(command_channel_https, format!("rm-backend-https-{}-{}", cluster_id, i), RequestType::RemoveBackend(remove)) {
+                debug!("Failed to remove HTTPS backend {}: {}", backend_id, e);
+            }
+        }
+    }
+}
+
+fn remove_cluster(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+) {
+    if let Err(e) = send_to_worker(command_channel, format!("rm-cluster-http-{}", cluster_id), RequestType::RemoveCluster(cluster_id.to_string())) {
+        debug!("Failed to remove HTTP cluster {}: {}", cluster_id, e);
+    }
+    if let Err(e) = send_to_worker(command_channel_https, format!("rm-cluster-https-{}", cluster_id), RequestType::RemoveCluster(cluster_id.to_string())) {
+        debug!("Failed to remove HTTPS cluster {}: {}", cluster_id, e);
+    }
+}
+
+fn remove_acme_frontends(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    hostnames: &[String],
+    http_port: u16,
+) {
+    for hostname in hostnames {
+        let acme_front = RequestHttpFrontend {
+            cluster_id: Some("acme-challenge".to_string()),
+            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+            hostname: hostname.clone(),
+            path: PathRule {
+                value: "/.well-known/acme-challenge/".to_string(),
+                kind: 1,
+            },
+            method: None,
+            position: RulePosition::Pre as i32,
+            tags: BTreeMap::new(),
+        };
+
+        if let Err(e) = send_to_worker(command_channel, format!("rm-frontend-acme-{}", hostname), RequestType::RemoveHttpFrontend(acme_front)) {
+            debug!("Failed to remove ACME frontend for {}: {}", hostname, e);
+        }
+    }
+}
+
+fn apply_routing_diff(
+    previous: &RoutingSnapshot,
+    current: &RoutingSnapshot,
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    http_port: u16,
+    https_port: u16,
+    acme_challenge_port: Option<u16>,
+) {
+    // Handle removed clusters
+    for (cluster_id, old_snapshot) in previous {
+        if !current.contains_key(cluster_id) {
+            info!("Removing stale cluster: {}", cluster_id);
+            remove_http_frontends(command_channel, command_channel_https, cluster_id, old_snapshot, http_port, https_port);
+            remove_backends(command_channel, command_channel_https, cluster_id, old_snapshot);
+            remove_cluster(command_channel, command_channel_https, cluster_id);
+
+            if acme_challenge_port.is_some() {
+                remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
+            }
+        }
+    }
+
+    // Handle changed clusters
+    for (cluster_id, old_snapshot) in previous {
+        if let Some(new_snapshot) = current.get(cluster_id) {
+            if old_snapshot != new_snapshot {
+                info!("Updating changed cluster: {}", cluster_id);
+                remove_http_frontends(command_channel, command_channel_https, cluster_id, old_snapshot, http_port, https_port);
+                remove_backends(command_channel, command_channel_https, cluster_id, old_snapshot);
+
+                if acme_challenge_port.is_some() && old_snapshot.hostnames != new_snapshot.hostnames {
+                    remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
+                }
+            }
+        }
+    }
 }
 
 fn parse_backend_address(host: &str, port: u16) -> anyhow::Result<SocketAddress> {
