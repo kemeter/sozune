@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use instant_acme::{
-    Account, AccountCredentials, Authorization, ChallengeType, Identifier, NewAccount, NewOrder,
+    Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
 };
 use rcgen::{CertificateParams, KeyPair};
 use tokio::sync::mpsc;
@@ -152,18 +152,37 @@ impl AcmeManager {
         // Create order
         let identifiers = vec![Identifier::Dns(hostname.to_string())];
         let mut order = account
-            .new_order(&NewOrder {
-                identifiers: &identifiers,
-            })
+            .new_order(&NewOrder::new(&identifiers))
             .await?;
 
-        // Process authorizations
-        let authorizations = order.authorizations().await?;
+        // Process authorizations and collect challenge tokens for cleanup
         let mut challenge_tokens: Vec<String> = Vec::new();
-        for auth in &authorizations {
-            let token = self.handle_authorization(&mut order, auth).await?;
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut auth_handle = result?;
+            let mut challenge = auth_handle
+                .challenge(ChallengeType::Http01)
+                .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found"))?;
+
+            let token = challenge.token.clone();
+            let key_auth = challenge.key_authorization();
+
+            // Store token → key_authorization in shared challenge state
+            {
+                let mut challenges = self.challenges.write().map_err(|e| {
+                    anyhow::anyhow!("Challenge state lock poisoned: {}", e)
+                })?;
+                challenges.insert(token.clone(), key_auth.as_str().to_string());
+            }
+
+            debug!("Challenge token stored: {} (type: HTTP-01)", token);
             challenge_tokens.push(token);
+
+            // Tell ACME server we're ready
+            challenge.set_ready().await?;
         }
+        // Drop authorizations borrow so we can use order again
+        drop(authorizations);
 
         // Wait for order to become ready
         let ready_result = Self::poll_order_ready(&mut order).await;
@@ -180,7 +199,7 @@ impl AcmeManager {
         let csr = params.serialize_request(&key_pair)?;
 
         // Finalize order with CSR
-        order.finalize(csr.der()).await?;
+        order.finalize_csr(csr.der()).await?;
 
         // Poll for certificate
         let cert_chain_pem = Self::poll_certificate(&mut order).await?;
@@ -216,7 +235,7 @@ impl AcmeManager {
                 Ok(data) => {
                     match serde_json::from_str::<AccountCredentials>(&data) {
                         Ok(credentials) => {
-                            match Account::from_credentials(credentials).await {
+                            match Account::builder()?.from_credentials(credentials).await {
                                 Ok(account) => {
                                     // Re-parse from already loaded data (from_credentials consumed the first parse)
                                     let creds: AccountCredentials =
@@ -247,13 +266,13 @@ impl AcmeManager {
             vec![format!("mailto:{}", self.config.email)]
         };
 
-        let (account, credentials) = Account::create(
+        let (account, credentials) = Account::builder()?.create(
             &NewAccount {
                 contact: &contact.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
-            server_url,
+            server_url.to_string(),
             None,
         )
         .await?;
@@ -265,38 +284,6 @@ impl AcmeManager {
         info!("Created new ACME account");
 
         Ok((account, credentials))
-    }
-
-    /// Handle a single authorization: find HTTP-01 challenge and set it up.
-    /// Returns the challenge token for later cleanup.
-    async fn handle_authorization(
-        &self,
-        order: &mut instant_acme::Order,
-        auth: &Authorization,
-    ) -> anyhow::Result<String> {
-        let http01_challenge = auth
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Http01)
-            .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found"))?;
-
-        let token = http01_challenge.token.clone();
-        let key_auth = order.key_authorization(http01_challenge);
-
-        // Store token → key_authorization in shared challenge state
-        {
-            let mut challenges = self.challenges.write().map_err(|e| {
-                anyhow::anyhow!("Challenge state lock poisoned: {}", e)
-            })?;
-            challenges.insert(token.clone(), key_auth.as_str().to_string());
-        }
-
-        debug!("Challenge token stored: {} (type: HTTP-01)", token);
-
-        // Tell ACME server we're ready
-        order.set_challenge_ready(&http01_challenge.url).await?;
-
-        Ok(token)
     }
 
     /// Remove challenge tokens from shared state after order completion
@@ -320,11 +307,11 @@ impl AcmeManager {
         loop {
             let state = order.refresh().await?;
             match state.status {
-                instant_acme::OrderStatus::Ready => return Ok(()),
-                instant_acme::OrderStatus::Invalid => {
+                OrderStatus::Ready => return Ok(()),
+                OrderStatus::Invalid => {
                     return Err(anyhow::anyhow!("Order became invalid"));
                 }
-                instant_acme::OrderStatus::Pending => {
+                OrderStatus::Pending => {
                     retries += 1;
                     if retries > 30 {
                         return Err(anyhow::anyhow!(

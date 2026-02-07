@@ -14,14 +14,14 @@ serde_json = "1.0.143"
 sozu-command-lib = "1.0.6"
 sozu-lib = "1.0.6"
 anyhow = "1.0.99"
-bollard = "0.19.2"
+bollard = "0.20"
 async-trait = "0.1.89"
-serde_yaml = "0.9.34+deprecated"
+serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+signal-hook = "0.4"
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 futures-util = "0.3"
 notify = "8.2.0"
-instant-acme = "0.7"
-rcgen = { version = "0.13", features = ["pem"] }
+instant-acme = "0.8"
+rcgen = { version = "0.14", features = ["pem"] }
