@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+    #[serde(default)]
+    pub middleware: MiddlewareConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -83,6 +85,20 @@ pub struct HttpsConfig {
     pub listen_address: u16,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct MiddlewareConfig {
+    #[serde(default = "default_middleware_port", deserialize_with = "deserialize_middleware_port_with_env")]
+    pub port: u16,
+}
+
+impl Default for MiddlewareConfig {
+    fn default() -> Self {
+        Self {
+            port: default_middleware_port(),
+        }
+    }
+}
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
@@ -138,6 +154,7 @@ impl Default for AppConfig {
             api: Default::default(),
             proxy: Default::default(),
             acme: None,
+            middleware: Default::default(),
         }
     }
 }
@@ -172,6 +189,10 @@ fn default_acme_staging() -> bool {
 
 fn default_acme_challenge_port() -> u16 {
     3036
+}
+
+fn default_middleware_port() -> u16 {
+    3037
 }
 
 fn default_http_port() -> u16 {
@@ -288,6 +309,7 @@ deserialize_string_with_env!(deserialize_acme_email_with_env, "SOZUNE_ACME_EMAIL
 deserialize_string_with_env!(deserialize_acme_certs_dir_with_env, "SOZUNE_ACME_CERTS_DIR", default_acme_certs_dir);
 deserialize_bool_with_env!(deserialize_acme_staging_with_env, "SOZUNE_ACME_STAGING", true);
 deserialize_with_env!(deserialize_acme_challenge_port_with_env, "SOZUNE_ACME_CHALLENGE_PORT", u16, default_acme_challenge_port);
+deserialize_with_env!(deserialize_middleware_port_with_env, "SOZUNE_MIDDLEWARE_PORT", u16, default_middleware_port);
 
 #[cfg(test)]
 mod tests {

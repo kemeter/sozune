@@ -25,3 +25,7 @@ futures-util = "0.3"
 notify = "8.2.0"
 instant-acme = "0.8"
 rcgen = { version = "0.14", features = ["pem"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+http-body-util = "0.1"
+base64 = "0.22"

@@ -16,6 +16,7 @@ use sozu_command_lib::{
 use crate::model::{Entrypoint, Protocol, PathConfig, PathRuleType};
 use crate::config::ProxyConfig;
 use crate::acme::CertCommand;
+use crate::middleware::{self, MiddlewareState};
 
 #[derive(Debug, Clone, PartialEq)]
 struct EntrypointSnapshot {
@@ -54,6 +55,8 @@ pub fn start_sozu_proxy(
     mut reload_rx: mpsc::UnboundedReceiver<()>,
     mut cert_rx: mpsc::UnboundedReceiver<CertCommand>,
     acme_challenge_port: Option<u16>,
+    middleware_state: MiddlewareState,
+    middleware_port: u16,
 ) -> anyhow::Result<()> {
     info!("Starting Sōzu HTTP and HTTPS workers");
 
@@ -137,7 +140,7 @@ pub fn start_sozu_proxy(
                         reload = reload_rx.recv() => {
                             match reload {
                                 Some(_) => {
-                                    previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot);
+                                    previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
                                 }
                                 None => {
                                     debug!("Reload channel closed");
@@ -163,7 +166,7 @@ pub fn start_sozu_proxy(
                 } else {
                     match reload_rx.recv().await {
                         Some(_) => {
-                            previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot);
+                            previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
                         }
                         None => {
                             debug!("Reload channel closed");
@@ -203,6 +206,8 @@ fn handle_reload(
     cluster_setup_delay_ms: u64,
     acme_challenge_port: Option<u16>,
     previous_snapshot: &RoutingSnapshot,
+    middleware_state: &MiddlewareState,
+    middleware_port: u16,
 ) -> RoutingSnapshot {
     info!("Received configuration reload request");
     let storage_read = match storage.read() {
@@ -217,12 +222,48 @@ fn handle_reload(
 
     apply_routing_diff(previous_snapshot, &current_snapshot, command_channel, command_channel_https, http_port, https_port, acme_challenge_port);
 
-    match configure_sozu_routing(command_channel, command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port) {
+    // Update middleware route table
+    update_middleware_routes(&*storage_read, middleware_state);
+
+    match configure_sozu_routing(command_channel, command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, middleware_port) {
         Ok(()) => info!("Configuration reloaded successfully"),
         Err(e) => error!("Failed to reload configuration: {}", e),
     }
 
     current_snapshot
+}
+
+/// Rebuild the middleware route table from current storage
+fn update_middleware_routes(
+    storage: &BTreeMap<String, Entrypoint>,
+    middleware_state: &MiddlewareState,
+) {
+    let mut table = match middleware_state.write() {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("Middleware state lock poisoned: {}", e);
+            return;
+        }
+    };
+
+    table.clear();
+
+    for (cluster_id, entrypoint) in storage {
+        if !matches!(entrypoint.protocol, Protocol::Http) {
+            continue;
+        }
+        if middleware::needs_middleware(&entrypoint.config) {
+            let route = middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
+            debug!("Middleware route for {} (hosts: {:?}): strip_prefix={:?}, auth={}, headers={}",
+                cluster_id,
+                entrypoint.config.hostnames,
+                route.strip_prefix,
+                route.auth.is_some(),
+                route.headers.len()
+            );
+            table.update_routes_for_entrypoint(&entrypoint.config.hostnames, route);
+        }
+    }
 }
 
 fn configure_sozu_routing(
@@ -233,6 +274,7 @@ fn configure_sozu_routing(
     https_port: u16,
     cluster_setup_delay_ms: u64,
     acme_challenge_port: Option<u16>,
+    middleware_port: u16,
 ) -> anyhow::Result<()> {
     info!("Applying Sōzu configuration for {} entrypoints", storage.len());
 
@@ -271,7 +313,7 @@ fn configure_sozu_routing(
                     }
                 }
 
-                configure_http_entrypoint(command_channel, command_channel_https, cluster_id, entrypoint, http_port, https_port)?;
+                configure_http_entrypoint(command_channel, command_channel_https, cluster_id, entrypoint, http_port, https_port, middleware_port)?;
             },
             Protocol::Tcp => {
                 debug!("TCP protocol not yet implemented for entrypoint: {}", entrypoint.name);
@@ -295,12 +337,13 @@ fn configure_http_entrypoint(
     entrypoint: &Entrypoint,
     http_port: u16,
     https_port: u16,
+    middleware_port: u16,
 ) -> anyhow::Result<()> {
     // Add cluster for both HTTP and HTTPS
     let cluster = Cluster {
         cluster_id: cluster_id.to_string(),
         sticky_session: false,
-        https_redirect: false,
+        https_redirect: entrypoint.config.https_redirect,
         proxy_protocol: None,
         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
         load_metric: None,
@@ -365,32 +408,57 @@ fn configure_http_entrypoint(
     }
 
     // Add backends
-    debug!("Setting up {} backends for {}: {:?}", entrypoint.backends.len(), entrypoint.name, entrypoint.backends);
-    for (backend_index, backend_host) in entrypoint.backends.iter().enumerate() {
-        let backend_port = entrypoint.config.port;
-        let address = parse_backend_address(backend_host, backend_port)?;
+    // If this entrypoint needs middleware, route through the middleware server instead
+    let use_middleware = middleware::needs_middleware(&entrypoint.config);
 
+    if use_middleware {
+        debug!("Routing {} through middleware server at 127.0.0.1:{}", entrypoint.name, middleware_port);
+        let address = SocketAddress::new_v4(127, 0, 0, 1, middleware_port);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: format!("{}-backend-{}", cluster_id, backend_index),
+            backend_id: format!("{}-backend-0", cluster_id),
             address,
-            load_balancing_parameters: Some(LoadBalancingParams {
-                weight: 100,
-            }),
+            load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
             sticky_id: None,
             backup: None,
         };
-        
-        debug!("Adding backend {}: {}:{}", backend.backend_id, backend_host, backend_port);
-        if let Err(e) = send_to_worker(command_channel, format!("add-backend-http-{}-{}", cluster_id, backend_index), RequestType::AddBackend(backend.clone())) {
-            debug!("Failed to add HTTP backend {} (may already exist): {}", backend.backend_id, e);
-        }
 
-        // HTTPS backend only if TLS is enabled
+        if let Err(e) = send_to_worker(command_channel, format!("add-backend-http-{}-0", cluster_id), RequestType::AddBackend(backend.clone())) {
+            debug!("Failed to add HTTP middleware backend {} (may already exist): {}", backend.backend_id, e);
+        }
         if entrypoint.config.tls {
-            let backend_id = backend.backend_id.clone();
-            if let Err(e) = send_to_worker(command_channel_https, format!("add-backend-https-{}-{}", cluster_id, backend_index), RequestType::AddBackend(backend)) {
-                debug!("Failed to add HTTPS backend {} (may already exist): {}", backend_id, e);
+            if let Err(e) = send_to_worker(command_channel_https, format!("add-backend-https-{}-0", cluster_id), RequestType::AddBackend(backend)) {
+                debug!("Failed to add HTTPS middleware backend (may already exist): {}", e);
+            }
+        }
+    } else {
+        debug!("Setting up {} backends for {}: {:?}", entrypoint.backends.len(), entrypoint.name, entrypoint.backends);
+        for (backend_index, backend_host) in entrypoint.backends.iter().enumerate() {
+            let backend_port = entrypoint.config.port;
+            let address = parse_backend_address(backend_host, backend_port)?;
+
+            let backend = AddBackend {
+                cluster_id: cluster_id.to_string(),
+                backend_id: format!("{}-backend-{}", cluster_id, backend_index),
+                address,
+                load_balancing_parameters: Some(LoadBalancingParams {
+                    weight: 100,
+                }),
+                sticky_id: None,
+                backup: None,
+            };
+
+            debug!("Adding backend {}: {}:{}", backend.backend_id, backend_host, backend_port);
+            if let Err(e) = send_to_worker(command_channel, format!("add-backend-http-{}-{}", cluster_id, backend_index), RequestType::AddBackend(backend.clone())) {
+                debug!("Failed to add HTTP backend {} (may already exist): {}", backend.backend_id, e);
+            }
+
+            // HTTPS backend only if TLS is enabled
+            if entrypoint.config.tls {
+                let backend_id = backend.backend_id.clone();
+                if let Err(e) = send_to_worker(command_channel_https, format!("add-backend-https-{}-{}", cluster_id, backend_index), RequestType::AddBackend(backend)) {
+                    debug!("Failed to add HTTPS backend {} (may already exist): {}", backend_id, e);
+                }
             }
         }
     }

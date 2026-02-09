@@ -28,6 +28,8 @@ pub struct EntrypointConfig {
     pub path: Option<PathConfig>,
     pub tls: bool,
     pub strip_prefix: bool,
+    #[serde(default)]
+    pub https_redirect: bool,
     pub priority: i32,
     pub auth: Option<AuthConfig>,
     pub headers: HashMap<String, String>,

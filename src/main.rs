@@ -11,6 +11,7 @@ use crate::config::AppConfig;
 
 mod acme;
 mod api;
+mod middleware;
 mod provider;
 mod proxy;
 mod config;
@@ -65,10 +66,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Create middleware state shared between middleware server and proxy reload
+    let middleware_state: middleware::MiddlewareState = Arc::new(RwLock::new(middleware::MiddlewareRouteTable::default()));
+    let middleware_state_proxy = Arc::clone(&middleware_state);
+    let middleware_port = config.middleware.port;
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let proxy_config = config.proxy.clone();
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        proxy::backend::init_proxy(storage_proxy, &proxy_config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port)
+        proxy::backend::init_proxy(storage_proxy, &proxy_config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port, middleware_state_proxy, middleware_port)
     });
 
     // Start provider services (Docker, etc.)
@@ -91,6 +97,14 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Ok::<(), anyhow::Error>(())
+    });
+
+    // Start middleware server
+    let middleware_task = tokio::spawn({
+        let middleware_state = Arc::clone(&middleware_state);
+        async move {
+            middleware::serve(middleware_port, middleware_state).await
+        }
     });
 
     // Start ACME module if enabled
@@ -161,13 +175,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let tasks_future = async {
-        tokio::try_join!(proxy_task, api_task, provider_task, acme_task)
+        tokio::try_join!(proxy_task, api_task, provider_task, acme_task, middleware_task)
     };
 
     tokio::select! {
         result = tasks_future => {
             signal_handle.close();
-            let (proxy_result, api_result, provider_result, acme_result) = result?;
+            let (proxy_result, api_result, provider_result, acme_result, middleware_result) = result?;
 
             match proxy_result {
                 Ok(_) => debug!("Proxy task completed successfully"),
@@ -187,6 +201,11 @@ async fn main() -> anyhow::Result<()> {
             match acme_result {
                 Ok(_) => debug!("ACME task completed successfully"),
                 Err(e) => error!("ACME task failed: {}", e),
+            }
+
+            match middleware_result {
+                Ok(_) => debug!("Middleware task completed successfully"),
+                Err(e) => error!("Middleware task failed: {}", e),
             }
         },
         _ = signal_task => {

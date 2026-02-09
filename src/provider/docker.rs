@@ -447,6 +447,9 @@ impl DockerProvider {
         let strip_prefix = labels.get(&format!("{}stripPrefix", prefix))
             .map_or(false, |v| v == "true");
 
+        let https_redirect = labels.get(&format!("{}httpsRedirect", prefix))
+            .map_or(false, |v| v == "true");
+
         let priority = labels.get(&format!("{}priority", prefix))
             .and_then(|p| p.parse().ok())
             .unwrap_or(0);
@@ -473,6 +476,7 @@ impl DockerProvider {
                 path,
                 tls,
                 strip_prefix,
+                https_redirect,
                 priority,
                 auth,
                 headers,
