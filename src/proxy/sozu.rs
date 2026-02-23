@@ -1,24 +1,22 @@
+use crate::acme::CertCommand;
+use crate::config::ProxyConfig;
+use crate::middleware::{self, MiddlewareState};
+use crate::model::{Entrypoint, PathConfig, PathRuleType, Protocol};
+use sozu_command_lib::{
+    channel::Channel,
+    config::ListenerBuilder,
+    proto::command::{
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms,
+        LoadBalancingParams, PathRule, RemoveBackend, Request, RequestHttpFrontend, RulePosition,
+        SocketAddress, Status, TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
+    },
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, error, debug};
-use sozu_command_lib::{
-    channel::Channel,
-    config::ListenerBuilder,
-    proto::command::{
-        SocketAddress, WorkerRequest, WorkerResponse, Request, request::RequestType,
-        AddBackend, RemoveBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        RequestHttpFrontend, PathRule, RulePosition,
-        AddCertificate, CertificateAndKey, TlsVersion,
-        Status,
-    },
-};
-use crate::model::{Entrypoint, Protocol, PathConfig, PathRuleType};
-use crate::config::ProxyConfig;
-use crate::acme::CertCommand;
-use crate::middleware::{self, MiddlewareState};
+use tracing::{debug, error, info};
 
 #[derive(Debug, Clone, PartialEq)]
 struct EntrypointSnapshot {
@@ -68,26 +66,38 @@ pub fn start_sozu_proxy(
     let buffer_size = config.buffer_size;
 
     // HTTP Listener
-    let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(0, 0, 0, 0, config.http.listen_address))
-        .to_http(None)
-        .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
+    let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(
+        0,
+        0,
+        0,
+        0,
+        config.http.listen_address,
+    ))
+    .to_http(None)
+    .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
 
-    let https_listener = ListenerBuilder::new_https(SocketAddress::new_v4(0, 0, 0, 0, config.https.listen_address))
-        .to_tls(None)
-        .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
+    let https_listener = ListenerBuilder::new_https(SocketAddress::new_v4(
+        0,
+        0,
+        0,
+        0,
+        config.https.listen_address,
+    ))
+    .to_tls(None)
+    .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
 
     // Create communication channels
-    let (mut command_channel, proxy_channel) =
-        Channel::generate(1000, 10000).map_err(|e| anyhow::anyhow!("Could not create HTTP channel: {}", e))?;
-    let (mut command_channel_https, proxy_channel_https) =
-        Channel::generate(1000, 10000).map_err(|e| anyhow::anyhow!("Could not create HTTPS channel: {}", e))?;
+    let (mut command_channel, proxy_channel) = Channel::generate(1000, 10000)
+        .map_err(|e| anyhow::anyhow!("Could not create HTTP channel: {}", e))?;
+    let (mut command_channel_https, proxy_channel_https) = Channel::generate(1000, 10000)
+        .map_err(|e| anyhow::anyhow!("Could not create HTTPS channel: {}", e))?;
 
     let worker_http_handle = thread::spawn(move || {
         if let Err(e) = sozu_lib::http::testing::start_http_worker(
             http_listener,
             proxy_channel,
             max_buffers,
-            buffer_size
+            buffer_size,
         ) {
             error!("HTTP server failed: {}", e);
         }
@@ -98,7 +108,7 @@ pub fn start_sozu_proxy(
             https_listener,
             proxy_channel_https,
             max_buffers,
-            buffer_size
+            buffer_size,
         ) {
             error!("HTTPS server failed: {}", e);
         }
@@ -112,8 +122,14 @@ pub fn start_sozu_proxy(
     // Initial configuration will be handled by provider reload signals
     info!("Waiting for providers to populate configuration");
 
-    info!("Sōzu HTTP worker running on 0.0.0.0:{}", config.http.listen_address);
-    info!("Sōzu HTTPS worker running on 0.0.0.0:{}", config.https.listen_address);
+    info!(
+        "Sōzu HTTP worker running on 0.0.0.0:{}",
+        config.http.listen_address
+    );
+    info!(
+        "Sōzu HTTPS worker running on 0.0.0.0:{}",
+        config.https.listen_address
+    );
 
     // Register ACME challenge cluster if enabled (routes added per-hostname during reload)
     if let Some(challenge_port) = acme_challenge_port {
@@ -231,12 +247,29 @@ fn handle_reload(
 
     let current_snapshot = snapshot_from_storage(&*storage_read);
 
-    apply_routing_diff(previous_snapshot, &current_snapshot, command_channel, command_channel_https, http_port, https_port, acme_challenge_port);
+    apply_routing_diff(
+        previous_snapshot,
+        &current_snapshot,
+        command_channel,
+        command_channel_https,
+        http_port,
+        https_port,
+        acme_challenge_port,
+    );
 
     // Update middleware route table
     update_middleware_routes(&*storage_read, middleware_state);
 
-    match configure_sozu_routing(command_channel, command_channel_https, &*storage_read, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, middleware_port) {
+    match configure_sozu_routing(
+        command_channel,
+        command_channel_https,
+        &*storage_read,
+        http_port,
+        https_port,
+        cluster_setup_delay_ms,
+        acme_challenge_port,
+        middleware_port,
+    ) {
         Ok(()) => info!("Configuration reloaded successfully"),
         Err(e) => error!("Failed to reload configuration: {}", e),
     }
@@ -264,8 +297,10 @@ fn update_middleware_routes(
             continue;
         }
         if middleware::needs_middleware(&entrypoint.config) {
-            let route = middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
-            debug!("Middleware route for {} (hosts: {:?}): strip_prefix={:?}, auth={}, headers={}",
+            let route =
+                middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
+            debug!(
+                "Middleware route for {} (hosts: {:?}): strip_prefix={:?}, auth={}, headers={}",
                 cluster_id,
                 entrypoint.config.hostnames,
                 route.strip_prefix,
@@ -287,7 +322,10 @@ fn configure_sozu_routing(
     acme_challenge_port: Option<u16>,
     middleware_port: u16,
 ) -> anyhow::Result<()> {
-    info!("Applying Sōzu configuration for {} entrypoints", storage.len());
+    info!(
+        "Applying Sōzu configuration for {} entrypoints",
+        storage.len()
+    );
 
     // Sort entrypoints by priority descending (higher priority first).
     // Since Sozu Pre rules are matched in insertion order, registering
@@ -318,20 +356,41 @@ fn configure_sozu_routing(
                             position: RulePosition::Pre as i32,
                             tags: BTreeMap::new(),
                         };
-                        if let Err(e) = send_to_worker(command_channel, format!("add-frontend-acme-{}", hostname), RequestType::AddHttpFrontend(acme_front)) {
-                            debug!("Failed to add ACME frontend for {} (may already exist): {}", hostname, e);
+                        if let Err(e) = send_to_worker(
+                            command_channel,
+                            format!("add-frontend-acme-{}", hostname),
+                            RequestType::AddHttpFrontend(acme_front),
+                        ) {
+                            debug!(
+                                "Failed to add ACME frontend for {} (may already exist): {}",
+                                hostname, e
+                            );
                         }
                     }
                 }
 
-                configure_http_entrypoint(command_channel, command_channel_https, cluster_id, entrypoint, http_port, https_port, middleware_port)?;
-            },
+                configure_http_entrypoint(
+                    command_channel,
+                    command_channel_https,
+                    cluster_id,
+                    entrypoint,
+                    http_port,
+                    https_port,
+                    middleware_port,
+                )?;
+            }
             Protocol::Tcp => {
-                debug!("TCP protocol not yet implemented for entrypoint: {}", entrypoint.name);
-            },
+                debug!(
+                    "TCP protocol not yet implemented for entrypoint: {}",
+                    entrypoint.name
+                );
+            }
             Protocol::Udp => {
-                debug!("UDP protocol not yet implemented for entrypoint: {}", entrypoint.name);
-            },
+                debug!(
+                    "UDP protocol not yet implemented for entrypoint: {}",
+                    entrypoint.name
+                );
+            }
         }
 
         thread::sleep(std::time::Duration::from_millis(cluster_setup_delay_ms));
@@ -362,11 +421,25 @@ fn configure_http_entrypoint(
     };
 
     // Send to HTTP and HTTPS workers - ignore errors if cluster already exists
-    if let Err(e) = send_to_worker(command_channel, format!("add-cluster-http-{}", cluster_id), RequestType::AddCluster(cluster.clone())) {
-        debug!("Failed to add HTTP cluster {} (may already exist): {}", cluster_id, e);
+    if let Err(e) = send_to_worker(
+        command_channel,
+        format!("add-cluster-http-{}", cluster_id),
+        RequestType::AddCluster(cluster.clone()),
+    ) {
+        debug!(
+            "Failed to add HTTP cluster {} (may already exist): {}",
+            cluster_id, e
+        );
     }
-    if let Err(e) = send_to_worker(command_channel_https, format!("add-cluster-https-{}", cluster_id), RequestType::AddCluster(cluster)) {
-        debug!("Failed to add HTTPS cluster {} (may already exist): {}", cluster_id, e);
+    if let Err(e) = send_to_worker(
+        command_channel_https,
+        format!("add-cluster-https-{}", cluster_id),
+        RequestType::AddCluster(cluster),
+    ) {
+        debug!(
+            "Failed to add HTTPS cluster {} (may already exist): {}",
+            cluster_id, e
+        );
     }
 
     // Configure frontends for each hostname
@@ -396,8 +469,15 @@ fn configure_http_entrypoint(
             tags: BTreeMap::new(),
         };
 
-        if let Err(e) = send_to_worker(command_channel, format!("add-frontend-http-{}-{}", cluster_id, hostname), RequestType::AddHttpFrontend(http_front)) {
-            debug!("Failed to add HTTP frontend for {} (may already exist): {}", hostname, e);
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("add-frontend-http-{}-{}", cluster_id, hostname),
+            RequestType::AddHttpFrontend(http_front),
+        ) {
+            debug!(
+                "Failed to add HTTP frontend for {} (may already exist): {}",
+                hostname, e
+            );
         }
 
         // HTTPS frontend if TLS is enabled
@@ -412,8 +492,15 @@ fn configure_http_entrypoint(
                 tags: BTreeMap::new(),
             };
 
-            if let Err(e) = send_to_worker(command_channel_https, format!("add-frontend-https-{}-{}", cluster_id, hostname), RequestType::AddHttpFrontend(https_front)) {
-                debug!("Failed to add HTTPS frontend for {} (may already exist): {}", hostname, e);
+            if let Err(e) = send_to_worker(
+                command_channel_https,
+                format!("add-frontend-https-{}-{}", cluster_id, hostname),
+                RequestType::AddHttpFrontend(https_front),
+            ) {
+                debug!(
+                    "Failed to add HTTPS frontend for {} (may already exist): {}",
+                    hostname, e
+                );
             }
         }
     }
@@ -423,7 +510,10 @@ fn configure_http_entrypoint(
     let use_middleware = middleware::needs_middleware(&entrypoint.config);
 
     if use_middleware {
-        debug!("Routing {} through middleware server at 127.0.0.1:{}", entrypoint.name, middleware_port);
+        debug!(
+            "Routing {} through middleware server at 127.0.0.1:{}",
+            entrypoint.name, middleware_port
+        );
         let address = SocketAddress::new_v4(127, 0, 0, 1, middleware_port);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
@@ -434,16 +524,35 @@ fn configure_http_entrypoint(
             backup: None,
         };
 
-        if let Err(e) = send_to_worker(command_channel, format!("add-backend-http-{}-0", cluster_id), RequestType::AddBackend(backend.clone())) {
-            debug!("Failed to add HTTP middleware backend {} (may already exist): {}", backend.backend_id, e);
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("add-backend-http-{}-0", cluster_id),
+            RequestType::AddBackend(backend.clone()),
+        ) {
+            debug!(
+                "Failed to add HTTP middleware backend {} (may already exist): {}",
+                backend.backend_id, e
+            );
         }
         if entrypoint.config.tls {
-            if let Err(e) = send_to_worker(command_channel_https, format!("add-backend-https-{}-0", cluster_id), RequestType::AddBackend(backend)) {
-                debug!("Failed to add HTTPS middleware backend (may already exist): {}", e);
+            if let Err(e) = send_to_worker(
+                command_channel_https,
+                format!("add-backend-https-{}-0", cluster_id),
+                RequestType::AddBackend(backend),
+            ) {
+                debug!(
+                    "Failed to add HTTPS middleware backend (may already exist): {}",
+                    e
+                );
             }
         }
     } else {
-        debug!("Setting up {} backends for {}: {:?}", entrypoint.backends.len(), entrypoint.name, entrypoint.backends);
+        debug!(
+            "Setting up {} backends for {}: {:?}",
+            entrypoint.backends.len(),
+            entrypoint.name,
+            entrypoint.backends
+        );
         for (backend_index, backend_host) in entrypoint.backends.iter().enumerate() {
             let backend_port = entrypoint.config.port;
             let address = parse_backend_address(backend_host, backend_port)?;
@@ -452,23 +561,38 @@ fn configure_http_entrypoint(
                 cluster_id: cluster_id.to_string(),
                 backend_id: format!("{}-backend-{}", cluster_id, backend_index),
                 address,
-                load_balancing_parameters: Some(LoadBalancingParams {
-                    weight: 100,
-                }),
+                load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
                 sticky_id: None,
                 backup: None,
             };
 
-            debug!("Adding backend {}: {}:{}", backend.backend_id, backend_host, backend_port);
-            if let Err(e) = send_to_worker(command_channel, format!("add-backend-http-{}-{}", cluster_id, backend_index), RequestType::AddBackend(backend.clone())) {
-                debug!("Failed to add HTTP backend {} (may already exist): {}", backend.backend_id, e);
+            debug!(
+                "Adding backend {}: {}:{}",
+                backend.backend_id, backend_host, backend_port
+            );
+            if let Err(e) = send_to_worker(
+                command_channel,
+                format!("add-backend-http-{}-{}", cluster_id, backend_index),
+                RequestType::AddBackend(backend.clone()),
+            ) {
+                debug!(
+                    "Failed to add HTTP backend {} (may already exist): {}",
+                    backend.backend_id, e
+                );
             }
 
             // HTTPS backend only if TLS is enabled
             if entrypoint.config.tls {
                 let backend_id = backend.backend_id.clone();
-                if let Err(e) = send_to_worker(command_channel_https, format!("add-backend-https-{}-{}", cluster_id, backend_index), RequestType::AddBackend(backend)) {
-                    debug!("Failed to add HTTPS backend {} (may already exist): {}", backend_id, e);
+                if let Err(e) = send_to_worker(
+                    command_channel_https,
+                    format!("add-backend-https-{}-{}", cluster_id, backend_index),
+                    RequestType::AddBackend(backend),
+                ) {
+                    debug!(
+                        "Failed to add HTTPS backend {} (may already exist): {}",
+                        backend_id, e
+                    );
                 }
             }
         }
@@ -495,7 +619,12 @@ fn wait_for_worker_ready(
             Ok(())
         }
         Err(e) => {
-            anyhow::bail!("{} worker failed to become ready within {:?}: {}", name, timeout, e);
+            anyhow::bail!(
+                "{} worker failed to become ready within {:?}: {}",
+                name,
+                timeout,
+                e
+            );
         }
     }
 }
@@ -552,7 +681,10 @@ fn register_acme_challenge_cluster(
         RequestType::AddBackend(backend),
     )?;
 
-    info!("ACME challenge cluster registered -> 127.0.0.1:{}", challenge_port);
+    info!(
+        "ACME challenge cluster registered -> 127.0.0.1:{}",
+        challenge_port
+    );
     Ok(())
 }
 
@@ -571,10 +703,7 @@ fn add_certificate(
             certificate: cert_pem.to_string(),
             certificate_chain: chain.to_vec(),
             key: key_pem.to_string(),
-            versions: vec![
-                TlsVersion::TlsV12 as i32,
-                TlsVersion::TlsV13 as i32,
-            ],
+            versions: vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
             names: names.to_vec(),
         },
         expired_at: None,
@@ -582,7 +711,10 @@ fn add_certificate(
 
     send_to_worker(
         command_channel_https,
-        format!("add-cert-{}", names.first().map(|s| s.as_str()).unwrap_or("unknown")),
+        format!(
+            "add-cert-{}",
+            names.first().map(|s| s.as_str()).unwrap_or("unknown")
+        ),
         RequestType::AddCertificate(cert),
     )?;
 
@@ -624,7 +756,11 @@ fn remove_http_frontends(
             tags: BTreeMap::new(),
         };
 
-        if let Err(e) = send_to_worker(command_channel, format!("rm-frontend-http-{}-{}", cluster_id, hostname), RequestType::RemoveHttpFrontend(http_front)) {
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("rm-frontend-http-{}-{}", cluster_id, hostname),
+            RequestType::RemoveHttpFrontend(http_front),
+        ) {
             debug!("Failed to remove HTTP frontend for {}: {}", hostname, e);
         }
 
@@ -639,7 +775,11 @@ fn remove_http_frontends(
                 tags: BTreeMap::new(),
             };
 
-            if let Err(e) = send_to_worker(command_channel_https, format!("rm-frontend-https-{}-{}", cluster_id, hostname), RequestType::RemoveHttpsFrontend(https_front)) {
+            if let Err(e) = send_to_worker(
+                command_channel_https,
+                format!("rm-frontend-https-{}-{}", cluster_id, hostname),
+                RequestType::RemoveHttpsFrontend(https_front),
+            ) {
                 debug!("Failed to remove HTTPS frontend for {}: {}", hostname, e);
             }
         }
@@ -656,7 +796,10 @@ fn remove_backends(
         let address = match parse_backend_address(backend_host, snapshot.port) {
             Ok(addr) => addr,
             Err(e) => {
-                debug!("Failed to parse backend address {}:{} for removal: {}", backend_host, snapshot.port, e);
+                debug!(
+                    "Failed to parse backend address {}:{} for removal: {}",
+                    backend_host, snapshot.port, e
+                );
                 continue;
             }
         };
@@ -667,12 +810,20 @@ fn remove_backends(
             address,
         };
 
-        if let Err(e) = send_to_worker(command_channel, format!("rm-backend-http-{}-{}", cluster_id, i), RequestType::RemoveBackend(remove.clone())) {
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("rm-backend-http-{}-{}", cluster_id, i),
+            RequestType::RemoveBackend(remove.clone()),
+        ) {
             debug!("Failed to remove HTTP backend {}: {}", backend_id, e);
         }
 
         if snapshot.tls {
-            if let Err(e) = send_to_worker(command_channel_https, format!("rm-backend-https-{}-{}", cluster_id, i), RequestType::RemoveBackend(remove)) {
+            if let Err(e) = send_to_worker(
+                command_channel_https,
+                format!("rm-backend-https-{}-{}", cluster_id, i),
+                RequestType::RemoveBackend(remove),
+            ) {
                 debug!("Failed to remove HTTPS backend {}: {}", backend_id, e);
             }
         }
@@ -684,10 +835,18 @@ fn remove_cluster(
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     cluster_id: &str,
 ) {
-    if let Err(e) = send_to_worker(command_channel, format!("rm-cluster-http-{}", cluster_id), RequestType::RemoveCluster(cluster_id.to_string())) {
+    if let Err(e) = send_to_worker(
+        command_channel,
+        format!("rm-cluster-http-{}", cluster_id),
+        RequestType::RemoveCluster(cluster_id.to_string()),
+    ) {
         debug!("Failed to remove HTTP cluster {}: {}", cluster_id, e);
     }
-    if let Err(e) = send_to_worker(command_channel_https, format!("rm-cluster-https-{}", cluster_id), RequestType::RemoveCluster(cluster_id.to_string())) {
+    if let Err(e) = send_to_worker(
+        command_channel_https,
+        format!("rm-cluster-https-{}", cluster_id),
+        RequestType::RemoveCluster(cluster_id.to_string()),
+    ) {
         debug!("Failed to remove HTTPS cluster {}: {}", cluster_id, e);
     }
 }
@@ -711,7 +870,11 @@ fn remove_acme_frontends(
             tags: BTreeMap::new(),
         };
 
-        if let Err(e) = send_to_worker(command_channel, format!("rm-frontend-acme-{}", hostname), RequestType::RemoveHttpFrontend(acme_front)) {
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("rm-frontend-acme-{}", hostname),
+            RequestType::RemoveHttpFrontend(acme_front),
+        ) {
             debug!("Failed to remove ACME frontend for {}: {}", hostname, e);
         }
     }
@@ -730,8 +893,20 @@ fn apply_routing_diff(
     for (cluster_id, old_snapshot) in previous {
         if !current.contains_key(cluster_id) {
             info!("Removing stale cluster: {}", cluster_id);
-            remove_http_frontends(command_channel, command_channel_https, cluster_id, old_snapshot, http_port, https_port);
-            remove_backends(command_channel, command_channel_https, cluster_id, old_snapshot);
+            remove_http_frontends(
+                command_channel,
+                command_channel_https,
+                cluster_id,
+                old_snapshot,
+                http_port,
+                https_port,
+            );
+            remove_backends(
+                command_channel,
+                command_channel_https,
+                cluster_id,
+                old_snapshot,
+            );
             remove_cluster(command_channel, command_channel_https, cluster_id);
 
             if acme_challenge_port.is_some() {
@@ -745,10 +920,23 @@ fn apply_routing_diff(
         if let Some(new_snapshot) = current.get(cluster_id) {
             if old_snapshot != new_snapshot {
                 info!("Updating changed cluster: {}", cluster_id);
-                remove_http_frontends(command_channel, command_channel_https, cluster_id, old_snapshot, http_port, https_port);
-                remove_backends(command_channel, command_channel_https, cluster_id, old_snapshot);
+                remove_http_frontends(
+                    command_channel,
+                    command_channel_https,
+                    cluster_id,
+                    old_snapshot,
+                    http_port,
+                    https_port,
+                );
+                remove_backends(
+                    command_channel,
+                    command_channel_https,
+                    cluster_id,
+                    old_snapshot,
+                );
 
-                if acme_challenge_port.is_some() && old_snapshot.hostnames != new_snapshot.hostnames {
+                if acme_challenge_port.is_some() && old_snapshot.hostnames != new_snapshot.hostnames
+                {
                     remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
                 }
             }
@@ -758,12 +946,18 @@ fn apply_routing_diff(
 
 fn parse_backend_address(host: &str, port: u16) -> anyhow::Result<SocketAddress> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
-    
+
     match addr {
         std::net::SocketAddr::V4(addr_v4) => {
             let ip = addr_v4.ip().octets();
-            Ok(SocketAddress::new_v4(ip[0], ip[1], ip[2], ip[3], addr_v4.port()))
-        },
+            Ok(SocketAddress::new_v4(
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                addr_v4.port(),
+            ))
+        }
         std::net::SocketAddr::V6(_) => {
             anyhow::bail!("IPv6 addresses are not yet supported")
         }
@@ -795,7 +989,10 @@ mod tests {
         match result {
             Ok(_) => (),
             Err(e) => {
-                println!("Hostname resolution failed (expected in some test environments): {}", e);
+                println!(
+                    "Hostname resolution failed (expected in some test environments): {}",
+                    e
+                );
             }
         }
     }

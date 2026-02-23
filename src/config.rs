@@ -17,11 +17,20 @@ pub struct AcmeConfig {
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_acme_email_with_env")]
     pub email: String,
-    #[serde(default = "default_acme_certs_dir", deserialize_with = "deserialize_acme_certs_dir_with_env")]
+    #[serde(
+        default = "default_acme_certs_dir",
+        deserialize_with = "deserialize_acme_certs_dir_with_env"
+    )]
     pub certs_dir: String,
-    #[serde(default = "default_acme_staging", deserialize_with = "deserialize_acme_staging_with_env")]
+    #[serde(
+        default = "default_acme_staging",
+        deserialize_with = "deserialize_acme_staging_with_env"
+    )]
     pub staging: bool,
-    #[serde(default = "default_acme_challenge_port", deserialize_with = "deserialize_acme_challenge_port_with_env")]
+    #[serde(
+        default = "default_acme_challenge_port",
+        deserialize_with = "deserialize_acme_challenge_port_with_env"
+    )]
     pub challenge_port: u16,
 }
 
@@ -37,7 +46,10 @@ pub struct DockerConfig {
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_docker_endpoint_with_env")]
     pub endpoint: String,
-    #[serde(default, deserialize_with = "deserialize_docker_expose_by_default_with_env")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_docker_expose_by_default_with_env"
+    )]
     pub expose_by_default: bool,
 }
 
@@ -63,31 +75,52 @@ pub struct ConfigFileConfig {
 pub struct ProxyConfig {
     pub http: HttpConfig,
     pub https: HttpsConfig,
-    #[serde(default = "default_max_buffers", deserialize_with = "deserialize_max_buffers_with_env")]
+    #[serde(
+        default = "default_max_buffers",
+        deserialize_with = "deserialize_max_buffers_with_env"
+    )]
     pub max_buffers: usize,
-    #[serde(default = "default_buffer_size", deserialize_with = "deserialize_buffer_size_with_env")]
+    #[serde(
+        default = "default_buffer_size",
+        deserialize_with = "deserialize_buffer_size_with_env"
+    )]
     pub buffer_size: usize,
-    #[serde(default = "default_startup_delay_ms", deserialize_with = "deserialize_startup_delay_ms_with_env")]
+    #[serde(
+        default = "default_startup_delay_ms",
+        deserialize_with = "deserialize_startup_delay_ms_with_env"
+    )]
     pub startup_delay_ms: u64,
-    #[serde(default = "default_cluster_setup_delay_ms", deserialize_with = "deserialize_cluster_setup_delay_ms_with_env")]
+    #[serde(
+        default = "default_cluster_setup_delay_ms",
+        deserialize_with = "deserialize_cluster_setup_delay_ms_with_env"
+    )]
     pub cluster_setup_delay_ms: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct HttpConfig {
-    #[serde(default = "default_http_port", deserialize_with = "deserialize_port_with_env")]
+    #[serde(
+        default = "default_http_port",
+        deserialize_with = "deserialize_port_with_env"
+    )]
     pub listen_address: u16,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct HttpsConfig {
-    #[serde(default = "default_https_port", deserialize_with = "deserialize_https_port_with_env")]
+    #[serde(
+        default = "default_https_port",
+        deserialize_with = "deserialize_https_port_with_env"
+    )]
     pub listen_address: u16,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MiddlewareConfig {
-    #[serde(default = "default_middleware_port", deserialize_with = "deserialize_middleware_port_with_env")]
+    #[serde(
+        default = "default_middleware_port",
+        deserialize_with = "deserialize_middleware_port_with_env"
+    )]
     pub port: u16,
 }
 
@@ -232,8 +265,18 @@ macro_rules! deserialize_with_env {
     };
 }
 
-deserialize_with_env!(deserialize_port_with_env, "SOZUNE_HTTP_PORT", u16, default_http_port);
-deserialize_with_env!(deserialize_https_port_with_env, "SOZUNE_HTTPS_PORT", u16, default_https_port);
+deserialize_with_env!(
+    deserialize_port_with_env,
+    "SOZUNE_HTTP_PORT",
+    u16,
+    default_http_port
+);
+deserialize_with_env!(
+    deserialize_https_port_with_env,
+    "SOZUNE_HTTPS_PORT",
+    u16,
+    default_https_port
+);
 
 // Fonction spécialisée pour les booléens
 fn get_env_bool(var: &str, default: bool) -> bool {
@@ -281,35 +324,117 @@ macro_rules! deserialize_string_with_env {
         where
             D: serde::Deserializer<'de>,
         {
-            let value = String::deserialize(deserializer).unwrap_or_else(|_| $default_value.to_string());
+            let value =
+                String::deserialize(deserializer).unwrap_or_else(|_| $default_value.to_string());
             Ok(get_env_string($env_var, value))
         }
     };
 }
 
 // Génération de toutes les fonctions avec les macros
-deserialize_bool_with_env!(deserialize_docker_enabled_with_env, "SOZUNE_PROVIDER_DOCKER_ENABLED", false);
-deserialize_string_with_env!(deserialize_docker_endpoint_with_env, "SOZUNE_PROVIDER_DOCKER_ENDPOINT", "/var/run/docker.sock", literal);
-deserialize_bool_with_env!(deserialize_docker_expose_by_default_with_env, "SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT", false);
+deserialize_bool_with_env!(
+    deserialize_docker_enabled_with_env,
+    "SOZUNE_PROVIDER_DOCKER_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_docker_endpoint_with_env,
+    "SOZUNE_PROVIDER_DOCKER_ENDPOINT",
+    "/var/run/docker.sock",
+    literal
+);
+deserialize_bool_with_env!(
+    deserialize_docker_expose_by_default_with_env,
+    "SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT",
+    false
+);
 
-deserialize_bool_with_env!(deserialize_config_file_enabled_with_env, "SOZUNE_PROVIDER_CONFIG_FILE_ENABLED", false);
-deserialize_string_with_env!(deserialize_config_file_path_with_env, "SOZUNE_PROVIDER_CONFIG_FILE_PATH", "/etc/sozune/config.yaml", literal);
-deserialize_bool_with_env!(deserialize_config_file_watch_with_env, "SOZUNE_PROVIDER_CONFIG_FILE_WATCH", true);
+deserialize_bool_with_env!(
+    deserialize_config_file_enabled_with_env,
+    "SOZUNE_PROVIDER_CONFIG_FILE_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_config_file_path_with_env,
+    "SOZUNE_PROVIDER_CONFIG_FILE_PATH",
+    "/etc/sozune/config.yaml",
+    literal
+);
+deserialize_bool_with_env!(
+    deserialize_config_file_watch_with_env,
+    "SOZUNE_PROVIDER_CONFIG_FILE_WATCH",
+    true
+);
 
-deserialize_bool_with_env!(deserialize_api_enabled_with_env, "SOZUNE_API_ENABLED", false);
-deserialize_string_with_env!(deserialize_api_listen_address_with_env, "SOZUNE_API_LISTEN_ADDRESS", default_api_listen_address);
+deserialize_bool_with_env!(
+    deserialize_api_enabled_with_env,
+    "SOZUNE_API_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_api_listen_address_with_env,
+    "SOZUNE_API_LISTEN_ADDRESS",
+    default_api_listen_address
+);
 
-deserialize_with_env!(deserialize_max_buffers_with_env, "SOZUNE_PROXY_MAX_BUFFERS", usize, default_max_buffers);
-deserialize_with_env!(deserialize_buffer_size_with_env, "SOZUNE_PROXY_BUFFER_SIZE", usize, default_buffer_size);
-deserialize_with_env!(deserialize_startup_delay_ms_with_env, "SOZUNE_PROXY_STARTUP_DELAY_MS", u64, default_startup_delay_ms);
-deserialize_with_env!(deserialize_cluster_setup_delay_ms_with_env, "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS", u64, default_cluster_setup_delay_ms);
+deserialize_with_env!(
+    deserialize_max_buffers_with_env,
+    "SOZUNE_PROXY_MAX_BUFFERS",
+    usize,
+    default_max_buffers
+);
+deserialize_with_env!(
+    deserialize_buffer_size_with_env,
+    "SOZUNE_PROXY_BUFFER_SIZE",
+    usize,
+    default_buffer_size
+);
+deserialize_with_env!(
+    deserialize_startup_delay_ms_with_env,
+    "SOZUNE_PROXY_STARTUP_DELAY_MS",
+    u64,
+    default_startup_delay_ms
+);
+deserialize_with_env!(
+    deserialize_cluster_setup_delay_ms_with_env,
+    "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS",
+    u64,
+    default_cluster_setup_delay_ms
+);
 
-deserialize_bool_with_env!(deserialize_acme_enabled_with_env, "SOZUNE_ACME_ENABLED", false);
-deserialize_string_with_env!(deserialize_acme_email_with_env, "SOZUNE_ACME_EMAIL", "", literal);
-deserialize_string_with_env!(deserialize_acme_certs_dir_with_env, "SOZUNE_ACME_CERTS_DIR", default_acme_certs_dir);
-deserialize_bool_with_env!(deserialize_acme_staging_with_env, "SOZUNE_ACME_STAGING", true);
-deserialize_with_env!(deserialize_acme_challenge_port_with_env, "SOZUNE_ACME_CHALLENGE_PORT", u16, default_acme_challenge_port);
-deserialize_with_env!(deserialize_middleware_port_with_env, "SOZUNE_MIDDLEWARE_PORT", u16, default_middleware_port);
+deserialize_bool_with_env!(
+    deserialize_acme_enabled_with_env,
+    "SOZUNE_ACME_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_acme_email_with_env,
+    "SOZUNE_ACME_EMAIL",
+    "",
+    literal
+);
+deserialize_string_with_env!(
+    deserialize_acme_certs_dir_with_env,
+    "SOZUNE_ACME_CERTS_DIR",
+    default_acme_certs_dir
+);
+deserialize_bool_with_env!(
+    deserialize_acme_staging_with_env,
+    "SOZUNE_ACME_STAGING",
+    true
+);
+deserialize_with_env!(
+    deserialize_acme_challenge_port_with_env,
+    "SOZUNE_ACME_CHALLENGE_PORT",
+    u16,
+    default_acme_challenge_port
+);
+deserialize_with_env!(
+    deserialize_middleware_port_with_env,
+    "SOZUNE_MIDDLEWARE_PORT",
+    u16,
+    default_middleware_port
+);
 
 #[cfg(test)]
 mod tests {

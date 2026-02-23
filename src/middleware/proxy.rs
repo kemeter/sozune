@@ -5,10 +5,10 @@ use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use tracing::{debug, error, warn};
 
+use super::MiddlewareAppState;
 use super::auth;
 use super::headers;
 use super::strip_prefix;
-use super::MiddlewareAppState;
 
 /// Main proxy handler: identifies the route by Host header,
 /// applies middleware stack, and forwards to the real backend.
@@ -61,7 +61,11 @@ pub async fn handle_proxy(
 
     // 3. Build the forwarded URI with strip_prefix applied
     let original_path = req.uri().path().to_string();
-    let query = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
 
     let forwarded_path = if let Some(ref prefix) = route.strip_prefix {
         strip_prefix::strip(prefix, &original_path)
@@ -102,9 +106,10 @@ pub async fn handle_proxy(
     match state.http_client.request(forwarded_req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let body = Body::new(body.map_err(|e| {
-                axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
-            }));
+            let body =
+                Body::new(body.map_err(|e| {
+                    axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                }));
             Response::from_parts(parts, body).into_response()
         }
         Err(e) => {

@@ -16,7 +16,7 @@ pub struct Entrypoint {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Protocol {
     Http,
-    Tcp, 
+    Tcp,
     Udp,
 }
 

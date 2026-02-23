@@ -4,8 +4,8 @@ mod proxy;
 mod strip_prefix;
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use axum::{Router, routing::any};
 use hyper_util::client::legacy::Client;
@@ -40,7 +40,11 @@ pub struct MiddlewareRoute {
 }
 
 impl MiddlewareRouteTable {
-    pub fn update_routes_for_entrypoint(&mut self, hostnames: &[String], route: Arc<MiddlewareRoute>) {
+    pub fn update_routes_for_entrypoint(
+        &mut self,
+        hostnames: &[String],
+        route: Arc<MiddlewareRoute>,
+    ) {
         for hostname in hostnames {
             self.routes.insert(hostname.clone(), Arc::clone(&route));
         }
@@ -70,13 +74,14 @@ impl MiddlewareRoute {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.strip_prefix
-        || config.auth.is_some()
-        || !config.headers.is_empty()
+    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty()
 }
 
 /// Build middleware route from entrypoint config
-pub fn build_middleware_route(config: &EntrypointConfig, backends: &[String]) -> Arc<MiddlewareRoute> {
+pub fn build_middleware_route(
+    config: &EntrypointConfig,
+    backends: &[String],
+) -> Arc<MiddlewareRoute> {
     let strip_prefix = if config.strip_prefix {
         config.path.as_ref().map(|p| p.value.clone())
     } else {

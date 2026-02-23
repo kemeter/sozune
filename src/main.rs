@@ -1,21 +1,21 @@
+use anyhow::Context;
+use futures_util::stream::StreamExt;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook_tokio::Signals;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use anyhow::Context;
-use tracing::{info, warn, error, debug};
-use signal_hook_tokio::Signals;
-use signal_hook::consts::{SIGINT, SIGTERM};
-use futures_util::stream::StreamExt;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 
 mod acme;
 mod api;
+mod config;
 mod middleware;
+mod model;
 mod provider;
 mod proxy;
-mod config;
-mod model;
 
 pub use model::*;
 
@@ -27,22 +27,21 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive("sozune=info".parse().expect("valid log directive"))
                 .add_directive("bollard=warn".parse().expect("valid log directive"))
                 .add_directive("hyper=warn".parse().expect("valid log directive"))
-                .add_directive("rustls=warn".parse().expect("valid log directive"))
+                .add_directive("rustls=warn".parse().expect("valid log directive")),
         )
         .init();
 
     info!("Starting Sozune proxy");
 
-    let config_path = std::env::var("CONFIG_PATH")
-        .unwrap_or_else(|_| "config.yaml".to_string());
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
 
     let config = if tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
         info!("Loading configuration from: {}", config_path);
-        let config_content = tokio::fs::read_to_string(&config_path).await
+        let config_content = tokio::fs::read_to_string(&config_path)
+            .await
             .context("Failed to read a config file")?;
 
-        serde_yaml::from_str(&config_content)
-            .context("Failed to parse a config file")?
+        serde_yaml::from_str(&config_content).context("Failed to parse a config file")?
     } else {
         info!("Configuration file not found, using the default configuration");
         AppConfig::default()
@@ -67,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create middleware state shared between middleware server and proxy reload
-    let middleware_state: middleware::MiddlewareState = Arc::new(RwLock::new(middleware::MiddlewareRouteTable::default()));
+    let middleware_state: middleware::MiddlewareState =
+        Arc::new(RwLock::new(middleware::MiddlewareRouteTable::default()));
     let middleware_state_proxy = Arc::clone(&middleware_state);
     let middleware_port = config.middleware.port;
 
@@ -75,7 +75,17 @@ async fn main() -> anyhow::Result<()> {
     let proxy_config = config.proxy.clone();
     let handle = tokio::runtime::Handle::current();
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        proxy::backend::init_proxy(storage_proxy, &proxy_config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port, middleware_state_proxy, middleware_port, handle)
+        proxy::backend::init_proxy(
+            storage_proxy,
+            &proxy_config,
+            shutdown_rx,
+            reload_rx,
+            cert_rx,
+            acme_challenge_port,
+            middleware_state_proxy,
+            middleware_port,
+            handle,
+        )
     });
 
     // Start provider services (Docker, etc.)
@@ -103,9 +113,7 @@ async fn main() -> anyhow::Result<()> {
     // Start middleware server
     let middleware_task = tokio::spawn({
         let middleware_state = Arc::clone(&middleware_state);
-        async move {
-            middleware::serve(middleware_port, middleware_state).await
-        }
+        async move { middleware::serve(middleware_port, middleware_state).await }
     });
 
     // Start ACME module if enabled
@@ -129,18 +137,16 @@ async fn main() -> anyhow::Result<()> {
                     let challenge_port = acme_config.challenge_port;
                     let challenges_server = Arc::clone(&challenges);
                     tokio::spawn(async move {
-                        if let Err(e) = acme::challenge_server::serve(challenge_port, challenges_server).await {
+                        if let Err(e) =
+                            acme::challenge_server::serve(challenge_port, challenges_server).await
+                        {
                             error!("ACME challenge server failed: {}", e);
                         }
                     });
 
                     // Run the ACME manager
-                    let manager = acme::AcmeManager::new(
-                        acme_config,
-                        challenges,
-                        storage_acme,
-                        cert_tx,
-                    );
+                    let manager =
+                        acme::AcmeManager::new(acme_config, challenges, storage_acme, cert_tx);
 
                     if let Err(e) = manager.run().await {
                         error!("ACME manager failed: {}", e);
@@ -176,7 +182,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let tasks_future = async {
-        tokio::try_join!(proxy_task, api_task, provider_task, acme_task, middleware_task)
+        tokio::try_join!(
+            proxy_task,
+            api_task,
+            provider_task,
+            acme_task,
+            middleware_task
+        )
     };
 
     tokio::select! {

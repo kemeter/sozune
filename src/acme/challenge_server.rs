@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use axum::{Router, extract::{Path, State}, http::StatusCode, routing::get};
-use tracing::{info, error};
+use axum::{
+    Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use tracing::{error, info};
 
 pub type ChallengeState = Arc<RwLock<HashMap<String, String>>>;
 
@@ -15,10 +20,7 @@ async fn handle_challenge(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    challenges
-        .get(&token)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)
+    challenges.get(&token).cloned().ok_or(StatusCode::NOT_FOUND)
 }
 
 pub async fn serve(port: u16, challenges: ChallengeState) -> anyhow::Result<()> {

@@ -59,7 +59,10 @@ mod tests {
     fn test_inject_invalid_header_name_skipped() {
         let mut headers = HeaderMap::new();
         let mut custom = HashMap::new();
-        custom.insert("invalid header name with spaces".to_string(), "value".to_string());
+        custom.insert(
+            "invalid header name with spaces".to_string(),
+            "value".to_string(),
+        );
         custom.insert("X-Valid".to_string(), "ok".to_string());
 
         inject_headers(&mut headers, &custom);

@@ -79,10 +79,7 @@ impl AcmeManager {
             return Ok(());
         }
 
-        info!(
-            "Found {} TLS-enabled hostname(s) to check",
-            hostnames.len()
-        );
+        info!("Found {} TLS-enabled hostname(s) to check", hostnames.len());
 
         for hostname in &hostnames {
             match self.needs_certificate(hostname).await {
@@ -151,9 +148,7 @@ impl AcmeManager {
 
         // Create order
         let identifiers = vec![Identifier::Dns(hostname.to_string())];
-        let mut order = account
-            .new_order(&NewOrder::new(&identifiers))
-            .await?;
+        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
         // Process authorizations and collect challenge tokens for cleanup
         let mut challenge_tokens: Vec<String> = Vec::new();
@@ -169,9 +164,10 @@ impl AcmeManager {
 
             // Store token → key_authorization in shared challenge state
             {
-                let mut challenges = self.challenges.write().map_err(|e| {
-                    anyhow::anyhow!("Challenge state lock poisoned: {}", e)
-                })?;
+                let mut challenges = self
+                    .challenges
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("Challenge state lock poisoned: {}", e))?;
                 challenges.insert(token.clone(), key_auth.as_str().to_string());
             }
 
@@ -238,18 +234,23 @@ impl AcmeManager {
                             match Account::builder()?.from_credentials(credentials).await {
                                 Ok(account) => {
                                     // Re-parse from already loaded data (from_credentials consumed the first parse)
-                                    let creds: AccountCredentials =
-                                        serde_json::from_str(&data)?;
+                                    let creds: AccountCredentials = serde_json::from_str(&data)?;
                                     info!("Loaded existing ACME account");
                                     return Ok((account, creds));
                                 }
                                 Err(e) => {
-                                    warn!("Failed to restore ACME account, creating new one: {}", e);
+                                    warn!(
+                                        "Failed to restore ACME account, creating new one: {}",
+                                        e
+                                    );
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to parse account credentials, creating new one: {}", e);
+                            warn!(
+                                "Failed to parse account credentials, creating new one: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -266,16 +267,17 @@ impl AcmeManager {
             vec![format!("mailto:{}", self.config.email)]
         };
 
-        let (account, credentials) = Account::builder()?.create(
-            &NewAccount {
-                contact: &contact.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            server_url.to_string(),
-            None,
-        )
-        .await?;
+        let (account, credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &contact.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                server_url.to_string(),
+                None,
+            )
+            .await?;
 
         // Save credentials
         tokio::fs::create_dir_all(&self.certs_dir).await?;
@@ -458,10 +460,7 @@ fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
         return (pem_chain.to_string(), Vec::new());
     }
 
-    let leaf = format!(
-        "{}-----END CERTIFICATE-----\n",
-        pem_blocks[0].trim_start()
-    );
+    let leaf = format!("{}-----END CERTIFICATE-----\n", pem_blocks[0].trim_start());
 
     let chain: Vec<String> = pem_blocks[1..]
         .iter()
@@ -513,10 +512,7 @@ fn parse_cert_expiry(pem_data: &str) -> Option<i64> {
 /// Simple base64 decoder (no external dependency needed)
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let input: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let input: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let mut output = Vec::with_capacity(input.len() * 3 / 4);
 
     for chunk in input.chunks(4) {
@@ -590,7 +586,10 @@ fn parse_asn1_sequence(data: &[u8]) -> Option<(usize, &[u8])> {
     }
     let (header_len, content_len) = parse_asn1_length(&data[1..])?;
     let total_header = 1 + header_len;
-    Some((total_header, &data[total_header..total_header + content_len]))
+    Some((
+        total_header,
+        &data[total_header..total_header + content_len],
+    ))
 }
 
 /// Parse an ASN.1 element and return (header_size, content_size) — total = header + content
