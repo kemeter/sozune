@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug};
 use sozu_command_lib::{
@@ -11,6 +12,7 @@ use sozu_command_lib::{
         AddBackend, RemoveBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
         RequestHttpFrontend, PathRule, RulePosition,
         AddCertificate, CertificateAndKey, TlsVersion,
+        Status,
     },
 };
 use crate::model::{Entrypoint, Protocol, PathConfig, PathRuleType};
@@ -102,8 +104,10 @@ pub fn start_sozu_proxy(
         }
     });
 
-    // Wait for workers to be ready
-    thread::sleep(std::time::Duration::from_millis(config.startup_delay_ms));
+    // Wait for workers to be ready by sending a Status probe
+    let timeout = Duration::from_millis(config.startup_delay_ms);
+    wait_for_worker_ready(&mut command_channel, "HTTP", timeout)?;
+    wait_for_worker_ready(&mut command_channel_https, "HTTPS", timeout)?;
 
     // Initial configuration will be handled by provider reload signals
     info!("Waiting for providers to populate configuration");
@@ -471,6 +475,29 @@ fn configure_http_entrypoint(
     }
 
     Ok(())
+}
+
+fn wait_for_worker_ready(
+    channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    channel.write_message(&WorkerRequest {
+        id: format!("{}-readiness-probe", name),
+        content: Request {
+            request_type: Some(RequestType::Status(Status {})),
+        },
+    })?;
+
+    match channel.read_message_blocking_timeout(Some(timeout)) {
+        Ok(_) => {
+            info!("{} worker is ready", name);
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("{} worker failed to become ready within {:?}: {}", name, timeout, e);
+        }
+    }
 }
 
 fn send_to_worker(
