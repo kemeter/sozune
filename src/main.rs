@@ -73,8 +73,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let proxy_config = config.proxy.clone();
+    let handle = tokio::runtime::Handle::current();
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        proxy::backend::init_proxy(storage_proxy, &proxy_config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port, middleware_state_proxy, middleware_port)
+        proxy::backend::init_proxy(storage_proxy, &proxy_config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port, middleware_state_proxy, middleware_port, handle)
     });
 
     // Start provider services (Docker, etc.)
@@ -213,10 +214,10 @@ async fn main() -> anyhow::Result<()> {
             signal_handle.close();
             let _ = shutdown_tx.send(());
 
-            // Force exit after short delay
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            warn!("Forcing shutdown");
-            std::process::exit(0);
+            // Give the proxy time to shut down gracefully, force exit as last resort
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            warn!("Graceful shutdown timed out, forcing exit");
+            std::process::exit(1);
         }
     }
 

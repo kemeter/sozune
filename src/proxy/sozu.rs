@@ -51,12 +51,13 @@ fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnaps
 pub fn start_sozu_proxy(
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     config: &ProxyConfig,
-    _shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     mut reload_rx: mpsc::UnboundedReceiver<()>,
     mut cert_rx: mpsc::UnboundedReceiver<CertCommand>,
     acme_challenge_port: Option<u16>,
     middleware_state: MiddlewareState,
     middleware_port: u16,
+    handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     info!("Starting Sōzu HTTP and HTTPS workers");
 
@@ -124,19 +125,17 @@ pub fn start_sozu_proxy(
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
 
     let reload_handle = thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create tokio runtime for reload handler: {}", e);
-                return;
-            }
-        };
-        rt.block_on(async {
+        handle.block_on(async {
+            let mut shutdown_rx = shutdown_rx;
             let mut cert_rx_open = true;
             let mut previous_snapshot: RoutingSnapshot = BTreeMap::new();
             loop {
                 if cert_rx_open {
                     tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            info!("Shutdown signal received in reload handler");
+                            break;
+                        }
                         reload = reload_rx.recv() => {
                             match reload {
                                 Some(_) => {
@@ -164,13 +163,21 @@ pub fn start_sozu_proxy(
                         }
                     }
                 } else {
-                    match reload_rx.recv().await {
-                        Some(_) => {
-                            previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
-                        }
-                        None => {
-                            debug!("Reload channel closed");
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            info!("Shutdown signal received in reload handler");
                             break;
+                        }
+                        reload = reload_rx.recv() => {
+                            match reload {
+                                Some(_) => {
+                                    previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
+                                }
+                                None => {
+                                    debug!("Reload channel closed");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

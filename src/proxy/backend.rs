@@ -16,6 +16,7 @@ pub fn init_proxy(
     acme_challenge_port: Option<u16>,
     middleware_state: MiddlewareState,
     middleware_port: u16,
+    handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
-    proxy::sozu::start_sozu_proxy(storage, config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port, middleware_state, middleware_port)
+    proxy::sozu::start_sozu_proxy(storage, config, shutdown_rx, reload_rx, cert_rx, acme_challenge_port, middleware_state, middleware_port, handle)
 }
