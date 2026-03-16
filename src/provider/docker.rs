@@ -368,34 +368,6 @@ impl DockerProvider {
         Ok(entrypoints)
     }
 
-    /// Check if a container event should trigger a reload
-    async fn should_reload_for_container(&self, event: &EventMessage) -> bool {
-        if let Some(actor) = &event.actor {
-            if let Some(container_id) = &actor.id {
-                // For stop/die/destroy events, we always reload since we can't inspect stopped containers
-                if let Some(action) = &event.action {
-                    if matches!(action.as_str(), "stop" | "die" | "destroy") {
-                        return true;
-                    }
-                }
-
-                // For other events, check if container has sozune labels
-                if let Ok(container) = self
-                    .docker
-                    .inspect_container(container_id, None::<InspectContainerOptions>)
-                    .await
-                {
-                    if let Some(config) = container.config {
-                        if let Some(labels) = config.labels {
-                            return self.should_expose_container(&labels);
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
     pub async fn get_entrypoints_from_containers(
         &self,
     ) -> Result<HashMap<String, Entrypoint>, bollard::errors::Error> {
