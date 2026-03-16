@@ -181,25 +181,24 @@ async fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    let tasks_future = async {
-        tokio::try_join!(
-            proxy_task,
-            api_task,
-            provider_task,
-            acme_task,
-            middleware_task
-        )
+    let secondary_tasks_future = async {
+        tokio::try_join!(api_task, provider_task, acme_task, middleware_task)
     };
 
-    tokio::select! {
-        result = tasks_future => {
-            signal_handle.close();
-            let (proxy_result, api_result, provider_result, acme_result, middleware_result) = result?;
+    tokio::pin!(proxy_task);
 
-            match proxy_result {
-                Ok(_) => debug!("Proxy task completed successfully"),
-                Err(e) => error!("Proxy task failed: {}", e),
+    tokio::select! {
+        result = &mut proxy_task => {
+            signal_handle.close();
+            match result {
+                Ok(Ok(_)) => debug!("Proxy task completed successfully"),
+                Ok(Err(e)) => error!("Proxy task failed: {}", e),
+                Err(e) => error!("Proxy task panicked: {:?}", e),
             }
+        },
+        result = secondary_tasks_future => {
+            signal_handle.close();
+            let (api_result, provider_result, acme_result, middleware_result) = result?;
 
             match api_result {
                 Ok(_) => debug!("API task completed successfully"),
@@ -226,10 +225,15 @@ async fn main() -> anyhow::Result<()> {
             signal_handle.close();
             let _ = shutdown_tx.send(());
 
-            // Give the proxy time to shut down gracefully, force exit as last resort
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            warn!("Graceful shutdown timed out, forcing exit");
-            std::process::exit(1);
+            match tokio::time::timeout(std::time::Duration::from_secs(10), proxy_task).await {
+                Ok(Ok(Ok(_))) => info!("Proxy shut down gracefully"),
+                Ok(Ok(Err(e))) => error!("Proxy shut down with error: {}", e),
+                Ok(Err(e)) => error!("Proxy task panicked: {:?}", e),
+                Err(_) => {
+                    warn!("Graceful shutdown timed out, forcing exit");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

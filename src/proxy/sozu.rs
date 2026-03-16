@@ -7,8 +7,9 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, RemoveBackend, Request, RequestHttpFrontend, RulePosition,
-        SocketAddress, Status, TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
+        LoadBalancingParams, PathRule, RemoveBackend, Request, RequestHttpFrontend, ResponseStatus,
+        RulePosition, SocketAddress, Status, TlsVersion, WorkerRequest, WorkerResponse,
+        request::RequestType,
     },
 };
 use std::collections::BTreeMap;
@@ -635,11 +636,23 @@ fn send_to_worker(
     request: RequestType,
 ) -> anyhow::Result<()> {
     channel.write_message(&WorkerRequest {
-        id,
+        id: id.clone(),
         content: Request {
             request_type: Some(request),
         },
     })?;
+
+    match channel.read_message_blocking_timeout(Some(Duration::from_millis(100))) {
+        Ok(response) => {
+            if response.status == ResponseStatus::Failure as i32 {
+                debug!("Worker rejected command {}: {}", id, response.message);
+            }
+        }
+        Err(_) => {
+            // Timeout or nothing yet - fire-and-forget is acceptable for configuration commands
+        }
+    }
+
     Ok(())
 }
 
