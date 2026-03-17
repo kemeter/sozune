@@ -16,12 +16,18 @@ pub async fn handle_proxy(
     State(state): State<MiddlewareAppState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
-    let host = req
+    let host = match req
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .filter(|h| !h.is_empty())
+    {
+        Some(h) => h.to_string(),
+        None => {
+            warn!("Request with missing or invalid Host header");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
 
     let route = {
         let table = match state.route_table.read() {
@@ -32,13 +38,14 @@ pub async fn handle_proxy(
             }
         };
 
+        // Route lookup validates Host against configured hostnames
         table.get_route_by_host(&host)
     };
 
     let route = match route {
         Some(r) => r,
         None => {
-            warn!("No middleware route found for host '{}'", host);
+            debug!("No middleware route for host '{}'", host);
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
