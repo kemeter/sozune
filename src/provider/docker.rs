@@ -588,6 +588,27 @@ impl DockerProvider {
         }
     }
 
+    /// Headers that must not be injected from Docker labels to prevent
+    /// request smuggling, SSRF, and host header attacks.
+    const BLOCKED_HEADERS: &[&str] = &[
+        "host",
+        "transfer-encoding",
+        "content-length",
+        "connection",
+        "upgrade",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "forwarded",
+        "cookie",
+        "authorization",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+    ];
+
     fn parse_header_labels(
         &self,
         labels: &HashMap<String, String>,
@@ -598,6 +619,16 @@ impl DockerProvider {
 
         for (key, value) in labels {
             if let Some(header_name) = key.strip_prefix(&header_prefix) {
+                if Self::BLOCKED_HEADERS
+                    .iter()
+                    .any(|blocked| blocked.eq_ignore_ascii_case(header_name))
+                {
+                    warn!(
+                        "Ignoring blocked header '{}' from Docker label",
+                        header_name
+                    );
+                    continue;
+                }
                 headers.insert(header_name.to_string(), value.clone());
             }
         }
