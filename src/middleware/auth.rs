@@ -64,12 +64,22 @@ pub fn check_basic_auth(
         None => return Err(unauthorized()),
     };
 
-    // Match against configured users with constant-time comparison
+    // Match against configured users
+    // Supports both bcrypt hashes (starting with $2b$/$2a$/$2y$) and plaintext (legacy)
     for user in users {
-        if constant_time_eq(user.username.as_bytes(), username.as_bytes())
-            && constant_time_eq(user.password_hash.as_bytes(), password.as_bytes())
-        {
-            return Ok(());
+        if constant_time_eq(user.username.as_bytes(), username.as_bytes()) {
+            let password_matches = if user.password_hash.starts_with("$2b$")
+                || user.password_hash.starts_with("$2a$")
+                || user.password_hash.starts_with("$2y$")
+            {
+                bcrypt::verify(password, &user.password_hash).unwrap_or(false)
+            } else {
+                constant_time_eq(user.password_hash.as_bytes(), password.as_bytes())
+            };
+
+            if password_matches {
+                return Ok(());
+            }
         }
     }
 
@@ -137,6 +147,31 @@ mod tests {
     fn test_unknown_user() {
         let users = make_users();
         let encoded = BASE64.encode("unknown:secret");
+        let req = make_request(Some(&format!("Basic {}", encoded)));
+        assert!(check_basic_auth(&req, &users).is_err());
+    }
+
+    #[test]
+    fn test_valid_bcrypt_credentials() {
+        // bcrypt hash of "secret" with cost 4 (fast for tests)
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        let users = vec![BasicAuthUser {
+            username: "admin".to_string(),
+            password_hash: hash,
+        }];
+        let encoded = BASE64.encode("admin:secret");
+        let req = make_request(Some(&format!("Basic {}", encoded)));
+        assert!(check_basic_auth(&req, &users).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_bcrypt_password() {
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        let users = vec![BasicAuthUser {
+            username: "admin".to_string(),
+            password_hash: hash,
+        }];
+        let encoded = BASE64.encode("admin:wrong");
         let req = make_request(Some(&format!("Basic {}", encoded)));
         assert!(check_basic_auth(&req, &users).is_err());
     }
