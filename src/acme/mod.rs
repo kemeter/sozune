@@ -279,10 +279,10 @@ impl AcmeManager {
             )
             .await?;
 
-        // Save credentials
+        // Save credentials with restrictive permissions
         tokio::fs::create_dir_all(&self.certs_dir).await?;
         let creds_json = serde_json::to_string_pretty(&credentials)?;
-        tokio::fs::write(&creds_path, &creds_json).await?;
+        write_with_restricted_permissions(&creds_path, creds_json.as_bytes()).await?;
         info!("Created new ACME account");
 
         Ok((account, credentials))
@@ -367,7 +367,7 @@ impl AcmeManager {
         tokio::fs::create_dir_all(&cert_dir).await?;
 
         tokio::fs::write(cert_dir.join("cert.pem"), cert_chain_pem).await?;
-        tokio::fs::write(cert_dir.join("key.pem"), key_pem).await?;
+        write_with_restricted_permissions(&cert_dir.join("key.pem"), key_pem.as_bytes()).await?;
 
         info!("Certificate saved to {}", cert_dir.display());
         Ok(())
@@ -447,6 +447,21 @@ impl AcmeManager {
             }
         }
     }
+}
+
+/// Write data to a file with 0600 permissions (owner read/write only)
+async fn write_with_restricted_permissions(
+    path: &std::path::Path,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    tokio::fs::write(path, data).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(path, perms).await?;
+    }
+    Ok(())
 }
 
 /// Split a PEM chain into the leaf certificate and the rest of the chain
