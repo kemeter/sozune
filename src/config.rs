@@ -209,7 +209,7 @@ fn default_cluster_setup_delay_ms() -> u64 {
 }
 
 fn default_api_listen_address() -> String {
-    "0.0.0.0:3035".to_string()
+    "127.0.0.1:3035".to_string()
 }
 
 fn default_acme_certs_dir() -> String {
