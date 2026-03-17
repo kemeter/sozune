@@ -102,9 +102,14 @@ pub async fn handle_proxy(
 
     let forwarded_req = Request::from_parts(parts, body);
 
-    // 5. Send the request to the real backend using the shared client
-    match state.http_client.request(forwarded_req).await {
-        Ok(resp) => {
+    // 5. Send the request to the real backend with a 30s timeout
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.http_client.request(forwarded_req),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
             let (parts, body) = resp.into_parts();
             let body =
                 Body::new(body.map_err(|e| {
@@ -112,9 +117,13 @@ pub async fn handle_proxy(
                 }));
             Response::from_parts(parts, body).into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Failed to forward request to {}: {}", target_uri, e);
             StatusCode::BAD_GATEWAY.into_response()
+        }
+        Err(_) => {
+            error!("Backend request to {} timed out", target_uri);
+            StatusCode::GATEWAY_TIMEOUT.into_response()
         }
     }
 }
