@@ -29,7 +29,7 @@ pub struct AcmeManager {
     config: AcmeConfig,
     challenges: ChallengeState,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-    cert_tx: mpsc::UnboundedSender<CertCommand>,
+    cert_tx: mpsc::Sender<CertCommand>,
     certs_dir: PathBuf,
 }
 
@@ -38,7 +38,7 @@ impl AcmeManager {
         config: AcmeConfig,
         challenges: ChallengeState,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        cert_tx: mpsc::UnboundedSender<CertCommand>,
+        cert_tx: mpsc::Sender<CertCommand>,
     ) -> Self {
         let certs_dir = PathBuf::from(&config.certs_dir);
         Self {
@@ -228,12 +228,14 @@ impl AcmeManager {
 
         // Parse chain and send to Sozu
         let (cert_pem, chain) = split_pem_chain(&cert_chain_pem);
-        self.cert_tx.send(CertCommand {
-            hostname: hostname.to_string(),
-            cert_pem,
-            key_pem,
-            chain,
-        })?;
+        self.cert_tx
+            .send(CertCommand {
+                hostname: hostname.to_string(),
+                cert_pem,
+                key_pem,
+                chain,
+            })
+            .await?;
 
         info!("Certificate for {} provisioned successfully", hostname);
         Ok(())
@@ -456,12 +458,16 @@ impl AcmeManager {
             }
 
             let (cert, chain) = split_pem_chain(&cert_pem);
-            if let Err(e) = self.cert_tx.send(CertCommand {
-                hostname: hostname.clone(),
-                cert_pem: cert,
-                key_pem,
-                chain,
-            }) {
+            if let Err(e) = self
+                .cert_tx
+                .send(CertCommand {
+                    hostname: hostname.clone(),
+                    cert_pem: cert,
+                    key_pem,
+                    chain,
+                })
+                .await
+            {
                 error!("Failed to send cert command for {}: {}", hostname, e);
             } else {
                 info!("Loaded existing certificate for {}", hostname);

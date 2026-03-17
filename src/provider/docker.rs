@@ -68,7 +68,7 @@ impl DockerProvider {
     pub async fn start_service(
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: mpsc::UnboundedSender<()>,
+        reload_tx: mpsc::Sender<()>,
     ) -> anyhow::Result<()> {
         info!("Starting Docker service");
 
@@ -77,31 +77,36 @@ impl DockerProvider {
         match self.get_entrypoints_from_containers().await {
             Ok(initial_entrypoints) => {
                 if !initial_entrypoints.is_empty() {
-                    let mut storage_changed = false;
-                    let mut storage_write = match storage.write() {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            error!("Storage lock poisoned during initial scan: {}", e);
-                            return Ok(());
+                    let storage_changed = {
+                        let mut changed = false;
+                        let mut storage_write = match storage.write() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                error!("Storage lock poisoned during initial scan: {}", e);
+                                return Ok(());
+                            }
+                        };
+
+                        for (key, mut entrypoint) in initial_entrypoints {
+                            entrypoint.source = Some("docker".to_string());
+
+                            if !storage_write.contains_key(&key) {
+                                info!("Found new container entrypoint: {}", key);
+                                storage_write.insert(key, entrypoint);
+                                changed = true;
+                            } else {
+                                info!(
+                                    "Container entrypoint {} already exists in storage",
+                                    key
+                                );
+                            }
                         }
+                        changed
                     };
-
-                    for (key, mut entrypoint) in initial_entrypoints {
-                        entrypoint.source = Some("docker".to_string());
-
-                        if !storage_write.contains_key(&key) {
-                            info!("Found new container entrypoint: {}", key);
-                            storage_write.insert(key, entrypoint);
-                            storage_changed = true;
-                        } else {
-                            info!("Container entrypoint {} already exists in storage", key);
-                        }
-                    }
-                    drop(storage_write);
 
                     // Only trigger reload if configuration actually changed
                     if storage_changed {
-                        if let Err(e) = reload_tx.send(()) {
+                        if let Err(e) = reload_tx.send(()).await {
                             warn!("Failed to send initial reload signal: {}", e);
                         } else {
                             info!("Initial configuration loaded from running containers");
@@ -126,7 +131,7 @@ impl DockerProvider {
     pub async fn start_event_listener(
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: mpsc::UnboundedSender<()>,
+        reload_tx: mpsc::Sender<()>,
     ) -> anyhow::Result<()> {
         info!("Starting Docker event listener");
 
@@ -309,7 +314,7 @@ impl DockerProvider {
 
                                 if storage_changed {
                                     info!("Storage updated, triggering reload");
-                                    if let Err(e) = reload_tx.send(()) {
+                                    if let Err(e) = reload_tx.send(()).await {
                                         error!("Failed to send reload signal: {}", e);
                                         break;
                                     }

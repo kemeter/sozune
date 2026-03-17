@@ -51,11 +51,9 @@ async fn main() -> anyhow::Result<()> {
     let storage = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
     let storage_proxy = Arc::clone(&storage);
 
-    // Create a channel for reload signals
-    let (reload_tx, reload_rx) = mpsc::unbounded_channel();
-
-    // Create a channel for certificate commands (ACME → proxy)
-    let (cert_tx, cert_rx) = mpsc::unbounded_channel();
+    // Create bounded channels to prevent memory exhaustion
+    let (reload_tx, reload_rx) = mpsc::channel(64);
+    let (cert_tx, cert_rx) = mpsc::channel(64);
 
     // Determine ACME challenge port
     let acme_enabled = config.acme.as_ref().is_some_and(|a| a.enabled);

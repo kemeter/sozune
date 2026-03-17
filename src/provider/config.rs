@@ -53,7 +53,7 @@ impl ConfigProvider {
     pub async fn start_file_watcher(
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: mpsc::UnboundedSender<()>,
+        reload_tx: mpsc::Sender<()>,
     ) -> anyhow::Result<()> {
         let config_path = self.config_path.clone();
         let storage_clone = Arc::clone(&storage);
@@ -113,7 +113,7 @@ impl ConfigProvider {
                     }
 
                     // Trigger proxy reload
-                    if let Err(e) = reload_tx.send(()) {
+                    if let Err(e) = reload_tx.send(()).await {
                         warn!("Failed to send a reload signal: {}", e);
                     } else {
                         info!("Config entrypoints reloaded successfully");

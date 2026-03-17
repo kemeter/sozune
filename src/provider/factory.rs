@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 pub async fn start_services(
     config: &AppConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-    reload_tx: mpsc::UnboundedSender<()>,
+    reload_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
     info!("Loading initial entrypoints and starting provider services");
 
