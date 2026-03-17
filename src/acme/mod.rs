@@ -121,8 +121,27 @@ impl AcmeManager {
         hostnames
     }
 
+    /// Validate that a hostname is safe to use as a directory name (no path traversal)
+    fn validate_hostname(hostname: &str) -> anyhow::Result<()> {
+        if hostname.is_empty()
+            || hostname.contains('/')
+            || hostname.contains('\\')
+            || hostname.contains('\0')
+            || hostname == "."
+            || hostname == ".."
+            || hostname.contains("..")
+        {
+            anyhow::bail!("Invalid hostname for certificate storage: {}", hostname);
+        }
+        Ok(())
+    }
+
     /// Check if a hostname needs a new certificate (missing or expiring within 30 days)
     async fn needs_certificate(&self, hostname: &str) -> bool {
+        if Self::validate_hostname(hostname).is_err() {
+            warn!("Skipping invalid hostname: {}", hostname);
+            return false;
+        }
         let cert_path = self.certs_dir.join(hostname).join("cert.pem");
         if !cert_path.exists() {
             return true;
@@ -137,6 +156,8 @@ impl AcmeManager {
 
     /// Full ACME HTTP-01 flow for a single hostname
     async fn provision_certificate(&self, hostname: &str) -> anyhow::Result<()> {
+        Self::validate_hostname(hostname)?;
+
         let server_url = if self.config.staging {
             "https://acme-staging-v02.api.letsencrypt.org/directory"
         } else {
