@@ -4,7 +4,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
@@ -55,6 +55,9 @@ async fn main() -> anyhow::Result<()> {
     let (reload_tx, reload_rx) = mpsc::channel(64);
     let (cert_tx, cert_rx) = mpsc::channel(64);
 
+    // Notify ACME manager when storage changes (new TLS entrypoints)
+    let acme_notify = Arc::new(Notify::new());
+
     // Determine ACME challenge port
     let acme_enabled = config.acme.as_ref().is_some_and(|a| a.enabled);
     let acme_challenge_port = if acme_enabled {
@@ -90,10 +93,11 @@ async fn main() -> anyhow::Result<()> {
     let provider_task = tokio::spawn({
         let storage_providers = Arc::clone(&storage);
         let reload_tx_providers = reload_tx.clone();
+        let acme_notify_providers = Arc::clone(&acme_notify);
         let config = config.clone();
 
         async move {
-            provider::factory::start_services(&config, storage_providers, reload_tx_providers).await
+            provider::factory::start_services(&config, storage_providers, reload_tx_providers, acme_notify_providers).await
         }
     });
 
@@ -144,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
 
                     // Run the ACME manager
                     let manager =
-                        acme::AcmeManager::new(acme_config, challenges, storage_acme, cert_tx);
+                        acme::AcmeManager::new(acme_config, challenges, storage_acme, cert_tx, Arc::clone(&acme_notify));
 
                     if let Err(e) = manager.run().await {
                         error!("ACME manager failed: {}", e);

@@ -69,6 +69,7 @@ impl DockerProvider {
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
+        acme_notify: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<()> {
         info!("Starting Docker service");
 
@@ -111,6 +112,7 @@ impl DockerProvider {
                         } else {
                             info!("Initial configuration loaded from running containers");
                         }
+                        acme_notify.notify_one();
                     } else {
                         info!("No new container entrypoints found, configuration unchanged");
                     }
@@ -124,7 +126,7 @@ impl DockerProvider {
         }
 
         // Start event listener
-        self.start_event_listener(storage, reload_tx).await
+        self.start_event_listener(storage, reload_tx, acme_notify).await
     }
 
     /// Start listening for Docker events and update storage directly
@@ -132,6 +134,7 @@ impl DockerProvider {
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
+        acme_notify: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<()> {
         info!("Starting Docker event listener");
 
@@ -318,6 +321,7 @@ impl DockerProvider {
                                         error!("Failed to send reload signal: {}", e);
                                         break;
                                     }
+                                    acme_notify.notify_one();
                                 }
                             }
                         }

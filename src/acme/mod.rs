@@ -9,7 +9,7 @@ use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
 };
 use rcgen::{CertificateParams, KeyPair};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AcmeConfig;
@@ -31,6 +31,7 @@ pub struct AcmeManager {
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     cert_tx: mpsc::Sender<CertCommand>,
     certs_dir: PathBuf,
+    notify: Arc<Notify>,
 }
 
 impl AcmeManager {
@@ -39,6 +40,7 @@ impl AcmeManager {
         challenges: ChallengeState,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         cert_tx: mpsc::Sender<CertCommand>,
+        notify: Arc<Notify>,
     ) -> Self {
         let certs_dir = PathBuf::from(&config.certs_dir);
         Self {
@@ -47,6 +49,7 @@ impl AcmeManager {
             storage,
             cert_tx,
             certs_dir,
+            notify,
         }
     }
 
@@ -60,13 +63,21 @@ impl AcmeManager {
             error!("Initial ACME provisioning failed: {}", e);
         }
 
-        // Renewal loop: check every 12 hours
+        // Renewal loop: check every 12 hours OR when notified of new entrypoints
         let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
         loop {
-            interval.tick().await;
-            info!("Running ACME renewal check");
+            tokio::select! {
+                _ = interval.tick() => {
+                    info!("Running ACME renewal check");
+                }
+                _ = self.notify.notified() => {
+                    // Small delay to let storage settle
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    info!("Running ACME check after storage update");
+                }
+            }
             if let Err(e) = self.provision_all().await {
-                error!("ACME renewal check failed: {}", e);
+                error!("ACME provisioning failed: {}", e);
             }
         }
     }
@@ -158,6 +169,9 @@ impl AcmeManager {
     async fn provision_certificate(&self, hostname: &str) -> anyhow::Result<()> {
         Self::validate_hostname(hostname)?;
 
+        // Ensure rustls has a crypto provider installed (needed by instant-acme/reqwest)
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
         let server_url = if self.config.staging {
             "https://acme-staging-v02.api.letsencrypt.org/directory"
         } else {
@@ -212,7 +226,8 @@ impl AcmeManager {
 
         // Generate key pair and CSR
         let key_pair = KeyPair::generate()?;
-        let params = CertificateParams::new(vec![hostname.to_string()])?;
+        let mut params = CertificateParams::new(vec![hostname.to_string()])?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params.serialize_request(&key_pair)?;
 
         // Finalize order with CSR

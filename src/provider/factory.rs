@@ -4,13 +4,14 @@ use crate::provider::{Provider, config::ConfigProvider, docker::DockerProvider};
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
 
 pub async fn start_services(
     config: &AppConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
+    acme_notify: Arc<Notify>,
 ) -> anyhow::Result<()> {
     info!("Loading initial entrypoints and starting provider services");
 
@@ -71,7 +72,7 @@ pub async fn start_services(
                 .context("Failed to create Docker provider")?;
 
             if let Err(e) = docker_provider
-                .start_service(storage, reload_tx.clone())
+                .start_service(storage, reload_tx.clone(), acme_notify)
                 .await
             {
                 error!("Docker service failed: {}", e);
