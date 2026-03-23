@@ -30,3 +30,4 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
 bcrypt = "0.17"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }

@@ -2232,6 +2232,7 @@ dependencies = [
  "instant-acme",
  "notify",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",

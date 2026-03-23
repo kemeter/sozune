@@ -174,6 +174,9 @@ pub fn start_sozu_proxy(
                                     info!("Adding certificate for {}", cmd.hostname);
                                     if let Err(e) = add_certificate(&mut command_channel_https, https_port, &cmd.cert_pem, &cmd.chain, &cmd.key_pem, &[cmd.hostname.clone()]) {
                                         error!("Failed to add certificate for {}: {}", cmd.hostname, e);
+                                    } else {
+                                        // Reload to ensure HTTPS frontends are properly configured with the new cert
+                                        previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
                                     }
                                 }
                                 None => {
@@ -493,15 +496,17 @@ fn configure_http_entrypoint(
                 tags: BTreeMap::new(),
             };
 
-            if let Err(e) = send_to_worker(
+            info!("Configuring HTTPS frontend for {} on cluster {}", hostname, cluster_id);
+            match send_to_worker(
                 command_channel_https,
                 format!("add-frontend-https-{}-{}", cluster_id, hostname),
-                RequestType::AddHttpFrontend(https_front),
+                RequestType::AddHttpsFrontend(https_front),
             ) {
-                debug!(
-                    "Failed to add HTTPS frontend for {} (may already exist): {}",
+                Ok(_) => info!("HTTPS frontend added for {}", hostname),
+                Err(e) => error!(
+                    "Failed to add HTTPS frontend for {}: {}",
                     hostname, e
-                );
+                ),
             }
         }
     }
@@ -585,15 +590,17 @@ fn configure_http_entrypoint(
             // HTTPS backend only if TLS is enabled
             if entrypoint.config.tls {
                 let backend_id = backend.backend_id.clone();
-                if let Err(e) = send_to_worker(
+                info!("Adding HTTPS backend {} -> {}:{}", backend_id, backend_host, backend_port);
+                match send_to_worker(
                     command_channel_https,
                     format!("add-backend-https-{}-{}", cluster_id, backend_index),
                     RequestType::AddBackend(backend),
                 ) {
-                    debug!(
-                        "Failed to add HTTPS backend {} (may already exist): {}",
+                    Ok(_) => info!("HTTPS backend {} added successfully", backend_id),
+                    Err(e) => error!(
+                        "Failed to add HTTPS backend {}: {}",
                         backend_id, e
-                    );
+                    ),
                 }
             }
         }
@@ -642,14 +649,28 @@ fn send_to_worker(
         },
     })?;
 
-    match channel.read_message_blocking_timeout(Some(Duration::from_millis(100))) {
-        Ok(response) => {
-            if response.status == ResponseStatus::Failure as i32 {
-                debug!("Worker rejected command {}: {}", id, response.message);
-            }
+    // Read responses until we find the one matching our request ID
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        Err(_) => {
-            // Timeout or nothing yet - fire-and-forget is acceptable for configuration commands
+        match channel.read_message_blocking_timeout(Some(remaining)) {
+            Ok(response) => {
+                if response.id == id {
+                    if response.status == ResponseStatus::Failure as i32 {
+                        error!("Worker rejected command {}: {}", id, response.message);
+                        return Err(anyhow::anyhow!("Worker rejected {}: {}", id, response.message));
+                    }
+                    return Ok(());
+                }
+                // Not our response, keep reading
+                debug!("Received response for {} while waiting for {}", response.id, id);
+            }
+            Err(_) => {
+                break;
+            }
         }
     }
 
