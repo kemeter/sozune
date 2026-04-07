@@ -23,7 +23,6 @@ pub enum Protocol {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct EntrypointConfig {
     pub hostnames: Vec<String>,
-    #[serde(deserialize_with = "deserialize_port")]
     pub port: u16,
     pub path: Option<PathConfig>,
     pub tls: bool,
@@ -58,15 +57,3 @@ pub struct BasicAuthUser {
     pub password_hash: String,
 }
 
-fn deserialize_port<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match String::deserialize(deserializer)?.parse::<u16>() {
-        Ok(port) => Ok(port),
-        Err(_) => {
-            warn!("Invalid port format, using default port 80");
-            Ok(80)
-        }
-    }
-}
