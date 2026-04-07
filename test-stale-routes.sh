@@ -31,6 +31,10 @@ HOST_AUTH="auth.func-test.localhost"
 HOST_HEADERS="headers.func-test.localhost"
 HOST_STRIP="strip.func-test.localhost"
 HOST_REDIRECT="redirect.func-test.localhost"
+HOST_RATELIMIT="ratelimit.func-test.localhost"
+HOST_COMPRESS="compress.func-test.localhost"
+API_PORT=18888
+API_TOKEN="test-secret-token"
 MIDDLEWARE_PORT=13037
 
 RED='\033[0;31m'
@@ -114,7 +118,9 @@ providers:
     enabled: false
 
 api:
-  enabled: false
+  enabled: true
+  listen_address: "127.0.0.1:$API_PORT"
+  token: "$API_TOKEN"
 
 proxy:
   http:
@@ -177,6 +183,22 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcredirect.host=$HOST_REDIRECT"
       - "sozune.http.svcredirect.httpsRedirect=true"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-ratelimit:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcratelimit.host=$HOST_RATELIMIT"
+      - "sozune.http.svcratelimit.ratelimit.average=5"
+      - "sozune.http.svcratelimit.ratelimit.burst=3"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-compress:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svccompress.host=$HOST_COMPRESS"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 
@@ -330,6 +352,148 @@ if [[ "$redirect_status" == "301" ]]; then
     pass "HTTPS redirect returns 301"
 else
     fail "HTTPS redirect returned $redirect_status instead of 301"
+fi
+
+# -- Rate Limiting --
+log "Testing rate limiting..."
+
+# Wait for rate limit route to be ready
+wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_RATELIMIT" "200" || true
+
+# Exhaust burst (3 requests)
+for i in $(seq 1 3); do
+    curl -s -o /dev/null --max-time 2 -H "Host: $HOST_RATELIMIT" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || true
+done
+
+# 4th request should be rate limited
+rl_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $HOST_RATELIMIT" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "000")
+if [[ "$rl_status" == "429" ]]; then
+    pass "rate limiting returns 429 after burst exceeded"
+else
+    fail "rate limiting returned $rl_status instead of 429"
+fi
+
+# -- Gzip Compression --
+log "Testing gzip compression..."
+
+# Wait for compress route to be ready
+wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_COMPRESS" "200" || true
+
+# Request with Accept-Encoding: gzip
+compress_encoding=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_COMPRESS" \
+    -H "Accept-Encoding: gzip" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | grep -i "content-encoding" || echo "")
+if echo "$compress_encoding" | grep -qi "gzip"; then
+    pass "gzip compression: response has Content-Encoding: gzip"
+else
+    fail "gzip compression: no Content-Encoding: gzip header found"
+fi
+
+# Request without Accept-Encoding should NOT be compressed
+no_compress_encoding=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_COMPRESS" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | grep -i "content-encoding" || echo "")
+if echo "$no_compress_encoding" | grep -qi "gzip"; then
+    fail "gzip compression: response compressed without Accept-Encoding"
+else
+    pass "gzip compression: no compression without Accept-Encoding"
+fi
+
+# -- API CRUD --
+log "Testing API CRUD..."
+
+API_URL="http://127.0.0.1:$API_PORT"
+AUTH_HEADER="Authorization: Bearer $API_TOKEN"
+
+# Health (no auth needed)
+health_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$API_URL/health" 2>/dev/null || echo "000")
+if [[ "$health_status" == "200" ]]; then
+    pass "API health endpoint returns 200"
+else
+    fail "API health endpoint returned $health_status instead of 200"
+fi
+
+# List without auth -> 401
+noauth_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$API_URL/entrypoints" 2>/dev/null || echo "000")
+if [[ "$noauth_status" == "401" ]]; then
+    pass "API returns 401 without auth token"
+else
+    fail "API returned $noauth_status instead of 401 without auth"
+fi
+
+# List with auth -> 200
+list_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "$AUTH_HEADER" "$API_URL/entrypoints" 2>/dev/null || echo "000")
+if [[ "$list_status" == "200" ]]; then
+    pass "API list entrypoints returns 200 with auth"
+else
+    fail "API list entrypoints returned $list_status instead of 200"
+fi
+
+# Create entrypoint
+create_response=$(curl -s -w "\n%{http_code}" --max-time 2 \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/json" \
+    -X POST "$API_URL/entrypoints" \
+    -d '{"name":"api-test","backends":["127.0.0.1:9999"],"protocol":"Http","config":{"hostnames":["apitest.localhost"],"port":9999,"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":{},"backend_timeout":null,"rate_limit":null,"sticky_session":false}}' \
+    2>/dev/null || echo "000")
+create_status=$(echo "$create_response" | tail -1)
+create_body=$(echo "$create_response" | sed '$d')
+if [[ "$create_status" == "201" ]]; then
+    pass "API create entrypoint returns 201"
+else
+    fail "API create entrypoint returned $create_status instead of 201"
+fi
+
+# Extract ID from create response
+ep_id=$(echo "$create_body" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+if [[ -n "$ep_id" ]]; then
+    # Get by ID
+    get_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "$AUTH_HEADER" "$API_URL/entrypoints/$ep_id" 2>/dev/null || echo "000")
+    if [[ "$get_status" == "200" ]]; then
+        pass "API get entrypoint by ID returns 200"
+    else
+        fail "API get entrypoint returned $get_status instead of 200"
+    fi
+
+    # Update
+    update_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "$AUTH_HEADER" \
+        -H "Content-Type: application/json" \
+        -X PUT "$API_URL/entrypoints/$ep_id" \
+        -d '{"name":"api-test-updated","backends":["127.0.0.1:9999"],"protocol":"Http","config":{"hostnames":["apitest.localhost"],"port":9999,"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":{},"backend_timeout":null,"rate_limit":null,"sticky_session":false}}' \
+        2>/dev/null || echo "000")
+    if [[ "$update_status" == "200" ]]; then
+        pass "API update entrypoint returns 200"
+    else
+        fail "API update entrypoint returned $update_status instead of 200"
+    fi
+
+    # Delete
+    delete_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "$AUTH_HEADER" \
+        -X DELETE "$API_URL/entrypoints/$ep_id" 2>/dev/null || echo "000")
+    if [[ "$delete_status" == "204" ]]; then
+        pass "API delete entrypoint returns 204"
+    else
+        fail "API delete entrypoint returned $delete_status instead of 204"
+    fi
+
+    # Get after delete -> 404
+    get_deleted_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "$AUTH_HEADER" "$API_URL/entrypoints/$ep_id" 2>/dev/null || echo "000")
+    if [[ "$get_deleted_status" == "404" ]]; then
+        pass "API get deleted entrypoint returns 404"
+    else
+        fail "API get deleted entrypoint returned $get_deleted_status instead of 404"
+    fi
+else
+    fail "API create did not return an ID, skipping GET/PUT/DELETE tests"
 fi
 
 # -- Summary --
