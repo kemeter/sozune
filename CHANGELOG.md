@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-04-07
+
+### API
+
+- CRUD operations for entrypoints (GET, POST, PUT, DELETE)
+- Live proxy reconfiguration without restart
+- Bearer token authentication (configurable via `token` or `SOZUNE_API_TOKEN`)
+- Protect Docker/config-managed entrypoints from API modifications
+- Health check endpoint (`GET /health`)
+
+### Fixes
+
+- Entrypoint port now accepts a number instead of a string
+
 ## [0.6.0] - 2026-04-07
 
 ### TLS & ACME
