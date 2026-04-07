@@ -113,6 +113,17 @@ async fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    // Start backend health checker
+    let health_task = tokio::spawn({
+        let storage_health = Arc::clone(&storage);
+        let reload_tx_health = reload_tx.clone();
+        async move {
+            let checker = proxy::health::HealthChecker::new(storage_health, reload_tx_health);
+            checker.run().await;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+
     // Start middleware server
     let middleware_task = tokio::spawn({
         let middleware_state = Arc::clone(&middleware_state);
@@ -185,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let secondary_tasks_future = async {
-        tokio::try_join!(api_task, provider_task, acme_task, middleware_task)
+        tokio::try_join!(api_task, provider_task, acme_task, middleware_task, health_task)
     };
 
     tokio::pin!(proxy_task);
@@ -201,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
         },
         result = secondary_tasks_future => {
             signal_handle.close();
-            let (api_result, provider_result, acme_result, middleware_result) = result?;
+            let (api_result, provider_result, acme_result, middleware_result, health_result) = result?;
 
             match api_result {
                 Ok(_) => debug!("API task completed successfully"),
@@ -221,6 +232,11 @@ async fn main() -> anyhow::Result<()> {
             match middleware_result {
                 Ok(_) => debug!("Middleware task completed successfully"),
                 Err(e) => error!("Middleware task failed: {}", e),
+            }
+
+            match health_result {
+                Ok(_) => debug!("Health checker completed successfully"),
+                Err(e) => error!("Health checker failed: {}", e),
             }
         },
         _ = signal_task => {
