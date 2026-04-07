@@ -4,7 +4,8 @@ use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, warn};
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
 
 use super::MiddlewareAppState;
 use super::auth;
@@ -18,6 +19,17 @@ pub async fn handle_proxy(
     State(state): State<MiddlewareAppState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
+    let start = Instant::now();
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let source_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "-".to_string());
+
     let host = match req
         .headers()
         .get("host")
@@ -161,7 +173,7 @@ pub async fn handle_proxy(
         }
     };
 
-    match result {
+    let response = match result {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let body =
@@ -174,7 +186,15 @@ pub async fn handle_proxy(
             error!("Failed to forward request to {}: {}", target_uri, e);
             StatusCode::BAD_GATEWAY.into_response()
         }
-    }
+    };
+
+    let duration = start.elapsed();
+    info!(
+        "{} {} {} {} {} {}ms",
+        source_ip, method, host, path, response.status().as_u16(), duration.as_millis()
+    );
+
+    response
 }
 
 /// Handle WebSocket upgrade by establishing a TCP tunnel to the backend
