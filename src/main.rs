@@ -102,11 +102,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let storage_server = storage.clone();
+    let reload_tx_api = reload_tx.clone();
     let api_config = config.api.clone();
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
-            api::server::serve(api_config, storage_server).await?;
+            api::server::serve(api_config, storage_server, reload_tx_api).await?;
         }
 
         Ok::<(), anyhow::Error>(())
