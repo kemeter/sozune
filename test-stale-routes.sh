@@ -34,6 +34,7 @@ HOST_REDIRECT="redirect.func-test.localhost"
 HOST_RATELIMIT="ratelimit.func-test.localhost"
 HOST_COMPRESS="compress.func-test.localhost"
 HOST_TIMEOUT="timeout.func-test.localhost"
+HOST_REGEX="regex.func-test.localhost"
 API_PORT=18888
 API_TOKEN="test-secret-token"
 MIDDLEWARE_PORT=13037
@@ -209,6 +210,14 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svctimeout.host=$HOST_TIMEOUT"
       - "sozune.http.svctimeout.backendTimeout=2"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-regex:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcregex.host=$HOST_REGEX"
+      - "sozune.http.svcregex.pathRegex=/users/[0-9]+"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 
@@ -529,8 +538,31 @@ SKIPPED=0
 
 skip() { echo -e "${YELLOW}[SKIP]${NC} $*"; SKIPPED=$((SKIPPED + 1)); }
 
-# -- Regex Path Matching (not implemented) --
-skip "regex path matching: /users/123 matches /users/[0-9]+"
+# -- Regex Path Matching --
+log "Testing regex path matching..."
+
+# Wait for regex route to be ready
+wait_for_status "http://127.0.0.1:$HTTP_PORT/users/123" "$HOST_REGEX" "200" || true
+
+# /users/123 should match regex ^/users/[0-9]+$
+regex_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $HOST_REGEX" \
+    "http://127.0.0.1:$HTTP_PORT/users/456" 2>/dev/null || echo "000")
+if [[ "$regex_status" == "200" ]]; then
+    pass "regex path matching: /users/456 matches /users/[0-9]+"
+else
+    fail "regex path matching: /users/456 returned $regex_status instead of 200"
+fi
+
+# /users/abc should NOT match
+regex_fail_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $HOST_REGEX" \
+    "http://127.0.0.1:$HTTP_PORT/users/abc" 2>/dev/null || echo "000")
+if [[ "$regex_fail_status" != "200" ]]; then
+    pass "regex path matching: /users/abc does not match /users/[0-9]+"
+else
+    fail "regex path matching: /users/abc should not match but returned 200"
+fi
 
 # -- Method-based Routing (not implemented) --
 skip "method-based routing: POST /api returns different backend than GET /api"

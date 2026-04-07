@@ -57,8 +57,9 @@ pub struct PathConfig {
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum PathRuleType {
-    Exact,
     Prefix,
+    Regex,
+    Exact,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

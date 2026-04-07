@@ -354,7 +354,7 @@ fn configure_sozu_routing(
                             hostname: hostname.clone(),
                             path: PathRule {
                                 value: "/.well-known/acme-challenge/".to_string(),
-                                kind: 1, // Prefix
+                                kind: 0, // Prefix
                             },
                             method: None,
                             position: RulePosition::Pre as i32,
@@ -452,14 +452,15 @@ fn configure_http_entrypoint(
             PathRule {
                 value: path_config.value.clone(),
                 kind: match path_config.rule_type {
-                    PathRuleType::Exact => 0,
-                    PathRuleType::Prefix => 1,
+                    PathRuleType::Prefix => 0,
+                    PathRuleType::Regex => 1,
+                    PathRuleType::Exact => 2,
                 },
             }
         } else {
             PathRule {
                 value: "/".to_string(),
-                kind: 1,
+                kind: 0, // Prefix
             }
         };
 
@@ -774,14 +775,15 @@ fn remove_http_frontends(
         PathRule {
             value: path_config.value.clone(),
             kind: match path_config.rule_type {
-                PathRuleType::Exact => 0,
-                PathRuleType::Prefix => 1,
+                PathRuleType::Prefix => 0,
+                PathRuleType::Regex => 1,
+                PathRuleType::Exact => 2,
             },
         }
     } else {
         PathRule {
             value: "/".to_string(),
-            kind: 1,
+            kind: 0,
         }
     };
 
@@ -903,7 +905,7 @@ fn remove_acme_frontends(
             hostname: hostname.clone(),
             path: PathRule {
                 value: "/.well-known/acme-challenge/".to_string(),
-                kind: 1,
+                kind: 0, // Prefix
             },
             method: None,
             position: RulePosition::Pre as i32,

@@ -502,15 +502,20 @@ impl DockerProvider {
         let path = if protocol == "http" {
             let exact_path = labels.get(&format!("{}path", prefix));
             let prefix_path = labels.get(&format!("{}prefix", prefix));
+            let regex_path = labels.get(&format!("{}pathRegex", prefix));
 
-            match (exact_path, prefix_path) {
-                (Some(path), _) => Some(PathConfig {
-                    rule_type: PathRuleType::Exact,
+            match (exact_path, prefix_path, regex_path) {
+                (Some(path), _, _) => Some(PathConfig {
+                    rule_type: PathRuleType::Prefix,
                     value: path.clone(),
                 }),
-                (None, Some(prefix)) => Some(PathConfig {
+                (None, Some(prefix), _) => Some(PathConfig {
                     rule_type: PathRuleType::Prefix,
                     value: prefix.clone(),
+                }),
+                (None, None, Some(regex)) => Some(PathConfig {
+                    rule_type: PathRuleType::Regex,
+                    value: regex.clone(),
                 }),
                 _ => Some(PathConfig {
                     rule_type: PathRuleType::Prefix,
