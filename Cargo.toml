@@ -1,6 +1,6 @@
 [package]
 name = "sozune"
-version = "0.9.0"
+version = "0.10.0"
 authors = ["mlanawo Mbechezi mlanawo.mbechezi@kemeter.io"]
 edition = "2024"
 

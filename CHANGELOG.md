@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-04-07
+
+### Load balancing
+
+- Weighted load balancing via `backend_weights` config or Docker labels
+- Sticky sessions via Sōzu native support (`stickySession` label / `sticky_session` config)
+- Active backend health checks with TCP probing (10s interval, 5s timeout)
+- Automatic proxy reload when backend health status changes
+
 ## [0.9.0] - 2026-04-07
 
 ### Middleware
