@@ -9,6 +9,7 @@ use tracing::{debug, error, warn};
 use super::MiddlewareAppState;
 use super::auth;
 use super::headers;
+use super::rate_limit::RateLimitResult;
 use super::strip_prefix;
 
 /// Main proxy handler: identifies the route by Host header,
@@ -51,14 +52,30 @@ pub async fn handle_proxy(
         }
     };
 
-    // 1. Basic auth check
+    // 1. Rate limit check (before auth to save CPU on bcrypt)
+    if let Some(ref limiter) = route.rate_limiter {
+        let source_ip = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| host.clone());
+
+        if matches!(limiter.check(&source_ip), RateLimitResult::Limited) {
+            warn!("Rate limited request from {} to {}", source_ip, host);
+            return (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
+        }
+    }
+
+    // 2. Basic auth check
     if let Some(ref users) = route.auth {
         if let Err(response) = auth::check_basic_auth(&req, users) {
             return response.into_response();
         }
     }
 
-    // 2. Pick a backend using round-robin
+    // 3. Pick a backend using round-robin
     let (backend_host, backend_port) = match route.next_backend() {
         Some(b) => b.clone(),
         None => {

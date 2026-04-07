@@ -1,6 +1,7 @@
 use crate::config::DockerConfig;
 use crate::model::{
     AuthConfig, BasicAuthUser, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol,
+    RateLimitConfig,
 };
 use crate::provider::Provider;
 use async_trait::async_trait;
@@ -541,6 +542,20 @@ impl DockerProvider {
             .get(&format!("{}backendTimeout", prefix))
             .and_then(|p| p.parse().ok());
 
+        let rate_limit = {
+            let average = labels
+                .get(&format!("{}ratelimit.average", prefix))
+                .and_then(|p| p.parse().ok());
+            let burst = labels
+                .get(&format!("{}ratelimit.burst", prefix))
+                .and_then(|p| p.parse().ok());
+            match (average, burst) {
+                (Some(avg), Some(b)) => Some(RateLimitConfig { average: avg, burst: b }),
+                (Some(avg), None) => Some(RateLimitConfig { average: avg, burst: avg }),
+                _ => None,
+            }
+        };
+
         let auth = self.parse_auth_labels(labels, &prefix);
 
         let headers = self.parse_header_labels(labels, &prefix);
@@ -568,6 +583,7 @@ impl DockerProvider {
                 auth,
                 headers,
                 backend_timeout,
+                rate_limit,
             },
             source: None, // Will be set by the caller
         })

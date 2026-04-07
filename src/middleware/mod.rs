@@ -1,6 +1,7 @@
 mod auth;
 mod headers;
 mod proxy;
+pub mod rate_limit;
 mod strip_prefix;
 
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use hyper_util::rt::TokioExecutor;
 use tracing::info;
 
 use crate::model::{BasicAuthUser, EntrypointConfig};
+use rate_limit::RateLimiter;
 
 /// Shared state for the middleware server
 #[derive(Clone)]
@@ -38,6 +40,7 @@ pub struct MiddlewareRoute {
     pub headers: HashMap<String, String>,
     pub strip_prefix: Option<String>,
     pub backend_timeout: Option<u64>,
+    pub rate_limiter: Option<RateLimiter>,
 }
 
 impl MiddlewareRouteTable {
@@ -75,7 +78,7 @@ impl MiddlewareRoute {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty() || config.backend_timeout.is_some()
+    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty() || config.backend_timeout.is_some() || config.rate_limit.is_some()
 }
 
 /// Build middleware route from entrypoint config
@@ -89,6 +92,8 @@ pub fn build_middleware_route(
         None
     };
 
+    let rate_limiter = config.rate_limit.as_ref().map(|rl| RateLimiter::new(rl.average, rl.burst));
+
     Arc::new(MiddlewareRoute {
         backends: backends.iter().map(|b| (b.clone(), config.port)).collect(),
         backend_counter: AtomicUsize::new(0),
@@ -96,6 +101,7 @@ pub fn build_middleware_route(
         headers: config.headers.clone(),
         strip_prefix,
         backend_timeout: config.backend_timeout,
+        rate_limiter,
     })
 }
 

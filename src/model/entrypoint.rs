@@ -33,6 +33,14 @@ pub struct EntrypointConfig {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub backend_timeout: Option<u64>,
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RateLimitConfig {
+    pub average: u64,
+    pub burst: u64,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

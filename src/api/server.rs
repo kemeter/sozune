@@ -560,6 +560,7 @@ mod tests {
                         auth: None,
                         headers: std::collections::HashMap::new(),
                         backend_timeout: None,
+                        rate_limit: None,
                     },
                     source: Some("docker".to_string()),
                 },
