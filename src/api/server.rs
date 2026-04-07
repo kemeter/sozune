@@ -12,7 +12,18 @@ pub async fn serve(
     config: ApiConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
 ) -> anyhow::Result<()> {
-    let app = Router::new().route(
+    let app = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"status":"ok"}"#.to_string(),
+                )
+            }),
+        )
+        .route(
         "/entrypoints",
         get(move || {
             let storage = storage.clone();
