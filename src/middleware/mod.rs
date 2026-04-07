@@ -37,6 +37,7 @@ pub struct MiddlewareRoute {
     pub auth: Option<Vec<BasicAuthUser>>,
     pub headers: HashMap<String, String>,
     pub strip_prefix: Option<String>,
+    pub backend_timeout: Option<u64>,
 }
 
 impl MiddlewareRouteTable {
@@ -74,7 +75,7 @@ impl MiddlewareRoute {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty()
+    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty() || config.backend_timeout.is_some()
 }
 
 /// Build middleware route from entrypoint config
@@ -94,6 +95,7 @@ pub fn build_middleware_route(
         auth: config.auth.as_ref().and_then(|a| a.basic.clone()),
         headers: config.headers.clone(),
         strip_prefix,
+        backend_timeout: config.backend_timeout,
     })
 }
 

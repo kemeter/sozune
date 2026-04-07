@@ -92,7 +92,14 @@ pub async fn handle_proxy(
         target_uri
     );
 
-    // 4. Build the forwarded request
+    // 4. Check for WebSocket upgrade
+    let is_websocket = req
+        .headers()
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+
+    // 5. Build the forwarded request
     let (mut parts, body) = req.into_parts();
 
     // Inject custom headers
@@ -109,14 +116,34 @@ pub async fn handle_proxy(
 
     let forwarded_req = Request::from_parts(parts, body);
 
-    // 5. Send the request to the real backend with a 30s timeout
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        state.http_client.request(forwarded_req),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => {
+    // 6. Send the request to the real backend
+    let timeout_secs = if is_websocket {
+        0 // No timeout for WebSocket
+    } else {
+        route.backend_timeout.unwrap_or(30)
+    };
+
+    let response_future = state.http_client.request(forwarded_req);
+
+    let result = if timeout_secs == 0 {
+        response_future.await.map_err(|e| e.to_string())
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            response_future,
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => {
+                error!("Backend request to {} timed out", target_uri);
+                return StatusCode::GATEWAY_TIMEOUT.into_response();
+            }
+        }
+    };
+
+    match result {
+        Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let body =
                 Body::new(body.map_err(|e| {
@@ -124,13 +151,9 @@ pub async fn handle_proxy(
                 }));
             Response::from_parts(parts, body).into_response()
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             error!("Failed to forward request to {}: {}", target_uri, e);
             StatusCode::BAD_GATEWAY.into_response()
-        }
-        Err(_) => {
-            error!("Backend request to {} timed out", target_uri);
-            StatusCode::GATEWAY_TIMEOUT.into_response()
         }
     }
 }

@@ -559,6 +559,7 @@ mod tests {
                         priority: 0,
                         auth: None,
                         headers: std::collections::HashMap::new(),
+                        backend_timeout: None,
                     },
                     source: Some("docker".to_string()),
                 },

@@ -537,6 +537,10 @@ impl DockerProvider {
             .and_then(|p| p.parse().ok())
             .unwrap_or(0);
 
+        let backend_timeout = labels
+            .get(&format!("{}backendTimeout", prefix))
+            .and_then(|p| p.parse().ok());
+
         let auth = self.parse_auth_labels(labels, &prefix);
 
         let headers = self.parse_header_labels(labels, &prefix);
@@ -563,6 +567,7 @@ impl DockerProvider {
                 priority,
                 auth,
                 headers,
+                backend_timeout,
             },
             source: None, // Will be set by the caller
         })

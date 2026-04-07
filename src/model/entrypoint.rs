@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Entrypoint {
@@ -32,6 +31,8 @@ pub struct EntrypointConfig {
     pub priority: i32,
     pub auth: Option<AuthConfig>,
     pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub backend_timeout: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
