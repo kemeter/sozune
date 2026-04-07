@@ -1,7 +1,9 @@
 use crate::config::ApiConfig;
 use crate::model::{Entrypoint, EntrypointConfig, Protocol};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self as axum_middleware, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -10,12 +12,13 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     pub reload_tx: mpsc::Sender<()>,
+    pub token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -26,15 +29,61 @@ pub struct CreateEntrypointRequest {
     pub config: EntrypointConfig,
 }
 
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let token = match &state.token {
+        Some(t) => t,
+        None => return next.run(req).await,
+    };
+
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.starts_with("Bearer ") => {
+            let provided = &header[7..];
+            if provided == token {
+                next.run(req).await
+            } else {
+                warn!("Invalid bearer token from {:?}", req.headers().get("host"));
+                Json(serde_json::json!({"error": "invalid token"}))
+                    .into_response_with_status(StatusCode::UNAUTHORIZED)
+            }
+        }
+        _ => {
+            Json(serde_json::json!({"error": "missing or invalid authorization header"}))
+                .into_response_with_status(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
+trait IntoResponseWithStatus {
+    fn into_response_with_status(self, status: StatusCode) -> Response;
+}
+
+impl IntoResponseWithStatus for Json<serde_json::Value> {
+    fn into_response_with_status(self, status: StatusCode) -> Response {
+        (status, self).into_response()
+    }
+}
+
 pub async fn serve(
     config: ApiConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
-    let state = AppState { storage, reload_tx };
+    let state = AppState {
+        storage,
+        reload_tx,
+        token: config.token.clone(),
+    };
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route("/entrypoints", get(list_entrypoints).post(create_entrypoint))
         .route(
             "/entrypoints/{id}",
@@ -42,6 +91,11 @@ pub async fn serve(
                 .put(update_entrypoint)
                 .delete(delete_entrypoint),
         )
+        .route_layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state);
 
     let addr = SocketAddr::from_str(&config.listen_address).map_err(|e| {
@@ -253,12 +307,21 @@ mod tests {
         AppState {
             storage: Arc::new(RwLock::new(BTreeMap::new())),
             reload_tx,
+            token: None,
+        }
+    }
+
+    fn test_state_with_token(token: &str) -> AppState {
+        let (reload_tx, _reload_rx) = mpsc::channel(64);
+        AppState {
+            storage: Arc::new(RwLock::new(BTreeMap::new())),
+            reload_tx,
+            token: Some(token.to_string()),
         }
     }
 
     fn test_app(state: AppState) -> Router {
-        Router::new()
-            .route("/health", get(health))
+        let protected = Router::new()
             .route("/entrypoints", get(list_entrypoints).post(create_entrypoint))
             .route(
                 "/entrypoints/{id}",
@@ -266,6 +329,11 @@ mod tests {
                     .put(update_entrypoint)
                     .delete(delete_entrypoint),
             )
+            .route_layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+        Router::new()
+            .route("/health", get(health))
+            .merge(protected)
             .with_state(state)
     }
 
@@ -524,5 +592,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_auth_required_when_token_configured() {
+        let state = test_state_with_token("secret-token");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_valid_token() {
+        let state = test_state_with_token("secret-token");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_invalid_token() {
+        let state = test_state_with_token("secret-token");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_health_not_protected() {
+        let state = test_state_with_token("secret-token");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
