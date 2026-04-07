@@ -1,4 +1,5 @@
 mod auth;
+mod compress;
 mod headers;
 mod proxy;
 pub mod rate_limit;

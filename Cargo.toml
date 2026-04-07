@@ -32,4 +32,5 @@ base64 = "0.22"
 bcrypt = "0.17"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tower = { version = "0.5", features = ["util"] }
+flate2 = "1"
 uuid = { version = "1", features = ["v4"] }

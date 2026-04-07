@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use super::MiddlewareAppState;
 use super::auth;
+use super::compress;
 use super::headers;
 use super::rate_limit::RateLimitResult;
 use super::strip_prefix;
@@ -115,6 +116,8 @@ pub async fn handle_proxy(
         backend_host, backend_port, forwarded_path, query
     );
 
+    let client_accepts_gzip = compress::accepts_gzip(req.headers());
+
     debug!(
         "Proxying {} {} -> {}",
         req.method(),
@@ -175,12 +178,40 @@ pub async fn handle_proxy(
 
     let response = match result {
         Ok(resp) => {
-            let (parts, body) = resp.into_parts();
-            let body =
-                Body::new(body.map_err(|e| {
+            let (mut parts, body) = resp.into_parts();
+
+            let should_compress = client_accepts_gzip
+                && compress::is_compressible(&parts.headers)
+                && !compress::is_already_compressed(&parts.headers);
+
+            if should_compress {
+                let body = Body::new(body.map_err(|e| {
                     axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
                 }));
-            Response::from_parts(parts, body).into_response()
+                match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+                    Ok(bytes) => match compress::gzip_compress(&bytes) {
+                        Ok(compressed) => {
+                            parts.headers.insert("content-encoding", "gzip".parse().unwrap());
+                            parts.headers.insert("content-length", compressed.len().to_string().parse().unwrap());
+                            parts.headers.remove("transfer-encoding");
+                            Response::from_parts(parts, Body::from(compressed)).into_response()
+                        }
+                        Err(e) => {
+                            debug!("Compression failed, sending uncompressed: {}", e);
+                            Response::from_parts(parts, Body::from(bytes)).into_response()
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to read response body for compression: {}", e);
+                        StatusCode::BAD_GATEWAY.into_response()
+                    }
+                }
+            } else {
+                let body = Body::new(body.map_err(|e| {
+                    axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                }));
+                Response::from_parts(parts, body).into_response()
+            }
         }
         Err(e) => {
             error!("Failed to forward request to {}: {}", target_uri, e);
