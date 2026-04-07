@@ -3,6 +3,7 @@ use axum::extract::State;
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, warn};
 
 use super::MiddlewareAppState;
@@ -59,7 +60,7 @@ pub async fn handle_proxy(
 
     // 2. Pick a backend using round-robin
     let (backend_host, backend_port) = match route.next_backend() {
-        Some(b) => b,
+        Some(b) => b.clone(),
         None => {
             error!("No backends configured for host '{}'", host);
             return StatusCode::BAD_GATEWAY.into_response();
@@ -99,6 +100,11 @@ pub async fn handle_proxy(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
+    if is_websocket {
+        return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query)
+            .await;
+    }
+
     // 5. Build the forwarded request
     let (mut parts, body) = req.into_parts();
 
@@ -117,11 +123,7 @@ pub async fn handle_proxy(
     let forwarded_req = Request::from_parts(parts, body);
 
     // 6. Send the request to the real backend
-    let timeout_secs = if is_websocket {
-        0 // No timeout for WebSocket
-    } else {
-        route.backend_timeout.unwrap_or(30)
-    };
+    let timeout_secs = route.backend_timeout.unwrap_or(30);
 
     let response_future = state.http_client.request(forwarded_req);
 
@@ -156,4 +158,111 @@ pub async fn handle_proxy(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// Handle WebSocket upgrade by establishing a TCP tunnel to the backend
+async fn handle_websocket(
+    req: Request<Body>,
+    backend_host: &str,
+    backend_port: u16,
+    path: &str,
+    query: &str,
+) -> axum::response::Response {
+    debug!("WebSocket upgrade request to {}:{}{}", backend_host, backend_port, path);
+
+    // Connect to backend
+    let backend_addr = format!("{}:{}", backend_host, backend_port);
+    let mut backend_stream = match tokio::net::TcpStream::connect(&backend_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to connect to backend {} for WebSocket: {}", backend_addr, e);
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    // Build the raw HTTP upgrade request to send to the backend
+    let mut upgrade_request = format!(
+        "GET {}{} HTTP/1.1\r\n",
+        path, query
+    );
+
+    for (key, value) in req.headers() {
+        if let Ok(v) = value.to_str() {
+            upgrade_request.push_str(&format!("{}: {}\r\n", key, v));
+        }
+    }
+    upgrade_request.push_str("\r\n");
+
+    // Send upgrade request to backend
+    if let Err(e) = backend_stream.write_all(upgrade_request.as_bytes()).await {
+        error!("Failed to send WebSocket upgrade to backend: {}", e);
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+
+    // Read the backend's response header
+    let mut response_buf = vec![0u8; 4096];
+    let n = match backend_stream.read(&mut response_buf).await {
+        Ok(n) if n > 0 => n,
+        _ => {
+            error!("No response from backend for WebSocket upgrade");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let response_str = String::from_utf8_lossy(&response_buf[..n]);
+
+    // Check that backend accepted the upgrade (101 Switching Protocols)
+    if !response_str.starts_with("HTTP/1.1 101") {
+        error!("Backend rejected WebSocket upgrade: {}", response_str.lines().next().unwrap_or(""));
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+
+    // Parse the response headers to forward to the client
+    let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+
+    for line in response_str.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(": ") {
+            response_builder = response_builder.header(key, value);
+        }
+    }
+
+    // Use hyper's upgrade mechanism to get the client's underlying connection
+    let on_upgrade = hyper::upgrade::on(req);
+
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let mut client_stream = hyper_util::rt::TokioIo::new(upgraded);
+                let (mut client_read, mut client_write) = tokio::io::split(&mut client_stream);
+                let (mut backend_read, mut backend_write) = tokio::io::split(&mut backend_stream);
+
+                let client_to_backend = tokio::io::copy(&mut client_read, &mut backend_write);
+                let backend_to_client = tokio::io::copy(&mut backend_read, &mut client_write);
+
+                tokio::select! {
+                    result = client_to_backend => {
+                        if let Err(e) = result {
+                            debug!("WebSocket client->backend closed: {}", e);
+                        }
+                    }
+                    result = backend_to_client => {
+                        if let Err(e) = result {
+                            debug!("WebSocket backend->client closed: {}", e);
+                        }
+                    }
+                }
+                debug!("WebSocket connection closed");
+            }
+            Err(e) => {
+                error!("WebSocket upgrade failed: {}", e);
+            }
+        }
+    });
+
+    response_builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
