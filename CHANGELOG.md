@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-04-07
+
+### Middleware
+
+- Rate limiting with token bucket algorithm per source IP
+- Configurable via Docker labels (`sozune.http.<name>.ratelimit.average`, `sozune.http.<name>.ratelimit.burst`) or config file
+- Automatic stale bucket cleanup (1h TTL)
+- Rate limit checked before auth to save CPU on bcrypt hashing
+- Access logs on all proxied requests (source IP, method, host, path, status, duration)
+
 ## [0.8.0] - 2026-04-07
 
 ### Protocol support
