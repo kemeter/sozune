@@ -1,71 +1,72 @@
 # Roadmap
 
-## Enforce already parsed features
+## P2 — Features différenciantes
 
-- [x] Apply custom headers injection (via middleware layer)
-- [x] Implement strip prefix / path rewriting (via middleware layer)
-- [x] Apply route priority ordering (currently all routes use `RulePosition::Pre`)
-- [x] Enforce basic authentication (via middleware layer)
-- [x] HTTPS redirect (via Sozu native `Cluster.https_redirect`)
-- [ ] Implement TCP proxying via Sozu TCP worker
-- [ ] Implement UDP proxying
+### Middleware
 
-## Sozu proxy reliability
+- [ ] Response caching
 
-- [x] Clean up stale routes on reload (diff-based removal of old clusters/frontends/backends)
-- [x] Read worker responses after sending commands (detect actual failures vs "already exists")
-- [x] Use `Handle::current()` instead of creating a nested Tokio runtime in reload handler
-- [x] Implement graceful shutdown via `shutdown_rx` (currently unused, relies on `process::exit`)
-- [x] Replace startup `thread::sleep` with proper worker readiness detection
-
-## TLS & Certificates
-
-- [x] Let's Encrypt / ACME automatic certificate provisioning
-- [ ] SNI-based certificate selection
-- [x] Certificate hot-reload without restart
-
-## Observability
-
-- [ ] Health check endpoint (`GET /health`)
-- [ ] Backend health checks (active probing)
-- [ ] Prometheus metrics endpoint (`GET /metrics`)
-- [ ] Request/response timing metrics
-- [ ] Error rate tracking
-
-## API
-
-- [ ] CRUD operations on entrypoints (POST, PUT, DELETE)
-- [ ] Live reconfiguration without file reload
-- [ ] API authentication
-
-## Load balancing
-
-- [ ] Weighted load balancing
-- [ ] Least-connections algorithm
-- [ ] Session affinity / sticky sessions
-- [ ] Health-based routing (remove unhealthy backends)
-
-## Advanced routing
+### Advanced routing
 
 - [ ] Regex-based path matching
 - [ ] Method-based routing (GET, POST, etc.)
 - [ ] Request/response header rewriting
-- [ ] IPv6 support
 
-## Protocol support
+### Administration
 
-- [ ] WebSocket upgrade handling
+- [ ] Configuration validation command (`sozune validate`)
+
+## P3 — Backlog
+
+### Protocol support
+
 - [ ] gRPC proxying
 - [ ] HTTP/2 support
+- [ ] TCP proxying via Sozu TCP worker
+- [ ] UDP proxying
 
-## Administration
+### Advanced routing
+
+- [ ] IPv6 support
+
+### Load balancing
+
+- [ ] Least-connections algorithm
+
+### Administration
 
 - [ ] Dashboard UI
 - [ ] Request tracing / debug mode
-- [ ] Configuration validation command (`sozune validate`)
 
-## Code quality
+### Observability
 
-- [ ] Fix clippy warnings
-- [ ] Remove dead code (`Provider::name()`, `should_reload_for_container()`)
-- [ ] Increase test coverage (Docker event handling, proxy configuration)
+- [ ] Prometheus metrics endpoint (`GET /metrics`)
+- [ ] Request/response timing metrics
+- [ ] Error rate tracking
+
+## Done
+
+- [x] Custom headers injection (middleware)
+- [x] Strip prefix / path rewriting (middleware)
+- [x] Basic authentication with bcrypt (middleware)
+- [x] HTTPS redirect (Sozu native)
+- [x] Route priority ordering
+- [x] Stale route cleanup on reload
+- [x] Worker response reading
+- [x] Shared Tokio runtime
+- [x] Graceful shutdown
+- [x] Startup readiness detection
+- [x] Let's Encrypt / ACME automatic certificate provisioning
+- [x] Certificate hot-reload without restart
+- [x] API CRUD entrypoints with live reconfiguration
+- [x] API bearer token authentication
+- [x] Health check endpoint (`GET /health`)
+- [x] Rate limiting (token bucket, per IP)
+- [x] Access logs
+- [x] WebSocket upgrade proxying
+- [x] Configurable backend timeout (SSE/long-lived connections)
+- [x] Gzip response compression (opt-in)
+- [x] Weighted load balancing
+- [x] Sticky sessions
+- [x] Backend health checks (active TCP probing)
+- [x] SNI-based certificate selection (Sōzu native)

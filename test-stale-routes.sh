@@ -522,10 +522,26 @@ else
     fail "backend timeout: normal request returned $timeout_status instead of 200"
 fi
 
+# ==============================================================
+# Future feature tests (SKIP - not yet implemented)
+# ==============================================================
+SKIPPED=0
+
+skip() { echo -e "${YELLOW}[SKIP]${NC} $*"; SKIPPED=$((SKIPPED + 1)); }
+
+# -- Regex Path Matching (not implemented) --
+skip "regex path matching: /users/123 matches /users/[0-9]+"
+
+# -- Method-based Routing (not implemented) --
+skip "method-based routing: POST /api returns different backend than GET /api"
+
+# -- Response Caching (not implemented) --
+skip "response caching: second request returns cached response"
+
 # -- Summary --
 echo ""
 echo "=============================="
-echo -e "  ${GREEN}Passed: $PASSED${NC}  ${RED}Failed: $FAILED${NC}"
+echo -e "  ${GREEN}Passed: $PASSED${NC}  ${RED}Failed: $FAILED${NC}  ${YELLOW}Skipped: $SKIPPED${NC}"
 echo "=============================="
 
 if [[ $FAILED -gt 0 ]]; then
