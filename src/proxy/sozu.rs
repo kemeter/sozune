@@ -416,7 +416,7 @@ fn configure_http_entrypoint(
     // Add cluster for both HTTP and HTTPS
     let cluster = Cluster {
         cluster_id: cluster_id.to_string(),
-        sticky_session: false,
+        sticky_session: entrypoint.config.sticky_session,
         https_redirect: entrypoint.config.https_redirect,
         proxy_protocol: None,
         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
@@ -563,11 +563,17 @@ fn configure_http_entrypoint(
             let backend_port = entrypoint.config.port;
             let address = parse_backend_address(backend_host, backend_port)?;
 
+            let weight = entrypoint
+                .backend_weights
+                .get(backend_host)
+                .copied()
+                .unwrap_or(100) as i32;
+
             let backend = AddBackend {
                 cluster_id: cluster_id.to_string(),
                 backend_id: format!("{}-backend-{}", cluster_id, backend_index),
                 address,
-                load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
+                load_balancing_parameters: Some(LoadBalancingParams { weight }),
                 sticky_id: None,
                 backup: None,
             };

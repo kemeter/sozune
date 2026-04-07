@@ -27,6 +27,7 @@ pub struct CreateEntrypointRequest {
     pub backends: Vec<String>,
     pub protocol: Protocol,
     pub config: EntrypointConfig,
+    pub backend_weights: Option<std::collections::HashMap<String, u32>>,
 }
 
 async fn auth_middleware(
@@ -171,6 +172,7 @@ async fn create_entrypoint(
         protocol: payload.protocol,
         config: payload.config,
         source: Some("api".to_string()),
+        backend_weights: payload.backend_weights.unwrap_or_default(),
     };
 
     {
@@ -236,6 +238,7 @@ async fn update_entrypoint(
             protocol: payload.protocol,
             config: payload.config,
             source: Some("api".to_string()),
+            backend_weights: payload.backend_weights.unwrap_or_default(),
         };
         storage.insert(id.clone(), entrypoint);
     }
@@ -561,8 +564,10 @@ mod tests {
                         headers: std::collections::HashMap::new(),
                         backend_timeout: None,
                         rate_limit: None,
+                        sticky_session: false,
                     },
                     source: Some("docker".to_string()),
+                    backend_weights: std::collections::HashMap::new(),
                 },
             );
         }

@@ -556,6 +556,10 @@ impl DockerProvider {
             }
         };
 
+        let sticky_session = labels
+            .get(&format!("{}stickySession", prefix))
+            .map_or(false, |v| v == "true");
+
         let auth = self.parse_auth_labels(labels, &prefix);
 
         let headers = self.parse_header_labels(labels, &prefix);
@@ -572,6 +576,7 @@ impl DockerProvider {
             backends: vec![container_ip.to_string()],
             name: service_name.to_string(),
             protocol: protocol_enum,
+            backend_weights: HashMap::new(),
             config: EntrypointConfig {
                 hostnames,
                 port,
@@ -584,6 +589,7 @@ impl DockerProvider {
                 headers,
                 backend_timeout,
                 rate_limit,
+                sticky_session,
             },
             source: None, // Will be set by the caller
         })

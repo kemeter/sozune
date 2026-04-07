@@ -10,6 +10,8 @@ pub struct Entrypoint {
     pub config: EntrypointConfig,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub backend_weights: HashMap<String, u32>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -35,6 +37,8 @@ pub struct EntrypointConfig {
     pub backend_timeout: Option<u64>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    pub sticky_session: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
