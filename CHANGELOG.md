@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-04-07
+
+### Protocol support
+
+- WebSocket upgrade proxying through middleware layer (bidirectional TCP tunnel)
+- Configurable backend timeout per entrypoint (`backendTimeout` label / `backend_timeout` config)
+- SSE / long-lived connections supported via `backend_timeout: 0` (disables timeout)
+- Sōzu natively handles WebSocket for non-middleware entrypoints
+
 ## [0.7.0] - 2026-04-07
 
 ### API
