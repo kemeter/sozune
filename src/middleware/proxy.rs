@@ -180,7 +180,8 @@ pub async fn handle_proxy(
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
 
-            let should_compress = client_accepts_gzip
+            let should_compress = route.compress
+                && client_accepts_gzip
                 && compress::is_compressible(&parts.headers)
                 && !compress::is_already_compressed(&parts.headers);
 

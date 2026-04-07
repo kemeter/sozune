@@ -560,6 +560,10 @@ impl DockerProvider {
             .get(&format!("{}stickySession", prefix))
             .map_or(false, |v| v == "true");
 
+        let compress = labels
+            .get(&format!("{}compress", prefix))
+            .map_or(false, |v| v == "true");
+
         let auth = self.parse_auth_labels(labels, &prefix);
 
         let headers = self.parse_header_labels(labels, &prefix);
@@ -590,6 +594,7 @@ impl DockerProvider {
                 backend_timeout,
                 rate_limit,
                 sticky_session,
+                compress,
             },
             source: None, // Will be set by the caller
         })

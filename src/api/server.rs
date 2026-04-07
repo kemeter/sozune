@@ -565,6 +565,7 @@ mod tests {
                         backend_timeout: None,
                         rate_limit: None,
                         sticky_session: false,
+                        compress: false,
                     },
                     source: Some("docker".to_string()),
                     backend_weights: std::collections::HashMap::new(),

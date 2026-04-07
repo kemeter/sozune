@@ -42,6 +42,7 @@ pub struct MiddlewareRoute {
     pub strip_prefix: Option<String>,
     pub backend_timeout: Option<u64>,
     pub rate_limiter: Option<RateLimiter>,
+    pub compress: bool,
 }
 
 impl MiddlewareRouteTable {
@@ -79,7 +80,7 @@ impl MiddlewareRoute {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty() || config.backend_timeout.is_some() || config.rate_limit.is_some()
+    config.strip_prefix || config.auth.is_some() || !config.headers.is_empty() || config.backend_timeout.is_some() || config.rate_limit.is_some() || config.compress
 }
 
 /// Build middleware route from entrypoint config
@@ -103,6 +104,7 @@ pub fn build_middleware_route(
         strip_prefix,
         backend_timeout: config.backend_timeout,
         rate_limiter,
+        compress: config.compress,
     })
 }
 

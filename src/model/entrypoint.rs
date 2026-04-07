@@ -39,6 +39,8 @@ pub struct EntrypointConfig {
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
     pub sticky_session: bool,
+    #[serde(default)]
+    pub compress: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

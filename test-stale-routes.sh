@@ -199,6 +199,7 @@ services:
     labels:
       - "sozune.enable=true"
       - "sozune.http.svccompress.host=$HOST_COMPRESS"
+      - "sozune.http.svccompress.compress=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 
