@@ -33,6 +33,7 @@ HOST_STRIP="strip.func-test.localhost"
 HOST_REDIRECT="redirect.func-test.localhost"
 HOST_RATELIMIT="ratelimit.func-test.localhost"
 HOST_COMPRESS="compress.func-test.localhost"
+HOST_TIMEOUT="timeout.func-test.localhost"
 API_PORT=18888
 API_TOKEN="test-secret-token"
 MIDDLEWARE_PORT=13037
@@ -200,6 +201,14 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svccompress.host=$HOST_COMPRESS"
       - "sozune.http.svccompress.compress=true"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-timeout:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svctimeout.host=$HOST_TIMEOUT"
+      - "sozune.http.svctimeout.backendTimeout=2"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 
@@ -495,6 +504,22 @@ if [[ -n "$ep_id" ]]; then
     fi
 else
     fail "API create did not return an ID, skipping GET/PUT/DELETE tests"
+fi
+
+# -- Backend Timeout --
+log "Testing configurable backend timeout..."
+
+# Wait for timeout route to be ready
+wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_TIMEOUT" "200" || true
+
+# Normal request should work (whoami responds instantly)
+timeout_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+    -H "Host: $HOST_TIMEOUT" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "000")
+if [[ "$timeout_status" == "200" ]]; then
+    pass "backend timeout: normal request succeeds within timeout"
+else
+    fail "backend timeout: normal request returned $timeout_status instead of 200"
 fi
 
 # -- Summary --
