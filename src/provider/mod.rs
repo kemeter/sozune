@@ -11,3 +11,4 @@ pub trait Provider {
 pub mod config;
 pub mod docker;
 pub mod factory;
+pub mod http;

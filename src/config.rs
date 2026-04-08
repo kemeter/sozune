@@ -38,6 +38,7 @@ pub struct AcmeConfig {
 pub struct ProvidersConfig {
     pub docker: Option<DockerConfig>,
     pub config_file: Option<ConfigFileConfig>,
+    pub http: Option<HttpProviderConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -61,6 +62,19 @@ pub struct ApiConfig {
     pub listen_address: String,
     #[serde(default, deserialize_with = "deserialize_api_token_with_env")]
     pub token: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct HttpProviderConfig {
+    #[serde(default, deserialize_with = "deserialize_http_provider_enabled_with_env")]
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_http_provider_url_with_env")]
+    pub url: String,
+    #[serde(
+        default = "default_http_provider_poll_interval",
+        deserialize_with = "deserialize_http_provider_poll_interval_with_env"
+    )]
+    pub poll_interval: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -229,6 +243,10 @@ fn default_acme_challenge_port() -> u16 {
 
 fn default_middleware_port() -> u16 {
     3037
+}
+
+fn default_http_provider_poll_interval() -> u64 {
+    30
 }
 
 fn default_http_port() -> u16 {
@@ -449,6 +467,24 @@ deserialize_with_env!(
     "SOZUNE_MIDDLEWARE_PORT",
     u16,
     default_middleware_port
+);
+
+deserialize_bool_with_env!(
+    deserialize_http_provider_enabled_with_env,
+    "SOZUNE_PROVIDER_HTTP_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_http_provider_url_with_env,
+    "SOZUNE_PROVIDER_HTTP_URL",
+    "",
+    literal
+);
+deserialize_with_env!(
+    deserialize_http_provider_poll_interval_with_env,
+    "SOZUNE_PROVIDER_HTTP_POLL_INTERVAL",
+    u64,
+    default_http_provider_poll_interval
 );
 
 #[cfg(test)]

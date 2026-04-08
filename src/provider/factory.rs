@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::model::Entrypoint;
-use crate::provider::{Provider, config::ConfigProvider, docker::DockerProvider};
+use crate::provider::{Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider};
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -72,7 +72,7 @@ pub async fn start_services(
                 .context("Failed to create Docker provider")?;
 
             if let Err(e) = docker_provider
-                .start_service(storage, reload_tx.clone(), acme_notify)
+                .start_service(Arc::clone(&storage), reload_tx.clone(), acme_notify)
                 .await
             {
                 error!("Docker service failed: {}", e);
@@ -80,7 +80,24 @@ pub async fn start_services(
         }
     }
 
-    // TODO: Add file watcher for config file provider if enabled
+    // Start HTTP provider if enabled
+    if let Some(http_config) = &config.providers.http {
+        if http_config.enabled {
+            info!("Starting HTTP provider");
+            let http_provider = HttpProvider::new(http_config.clone());
+            let storage_http = Arc::clone(&storage);
+            let reload_tx_http = reload_tx.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = http_provider
+                    .start_polling(storage_http, reload_tx_http)
+                    .await
+                {
+                    error!("HTTP provider failed: {}", e);
+                }
+            });
+        }
+    }
 
     Ok(())
 }

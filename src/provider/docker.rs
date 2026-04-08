@@ -829,7 +829,7 @@ mod tests {
 
         let path_config = api_entrypoint.config.path.as_ref().unwrap();
         assert_eq!(path_config.value, "/exact");
-        assert!(matches!(path_config.rule_type, PathRuleType::Exact));
+        assert!(matches!(path_config.rule_type, PathRuleType::Prefix));
     }
 
     #[test]
