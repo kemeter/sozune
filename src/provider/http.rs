@@ -112,3 +112,122 @@ impl HttpProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, routing::get};
+    use std::collections::HashMap;
+    use crate::model::{EntrypointConfig, Protocol};
+
+    fn sample_entrypoints_json() -> String {
+        serde_json::to_string(&vec![
+            Entrypoint {
+                id: "web".to_string(),
+                name: "web".to_string(),
+                backends: vec!["127.0.0.1:3000".to_string()],
+                protocol: Protocol::Http,
+                config: EntrypointConfig {
+                    hostnames: vec!["example.com".to_string()],
+                    port: 80,
+                    path: None,
+                    tls: false,
+                    strip_prefix: false,
+                    https_redirect: false,
+                    priority: 0,
+                    auth: None,
+                    headers: HashMap::new(),
+                    backend_timeout: None,
+                    rate_limit: None,
+                    sticky_session: false,
+                    compress: false,
+                },
+                source: None,
+                backend_weights: HashMap::new(),
+            },
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_fetch_entrypoints() {
+        let json = sample_entrypoints_json();
+        let app = Router::new().route("/config", get(move || {
+            let json = json.clone();
+            async move { json }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = HttpProvider::new(HttpProviderConfig {
+            enabled: true,
+            url: format!("http://{}/config", addr),
+            poll_interval: 30,
+        });
+
+        let result = provider.fetch_entrypoints().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("web"));
+        assert_eq!(result["web"].config.hostnames, vec!["example.com"]);
+    }
+
+    #[tokio::test]
+    async fn test_polling_updates_storage() {
+        let json = sample_entrypoints_json();
+        let app = Router::new().route("/config", get(move || {
+            let json = json.clone();
+            async move { json }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = HttpProvider::new(HttpProviderConfig {
+            enabled: true,
+            url: format!("http://{}/config", addr),
+            poll_interval: 1,
+        });
+
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let (reload_tx, mut reload_rx) = mpsc::channel(64);
+
+        let storage_clone = Arc::clone(&storage);
+        let handle = tokio::spawn(async move {
+            provider.start_polling(storage_clone, reload_tx).await.unwrap();
+        });
+
+        // Wait for first poll to trigger reload
+        tokio::time::timeout(Duration::from_secs(5), reload_rx.recv())
+            .await
+            .expect("timeout waiting for reload")
+            .expect("channel closed");
+
+        handle.abort();
+
+        let storage_read = storage.read().unwrap();
+        assert_eq!(storage_read.len(), 1);
+        let ep = storage_read.get("web").unwrap();
+        assert_eq!(ep.source.as_deref(), Some("http"));
+        assert_eq!(ep.config.hostnames, vec!["example.com"]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_error_on_404() {
+        let app = Router::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = HttpProvider::new(HttpProviderConfig {
+            enabled: true,
+            url: format!("http://{}/missing", addr),
+            poll_interval: 30,
+        });
+
+        let result = provider.fetch_entrypoints().await;
+        assert!(result.is_err());
+    }
+}
