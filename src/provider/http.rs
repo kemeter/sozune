@@ -27,9 +27,7 @@ impl HttpProvider {
 
         let body = response.text().await?;
 
-        // Try JSON first, then YAML
         let entrypoints: Vec<Entrypoint> = serde_json::from_str(&body)
-            .or_else(|_| serde_yaml::from_str(&body))
             .map_err(|e| anyhow::anyhow!("Failed to parse HTTP provider response: {}", e))?;
 
         Ok(entrypoints
