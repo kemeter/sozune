@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use axum::http::{HeaderValue, Method, header};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -94,10 +96,37 @@ pub async fn serve(
         )
         .route_layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .merge(protected)
         .with_state(state);
+
+    if !config.cors_origins.is_empty() {
+        let origins: Vec<HeaderValue> = config
+            .cors_origins
+            .iter()
+            .filter_map(|o| match HeaderValue::from_str(o) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("Invalid CORS origin '{}': {}", o, e);
+                    None
+                }
+            })
+            .collect();
+
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]);
+
+        app = app.layer(cors);
+    }
 
     let addr = SocketAddr::from_str(&config.listen_address).map_err(|e| {
         anyhow::anyhow!(

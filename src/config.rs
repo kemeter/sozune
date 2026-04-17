@@ -62,6 +62,8 @@ pub struct ApiConfig {
     pub listen_address: String,
     #[serde(default, deserialize_with = "deserialize_api_token_with_env")]
     pub token: Option<String>,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -164,6 +166,7 @@ impl Default for ApiConfig {
             enabled: false,
             listen_address: default_api_listen_address(),
             token: None,
+            cors_origins: Vec::new(),
         }
     }
 }
