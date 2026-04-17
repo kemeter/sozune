@@ -161,7 +161,8 @@ async fn list_entrypoints(
             );
         }
     };
-    (StatusCode::OK, Json(serde_json::json!(*storage)))
+    let list: Vec<&Entrypoint> = storage.values().collect();
+    (StatusCode::OK, Json(serde_json::json!(list)))
 }
 
 async fn get_entrypoint(
