@@ -1,0 +1,103 @@
+@import url('https://rsms.me/inter/inter.css');
+
+:root {
+  --bg-0: #0a0c10;
+  --bg-1: #0f1216;
+  --bg-2: #151a21;
+  --bg-3: #1c222b;
+  --bg-hover: #1f2631;
+  --border: #242b36;
+  --border-strong: #2f3847;
+
+  --fg-0: #e8ecf1;
+  --fg-1: #b6bdc9;
+  --fg-2: #7a8594;
+  --fg-3: #4d5663;
+
+  --accent: #5b8dff;
+  --accent-hover: #7aa1ff;
+  --accent-bg: rgba(91, 141, 255, 0.1);
+
+  --success: #3fb950;
+  --success-bg: rgba(63, 185, 80, 0.12);
+  --warning: #f0b429;
+  --warning-bg: rgba(240, 180, 41, 0.12);
+  --danger: #f85149;
+  --danger-bg: rgba(248, 81, 73, 0.12);
+
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+
+  font-family: var(--font-sans);
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  color-scheme: dark;
+}
+
+@supports (font-variation-settings: normal) {
+  :root {
+    font-family: 'Inter var', var(--font-sans);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--accent-hover);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-3);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
