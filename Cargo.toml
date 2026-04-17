@@ -38,3 +38,5 @@ uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 subtle = "2"
+rust-embed = "8"
+mime_guess = "2"

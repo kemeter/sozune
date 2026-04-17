@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub acme: Option<AcmeConfig>,
     #[serde(default)]
     pub middleware: MiddlewareConfig,
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -153,6 +155,30 @@ pub struct HttpsConfig {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct DashboardConfig {
+    #[serde(default, deserialize_with = "deserialize_dashboard_enabled_with_env")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_dashboard_listen_address",
+        deserialize_with = "deserialize_dashboard_listen_address_with_env"
+    )]
+    pub listen_address: String,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: default_dashboard_listen_address(),
+        }
+    }
+}
+
+fn default_dashboard_listen_address() -> String {
+    "127.0.0.1:8081".to_string()
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct MiddlewareConfig {
     #[serde(
         default = "default_middleware_port",
@@ -227,6 +253,7 @@ impl Default for AppConfig {
             proxy: Default::default(),
             acme: None,
             middleware: Default::default(),
+            dashboard: Default::default(),
         }
     }
 }
@@ -495,6 +522,17 @@ deserialize_with_env!(
     "SOZUNE_PROVIDER_HTTP_POLL_INTERVAL",
     u64,
     default_http_provider_poll_interval
+);
+
+deserialize_bool_with_env!(
+    deserialize_dashboard_enabled_with_env,
+    "SOZUNE_DASHBOARD_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_dashboard_listen_address_with_env,
+    "SOZUNE_DASHBOARD_LISTEN_ADDRESS",
+    default_dashboard_listen_address
 );
 
 #[cfg(test)]

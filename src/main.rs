@@ -15,6 +15,7 @@ mod acme;
 mod api;
 mod cli;
 mod config;
+mod dashboard;
 mod labels;
 mod middleware;
 mod model;
@@ -139,6 +140,16 @@ async fn serve() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    let dashboard_config = config.dashboard.clone();
+    let dashboard_task = tokio::spawn(async move {
+        if dashboard_config.enabled {
+            info!("Starting Dashboard server");
+            dashboard::server::serve(dashboard_config).await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
     // Start backend health checker
     let health_task = tokio::spawn({
         let storage_health = Arc::clone(&storage);
@@ -229,6 +240,7 @@ async fn serve() -> anyhow::Result<()> {
     let secondary_tasks_future = async {
         tokio::try_join!(
             api_task,
+            dashboard_task,
             provider_task,
             acme_task,
             middleware_task,
@@ -249,11 +261,16 @@ async fn serve() -> anyhow::Result<()> {
         },
         result = secondary_tasks_future => {
             signal_handle.close();
-            let (api_result, provider_result, acme_result, middleware_result, health_result) = result?;
+            let (api_result, dashboard_result, provider_result, acme_result, middleware_result, health_result) = result?;
 
             match api_result {
                 Ok(_) => debug!("API task completed successfully"),
                 Err(e) => error!("API task failed: {}", e),
+            }
+
+            match dashboard_result {
+                Ok(_) => debug!("Dashboard task completed successfully"),
+                Err(e) => error!("Dashboard task failed: {}", e),
             }
 
             match provider_result {
