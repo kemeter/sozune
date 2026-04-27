@@ -1,0 +1,32 @@
+@import './variables.css';
+@import './reset.css';
+@import './components/header.css';
+@import './components/footer.css';
+@import './components/hero.css';
+@import './components/feature-section.css';
+@import './components/code-block.css';
+@import './components/sidebar.css';
+@import './components/doc-content.css';
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+body {
+  background: var(--bg-base);
+  min-height: 100vh;
+}
+
+.container {
+  width: 100%;
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.container-prose {
+  max-width: var(--max-w-prose);
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--accent);
+}

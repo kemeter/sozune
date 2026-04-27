@@ -1,0 +1,50 @@
+:root {
+  /* Surfaces — clair, légèrement teinté */
+  --bg-base: #fafaf7;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-subtle: #f3f2ee;
+  --bg-code: #0e1414;
+
+  /* Borders */
+  --border-subtle: #e6e4dd;
+  --border-default: #d3d0c7;
+  --border-strong: #b3afa3;
+
+  /* Text — ink teinté navy, jamais pur noir */
+  --text-primary: #0e1726;
+  --text-secondary: #4d5870;
+  --text-muted: #8a93a6;
+  --text-inverse: #fafaf7;
+  --text-on-code: #e9ebef;
+
+  /* Accent unique — bleu marine */
+  --accent: #1a3a6e;
+  --accent-hover: #122a52;
+  --accent-soft: rgba(26, 58, 110, 0.08);
+  --accent-strong: #0b1e3d;
+
+  /* Semantic */
+  --color-success: #1f7a3f;
+  --color-warning: #a86a00;
+  --color-danger: #b3261e;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Menlo', monospace;
+
+  /* Sizing */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  /* Shadow — subtil seulement */
+  --shadow-card: 0 1px 2px rgba(14, 23, 38, 0.04), 0 1px 1px rgba(14, 23, 38, 0.03);
+  --shadow-elevated: 0 4px 12px rgba(14, 23, 38, 0.06);
+
+  /* Layout */
+  --max-w: 1120px;
+  --max-w-prose: 720px;
+  --header-h: 64px;
+}
