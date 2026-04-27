@@ -6,7 +6,7 @@
     "build": "aplos build"
   },
   "dependencies": {
-    "aplos": "^2.5.0",
+    "aplos": "github:alpac0de/aplos",
     "prismjs": "^1.29.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
