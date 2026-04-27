@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "aplos server",
-    "build": "aplos build"
+    "build": "aplos build --static"
   },
   "dependencies": {
     "aplos": "github:alpac0de/aplos",

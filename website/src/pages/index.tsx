@@ -1,5 +1,3 @@
-'use static';
-
 import Hero from '@/components/Hero';
 import FeatureSection from '@/components/FeatureSection';
 
