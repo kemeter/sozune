@@ -422,6 +422,7 @@ fn configure_http_entrypoint(
         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
         load_metric: None,
         answer_503: None,
+        http2: None,
     };
 
     // Send to HTTP and HTTPS workers - ignore errors if cluster already exists
@@ -699,6 +700,7 @@ fn register_acme_challenge_cluster(
         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
         load_metric: None,
         answer_503: None,
+        http2: None,
     };
 
     send_to_worker(
