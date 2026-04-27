@@ -1,0 +1,84 @@
+# Load balancing
+
+Sozune balances traffic across multiple backends with round-robin. Weighted distribution and sticky sessions are opt-in.
+
+## Default — round-robin
+
+Sōzu spreads requests evenly across all healthy backends of a cluster. No configuration needed; this is always on.
+
+## Multiple backends from Docker
+
+Several containers can serve the same Sozune service. They are merged into a single cluster when they share the same `<service_name>` in their labels.
+
+```yaml
+services:
+  app-instance-1:
+    image: my-app
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.app.host=app.example.com"
+
+  app-instance-2:
+    image: my-app
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.app.host=app.example.com"
+```
+
+Both containers register as backends of the `app` service (the part of `sozune.http.app.host`). Traffic for `app.example.com` is balanced between them.
+
+The Compose service name (`app-instance-1`, `app-instance-2`) is irrelevant — only the Sozune service name in the label matters.
+
+## Multiple backends from the API
+
+```json
+POST /entrypoints
+{
+  "name": "app",
+  "backends": ["10.0.0.5:8080", "10.0.0.6:8080"],
+  "protocol": "Http",
+  "config": { "hostnames": ["app.example.com"], "port": 8080, ... }
+}
+```
+
+## Weighted load balancing
+
+Weights are exposed only through the [REST API](/documentation/api), via the `backend_weights` map:
+
+```json
+{
+  "name": "app",
+  "backends": ["10.0.0.5:8080", "10.0.0.6:8080"],
+  "backend_weights": {
+    "10.0.0.5:8080": 80,
+    "10.0.0.6:8080": 20
+  },
+  ...
+}
+```
+
+Backends without an explicit weight default to `100`. Higher weights receive proportionally more traffic.
+
+There is currently no Docker label to set per-backend weights.
+
+## Sticky sessions
+
+Pin a client to the same backend for the duration of its session:
+
+```yaml
+labels:
+  - "sozune.http.app.host=app.example.com"
+  - "sozune.http.app.stickySession=true"
+```
+
+When enabled, Sōzu sets a session cookie and routes subsequent requests with that cookie to the originally selected backend. If the backend disappears, the client is reassigned.
+
+Sticky sessions are best-effort affinity, not absolute pinning.
+
+## What's not supported
+
+- **Least-connections** algorithm
+- **Power-of-two-choices** algorithm (available in Sōzu, not exposed here)
+- **Custom hashing** (consistent hashing, IP hash)
+
+Round-robin is the only algorithm currently exposed by Sozune.
