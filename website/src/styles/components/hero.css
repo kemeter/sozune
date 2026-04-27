@@ -2,6 +2,15 @@
   padding: 96px 0 80px;
 }
 
+@media (max-width: 640px) {
+  .hero {
+    padding: 64px 0 56px;
+  }
+  .hero-actions {
+    margin-bottom: 40px;
+  }
+}
+
 .hero-inner {
   text-align: center;
 }

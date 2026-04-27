@@ -6,7 +6,7 @@
 }
 
 .doc-content h1 {
-  font-size: 36px;
+  font-size: clamp(28px, 5vw, 36px);
   font-weight: 600;
   letter-spacing: -0.02em;
   margin: 0 0 16px;
@@ -92,6 +92,8 @@
   margin: 24px 0;
   border-collapse: collapse;
   font-size: 14px;
+  display: block;
+  overflow-x: auto;
 }
 
 .doc-content table th,

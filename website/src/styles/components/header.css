@@ -14,7 +14,16 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 32px;
+  gap: 16px;
+}
+
+@media (max-width: 480px) {
+  .header-inner {
+    gap: 12px;
+  }
+  .header-nav {
+    gap: 16px;
+  }
 }
 
 .header-logo {

@@ -5,13 +5,6 @@
   padding: 48px 0 96px;
 }
 
-@media (max-width: 768px) {
-  .doc-layout {
-    grid-template-columns: 1fr;
-    gap: 24px;
-  }
-}
-
 .doc-sidebar {
   position: sticky;
   top: calc(var(--header-h) + 24px);
@@ -51,4 +44,20 @@
   color: var(--accent);
   background: var(--accent-soft);
   font-weight: 500;
+}
+
+@media (max-width: 768px) {
+  .doc-layout {
+    grid-template-columns: 1fr;
+    gap: 24px;
+    padding: 32px 0 64px;
+  }
+  .doc-sidebar {
+    position: static;
+    max-height: none;
+    overflow: visible;
+    width: 100%;
+    border-bottom: 1px solid var(--border-subtle);
+    padding-bottom: 16px;
+  }
 }
