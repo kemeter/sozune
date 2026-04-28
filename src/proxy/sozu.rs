@@ -24,6 +24,7 @@ use tracing::{debug, error, info};
 struct EntrypointSnapshot {
     hostnames: Vec<String>,
     path: Option<PathConfig>,
+    strip_prefix: bool,
     tls: bool,
     port: u16,
     backends: Vec<String>,
@@ -41,6 +42,7 @@ fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnaps
                 EntrypointSnapshot {
                     hostnames: ep.config.hostnames.clone(),
                     path: ep.config.path.clone(),
+                    strip_prefix: ep.config.strip_prefix,
                     tls: ep.config.tls,
                     port: ep.config.port,
                     backends: ep.backends.clone(),
@@ -445,6 +447,90 @@ fn map_redirect_scheme(scheme: crate::model::RedirectScheme) -> i32 {
     }
 }
 
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | '^' | '$' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn build_path_and_rewrite(
+    path_config: Option<&PathConfig>,
+    strip_prefix: bool,
+    cluster_id: &str,
+) -> (PathRule, Option<String>) {
+    let Some(path_config) = path_config else {
+        return (
+            PathRule {
+                value: "/".to_string(),
+                kind: 0,
+            },
+            None,
+        );
+    };
+
+    if !strip_prefix {
+        let kind = match path_config.rule_type {
+            PathRuleType::Prefix => 0,
+            PathRuleType::Regex => 1,
+            PathRuleType::Exact => 2,
+        };
+        return (
+            PathRule {
+                value: path_config.value.clone(),
+                kind,
+            },
+            None,
+        );
+    }
+
+    match path_config.rule_type {
+        PathRuleType::Prefix => {
+            // Convert to a regex that matches the prefix optionally followed
+            // by `/<tail>`. The non-capturing `/` before the capture lets
+            // the rewrite template prepend a literal `/` so backends always
+            // see a valid absolute path, regardless of whether the client
+            // requested `/api`, `/api/`, or `/api/users`.
+            let escaped = regex_escape(path_config.value.trim_end_matches('/'));
+            let pattern = format!("^{}(?:/(.*))?$", escaped);
+            (
+                PathRule {
+                    value: pattern,
+                    kind: 1,
+                },
+                Some("/$PATH[1]".to_string()),
+            )
+        }
+        PathRuleType::Exact => (
+            PathRule {
+                value: path_config.value.clone(),
+                kind: 2,
+            },
+            Some("/".to_string()),
+        ),
+        PathRuleType::Regex => {
+            debug!(
+                "strip_prefix on Regex path is not supported natively for {}; configure rewrite via Sozu directly if needed",
+                cluster_id
+            );
+            (
+                PathRule {
+                    value: path_config.value.clone(),
+                    kind: 1,
+                },
+                None,
+            )
+        }
+    }
+}
+
 fn configure_http_entrypoint(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -500,39 +586,13 @@ fn configure_http_entrypoint(
 
     // Configure frontends for each hostname
     for hostname in &entrypoint.config.hostnames {
-        let path_rule = if let Some(path_config) = &entrypoint.config.path {
-            PathRule {
-                value: path_config.value.clone(),
-                kind: match path_config.rule_type {
-                    PathRuleType::Prefix => 0,
-                    PathRuleType::Regex => 1,
-                    PathRuleType::Exact => 2,
-                },
-            }
-        } else {
-            PathRule {
-                value: "/".to_string(),
-                kind: 0, // Prefix
-            }
-        };
+        let (path_rule, frontend_rewrite_path) = build_path_and_rewrite(
+            entrypoint.config.path.as_ref(),
+            entrypoint.config.strip_prefix,
+            cluster_id,
+        );
 
         let frontend_headers = build_request_headers(&entrypoint.config.headers);
-        let frontend_rewrite_path = if entrypoint.config.strip_prefix {
-            match entrypoint.config.path.as_ref().map(|p| &p.rule_type) {
-                Some(PathRuleType::Prefix) => Some("$PATH[1]".to_string()),
-                Some(PathRuleType::Exact) => Some("/".to_string()),
-                Some(PathRuleType::Regex) => {
-                    debug!(
-                        "strip_prefix on Regex path is not supported natively for {}; configure rewrite via Sozu directly if needed",
-                        cluster_id
-                    );
-                    None
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();
@@ -860,21 +920,8 @@ fn remove_http_frontends(
     http_port: u16,
     https_port: u16,
 ) {
-    let path_rule = if let Some(path_config) = &snapshot.path {
-        PathRule {
-            value: path_config.value.clone(),
-            kind: match path_config.rule_type {
-                PathRuleType::Prefix => 0,
-                PathRuleType::Regex => 1,
-                PathRuleType::Exact => 2,
-            },
-        }
-    } else {
-        PathRule {
-            value: "/".to_string(),
-            kind: 0,
-        }
-    };
+    let (path_rule, _) =
+        build_path_and_rewrite(snapshot.path.as_ref(), snapshot.strip_prefix, cluster_id);
 
     for hostname in &snapshot.hostnames {
         let http_front = RequestHttpFrontend {
