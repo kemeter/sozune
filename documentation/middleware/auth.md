@@ -13,32 +13,36 @@ Multiple users are comma-separated.
 
 ## Password format
 
-Two formats are accepted:
-
-- **bcrypt** (recommended) — hashes prefixed with `$2b$`, `$2a$`, or `$2y$`.
-- **plaintext** (legacy) — accepted as-is, no hashing.
+The password must be supplied as a **lowercase hex SHA-256** of the plaintext password. The hash is compared in constant-time on every authenticated request, so a fast hash is required at the proxy layer.
 
 ```yaml
 labels:
-  # bcrypt — recommended
-  - "sozune.http.app.auth.basic=admin:$2b$12$KIXxPfn..."
-
-  # plaintext — legacy, avoid in production
-  - "sozune.http.app.auth.basic=admin:secret"
+  # admin / secret
+  - "sozune.http.app.auth.basic=admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
 
   # multiple users
-  - "sozune.http.app.auth.basic=alice:$2b$12$...,bob:$2b$12$..."
+  - "sozune.http.app.auth.basic=alice:5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5,bob:7cb6efb98ba5972a9b5090dc2e517fe14d12cb04f905d4eeb2bbb5a5b1b8a2dc"
 ```
 
-## Generating a bcrypt hash
+## Generating the hash
 
 ```bash
-htpasswd -nbBC 12 admin secret
-# admin:$2y$12$...
-
-# In Compose YAML, escape every '$' as '$$':
-# - "sozune.http.app.auth.basic=admin:$$2y$$12$$..."
+echo -n 'secret' | sha256sum | awk '{print $1}'
+# 2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b
 ```
+
+The `-n` flag is essential — without it, `echo` appends a newline and the hash will not match.
+
+## Custom realm
+
+The `WWW-Authenticate` realm presented to the client on a `401` response defaults to a generic value. Override it with:
+
+```yaml
+labels:
+  - "sozune.http.app.wwwAuthenticate=Admin Area"
+```
+
+The client will see `WWW-Authenticate: Basic realm="Admin Area"`.
 
 ## Behaviour
 
@@ -48,10 +52,8 @@ htpasswd -nbBC 12 admin secret
 - Unknown username or wrong password → `401`
 - Match → request is forwarded to the backend.
 
-The `401` response carries `WWW-Authenticate: Basic realm="restricted"`.
-
 ## Security notes
 
-- Username and password comparisons are **constant-time** to mitigate timing attacks.
-- Basic auth sends credentials base64-encoded but **not encrypted**. Always combine with TLS.
-- Plaintext password support exists for backwards compatibility only — prefer bcrypt.
+- Comparisons are **constant-time** to mitigate timing attacks.
+- Basic auth sends credentials base64-encoded but **not encrypted**. Always combine with TLS (`tls=true` + `httpsRedirect=true`).
+- Treat your label source (Compose file, Swarm secret, etc.) as a credential store — anyone who can read the SHA-256 hash can brute-force a weak password offline. Use long random passwords.

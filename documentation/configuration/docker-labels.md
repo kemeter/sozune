@@ -34,7 +34,12 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | `sozune.http.<svc>.auth.basic` | [Basic auth](/documentation/middleware/auth) |
 | `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/middleware/headers) |
 | `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/middleware/strip-prefix) |
-| `sozune.http.<svc>.httpsRedirect` | [HTTPS redirect](/documentation/middleware/https-redirect) |
+| `sozune.http.<svc>.httpsRedirect` | [Redirects](/documentation/middleware/redirects) |
+| `sozune.http.<svc>.httpsRedirectPort` | [Redirects](/documentation/middleware/redirects) |
+| `sozune.http.<svc>.redirect` | [Redirects](/documentation/middleware/redirects) |
+| `sozune.http.<svc>.redirectScheme` | [Redirects](/documentation/middleware/redirects) |
+| `sozune.http.<svc>.redirectTemplate` | [Redirects](/documentation/middleware/redirects) |
+| `sozune.http.<svc>.wwwAuthenticate` | [Basic auth](/documentation/middleware/auth) |
 | `sozune.http.<svc>.ratelimit.average` | [Rate limit](/documentation/middleware/rate-limit) |
 | `sozune.http.<svc>.ratelimit.burst` | [Rate limit](/documentation/middleware/rate-limit) |
 | `sozune.http.<svc>.compress` | [Gzip compression](/documentation/middleware/compress) |

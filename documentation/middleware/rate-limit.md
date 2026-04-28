@@ -34,7 +34,7 @@ A client gets up to 20 requests in a burst, then steady traffic is capped at 10 
 - A new bucket starts **full** (`burst` tokens), so the very first burst from a fresh IP goes through.
 - Tokens refill linearly at `average` per second, capped at `burst`.
 - When a request finds the bucket empty, Sozune returns `429 Too Many Requests` with body `Too Many Requests`.
-- The check runs **before** basic auth, so failed-auth attempts also count against the limit (cheaper than verifying bcrypt for nothing).
+- The check runs in Sozune's middleware proxy. Basic auth runs natively in Sōzu, separately from rate limiting; the two enforcement layers are independent.
 
 ## Source IP detection
 

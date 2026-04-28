@@ -62,6 +62,8 @@ curl -X POST http://localhost:3035/entrypoints \
   }'
 ```
 
+The `config` object accepts the same fields as the [HTTP provider](/documentation/configuration/http-provider) schema. Optional fields default to `null` / `false` when omitted.
+
 ### `GET /entrypoints/:id`
 
 Fetches a single entrypoint.

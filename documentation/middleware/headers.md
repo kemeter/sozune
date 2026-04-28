@@ -31,7 +31,7 @@ X-Tenant-Id: acme
 
 ## Behaviour
 
-- Headers are injected on the **request to the backend**, not on the response to the client.
+- Headers are injected on the **request to the backend**, applied natively by Sōzu before the request hits the wire.
 - An existing header with the same name is **overwritten**.
 - Header names are case-insensitive (HTTP standard).
 - Invalid header names or values (e.g. names with spaces) are skipped with a warning, the rest still apply.
@@ -46,5 +46,5 @@ This protects against request smuggling, host header attacks, and credential inj
 
 ## Limitations
 
-- **Request-only**. There is currently no label to set a header on the response back to the client.
-- **No removal / rewrite**. You can only set a header to a fixed value; you cannot delete an existing one or rewrite it conditionally.
+- **Request-only via labels**. The Docker label syntax sets headers on the request to the backend. Sōzu also supports response and bidirectional header edits natively — they are not yet exposed as Sozune labels.
+- **Set-only via labels**. The label syntax overwrites or creates a header. Sōzu also supports header deletion (HAProxy `del-header` parity) — not yet exposed as a Sozune label either.

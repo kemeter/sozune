@@ -103,7 +103,7 @@ providers:
 
 | Field | Default | Description |
 |---|---|---|
-| `middleware.port` | `3037` | Port the internal middleware proxy listens on (auth, headers, rate limit, gzip) |
+| `middleware.port` | `3037` | Port the internal middleware proxy listens on (rate limit, gzip, backend timeout). Auth, headers, strip prefix and redirects run natively in Sōzu and do not pass through this port. |
 
 ## ACME
 

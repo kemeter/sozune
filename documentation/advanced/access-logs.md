@@ -1,10 +1,14 @@
 # Access logs
 
-Sozune logs every proxied request via the standard `tracing` infrastructure. There is no separate access log file — logs go to stdout.
+Sozune logs every request that flows through its internal middleware proxy (compress, rate limit, backend timeout) via the standard `tracing` infrastructure. There is no separate access log file — logs go to stdout.
+
+## What is and isn't logged
+
+The Sozune access log is emitted by the middleware proxy. A request reaches that proxy only if its entrypoint uses one of the middleware features that still run in Axum: `compress`, `ratelimit.*`, `backendTimeout`. Entrypoints that use only natively-handled features (basic auth, custom headers, strip prefix, redirects) bypass the middleware proxy entirely and **do not produce a Sozune access log line**. Sōzu itself still logs at the listener level, but in its own format.
 
 ## Format
 
-Each request emits one line at `info` level:
+Each logged request emits one line at `info` level:
 
 ```
 <source-ip> <method> <host> <path> <status> <duration>ms

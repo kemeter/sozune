@@ -30,12 +30,12 @@ labels:
 
 ## Behaviour
 
-- The match is **path-segment aware**: `/api` does NOT strip `/apiv2/...`. Only `/api`, `/api/`, and `/api/<more>` are stripped.
+- The match is **path-segment aware**: `/api` does NOT strip `/apiv2/...`. Only `/api`, `/api/`, and `/api/<more>` are stripped — anything else returns `404`.
 - Trailing slashes on the prefix are normalised: `/api/` and `/api` behave identically.
-- If the path doesn't start with the prefix, it's forwarded unchanged.
-- The remaining path always starts with `/`. An exact match on the prefix becomes `/`.
+- The remaining path always starts with `/`. An exact match on the prefix (`/api`) becomes `/`.
 
 ## Notes
 
 - The `path` and `prefix` labels are interchangeable for this purpose.
-- **Don't combine `stripPrefix` with `pathRegex`.** When both are set, Sozune tries to strip the literal regex string (e.g. `/users/[0-9]+`) from the request path, which never matches in practice — the request is forwarded unchanged. Use `path` or `prefix` if you want the strip to actually do something.
+- Under the hood, Sozune turns the prefix into an anchored regex matcher on the Sōzu side. This is what enforces the segment boundary and guarantees a valid path is forwarded in every case.
+- **`stripPrefix` is not supported with `pathRegex`.** When the path is declared via `pathRegex`, Sozune skips the strip and logs a debug message — write your own rewrite via the `path`/`prefix` form if you need it.

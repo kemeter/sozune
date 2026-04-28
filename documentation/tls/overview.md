@@ -27,7 +27,7 @@ Sozune supports SNI natively (inherited from Sōzu). Many domains, each with its
 
 ## HTTPS redirect
 
-Force HTTP traffic to HTTPS — see [HTTPS redirect](/documentation/middleware/https-redirect).
+Force HTTP traffic to HTTPS — see [Redirects](/documentation/middleware/redirects).
 
 ## What's not configurable
 
