@@ -10,7 +10,6 @@ use tracing::{debug, error, info, warn};
 use super::MiddlewareAppState;
 use super::auth;
 use super::compress;
-use super::headers;
 use super::rate_limit::RateLimitResult;
 use super::strip_prefix;
 
@@ -139,9 +138,6 @@ pub async fn handle_proxy(
 
     // 5. Build the forwarded request
     let (mut parts, body) = req.into_parts();
-
-    // Inject custom headers
-    headers::inject_headers(&mut parts.headers, &route.headers);
 
     // Update the URI
     parts.uri = match target_uri.parse::<Uri>() {

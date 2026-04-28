@@ -6,13 +6,13 @@ use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, RemoveBackend, Request, RequestHttpFrontend, ResponseStatus,
-        RulePosition, SocketAddress, Status, TlsVersion, WorkerRequest, WorkerResponse,
-        request::RequestType,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, Header, HeaderPosition,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RemoveBackend, Request,
+        RequestHttpFrontend, ResponseStatus, RulePosition, SocketAddress, Status, TlsVersion,
+        WorkerRequest, WorkerResponse, request::RequestType,
     },
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -304,12 +304,11 @@ fn update_middleware_routes(
             let route =
                 middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
             debug!(
-                "Middleware route for {} (hosts: {:?}): strip_prefix={:?}, auth={}, headers={}",
+                "Middleware route for {} (hosts: {:?}): strip_prefix={:?}, auth={}",
                 cluster_id,
                 entrypoint.config.hostnames,
                 route.strip_prefix,
                 route.auth.is_some(),
-                route.headers.len()
             );
             table.update_routes_for_entrypoint(&entrypoint.config.hostnames, route);
         }
@@ -405,6 +404,17 @@ fn configure_sozu_routing(
     Ok(())
 }
 
+fn build_request_headers(custom: &HashMap<String, String>) -> Vec<Header> {
+    custom
+        .iter()
+        .map(|(key, val)| Header {
+            position: HeaderPosition::Request as i32,
+            key: key.clone(),
+            val: val.clone(),
+        })
+        .collect()
+}
+
 fn configure_http_entrypoint(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -467,6 +477,8 @@ fn configure_http_entrypoint(
             }
         };
 
+        let frontend_headers = build_request_headers(&entrypoint.config.headers);
+
         let http_front = RequestHttpFrontend {
             cluster_id: Some(cluster_id.to_string()),
             address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
@@ -475,6 +487,7 @@ fn configure_http_entrypoint(
             method: None,
             position: RulePosition::Pre as i32,
             tags: BTreeMap::new(),
+            headers: frontend_headers.clone(),
             ..Default::default()
         };
 
@@ -499,6 +512,7 @@ fn configure_http_entrypoint(
                 method: None,
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
+                headers: frontend_headers.clone(),
                 ..Default::default()
             };
 
