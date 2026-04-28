@@ -9,7 +9,7 @@ Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https:/
 - **HTTP/2** — negotiated through ALPN on every TLS listener.
 - **Hot reload** — REST API applies changes on the fly, no downtime.
 - **Wildcard & regex hostnames** — `*.example.com`, `/cdn[0-9]+/.example.com`.
-- **Multi-protocol** — HTTP, HTTPS, WebSocket. TCP / UDP on the [roadmap](ROADMAP.md).
+- **Multi-protocol** — HTTP, HTTPS, WebSocket.
 
 ## Quick start
 
@@ -97,7 +97,7 @@ curl -H "Host: whoami.localhost" http://localhost
 
 ## Contributing
 
-Pull requests welcome. See [ROADMAP.md](ROADMAP.md) for what's in flight.
+Pull requests welcome.
 
 ## License
 

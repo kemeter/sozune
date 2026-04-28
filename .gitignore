@@ -2,3 +2,4 @@
 **/*.rs.bk
 /registry
 sozune.db
+ROADMAP.md

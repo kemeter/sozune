@@ -55,7 +55,7 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | `sozune.udp.<svc>.host` | Hostname for the UDP service |
 | `sozune.udp.<svc>.port` | Backend port |
 
-> **Note:** TCP and UDP entrypoints are recognised at the label-parsing level but are not currently proxied (the Sōzu TCP worker integration is on the [roadmap](https://github.com/kemeter/sozune/blob/main/ROADMAP.md)).
+> **Note:** TCP and UDP entrypoints are recognised at the label-parsing level but are not currently proxied — the Sōzu TCP worker integration is not yet wired in.
 
 ## Full example
 
