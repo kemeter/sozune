@@ -304,10 +304,11 @@ fn update_middleware_routes(
             let route =
                 middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
             debug!(
-                "Middleware route for {} (hosts: {:?}): strip_prefix={:?}",
+                "Middleware route for {} (hosts: {:?}): rate_limited={}, compress={}",
                 cluster_id,
                 entrypoint.config.hostnames,
-                route.strip_prefix,
+                route.rate_limiter.is_some(),
+                route.compress,
             );
             table.update_routes_for_entrypoint(&entrypoint.config.hostnames, route);
         }
@@ -497,6 +498,22 @@ fn configure_http_entrypoint(
         };
 
         let frontend_headers = build_request_headers(&entrypoint.config.headers);
+        let frontend_rewrite_path = if entrypoint.config.strip_prefix {
+            match entrypoint.config.path.as_ref().map(|p| &p.rule_type) {
+                Some(PathRuleType::Prefix) => Some("$PATH[1]".to_string()),
+                Some(PathRuleType::Exact) => Some("/".to_string()),
+                Some(PathRuleType::Regex) => {
+                    debug!(
+                        "strip_prefix on Regex path is not supported natively for {}; configure rewrite via Sozu directly if needed",
+                        cluster_id
+                    );
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let http_front = RequestHttpFrontend {
             cluster_id: Some(cluster_id.to_string()),
@@ -508,6 +525,7 @@ fn configure_http_entrypoint(
             tags: BTreeMap::new(),
             headers: frontend_headers.clone(),
             required_auth: frontend_required_auth,
+            rewrite_path: frontend_rewrite_path.clone(),
             ..Default::default()
         };
 
@@ -534,6 +552,7 @@ fn configure_http_entrypoint(
                 tags: BTreeMap::new(),
                 headers: frontend_headers.clone(),
                 required_auth: frontend_required_auth,
+                rewrite_path: frontend_rewrite_path.clone(),
                 ..Default::default()
             };
 

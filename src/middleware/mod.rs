@@ -1,7 +1,6 @@
 mod compress;
 mod proxy;
 pub mod rate_limit;
-mod strip_prefix;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -34,7 +33,6 @@ pub struct MiddlewareRouteTable {
 pub struct MiddlewareRoute {
     pub backends: Vec<(String, u16)>,
     pub backend_counter: AtomicUsize,
-    pub strip_prefix: Option<String>,
     pub backend_timeout: Option<u64>,
     pub rate_limiter: Option<RateLimiter>,
     pub compress: bool,
@@ -75,7 +73,7 @@ impl MiddlewareRoute {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.strip_prefix || config.backend_timeout.is_some() || config.rate_limit.is_some() || config.compress
+    config.backend_timeout.is_some() || config.rate_limit.is_some() || config.compress
 }
 
 /// Build middleware route from entrypoint config
@@ -83,18 +81,11 @@ pub fn build_middleware_route(
     config: &EntrypointConfig,
     backends: &[String],
 ) -> Arc<MiddlewareRoute> {
-    let strip_prefix = if config.strip_prefix {
-        config.path.as_ref().map(|p| p.value.clone())
-    } else {
-        None
-    };
-
     let rate_limiter = config.rate_limit.as_ref().map(|rl| RateLimiter::new(rl.average, rl.burst));
 
     Arc::new(MiddlewareRoute {
         backends: backends.iter().map(|b| (b.clone(), config.port)).collect(),
         backend_counter: AtomicUsize::new(0),
-        strip_prefix,
         backend_timeout: config.backend_timeout,
         rate_limiter,
         compress: config.compress,

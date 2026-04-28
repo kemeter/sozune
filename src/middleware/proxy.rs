@@ -10,7 +10,6 @@ use tracing::{debug, error, info, warn};
 use super::MiddlewareAppState;
 use super::compress;
 use super::rate_limit::RateLimitResult;
-use super::strip_prefix;
 
 /// Main proxy handler: identifies the route by Host header,
 /// applies middleware stack, and forwards to the real backend.
@@ -88,7 +87,7 @@ pub async fn handle_proxy(
         }
     };
 
-    // 3. Build the forwarded URI with strip_prefix applied
+    // 3. Build the forwarded URI
     let original_path = req.uri().path().to_string();
     let query = req
         .uri()
@@ -96,11 +95,7 @@ pub async fn handle_proxy(
         .map(|q| format!("?{}", q))
         .unwrap_or_default();
 
-    let forwarded_path = if let Some(ref prefix) = route.strip_prefix {
-        strip_prefix::strip(prefix, &original_path)
-    } else {
-        original_path.clone()
-    };
+    let forwarded_path = original_path.clone();
 
     let target_uri = format!(
         "http://{}:{}{}{}",
