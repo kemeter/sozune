@@ -43,7 +43,7 @@ POST /entrypoints
 
 ## Weighted load balancing
 
-Weights are exposed only through the [REST API](/documentation/api), via the `backend_weights` map:
+Weights are exposed only through the [REST API](/documentation/configuration/api), via the `backend_weights` map:
 
 ```json
 {

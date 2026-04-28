@@ -24,10 +24,10 @@ cargo build --release
 
 ## Verify the install
 
-`/health` is exposed by the [REST API](/documentation/api), not by the proxy itself. With the API enabled (default port `127.0.0.1:3035`):
+`/health` is exposed by the [REST API](/documentation/configuration/api), not by the proxy itself. With the API enabled (default port `127.0.0.1:3035`):
 
 ```bash
 curl http://127.0.0.1:3035/health
 ```
 
-You should get `200 OK`. Next: [Quick start](/documentation/quick-start).
+You should get `200 OK`. Next: [Quick start](/documentation/getting-started/quick-start).

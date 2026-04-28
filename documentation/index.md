@@ -13,39 +13,39 @@ Sozune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). 
 
 ## Get started
 
-- [Installation](/documentation/installation)
-- [Quick start](/documentation/quick-start)
+- [Installation](/documentation/getting-started/installation)
+- [Quick start](/documentation/getting-started/quick-start)
 
 ## Configuration
 
-- [Configuration overview](/documentation/overview)
-- [Docker labels](/documentation/docker-labels)
-- [HTTP provider](/documentation/http-provider)
-- [REST API](/documentation/api)
+- [Configuration overview](/documentation/configuration/overview)
+- [Docker labels](/documentation/configuration/docker-labels)
+- [HTTP provider](/documentation/configuration/http-provider)
+- [REST API](/documentation/configuration/api)
 
 ## Routing
 
-- [Hostnames](/documentation/hostnames)
-- [Path matching](/documentation/path-matching)
-- [Load balancing](/documentation/load-balancing)
+- [Hostnames](/documentation/routing/hostnames)
+- [Path matching](/documentation/routing/path-matching)
+- [Load balancing](/documentation/routing/load-balancing)
 
 ## TLS
 
-- [TLS overview](/documentation/tls-overview)
-- [ACME / Let's Encrypt](/documentation/acme)
+- [TLS overview](/documentation/tls/overview)
+- [ACME / Let's Encrypt](/documentation/tls/acme)
 
 ## Middleware
 
-- [Basic auth](/documentation/auth)
-- [Custom headers](/documentation/headers)
-- [Strip prefix](/documentation/strip-prefix)
-- [HTTPS redirect](/documentation/https-redirect)
-- [Rate limit](/documentation/rate-limit)
-- [Gzip compression](/documentation/compress)
-- [Backend timeout](/documentation/backend-timeout)
+- [Basic auth](/documentation/middleware/auth)
+- [Custom headers](/documentation/middleware/headers)
+- [Strip prefix](/documentation/middleware/strip-prefix)
+- [HTTPS redirect](/documentation/middleware/https-redirect)
+- [Rate limit](/documentation/middleware/rate-limit)
+- [Gzip compression](/documentation/middleware/compress)
+- [Backend timeout](/documentation/middleware/backend-timeout)
 
 ## Advanced
 
-- [Health checks](/documentation/health-checks)
-- [WebSocket](/documentation/websocket)
-- [Access logs](/documentation/access-logs)
+- [Health checks](/documentation/advanced/health-checks)
+- [WebSocket](/documentation/advanced/websocket)
+- [Access logs](/documentation/advanced/access-logs)

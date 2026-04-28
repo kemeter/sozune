@@ -39,11 +39,11 @@ labels:
 
 ## Exact
 
-There is no Docker label for exact path matches. Create the entrypoint through the [REST API](/documentation/api) with a `PathConfig` of `rule_type: Exact`.
+There is no Docker label for exact path matches. Create the entrypoint through the [REST API](/documentation/configuration/api) with a `PathConfig` of `rule_type: Exact`.
 
 ## Strip prefix
 
-Paired with a prefix rule, `stripPrefix` removes the matched prefix before forwarding. See [strip prefix](/documentation/strip-prefix).
+Paired with a prefix rule, `stripPrefix` removes the matched prefix before forwarding. See [strip prefix](/documentation/middleware/strip-prefix).
 
 ## When multiple labels are set
 

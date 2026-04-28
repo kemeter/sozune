@@ -39,7 +39,7 @@ labels:
 
 - The timer covers the full request: connecting to the backend, sending the request, and reading the response.
 - On timeout, the client receives `504 Gateway Timeout`.
-- WebSocket upgrades are handled outside of this timeout — see [WebSocket](/documentation/websocket).
+- WebSocket upgrades are handled outside of this timeout — see [WebSocket](/documentation/advanced/websocket).
 
 ## When to set it
 

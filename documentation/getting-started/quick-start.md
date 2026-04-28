@@ -48,5 +48,5 @@ curl -H "Host: whoami.localhost" http://localhost
 
 ## What's next
 
-- [Full Docker labels reference](/documentation/docker-labels)
-- [REST API](/documentation/api)
+- [Full Docker labels reference](/documentation/configuration/docker-labels)
+- [REST API](/documentation/configuration/api)

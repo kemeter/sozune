@@ -107,7 +107,7 @@ providers:
 
 ## ACME
 
-See [ACME / Let's Encrypt](/documentation/acme).
+See [ACME / Let's Encrypt](/documentation/tls/acme).
 
 ## Environment variable overrides
 

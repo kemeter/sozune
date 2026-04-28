@@ -19,11 +19,11 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 
 | Label | Example | Reference |
 |---|---|---|
-| `sozune.http.<svc>.host` | `app.example.com` | [Hostnames](/documentation/hostnames) |
+| `sozune.http.<svc>.host` | `app.example.com` | [Hostnames](/documentation/routing/hostnames) |
 | `sozune.http.<svc>.port` | `8080` | Backend port (defaults: 80 for `http`, 443 for `https`, 8080 for `tcp`/`udp`) |
-| `sozune.http.<svc>.path` | `/api` | [Path matching](/documentation/path-matching) |
+| `sozune.http.<svc>.path` | `/api` | [Path matching](/documentation/routing/path-matching) |
 | `sozune.http.<svc>.prefix` | `/api` | Alias for `path` |
-| `sozune.http.<svc>.pathRegex` | `/users/[0-9]+` | [Path matching](/documentation/path-matching) |
+| `sozune.http.<svc>.pathRegex` | `/users/[0-9]+` | [Path matching](/documentation/routing/path-matching) |
 | `sozune.http.<svc>.priority` | `100` | Higher wins when multiple rules match (default `0`) |
 | `sozune.http.<svc>.tls` | `true` | Enables TLS termination (provisions an ACME cert) |
 
@@ -31,15 +31,15 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 
 | Label | Reference |
 |---|---|
-| `sozune.http.<svc>.auth.basic` | [Basic auth](/documentation/auth) |
-| `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/headers) |
-| `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/strip-prefix) |
-| `sozune.http.<svc>.httpsRedirect` | [HTTPS redirect](/documentation/https-redirect) |
-| `sozune.http.<svc>.ratelimit.average` | [Rate limit](/documentation/rate-limit) |
-| `sozune.http.<svc>.ratelimit.burst` | [Rate limit](/documentation/rate-limit) |
-| `sozune.http.<svc>.compress` | [Gzip compression](/documentation/compress) |
-| `sozune.http.<svc>.backendTimeout` | [Backend timeout](/documentation/backend-timeout) |
-| `sozune.http.<svc>.stickySession` | [Sticky sessions](/documentation/load-balancing) |
+| `sozune.http.<svc>.auth.basic` | [Basic auth](/documentation/middleware/auth) |
+| `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/middleware/headers) |
+| `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/middleware/strip-prefix) |
+| `sozune.http.<svc>.httpsRedirect` | [HTTPS redirect](/documentation/middleware/https-redirect) |
+| `sozune.http.<svc>.ratelimit.average` | [Rate limit](/documentation/middleware/rate-limit) |
+| `sozune.http.<svc>.ratelimit.burst` | [Rate limit](/documentation/middleware/rate-limit) |
+| `sozune.http.<svc>.compress` | [Gzip compression](/documentation/middleware/compress) |
+| `sozune.http.<svc>.backendTimeout` | [Backend timeout](/documentation/middleware/backend-timeout) |
+| `sozune.http.<svc>.stickySession` | [Sticky sessions](/documentation/routing/load-balancing) |
 
 ## Routing — TCP / UDP
 

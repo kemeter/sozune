@@ -13,7 +13,7 @@ When Sozune receives a request with `Upgrade: websocket`, it:
 
 ## No timeout
 
-WebSocket connections are **not subject** to the [`backendTimeout`](/documentation/backend-timeout) setting. Once the upgrade is accepted, Sozune treats the tunnel as long-lived. Idle connections stay open until one side closes.
+WebSocket connections are **not subject** to the [`backendTimeout`](/documentation/middleware/backend-timeout) setting. Once the upgrade is accepted, Sozune treats the tunnel as long-lived. Idle connections stay open until one side closes.
 
 ## Example
 

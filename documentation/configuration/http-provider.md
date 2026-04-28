@@ -20,7 +20,7 @@ providers:
 
 ## Expected response
 
-A JSON array of entrypoints with the same schema as the [REST API](/documentation/api):
+A JSON array of entrypoints with the same schema as the [REST API](/documentation/configuration/api):
 
 ```json
 [

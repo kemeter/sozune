@@ -1,6 +1,6 @@
 # TLS overview
 
-Sozune terminates TLS on its HTTPS listener. Certificates come from [ACME / Let's Encrypt](/documentation/acme).
+Sozune terminates TLS on its HTTPS listener. Certificates come from [ACME / Let's Encrypt](/documentation/tls/acme).
 
 ## Enable TLS for a service
 
@@ -27,7 +27,7 @@ Sozune supports SNI natively (inherited from Sōzu). Many domains, each with its
 
 ## HTTPS redirect
 
-Force HTTP traffic to HTTPS — see [HTTPS redirect](/documentation/https-redirect).
+Force HTTP traffic to HTTPS — see [HTTPS redirect](/documentation/middleware/https-redirect).
 
 ## What's not configurable
 
