@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+pub mod render;
+pub mod report;
 pub mod validate;
 
 #[derive(Parser, Debug)]

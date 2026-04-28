@@ -60,8 +60,21 @@ impl LabelSource for DockerProvider {
                 continue;
             };
             let id = container.id.unwrap_or_default();
+            let display_name = container
+                .names
+                .as_ref()
+                .and_then(|names| names.first().cloned())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| id.clone());
             let networks = self.extract_networks(&id).await;
-            candidates.push(self.build_candidate(id, labels, networks));
+            candidates.push(Candidate {
+                provider: "docker",
+                id,
+                display_name,
+                labels,
+                networks,
+                enabled_default: self.config.expose_by_default,
+            });
         }
         Ok(candidates)
     }
