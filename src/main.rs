@@ -12,6 +12,7 @@ use crate::config::AppConfig;
 mod acme;
 mod api;
 mod config;
+mod labels;
 mod middleware;
 mod model;
 mod provider;
