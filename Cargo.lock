@@ -2394,7 +2394,7 @@ dependencies = [
 [[package]]
 name = "sozu-command-lib"
 version = "1.1.1"
-source = "git+https://github.com/Shine-neko/sozu?rev=7657dbf5a442e0b4b9064610749ea8d08bcf54c5#7657dbf5a442e0b4b9064610749ea8d08bcf54c5"
+source = "git+https://github.com/Shine-neko/sozu?rev=53df2e07c9fd3edfe734c9eb63636940150c3ad1#53df2e07c9fd3edfe734c9eb63636940150c3ad1"
 dependencies = [
  "hex",
  "libc",
@@ -2422,9 +2422,10 @@ dependencies = [
 [[package]]
 name = "sozu-lib"
 version = "1.1.1"
-source = "git+https://github.com/Shine-neko/sozu?rev=7657dbf5a442e0b4b9064610749ea8d08bcf54c5#7657dbf5a442e0b4b9064610749ea8d08bcf54c5"
+source = "git+https://github.com/Shine-neko/sozu?rev=53df2e07c9fd3edfe734c9eb63636940150c3ad1#53df2e07c9fd3edfe734c9eb63636940150c3ad1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cookie-factory",
  "hdrhistogram",
  "hex",
@@ -2446,6 +2447,7 @@ dependencies = [
  "slab",
  "socket2",
  "sozu-command-lib",
+ "subtle",
  "thiserror 2.0.18",
  "time",
 ]

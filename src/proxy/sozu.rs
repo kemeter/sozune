@@ -359,6 +359,7 @@ fn configure_sozu_routing(
                             method: None,
                             position: RulePosition::Pre as i32,
                             tags: BTreeMap::new(),
+                            ..Default::default()
                         };
                         if let Err(e) = send_to_worker(
                             command_channel,
@@ -423,6 +424,7 @@ fn configure_http_entrypoint(
         load_metric: None,
         answer_503: None,
         http2: None,
+        ..Default::default()
     };
 
     // Send to HTTP and HTTPS workers - ignore errors if cluster already exists
@@ -473,6 +475,7 @@ fn configure_http_entrypoint(
             method: None,
             position: RulePosition::Pre as i32,
             tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         if let Err(e) = send_to_worker(
@@ -496,6 +499,7 @@ fn configure_http_entrypoint(
                 method: None,
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
+                ..Default::default()
             };
 
             info!("Configuring HTTPS frontend for {} on cluster {}", hostname, cluster_id);
@@ -701,6 +705,7 @@ fn register_acme_challenge_cluster(
         load_metric: None,
         answer_503: None,
         http2: None,
+        ..Default::default()
     };
 
     send_to_worker(
@@ -798,6 +803,7 @@ fn remove_http_frontends(
             method: None,
             position: RulePosition::Pre as i32,
             tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         if let Err(e) = send_to_worker(
@@ -817,6 +823,7 @@ fn remove_http_frontends(
                 method: None,
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
+                ..Default::default()
             };
 
             if let Err(e) = send_to_worker(
@@ -912,6 +919,7 @@ fn remove_acme_frontends(
             method: None,
             position: RulePosition::Pre as i32,
             tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         if let Err(e) = send_to_worker(
