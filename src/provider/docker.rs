@@ -1,20 +1,19 @@
 use crate::config::DockerConfig;
-use crate::model::{
-    AuthConfig, BasicAuthUser, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol,
-    RateLimitConfig,
-};
+use crate::labels::candidate::{Candidate, NetworkInfo};
+use crate::labels::diagnostic::{Diagnostic, Severity};
+use crate::labels::{self};
+use crate::model::Entrypoint;
 use crate::provider::Provider;
 use async_trait::async_trait;
 use bollard::{
     Docker,
-    models::EventMessage,
     query_parameters::{EventsOptions, InspectContainerOptions, ListContainersOptions},
 };
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct DockerProvider {
     docker: Docker,
@@ -40,12 +39,6 @@ impl Provider for DockerProvider {
 }
 
 impl DockerProvider {
-    /// Check if container should be exposed based on sozune.enable label and expose_by_default config
-    fn should_expose_container(&self, labels: &HashMap<String, String>) -> bool {
-        labels
-            .get("sozune.enable")
-            .map_or(self.config.expose_by_default, |v| v == "true")
-    }
     pub fn new(config: DockerConfig) -> Result<Self, bollard::errors::Error> {
         let docker = if config.endpoint.starts_with("unix://") {
             Docker::connect_with_socket(&config.endpoint, 120, bollard::API_DEFAULT_VERSION)?
@@ -339,43 +332,19 @@ impl DockerProvider {
         Ok(())
     }
 
-    /// Get entrypoints for a specific container
+    /// Get entrypoints for a specific container.
     async fn get_container_entrypoints(
         &self,
         container_id: &str,
     ) -> Result<HashMap<String, Entrypoint>, bollard::errors::Error> {
-        let mut entrypoints = HashMap::new();
+        let candidate = match self.inspect_to_candidate(container_id).await? {
+            Some(c) => c,
+            None => return Ok(HashMap::new()),
+        };
 
-        let container = self
-            .docker
-            .inspect_container(container_id, None::<InspectContainerOptions>)
-            .await?;
-
-        if let Some(config) = container.config {
-            if let Some(labels) = config.labels {
-                // Check if Sozune is enabled for this container
-                if !self.should_expose_container(&labels) {
-                    return Ok(entrypoints);
-                }
-
-                // Get container IP address
-                let container_ip = self
-                    .get_container_ip(container_id)
-                    .await
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
-
-                // Parse labels by protocol
-                for protocol in &["http", "tcp", "udp"] {
-                    let protocol_entrypoints =
-                        self.parse_protocol_labels(&labels, protocol, &container_ip);
-                    for (key, entrypoint) in protocol_entrypoints {
-                        entrypoints.insert(key, entrypoint);
-                    }
-                }
-            }
-        }
-
-        Ok(entrypoints)
+        let result = labels::parse(&candidate);
+        log_diagnostics(&candidate, &result.diagnostics);
+        Ok(result.entrypoints)
     }
 
     pub async fn get_entrypoints_from_containers(
@@ -392,45 +361,47 @@ impl DockerProvider {
             .await?;
 
         for container in containers {
-            if let Some(labels) = container.labels {
-                let container_id = container.id.unwrap_or_default();
+            let Some(container_labels) = container.labels else {
+                continue;
+            };
+            let container_id = container.id.unwrap_or_default();
 
-                // Check if Sozune is enabled for this container
-                if !self.should_expose_container(&labels) {
-                    info!(
-                        "Skipping container {} since Sozune is disabled",
-                        container_id
-                    );
-                    continue;
-                }
+            // Network info is only available via inspect, not list — fetch it.
+            let networks = self.extract_networks(&container_id).await;
+            let candidate = self.build_candidate(
+                container_id.clone(),
+                container_labels,
+                networks,
+            );
 
-                // Get container IP address
-                let container_ip = self
-                    .get_container_ip(&container_id)
-                    .await
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
+            let result = labels::parse(&candidate);
+            log_diagnostics(&candidate, &result.diagnostics);
 
-                // Track container IP for cleanup on stop
-                if let Ok(mut ips) = self.container_ips.lock() {
-                    ips.insert(container_id.clone(), container_ip.clone());
-                }
+            if result.entrypoints.is_empty() {
+                continue;
+            }
 
-                // Parse labels by protocol
-                for protocol in &["http", "tcp", "udp"] {
-                    let protocol_entrypoints =
-                        self.parse_protocol_labels(&labels, protocol, &container_ip);
-                    for (key, entrypoint) in protocol_entrypoints {
-                        if let Some(existing) = entrypoints.get_mut(&key) {
-                            existing.backends.push(container_ip.clone());
-                            info!(
-                                "Added backend {} to existing entrypoint {}",
-                                container_ip, key
-                            );
-                        } else {
-                            entrypoints.insert(key.clone(), entrypoint);
-                            info!("Created new entrypoint {}", key);
-                        }
+            // Track the resolved backend IP for cleanup on stop. Every
+            // entrypoint produced by a single candidate carries the same
+            // backend list, so peek at the first.
+            if let Some(first) = result.entrypoints.values().next() {
+                if let Some(ip) = first.backends.first() {
+                    if let Ok(mut ips) = self.container_ips.lock() {
+                        ips.insert(container_id.clone(), ip.clone());
                     }
+                }
+            }
+
+            for (key, entrypoint) in result.entrypoints {
+                let backend_ip = entrypoint.backends.first().cloned().unwrap_or_default();
+                if let Some(existing) = entrypoints.get_mut(&key) {
+                    if !existing.backends.contains(&backend_ip) {
+                        existing.backends.push(backend_ip.clone());
+                        info!("Added backend {} to existing entrypoint {}", backend_ip, key);
+                    }
+                } else {
+                    entrypoints.insert(key.clone(), entrypoint);
+                    info!("Created new entrypoint {}", key);
                 }
             }
         }
@@ -438,551 +409,140 @@ impl DockerProvider {
         Ok(entrypoints)
     }
 
-    fn parse_protocol_labels(
+    /// Inspect a container and turn it into a `Candidate`. Returns `None` when
+    /// the container has no labels at all (sozune cannot route it either way).
+    async fn inspect_to_candidate(
         &self,
-        labels: &HashMap<String, String>,
-        protocol: &str,
-        container_ip: &str,
-    ) -> HashMap<String, Entrypoint> {
-        let mut entrypoints = HashMap::new();
-        let prefix = format!("sozune.{}.", protocol);
-
-        // Find all service names for this protocol
-        let mut service_names = std::collections::HashSet::new();
-        for key in labels.keys() {
-            if key.starts_with(&prefix) {
-                if let Some(rest) = key.strip_prefix(&prefix) {
-                    if let Some(service_name) = rest.split('.').next() {
-                        service_names.insert(service_name.to_string());
-                    }
-                }
-            }
-        }
-
-        // Create an entrypoint for each service
-        for service_name in service_names {
-            if let Some(entrypoint) =
-                self.create_entrypoint_from_labels(labels, protocol, &service_name, container_ip)
-            {
-                let key = format!("{}_{}", protocol, service_name);
-                entrypoints.insert(key, entrypoint);
-            }
-        }
-
-        entrypoints
-    }
-
-    fn create_entrypoint_from_labels(
-        &self,
-        labels: &HashMap<String, String>,
-        protocol: &str,
-        service_name: &str,
-        container_ip: &str,
-    ) -> Option<Entrypoint> {
-        let prefix = format!("sozune.{}.{}.", protocol, service_name);
-
-        // Get hostnames (required)
-        let hostnames_str = labels.get(&format!("{}host", prefix))?;
-        let hostnames: Vec<String> = hostnames_str
-            .split(',')
-            .map(|h| h.trim().to_string())
-            .collect();
-
-        // Port (default based on protocol)
-        let default_port = match protocol {
-            "http" => 80,
-            "https" => 443,
-            _ => 8080,
-        };
-        let port = labels
-            .get(&format!("{}port", prefix))
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(default_port);
-
-        let path = if protocol == "http" {
-            let exact_path = labels.get(&format!("{}path", prefix));
-            let prefix_path = labels.get(&format!("{}prefix", prefix));
-            let regex_path = labels.get(&format!("{}pathRegex", prefix));
-
-            match (exact_path, prefix_path, regex_path) {
-                (Some(path), _, _) => Some(PathConfig {
-                    rule_type: PathRuleType::Prefix,
-                    value: path.clone(),
-                }),
-                (None, Some(prefix), _) => Some(PathConfig {
-                    rule_type: PathRuleType::Prefix,
-                    value: prefix.clone(),
-                }),
-                (None, None, Some(regex)) => Some(PathConfig {
-                    rule_type: PathRuleType::Regex,
-                    value: regex.clone(),
-                }),
-                _ => Some(PathConfig {
-                    rule_type: PathRuleType::Prefix,
-                    value: "/".to_string(),
-                }),
-            }
-        } else {
-            None
-        };
-
-        let tls = labels
-            .get(&format!("{}tls", prefix))
-            .map_or(false, |v| v == "true");
-
-        let strip_prefix = labels
-            .get(&format!("{}stripPrefix", prefix))
-            .map_or(false, |v| v == "true");
-
-        let https_redirect = labels
-            .get(&format!("{}httpsRedirect", prefix))
-            .map_or(false, |v| v == "true");
-
-        let https_redirect_port = labels
-            .get(&format!("{}httpsRedirectPort", prefix))
-            .and_then(|p| p.parse().ok());
-
-        let redirect = labels
-            .get(&format!("{}redirect", prefix))
-            .and_then(|v| match v.as_str() {
-                "forward" => Some(crate::model::RedirectPolicy::Forward),
-                "permanent" => Some(crate::model::RedirectPolicy::Permanent),
-                "unauthorized" => Some(crate::model::RedirectPolicy::Unauthorized),
-                _ => {
-                    warn!("Invalid redirect policy '{}', expected forward|permanent|unauthorized", v);
-                    None
-                }
-            });
-
-        let redirect_scheme = labels
-            .get(&format!("{}redirectScheme", prefix))
-            .and_then(|v| match v.as_str() {
-                "use_same" => Some(crate::model::RedirectScheme::UseSame),
-                "use_http" => Some(crate::model::RedirectScheme::UseHttp),
-                "use_https" => Some(crate::model::RedirectScheme::UseHttps),
-                _ => {
-                    warn!("Invalid redirect scheme '{}', expected use_same|use_http|use_https", v);
-                    None
-                }
-            });
-
-        let redirect_template = labels
-            .get(&format!("{}redirectTemplate", prefix))
-            .cloned();
-
-        let www_authenticate = labels
-            .get(&format!("{}wwwAuthenticate", prefix))
-            .cloned();
-
-        let priority = labels
-            .get(&format!("{}priority", prefix))
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0);
-
-        let backend_timeout = labels
-            .get(&format!("{}backendTimeout", prefix))
-            .and_then(|p| p.parse().ok());
-
-        let rate_limit = {
-            let average = labels
-                .get(&format!("{}ratelimit.average", prefix))
-                .and_then(|p| p.parse().ok());
-            let burst = labels
-                .get(&format!("{}ratelimit.burst", prefix))
-                .and_then(|p| p.parse().ok());
-            match (average, burst) {
-                (Some(avg), Some(b)) => Some(RateLimitConfig { average: avg, burst: b }),
-                (Some(avg), None) => Some(RateLimitConfig { average: avg, burst: avg }),
-                _ => None,
-            }
-        };
-
-        let sticky_session = labels
-            .get(&format!("{}stickySession", prefix))
-            .map_or(false, |v| v == "true");
-
-        let compress = labels
-            .get(&format!("{}compress", prefix))
-            .map_or(false, |v| v == "true");
-
-        let auth = self.parse_auth_labels(labels, &prefix);
-
-        let headers = self.parse_header_labels(labels, &prefix);
-
-        let protocol_enum = match protocol {
-            "http" => Protocol::Http,
-            "tcp" => Protocol::Tcp,
-            "udp" => Protocol::Udp,
-            _ => return None,
-        };
-
-        Some(Entrypoint {
-            id: format!("{}_{}", protocol, service_name),
-            backends: vec![container_ip.to_string()],
-            name: service_name.to_string(),
-            protocol: protocol_enum,
-            backend_weights: HashMap::new(),
-            config: EntrypointConfig {
-                hostnames,
-                port,
-                path,
-                tls,
-                strip_prefix,
-                https_redirect,
-                https_redirect_port,
-                redirect,
-                redirect_scheme,
-                redirect_template,
-                www_authenticate,
-                priority,
-                auth,
-                headers,
-                backend_timeout,
-                rate_limit,
-                sticky_session,
-                compress,
-            },
-            source: None, // Will be set by the caller
-        })
-    }
-
-    fn parse_auth_labels(
-        &self,
-        labels: &HashMap<String, String>,
-        prefix: &str,
-    ) -> Option<AuthConfig> {
-        let basic_auth_str = labels.get(&format!("{}auth.basic", prefix))?;
-        let users: Vec<BasicAuthUser> = basic_auth_str
-            .split(',')
-            .filter_map(|entry| {
-                let parts: Vec<&str> = entry.trim().splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    Some(BasicAuthUser {
-                        username: parts[0].to_string(),
-                        password_hash: parts[1].to_string(),
-                    })
-                } else {
-                    warn!("Invalid basic auth format: {}", entry);
-                    None
-                }
-            })
-            .collect();
-
-        if users.is_empty() {
-            None
-        } else {
-            Some(AuthConfig { basic: Some(users) })
-        }
-    }
-
-    /// Headers that must not be injected from Docker labels to prevent
-    /// request smuggling, SSRF, and host header attacks.
-    const BLOCKED_HEADERS: &[&str] = &[
-        "host",
-        "transfer-encoding",
-        "content-length",
-        "connection",
-        "upgrade",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-proto",
-        "x-real-ip",
-        "forwarded",
-        "cookie",
-        "authorization",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-    ];
-
-    fn parse_header_labels(
-        &self,
-        labels: &HashMap<String, String>,
-        prefix: &str,
-    ) -> Vec<crate::model::HeaderConfig> {
-        let header_prefix = format!("{}headers.", prefix);
-        let mut headers = Vec::new();
-
-        for (key, value) in labels {
-            let Some(remainder) = key.strip_prefix(&header_prefix) else {
-                continue;
-            };
-
-            let (direction, header_name) = if let Some(name) = remainder.strip_prefix("response.") {
-                (crate::model::HeaderDirection::Response, name)
-            } else if let Some(name) = remainder.strip_prefix("both.") {
-                (crate::model::HeaderDirection::Both, name)
-            } else {
-                (crate::model::HeaderDirection::Request, remainder)
-            };
-
-            if Self::BLOCKED_HEADERS
-                .iter()
-                .any(|blocked| blocked.eq_ignore_ascii_case(header_name))
-            {
-                warn!(
-                    "Ignoring blocked header '{}' from Docker label",
-                    header_name
-                );
-                continue;
-            }
-
-            headers.push(crate::model::HeaderConfig {
-                name: header_name.to_string(),
-                value: value.clone(),
-                direction,
-            });
-        }
-
-        headers
-    }
-
-    async fn get_container_ip(&self, container_id: &str) -> Option<String> {
+        container_id: &str,
+    ) -> Result<Option<Candidate>, bollard::errors::Error> {
         let container = self
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
-            .await
-            .ok()?;
+            .await?;
 
-        let preferred_network = container
-            .config
-            .as_ref()
-            .and_then(|config| config.labels.as_ref())
-            .and_then(|labels| labels.get("sozune.network"))
-            .map(|network| network.clone());
+        let display_name = container
+            .name
+            .clone()
+            .map(|n| n.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| container_id.to_string());
 
-        if let Some(network_settings) = container.network_settings {
-            if let Some(networks) = network_settings.networks {
-                // If a preferred network is specified, use it
-                if let Some(preferred) = &preferred_network {
-                    if let Some(network) = networks.get(preferred) {
-                        if let Some(ip) = &network.ip_address {
-                            if !ip.is_empty() {
-                                return Some(ip.clone());
-                            }
-                        }
-                    }
-                }
+        let Some(config) = container.config else {
+            return Ok(None);
+        };
+        let Some(labels) = config.labels else {
+            return Ok(None);
+        };
 
-                // Fallback: take the first IP found in networks
-                for (_, network) in networks {
-                    if let Some(ip) = network.ip_address {
-                        if !ip.is_empty() {
-                            return Some(ip);
-                        }
-                    }
-                }
-            }
+        let networks = container
+            .network_settings
+            .and_then(|s| s.networks)
+            .map(|nets| {
+                nets.into_iter()
+                    .map(|(name, n)| NetworkInfo {
+                        name,
+                        ip: n.ip_address.filter(|ip| !ip.is_empty()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(Candidate {
+            provider: "docker",
+            id: container_id.to_string(),
+            display_name,
+            labels,
+            networks,
+            enabled_default: self.config.expose_by_default,
+        }))
+    }
+
+    /// Build a `Candidate` from labels already obtained via list_containers
+    /// (which omits network_settings). Caller supplies `networks` separately.
+    fn build_candidate(
+        &self,
+        container_id: String,
+        labels: HashMap<String, String>,
+        networks: Vec<NetworkInfo>,
+    ) -> Candidate {
+        Candidate {
+            provider: "docker",
+            display_name: container_id.clone(),
+            id: container_id,
+            labels,
+            networks,
+            enabled_default: self.config.expose_by_default,
         }
+    }
 
-        None
+    /// Fetch network information for a container via inspect.
+    async fn extract_networks(&self, container_id: &str) -> Vec<NetworkInfo> {
+        let container = match self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    "Could not inspect container {} for networks: {}",
+                    container_id, e
+                );
+                return Vec::new();
+            }
+        };
+
+        container
+            .network_settings
+            .and_then(|s| s.networks)
+            .map(|nets| {
+                nets.into_iter()
+                    .map(|(name, n)| NetworkInfo {
+                        name,
+                        ip: n.ip_address.filter(|ip| !ip.is_empty()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolve a container's backend IP using the shared label parser.
+    /// Used by the event listener to track backends for cleanup on stop.
+    async fn get_container_ip(&self, container_id: &str) -> Option<String> {
+        let candidate = self.inspect_to_candidate(container_id).await.ok().flatten()?;
+        let mut throwaway = Vec::new();
+        let ip = labels::network::resolve_ip(&candidate, &mut throwaway);
+        if ip == "127.0.0.1" { None } else { Some(ip) }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn create_test_labels() -> HashMap<String, String> {
-        let mut labels = HashMap::new();
-        labels.insert("sozune.enable".to_string(), "true".to_string());
-
-        // Web service HTTP
-        labels.insert(
-            "sozune.http.web.host".to_string(),
-            "example.com,www.example.com".to_string(),
-        );
-        labels.insert("sozune.http.web.port".to_string(), "8080".to_string());
-        labels.insert("sozune.http.web.prefix".to_string(), "/api".to_string());
-        labels.insert("sozune.http.web.tls".to_string(), "true".to_string());
-        labels.insert(
-            "sozune.http.web.stripPrefix".to_string(),
-            "false".to_string(),
-        );
-        labels.insert("sozune.http.web.priority".to_string(), "10".to_string());
-        labels.insert(
-            "sozune.http.web.auth.basic".to_string(),
-            "admin:$2b$10$hash1,user:$2b$10$hash2".to_string(),
-        );
-        labels.insert(
-            "sozune.http.web.headers.X-Custom-Header".to_string(),
-            "custom-value".to_string(),
-        );
-
-        // API service HTTP
-        labels.insert(
-            "sozune.http.api.host".to_string(),
-            "api.example.com".to_string(),
-        );
-        labels.insert("sozune.http.api.port".to_string(), "3000".to_string());
-        labels.insert("sozune.http.api.path".to_string(), "/exact".to_string());
-
-        // TCP service
-        labels.insert(
-            "sozune.tcp.db.host".to_string(),
-            "db.example.com".to_string(),
-        );
-        labels.insert("sozune.tcp.db.port".to_string(), "5432".to_string());
-
-        labels
-    }
-
-    #[test]
-    fn test_parse_protocol_labels() {
-        let provider = DockerProvider {
-            docker: Docker::connect_with_local_defaults().unwrap(),
-            config: Default::default(),
-            container_ips: std::sync::Mutex::new(HashMap::new()),
-        };
-        let labels = create_test_labels();
-        let container_ip = "192.168.1.100";
-
-        // Test parsing HTTP labels
-        let http_entrypoints = provider.parse_protocol_labels(&labels, "http", container_ip);
-
-        // Should have 2 HTTP services: web and api
-        assert_eq!(http_entrypoints.len(), 2);
-
-        // Test web service
-        let web_entrypoint = http_entrypoints.get("http_web").unwrap();
-        assert_eq!(web_entrypoint.name, "web");
-        assert!(matches!(web_entrypoint.protocol, Protocol::Http));
-        assert_eq!(
-            web_entrypoint.config.hostnames,
-            vec!["example.com", "www.example.com"]
-        );
-        assert_eq!(web_entrypoint.config.port, 8080);
-        assert_eq!(web_entrypoint.config.tls, true);
-        assert_eq!(web_entrypoint.config.strip_prefix, false);
-        assert_eq!(web_entrypoint.config.priority, 10);
-
-        let path_config = web_entrypoint.config.path.as_ref().unwrap();
-        assert_eq!(path_config.value, "/api");
-        assert!(matches!(path_config.rule_type, PathRuleType::Prefix));
-
-        let auth = web_entrypoint.config.auth.as_ref().unwrap();
-        let basic_users = auth.basic.as_ref().unwrap();
-        assert_eq!(basic_users.len(), 2);
-        assert_eq!(basic_users[0].username, "admin");
-        assert_eq!(basic_users[0].password_hash, "$2b$10$hash1");
-
-        let custom_header = web_entrypoint
-            .config
-            .headers
-            .iter()
-            .find(|h| h.name == "X-Custom-Header")
-            .expect("X-Custom-Header should be parsed");
-        assert_eq!(custom_header.value, "custom-value");
-        assert_eq!(custom_header.direction, crate::model::HeaderDirection::Request);
-
-        // Test api service
-        let api_entrypoint = http_entrypoints.get("http_api").unwrap();
-        assert_eq!(api_entrypoint.name, "api");
-        assert_eq!(api_entrypoint.config.hostnames, vec!["api.example.com"]);
-        assert_eq!(api_entrypoint.config.port, 3000);
-
-        let path_config = api_entrypoint.config.path.as_ref().unwrap();
-        assert_eq!(path_config.value, "/exact");
-        assert!(matches!(path_config.rule_type, PathRuleType::Prefix));
-    }
-
-    #[test]
-    fn test_parse_tcp_labels() {
-        let provider = DockerProvider {
-            docker: Docker::connect_with_local_defaults().unwrap(),
-            config: Default::default(),
-            container_ips: std::sync::Mutex::new(HashMap::new()),
-        };
-        let labels = create_test_labels();
-        let container_ip = "192.168.1.100";
-
-        // Test parsing TCP labels
-        let tcp_entrypoints = provider.parse_protocol_labels(&labels, "tcp", container_ip);
-
-        // Should have 1 TCP service: db
-        assert_eq!(tcp_entrypoints.len(), 1);
-
-        let db_entrypoint = tcp_entrypoints.get("tcp_db").unwrap();
-        assert_eq!(db_entrypoint.name, "db");
-        assert!(matches!(db_entrypoint.protocol, Protocol::Tcp));
-        assert_eq!(db_entrypoint.config.hostnames, vec!["db.example.com"]);
-        assert_eq!(db_entrypoint.config.port, 5432);
-        assert_eq!(db_entrypoint.config.path, None);
-    }
-
-    #[test]
-    fn test_parse_auth_labels() {
-        let provider = DockerProvider {
-            docker: Docker::connect_with_local_defaults().unwrap(),
-            config: Default::default(),
-            container_ips: std::sync::Mutex::new(HashMap::new()),
-        };
-        let labels = create_test_labels();
-
-        let auth = provider.parse_auth_labels(&labels, "sozune.http.web.");
-        assert!(auth.is_some());
-
-        let auth = auth.unwrap();
-        let basic_users = auth.basic.unwrap();
-        assert_eq!(basic_users.len(), 2);
-        assert_eq!(basic_users[0].username, "admin");
-        assert_eq!(basic_users[1].username, "user");
-    }
-
-    #[test]
-    fn test_parse_header_labels() {
-        let provider = DockerProvider {
-            docker: Docker::connect_with_local_defaults().unwrap(),
-            config: Default::default(),
-            container_ips: std::sync::Mutex::new(HashMap::new()),
-        };
-        let labels = create_test_labels();
-
-        let headers = provider.parse_header_labels(&labels, "sozune.http.web.");
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].name, "X-Custom-Header");
-        assert_eq!(headers[0].value, "custom-value");
-        assert_eq!(headers[0].direction, crate::model::HeaderDirection::Request);
-    }
-
-    #[test]
-    fn test_disabled_container() {
-        let provider = DockerProvider {
-            docker: Docker::connect_with_local_defaults().unwrap(),
-            config: Default::default(),
-            container_ips: std::sync::Mutex::new(HashMap::new()),
-        };
-        let mut labels = HashMap::new();
-        labels.insert("sozune.enable".to_string(), "false".to_string());
-        labels.insert(
-            "sozune.http.web.host".to_string(),
-            "example.com".to_string(),
-        );
-
-        let entrypoints = provider.parse_protocol_labels(&labels, "http", "192.168.1.100");
-        assert_eq!(entrypoints.len(), 1);
-
-        // Enable check is done upstream in get_entrypoints_from_containers
-        assert_eq!(
-            labels.get("sozune.enable").map_or(false, |v| v == "true"),
-            false
-        );
-    }
-
-    #[test]
-    fn test_missing_host_label() {
-        let provider = DockerProvider {
-            docker: Docker::connect_with_local_defaults().unwrap(),
-            config: Default::default(),
-            container_ips: std::sync::Mutex::new(HashMap::new()),
-        };
-        let mut labels = HashMap::new();
-        labels.insert("sozune.enable".to_string(), "true".to_string());
-        labels.insert("sozune.http.web.port".to_string(), "8080".to_string());
-
-        let entrypoints = provider.parse_protocol_labels(&labels, "http", "192.168.1.100");
-        assert_eq!(entrypoints.len(), 0);
+/// Emit each diagnostic at the appropriate tracing level so the runtime logs
+/// match what `sozune validate` would report.
+fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
+    for d in diagnostics {
+        let target = format!("{}/{}", candidate.provider, candidate.display_name);
+        match d.severity() {
+            Severity::Error => error!(
+                "[{}] {}: {} (label={})",
+                target,
+                d.code.as_str(),
+                d.message,
+                d.label.as_deref().unwrap_or("-")
+            ),
+            Severity::Warn => warn!(
+                "[{}] {}: {} (label={}, value={:?})",
+                target,
+                d.code.as_str(),
+                d.message,
+                d.label.as_deref().unwrap_or("-"),
+                d.value.as_deref().unwrap_or("")
+            ),
+            Severity::Info => debug!(
+                "[{}] {}: {}",
+                target,
+                d.code.as_str(),
+                d.message
+            ),
+        }
     }
 }
+
