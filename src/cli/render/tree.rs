@@ -128,12 +128,7 @@ fn format_route(ep: &Entrypoint) -> String {
         Protocol::Udp => "udp",
     };
     let host = ep.config.hostnames.first().cloned().unwrap_or_default();
-    let path_str = ep
-        .config
-        .path
-        .as_ref()
-        .map(format_path)
-        .unwrap_or_default();
+    let path_str = ep.config.path.as_ref().map(format_path).unwrap_or_default();
     let backends = ep.backends.join(", ");
     format!(
         "{}://{}:{}{}  →  {}",
@@ -235,10 +230,7 @@ mod tests {
         let c = candidate(
             "docker",
             "broken",
-            &[
-                ("sozune.enable", "true"),
-                ("sozune.http.web.port", "8080"),
-            ],
+            &[("sozune.enable", "true"), ("sozune.http.web.port", "8080")],
         );
         let report = ValidationReport {
             candidates: vec![report_for(c)],

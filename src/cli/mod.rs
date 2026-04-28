@@ -5,7 +5,11 @@ pub mod report;
 pub mod validate;
 
 #[derive(Parser, Debug)]
-#[command(name = "sozune", version, about = "Container-native HTTP/TCP/UDP proxy")]
+#[command(
+    name = "sozune",
+    version,
+    about = "Container-native HTTP/TCP/UDP proxy"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

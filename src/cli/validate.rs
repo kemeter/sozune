@@ -25,30 +25,6 @@ pub struct ValidateArgs {
     /// Minimum diagnostic severity to display.
     #[arg(long, value_enum, default_value_t = SeverityFilter::Warn)]
     pub severity: SeverityFilter,
-
-    /// Render output as a table with diagnostics inline as sub-rows.
-    #[arg(long, conflicts_with_all = ["summary", "flat", "json"])]
-    pub table: bool,
-
-    /// One-line-per-candidate dense summary (codes only).
-    #[arg(long, conflicts_with_all = ["table", "flat", "json"])]
-    pub summary: bool,
-
-    /// Card per candidate with horizontal rules.
-    #[arg(long, conflicts_with_all = ["table", "summary", "json"])]
-    pub flat: bool,
-
-    /// Machine-readable JSON output for CI / scripts.
-    #[arg(long, conflicts_with_all = ["table", "summary", "flat"])]
-    pub json: bool,
-
-    /// Re-validate on provider events (Docker events, file changes).
-    #[arg(long)]
-    pub watch: bool,
-
-    /// Print documentation for a diagnostic code (e.g. W009) and exit.
-    #[arg(long, value_name = "CODE")]
-    pub explain: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -69,11 +45,6 @@ impl SeverityFilter {
 }
 
 pub async fn run(args: ValidateArgs) -> anyhow::Result<i32> {
-    if let Some(code) = &args.explain {
-        eprintln!("--explain {code}: not yet implemented");
-        return Ok(2);
-    }
-
     let config = load_config().await?;
     let candidates = collect_candidates(&config, args.provider.as_deref()).await?;
     let mut report = build_report(candidates);
@@ -84,9 +55,7 @@ pub async fn run(args: ValidateArgs) -> anyhow::Result<i32> {
             .retain(|c| c.id == *id || c.display_name == *id);
     }
     if args.only_skipped {
-        report
-            .candidates
-            .retain(|c| c.status == Status::Skipped);
+        report.candidates.retain(|c| c.status == Status::Skipped);
     }
 
     let min_severity = args.severity.to_severity();
@@ -97,8 +66,7 @@ pub async fn run(args: ValidateArgs) -> anyhow::Result<i32> {
 }
 
 async fn load_config() -> anyhow::Result<AppConfig> {
-    let config_path =
-        std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
 
     if !tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
         return Ok(AppConfig::default());
@@ -143,7 +111,11 @@ fn build_report(candidates: Vec<Candidate>) -> ValidationReport {
 }
 
 fn exit_code(report: &ValidationReport) -> i32 {
-    if report.candidates.iter().any(|c| c.status == Status::Skipped) {
+    if report
+        .candidates
+        .iter()
+        .any(|c| c.status == Status::Skipped)
+    {
         1
     } else {
         0
