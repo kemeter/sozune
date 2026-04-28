@@ -1,6 +1,7 @@
 use crate::config::DockerConfig;
 use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
+use crate::labels::source::LabelSource;
 use crate::labels::{self};
 use crate::model::Entrypoint;
 use crate::provider::Provider;
@@ -35,6 +36,34 @@ impl Provider for DockerProvider {
 
     fn name(&self) -> &'static str {
         "docker"
+    }
+}
+
+#[async_trait]
+impl LabelSource for DockerProvider {
+    fn provider_name(&self) -> &'static str {
+        "docker"
+    }
+
+    async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: false,
+                ..Default::default()
+            }))
+            .await?;
+
+        let mut candidates = Vec::with_capacity(containers.len());
+        for container in containers {
+            let Some(labels) = container.labels else {
+                continue;
+            };
+            let id = container.id.unwrap_or_default();
+            let networks = self.extract_networks(&id).await;
+            candidates.push(self.build_candidate(id, labels, networks));
+        }
+        Ok(candidates)
     }
 }
 

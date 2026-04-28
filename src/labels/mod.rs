@@ -13,7 +13,9 @@ pub mod diagnostic;
 pub mod fields;
 pub mod network;
 pub mod parser;
+pub mod source;
 
 pub use candidate::{Candidate, NetworkInfo};
 pub use diagnostic::{Diagnostic, DiagnosticCode, ParseResult, Severity};
 pub use parser::parse;
+pub use source::LabelSource;
