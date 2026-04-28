@@ -11,6 +11,7 @@
 pub mod candidate;
 pub mod diagnostic;
 pub mod fields;
+pub mod network;
 pub mod parser;
 
 pub use candidate::{Candidate, NetworkInfo};
