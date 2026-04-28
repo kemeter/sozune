@@ -52,6 +52,66 @@ fn default_port_for(protocol: &str) -> u16 {
     }
 }
 
+/// Parse the priority label. Defaults to 0 when absent. Non-numeric values
+/// emit `W002` and also fall back to 0.
+pub fn parse_priority(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> i32 {
+    let key = format!("{prefix}priority");
+    match labels.get(&key) {
+        None => 0,
+        Some(raw) => match raw.parse::<i32>() {
+            Ok(p) => p,
+            Err(_) => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W002InvalidPriority,
+                        "priority is not a valid integer, defaulting to 0",
+                    )
+                    .with_label(&key)
+                    .with_value(raw),
+                );
+                0
+            }
+        },
+    }
+}
+
+/// Parse the backendTimeout label (milliseconds). Returns `None` when absent
+/// or invalid; non-numeric values emit `W003`.
+pub fn parse_backend_timeout(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<u64> {
+    let key = format!("{prefix}backendTimeout");
+    let raw = labels.get(&key)?;
+    match raw.parse::<u64>() {
+        Ok(t) => Some(t),
+        Err(_) => {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W003InvalidTimeout,
+                    "backendTimeout is not a valid integer, no timeout applied",
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint("expected milliseconds as a positive integer"),
+            );
+            None
+        }
+    }
+}
+
+/// Parse a boolean label. Treats `"true"` (case-sensitive) as true, anything
+/// else as false. No diagnostic — matches existing `map_or(false, |v| v == "true")`
+/// semantics.
+pub fn parse_bool(labels: &HashMap<String, String>, key: &str) -> bool {
+    labels.get(key).is_some_and(|v| v == "true")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +187,82 @@ mod tests {
         );
         assert_eq!(port, 80);
         assert_eq!(diags[0].code, DiagnosticCode::W001InvalidPort);
+    }
+
+    #[test]
+    fn priority_defaults_to_zero_when_absent() {
+        let mut diags = Vec::new();
+        assert_eq!(parse_priority(&labels(&[]), "sozune.http.web.", &mut diags), 0);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn priority_parses_valid_int() {
+        let mut diags = Vec::new();
+        assert_eq!(
+            parse_priority(
+                &labels(&[("sozune.http.web.priority", "10")]),
+                "sozune.http.web.",
+                &mut diags,
+            ),
+            10,
+        );
+    }
+
+    #[test]
+    fn priority_invalid_emits_w002() {
+        let mut diags = Vec::new();
+        let p = parse_priority(
+            &labels(&[("sozune.http.web.priority", "high")]),
+            "sozune.http.web.",
+            &mut diags,
+        );
+        assert_eq!(p, 0);
+        assert_eq!(diags[0].code, DiagnosticCode::W002InvalidPriority);
+    }
+
+    #[test]
+    fn timeout_returns_none_when_absent() {
+        let mut diags = Vec::new();
+        assert_eq!(
+            parse_backend_timeout(&labels(&[]), "sozune.http.web.", &mut diags),
+            None,
+        );
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn timeout_parses_valid_value() {
+        let mut diags = Vec::new();
+        assert_eq!(
+            parse_backend_timeout(
+                &labels(&[("sozune.http.web.backendTimeout", "5000")]),
+                "sozune.http.web.",
+                &mut diags,
+            ),
+            Some(5000),
+        );
+    }
+
+    #[test]
+    fn timeout_invalid_emits_w003() {
+        let mut diags = Vec::new();
+        let t = parse_backend_timeout(
+            &labels(&[("sozune.http.web.backendTimeout", "soon")]),
+            "sozune.http.web.",
+            &mut diags,
+        );
+        assert_eq!(t, None);
+        assert_eq!(diags[0].code, DiagnosticCode::W003InvalidTimeout);
+    }
+
+    #[test]
+    fn bool_true_only_for_literal_true() {
+        let l = labels(&[("a", "true"), ("b", "True"), ("c", "1"), ("d", "false")]);
+        assert!(parse_bool(&l, "a"));
+        assert!(!parse_bool(&l, "b"));
+        assert!(!parse_bool(&l, "c"));
+        assert!(!parse_bool(&l, "d"));
+        assert!(!parse_bool(&l, "missing"));
     }
 }
