@@ -30,6 +30,16 @@ pub struct EntrypointConfig {
     pub strip_prefix: bool,
     #[serde(default)]
     pub https_redirect: bool,
+    #[serde(default)]
+    pub https_redirect_port: Option<u16>,
+    #[serde(default)]
+    pub redirect: Option<RedirectPolicy>,
+    #[serde(default)]
+    pub redirect_scheme: Option<RedirectScheme>,
+    #[serde(default)]
+    pub redirect_template: Option<String>,
+    #[serde(default)]
+    pub www_authenticate: Option<String>,
     pub priority: i32,
     pub auth: Option<AuthConfig>,
     pub headers: HashMap<String, String>,
@@ -41,6 +51,22 @@ pub struct EntrypointConfig {
     pub sticky_session: bool,
     #[serde(default)]
     pub compress: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RedirectPolicy {
+    Forward,
+    Permanent,
+    Unauthorized,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RedirectScheme {
+    UseSame,
+    UseHttp,
+    UseHttps,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

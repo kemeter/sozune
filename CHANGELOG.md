@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-04-28
+
+### Native middleware migration
+
+The `headers`, `auth`, and `strip_prefix` middlewares no longer pass through the internal Axum proxy — they are configured directly on the Sozu cluster/frontend, removing one network hop.
+
+- **Headers**: `RequestHttpFrontend.headers` (request-side) replaces `headers::inject_headers`. Empty header value performs a delete (HAProxy parity).
+- **Basic auth**: `Cluster.authorized_hashes` + `RequestHttpFrontend.required_auth` replace the Axum `auth::check_basic_auth` chain.
+- **Strip prefix**: `RequestHttpFrontend.rewrite_path` replaces `strip_prefix::strip`. `Prefix` paths use `$PATH[1]`, `Exact` paths use `/`. `Regex` paths are not auto-converted.
+- `needs_middleware()` no longer returns `true` for entrypoints that only use these three; they bypass the middleware proxy entirely.
+
+### Redirect & auth knobs
+
+New `EntrypointConfig` fields, parsed from Docker labels and passed through to Sozu:
+
+- `httpsRedirectPort` → `Cluster.https_redirect_port` (override the port used in `Location` headers when `httpsRedirect=true`)
+- `redirect` → `RequestHttpFrontend.redirect` (`forward` | `permanent` | `unauthorized`)
+- `redirectScheme` → `RequestHttpFrontend.redirect_scheme` (`use_same` | `use_http` | `use_https`)
+- `redirectTemplate` → `RequestHttpFrontend.redirect_template` (template with `%REDIRECT_LOCATION` / `%STATUS_CODE`)
+- `wwwAuthenticate` → `Cluster.www_authenticate` (realm in the 401 `WWW-Authenticate` header)
+
+### Breaking changes
+
+- **Basic auth password format**: `password_hash` (in `auth.basic` config and `sozune.http.<name>.auth.basic` Docker labels) must now be lowercase **hex(SHA-256)** of the password instead of bcrypt. Bcrypt is rejected by Sozu's native auth path. Generate hashes with `echo -n 'password' | sha256sum`. The `bcrypt` dependency has been removed.
+- `strip_prefix` no longer rejects partial-segment matches (e.g. `/apiv2` against prefix `/api`). The behavior now follows Sozu's `PathRule::Prefix` `starts_with` semantics. Use a trailing slash (`/api/`) or a regex path to enforce segment boundaries.
+
+### Internals
+
+- Middleware module slimmed down: `auth.rs`, `headers.rs`, `strip_prefix.rs` deleted (~340 LOC removed).
+- `MiddlewareRoute` now only carries `backends`, `backend_counter`, `backend_timeout`, `rate_limiter`, `compress`.
+
 ## [0.10.0] - 2026-04-07
 
 ### Load balancing

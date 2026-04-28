@@ -538,6 +538,42 @@ impl DockerProvider {
             .get(&format!("{}httpsRedirect", prefix))
             .map_or(false, |v| v == "true");
 
+        let https_redirect_port = labels
+            .get(&format!("{}httpsRedirectPort", prefix))
+            .and_then(|p| p.parse().ok());
+
+        let redirect = labels
+            .get(&format!("{}redirect", prefix))
+            .and_then(|v| match v.as_str() {
+                "forward" => Some(crate::model::RedirectPolicy::Forward),
+                "permanent" => Some(crate::model::RedirectPolicy::Permanent),
+                "unauthorized" => Some(crate::model::RedirectPolicy::Unauthorized),
+                _ => {
+                    warn!("Invalid redirect policy '{}', expected forward|permanent|unauthorized", v);
+                    None
+                }
+            });
+
+        let redirect_scheme = labels
+            .get(&format!("{}redirectScheme", prefix))
+            .and_then(|v| match v.as_str() {
+                "use_same" => Some(crate::model::RedirectScheme::UseSame),
+                "use_http" => Some(crate::model::RedirectScheme::UseHttp),
+                "use_https" => Some(crate::model::RedirectScheme::UseHttps),
+                _ => {
+                    warn!("Invalid redirect scheme '{}', expected use_same|use_http|use_https", v);
+                    None
+                }
+            });
+
+        let redirect_template = labels
+            .get(&format!("{}redirectTemplate", prefix))
+            .cloned();
+
+        let www_authenticate = labels
+            .get(&format!("{}wwwAuthenticate", prefix))
+            .cloned();
+
         let priority = labels
             .get(&format!("{}priority", prefix))
             .and_then(|p| p.parse().ok())
@@ -593,6 +629,11 @@ impl DockerProvider {
                 tls,
                 strip_prefix,
                 https_redirect,
+                https_redirect_port,
+                redirect,
+                redirect_scheme,
+                redirect_template,
+                www_authenticate,
                 priority,
                 auth,
                 headers,

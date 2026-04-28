@@ -7,9 +7,10 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, Header, HeaderPosition,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RemoveBackend, Request,
-        RequestHttpFrontend, ResponseStatus, RulePosition, SocketAddress, Status, TlsVersion,
-        WorkerRequest, WorkerResponse, request::RequestType,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RedirectPolicy as SozuRedirectPolicy,
+        RedirectScheme as SozuRedirectScheme, RemoveBackend, Request, RequestHttpFrontend,
+        ResponseStatus, RulePosition, SocketAddress, Status, TlsVersion, WorkerRequest,
+        WorkerResponse, request::RequestType,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -428,6 +429,22 @@ fn build_authorized_hashes(auth: &Option<crate::model::AuthConfig>) -> Vec<Strin
         .collect()
 }
 
+fn map_redirect_policy(policy: crate::model::RedirectPolicy) -> i32 {
+    match policy {
+        crate::model::RedirectPolicy::Forward => SozuRedirectPolicy::Forward as i32,
+        crate::model::RedirectPolicy::Permanent => SozuRedirectPolicy::Permanent as i32,
+        crate::model::RedirectPolicy::Unauthorized => SozuRedirectPolicy::Unauthorized as i32,
+    }
+}
+
+fn map_redirect_scheme(scheme: crate::model::RedirectScheme) -> i32 {
+    match scheme {
+        crate::model::RedirectScheme::UseSame => SozuRedirectScheme::UseSame as i32,
+        crate::model::RedirectScheme::UseHttp => SozuRedirectScheme::UseHttp as i32,
+        crate::model::RedirectScheme::UseHttps => SozuRedirectScheme::UseHttps as i32,
+    }
+}
+
 fn configure_http_entrypoint(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -454,6 +471,8 @@ fn configure_http_entrypoint(
         answer_503: None,
         http2: None,
         authorized_hashes,
+        https_redirect_port: entrypoint.config.https_redirect_port.map(|p| p as u32),
+        www_authenticate: entrypoint.config.www_authenticate.clone(),
         ..Default::default()
     };
 
@@ -514,6 +533,9 @@ fn configure_http_entrypoint(
         } else {
             None
         };
+        let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
+        let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
+        let frontend_redirect_template = entrypoint.config.redirect_template.clone();
 
         let http_front = RequestHttpFrontend {
             cluster_id: Some(cluster_id.to_string()),
@@ -526,6 +548,9 @@ fn configure_http_entrypoint(
             headers: frontend_headers.clone(),
             required_auth: frontend_required_auth,
             rewrite_path: frontend_rewrite_path.clone(),
+            redirect: frontend_redirect,
+            redirect_scheme: frontend_redirect_scheme,
+            redirect_template: frontend_redirect_template.clone(),
             ..Default::default()
         };
 
@@ -553,6 +578,9 @@ fn configure_http_entrypoint(
                 headers: frontend_headers.clone(),
                 required_auth: frontend_required_auth,
                 rewrite_path: frontend_rewrite_path.clone(),
+                redirect: frontend_redirect,
+                redirect_scheme: frontend_redirect_scheme,
+                redirect_template: frontend_redirect_template.clone(),
                 ..Default::default()
             };
 
