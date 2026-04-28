@@ -407,13 +407,17 @@ fn configure_sozu_routing(
     Ok(())
 }
 
-fn build_request_headers(custom: &HashMap<String, String>) -> Vec<Header> {
-    custom
+fn build_frontend_headers(edits: &[crate::model::HeaderConfig]) -> Vec<Header> {
+    edits
         .iter()
-        .map(|(key, val)| Header {
-            position: HeaderPosition::Request as i32,
-            key: key.clone(),
-            val: val.clone(),
+        .map(|edit| Header {
+            position: match edit.direction {
+                crate::model::HeaderDirection::Request => HeaderPosition::Request as i32,
+                crate::model::HeaderDirection::Response => HeaderPosition::Response as i32,
+                crate::model::HeaderDirection::Both => HeaderPosition::Both as i32,
+            },
+            key: edit.name.clone(),
+            val: edit.value.clone(),
         })
         .collect()
 }
@@ -592,7 +596,7 @@ fn configure_http_entrypoint(
             cluster_id,
         );
 
-        let frontend_headers = build_request_headers(&entrypoint.config.headers);
+        let frontend_headers = build_frontend_headers(&entrypoint.config.headers);
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();

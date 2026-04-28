@@ -42,7 +42,8 @@ pub struct EntrypointConfig {
     pub www_authenticate: Option<String>,
     pub priority: i32,
     pub auth: Option<AuthConfig>,
-    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub headers: Vec<HeaderConfig>,
     #[serde(default)]
     pub backend_timeout: Option<u64>,
     #[serde(default)]
@@ -51,6 +52,23 @@ pub struct EntrypointConfig {
     pub sticky_session: bool,
     #[serde(default)]
     pub compress: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct HeaderConfig {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub direction: HeaderDirection,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderDirection {
+    #[default]
+    Request,
+    Response,
+    Both,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]

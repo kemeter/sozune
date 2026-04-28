@@ -32,7 +32,9 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | Label | Reference |
 |---|---|
 | `sozune.http.<svc>.auth.basic` | [Basic auth](/documentation/middleware/auth) |
-| `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/middleware/headers) |
+| `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/middleware/headers) — request-side by default |
+| `sozune.http.<svc>.headers.response.<name>` | [Custom headers](/documentation/middleware/headers) — response-side |
+| `sozune.http.<svc>.headers.both.<name>` | [Custom headers](/documentation/middleware/headers) — both directions |
 | `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/middleware/strip-prefix) |
 | `sozune.http.<svc>.httpsRedirect` | [Redirects](/documentation/middleware/redirects) |
 | `sozune.http.<svc>.httpsRedirectPort` | [Redirects](/documentation/middleware/redirects) |

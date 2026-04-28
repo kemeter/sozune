@@ -93,6 +93,30 @@ services:
       - "sozune.http.svcheaders.headers.X-Custom-Test=hello-sozune"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-headers-response:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcheadresp.host=$HOST_HEADERS_RESPONSE"
+      - "sozune.http.svcheadresp.headers.response.X-Powered-By=sozune"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-headers-both:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcheadboth.host=$HOST_HEADERS_BOTH"
+      - "sozune.http.svcheadboth.headers.both.X-Trace=tracevalue"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-headers-delete:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcheaddel.host=$HOST_HEADERS_DELETE"
+      - "sozune.http.svcheaddel.headers.User-Agent="
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-strip:
     image: traefik/whoami
     labels:

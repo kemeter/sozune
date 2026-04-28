@@ -40,6 +40,44 @@ else
     fail "custom header X-Custom-Test NOT found in backend response"
 fi
 
+log "[02] Middleware: response-side header injection"
+
+response_headers=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_HEADERS_RESPONSE" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
+if echo "$response_headers" | grep -qi "^X-Powered-By: sozune"; then
+    pass "response header X-Powered-By added to client response"
+else
+    fail "response header X-Powered-By NOT found in client response"
+fi
+
+both_body=$(curl -s -D /tmp/sozune-both-headers --max-time 2 \
+    -H "Host: $HOST_HEADERS_BOTH" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
+if grep -qi "^X-Trace: tracevalue" /tmp/sozune-both-headers 2>/dev/null; then
+    pass "both-direction header X-Trace visible in client response"
+else
+    fail "both-direction header X-Trace NOT found in client response"
+fi
+if printf '%s\n' "$both_body" | grep -qi "^X-Trace: tracevalue"; then
+    pass "both-direction header X-Trace also forwarded to backend"
+else
+    fail "both-direction header X-Trace NOT forwarded to backend"
+fi
+rm -f /tmp/sozune-both-headers
+
+log "[02] Middleware: header delete"
+
+delete_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_HEADERS_DELETE" \
+    -H "User-Agent: should-be-deleted/1.0" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
+if echo "$delete_body" | grep -qi "User-Agent: should-be-deleted"; then
+    fail "header delete: User-Agent leaked through to backend"
+else
+    pass "header delete: User-Agent removed before reaching backend"
+fi
+
 log "[02] Middleware: strip prefix"
 
 strip_body=$(curl -s --max-time 2 \

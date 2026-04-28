@@ -700,24 +700,39 @@ impl DockerProvider {
         &self,
         labels: &HashMap<String, String>,
         prefix: &str,
-    ) -> HashMap<String, String> {
+    ) -> Vec<crate::model::HeaderConfig> {
         let header_prefix = format!("{}headers.", prefix);
-        let mut headers = HashMap::new();
+        let mut headers = Vec::new();
 
         for (key, value) in labels {
-            if let Some(header_name) = key.strip_prefix(&header_prefix) {
-                if Self::BLOCKED_HEADERS
-                    .iter()
-                    .any(|blocked| blocked.eq_ignore_ascii_case(header_name))
-                {
-                    warn!(
-                        "Ignoring blocked header '{}' from Docker label",
-                        header_name
-                    );
-                    continue;
-                }
-                headers.insert(header_name.to_string(), value.clone());
+            let Some(remainder) = key.strip_prefix(&header_prefix) else {
+                continue;
+            };
+
+            let (direction, header_name) = if let Some(name) = remainder.strip_prefix("response.") {
+                (crate::model::HeaderDirection::Response, name)
+            } else if let Some(name) = remainder.strip_prefix("both.") {
+                (crate::model::HeaderDirection::Both, name)
+            } else {
+                (crate::model::HeaderDirection::Request, remainder)
+            };
+
+            if Self::BLOCKED_HEADERS
+                .iter()
+                .any(|blocked| blocked.eq_ignore_ascii_case(header_name))
+            {
+                warn!(
+                    "Ignoring blocked header '{}' from Docker label",
+                    header_name
+                );
+                continue;
             }
+
+            headers.push(crate::model::HeaderConfig {
+                name: header_name.to_string(),
+                value: value.clone(),
+                direction,
+            });
         }
 
         headers
@@ -853,14 +868,14 @@ mod tests {
         assert_eq!(basic_users[0].username, "admin");
         assert_eq!(basic_users[0].password_hash, "$2b$10$hash1");
 
-        assert_eq!(
-            web_entrypoint
-                .config
-                .headers
-                .get("X-Custom-Header")
-                .unwrap(),
-            "custom-value"
-        );
+        let custom_header = web_entrypoint
+            .config
+            .headers
+            .iter()
+            .find(|h| h.name == "X-Custom-Header")
+            .expect("X-Custom-Header should be parsed");
+        assert_eq!(custom_header.value, "custom-value");
+        assert_eq!(custom_header.direction, crate::model::HeaderDirection::Request);
 
         // Test api service
         let api_entrypoint = http_entrypoints.get("http_api").unwrap();
@@ -927,7 +942,9 @@ mod tests {
 
         let headers = provider.parse_header_labels(&labels, "sozune.http.web.");
         assert_eq!(headers.len(), 1);
-        assert_eq!(headers.get("X-Custom-Header").unwrap(), "custom-value");
+        assert_eq!(headers[0].name, "X-Custom-Header");
+        assert_eq!(headers[0].value, "custom-value");
+        assert_eq!(headers[0].direction, crate::model::HeaderDirection::Request);
     }
 
     #[test]

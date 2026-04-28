@@ -141,7 +141,7 @@ mod tests {
                     www_authenticate: None,
                     priority: 0,
                     auth: None,
-                    headers: HashMap::new(),
+                    headers: Vec::new(),
                     backend_timeout: None,
                     rate_limit: None,
                     sticky_session: false,

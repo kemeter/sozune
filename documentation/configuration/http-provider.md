@@ -42,7 +42,7 @@ A JSON array of entrypoints with the same schema as the [REST API](/documentatio
       "redirect_template": null,
       "www_authenticate": null,
       "priority": 0,
-      "headers": {},
+      "headers": [],
       "auth": null,
       "backend_timeout": null,
       "rate_limit": null,

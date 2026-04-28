@@ -384,7 +384,7 @@ mod tests {
                 "https_redirect": false,
                 "priority": 0,
                 "auth": null,
-                "headers": {}
+                "headers": []
             }
         })
     }
@@ -596,7 +596,7 @@ mod tests {
                         www_authenticate: None,
                         priority: 0,
                         auth: None,
-                        headers: std::collections::HashMap::new(),
+                        headers: Vec::new(),
                         backend_timeout: None,
                         rate_limit: None,
                         sticky_session: false,

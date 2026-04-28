@@ -13,6 +13,15 @@ The `headers`, `auth`, and `strip_prefix` middlewares no longer pass through the
 - **Strip prefix**: `RequestHttpFrontend.rewrite_path` replaces `strip_prefix::strip`. `Prefix` paths use `$PATH[1]`, `Exact` paths use `/`. `Regex` paths are not auto-converted.
 - `needs_middleware()` no longer returns `true` for entrypoints that only use these three; they bypass the middleware proxy entirely.
 
+### Header direction & deletion
+
+The `headers.*` Docker label gains support for response-side and bidirectional edits, plus deletion via empty value:
+
+- `headers.<name>=<value>` — request-side (default, unchanged)
+- `headers.response.<name>=<value>` — response-side
+- `headers.both.<name>=<value>` — both directions
+- `headers.<name>=` (empty value) — deletes the header (HAProxy `del-header` parity)
+
 ### Redirect & auth knobs
 
 New `EntrypointConfig` fields, parsed from Docker labels and passed through to Sozu:
@@ -27,6 +36,7 @@ New `EntrypointConfig` fields, parsed from Docker labels and passed through to S
 
 - **Basic auth password format**: `password_hash` (in `auth.basic` config and `sozune.http.<name>.auth.basic` Docker labels) must now be lowercase **hex(SHA-256)** of the password instead of bcrypt. Bcrypt is rejected by Sozu's native auth path. Generate hashes with `echo -n 'password' | sha256sum`. The `bcrypt` dependency has been removed.
 - `strip_prefix` no longer rejects partial-segment matches (e.g. `/apiv2` against prefix `/api`). The behavior now follows Sozu's `PathRule::Prefix` `starts_with` semantics. Use a trailing slash (`/api/`) or a regex path to enforce segment boundaries.
+- **`headers` field schema**: `EntrypointConfig.headers` changed from `HashMap<String, String>` to `Vec<HeaderConfig>` where `HeaderConfig = { name, value, direction }`. The HTTP provider JSON and REST API payloads must use an array (`"headers": []`) instead of an object (`"headers": {}`).
 
 ### Internals
 
