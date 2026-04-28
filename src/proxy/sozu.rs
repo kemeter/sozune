@@ -304,11 +304,10 @@ fn update_middleware_routes(
             let route =
                 middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
             debug!(
-                "Middleware route for {} (hosts: {:?}): strip_prefix={:?}, auth={}",
+                "Middleware route for {} (hosts: {:?}): strip_prefix={:?}",
                 cluster_id,
                 entrypoint.config.hostnames,
                 route.strip_prefix,
-                route.auth.is_some(),
             );
             table.update_routes_for_entrypoint(&entrypoint.config.hostnames, route);
         }
@@ -415,6 +414,19 @@ fn build_request_headers(custom: &HashMap<String, String>) -> Vec<Header> {
         .collect()
 }
 
+fn build_authorized_hashes(auth: &Option<crate::model::AuthConfig>) -> Vec<String> {
+    let Some(cfg) = auth else {
+        return Vec::new();
+    };
+    let Some(ref users) = cfg.basic else {
+        return Vec::new();
+    };
+    users
+        .iter()
+        .map(|u| format!("{}:{}", u.username, u.password_hash))
+        .collect()
+}
+
 fn configure_http_entrypoint(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -425,6 +437,12 @@ fn configure_http_entrypoint(
     middleware_port: u16,
 ) -> anyhow::Result<()> {
     // Add cluster for both HTTP and HTTPS
+    let authorized_hashes = build_authorized_hashes(&entrypoint.config.auth);
+    let frontend_required_auth = if authorized_hashes.is_empty() {
+        None
+    } else {
+        Some(true)
+    };
     let cluster = Cluster {
         cluster_id: cluster_id.to_string(),
         sticky_session: entrypoint.config.sticky_session,
@@ -434,6 +452,7 @@ fn configure_http_entrypoint(
         load_metric: None,
         answer_503: None,
         http2: None,
+        authorized_hashes,
         ..Default::default()
     };
 
@@ -488,6 +507,7 @@ fn configure_http_entrypoint(
             position: RulePosition::Pre as i32,
             tags: BTreeMap::new(),
             headers: frontend_headers.clone(),
+            required_auth: frontend_required_auth,
             ..Default::default()
         };
 
@@ -513,6 +533,7 @@ fn configure_http_entrypoint(
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
                 headers: frontend_headers.clone(),
+                required_auth: frontend_required_auth,
                 ..Default::default()
             };
 

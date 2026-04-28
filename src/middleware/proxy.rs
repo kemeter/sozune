@@ -8,7 +8,6 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use super::MiddlewareAppState;
-use super::auth;
 use super::compress;
 use super::rate_limit::RateLimitResult;
 use super::strip_prefix;
@@ -64,7 +63,7 @@ pub async fn handle_proxy(
         }
     };
 
-    // 1. Rate limit check (before auth to save CPU on bcrypt)
+    // 1. Rate limit check
     if let Some(ref limiter) = route.rate_limiter {
         let source_ip = req
             .headers()
@@ -80,14 +79,7 @@ pub async fn handle_proxy(
         }
     }
 
-    // 2. Basic auth check
-    if let Some(ref users) = route.auth {
-        if let Err(response) = auth::check_basic_auth(&req, users) {
-            return response.into_response();
-        }
-    }
-
-    // 3. Pick a backend using round-robin
+    // 2. Pick a backend using round-robin
     let (backend_host, backend_port) = match route.next_backend() {
         Some(b) => b.clone(),
         None => {
