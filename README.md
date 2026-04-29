@@ -59,7 +59,7 @@ curl -H "Host: whoami.localhost" http://localhost
 - Routing — [Hostnames](documentation/routing/hostnames.md) · [Path matching](documentation/routing/path-matching.md) · [Load balancing](documentation/routing/load-balancing.md)
 - TLS — [Overview](documentation/tls/overview.md) · [ACME / Let's Encrypt](documentation/tls/acme.md)
 - Middleware — [Basic auth](documentation/middleware/auth.md) · [Custom headers](documentation/middleware/headers.md) · [Strip prefix](documentation/middleware/strip-prefix.md) · [Redirects](documentation/middleware/redirects.md) · [Rate limit](documentation/middleware/rate-limit.md) · [Gzip compression](documentation/middleware/compress.md) · [Backend timeout](documentation/middleware/backend-timeout.md)
-- Advanced — [Health checks](documentation/advanced/health-checks.md) · [WebSocket](documentation/advanced/websocket.md) · [Access logs](documentation/advanced/access-logs.md)
+- Advanced — [Health checks](documentation/advanced/health-checks.md) · [WebSocket](documentation/advanced/websocket.md) · [Access logs](documentation/advanced/access-logs.md) · [Debugging](documentation/advanced/debugging.md)
 
 ## Architecture
 
