@@ -2543,7 +2543,7 @@ dependencies = [
 [[package]]
 name = "sozu-command-lib"
 version = "1.1.1"
-source = "git+https://github.com/Shine-neko/sozu?rev=53df2e07c9fd3edfe734c9eb63636940150c3ad1#53df2e07c9fd3edfe734c9eb63636940150c3ad1"
+source = "git+https://github.com/sozu-proxy/sozu?rev=f243296#f243296fdc07f183541b2251e349bb4cded7c0b1"
 dependencies = [
  "hex",
  "libc",
@@ -2571,7 +2571,7 @@ dependencies = [
 [[package]]
 name = "sozu-lib"
 version = "1.1.1"
-source = "git+https://github.com/Shine-neko/sozu?rev=53df2e07c9fd3edfe734c9eb63636940150c3ad1#53df2e07c9fd3edfe734c9eb63636940150c3ad1"
+source = "git+https://github.com/sozu-proxy/sozu?rev=f243296#f243296fdc07f183541b2251e349bb4cded7c0b1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
