@@ -36,3 +36,5 @@ flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+subtle = "2"

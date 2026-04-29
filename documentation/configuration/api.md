@@ -10,21 +10,56 @@ Sozune exposes a REST API to manage entrypoints on the fly, without restarting.
 api:
   enabled: true
   listen_address: "127.0.0.1:3035"
-  token: "your-secret-token"
+  users:
+    - name: admin
+      hash: "b630f5d579dfef28c45ddf5e3c7a65f09ebca4d5b064a70c4203578c8667fdeb"
+      role: admin
+    - name: dashboard
+      hash: "7d4cab0d7c8a5e9eef83b7d306b4cb6dad27b3aaf7df9e0db18f78f9efb1ee43"
+      role: read-only
   cors_origins:
     - "https://dashboard.example.com"
 ```
 
+The API refuses to start when `users` is empty. There is no anonymous mode.
+
 ## Authentication
 
-When a `token` is configured, every route (except `/health`) requires a matching bearer token:
+The API uses HTTP Basic. Each user has a `name`, a `hash` (hex of `sha256(password)`), and a `role`.
+
+Generate a hash with:
 
 ```bash
-curl -H "Authorization: Bearer your-secret-token" \
-     http://localhost:3035/entrypoints
+echo -n "your-password" | sha256sum
 ```
 
-**If `token` is not set, the API runs without any authentication.** Every route is publicly reachable on `listen_address`. Always either bind the API to `127.0.0.1` (default) or set a token before exposing it.
+Then call the API with the password — sozune hashes it on receive and compares in constant time:
+
+```bash
+curl -u admin:your-password http://localhost:3035/entrypoints
+```
+
+The hash format matches what sozune accepts in route-level basic auth (`sozune.http.<svc>.auth.basic`), so the same generation step works on both sides.
+
+## Roles
+
+| Role | GET | POST / PUT / DELETE |
+|---|---|---|
+| `admin` (default) | yes | yes |
+| `read-only` | yes | 403 |
+
+`role` can be omitted; it defaults to `admin`.
+
+## Securing the API on a network
+
+> **HTTP Basic over plaintext HTTP sends the password in the clear on every request.** It is only safe when the connection is encrypted.
+
+Sozune's API listens in HTTP. If you bind it to anything other than `127.0.0.1`, put it behind TLS yourself. Two common patterns:
+
+- **Behind sozune itself** — declare an entrypoint that points at `127.0.0.1:3035` with `tls: true` and an ACME-issued certificate, and only the TLS-fronted hostname is reachable from outside.
+- **Behind another reverse proxy** that already terminates TLS (nginx, Caddy, an ingress controller).
+
+The default `listen_address: "127.0.0.1:3035"` keeps the API local-only — fine for CLI use from the same host, never expose it on `0.0.0.0` without TLS in front.
 
 ## Endpoints
 
@@ -39,15 +74,15 @@ curl http://localhost:3035/health
 
 ### `GET /entrypoints`
 
-Lists every entrypoint (Docker + API).
+Lists every entrypoint (Docker + API). Available to both roles.
 
 ### `POST /entrypoints`
 
-Creates an entrypoint through the API.
+Creates an entrypoint through the API. Admin only.
 
 ```bash
 curl -X POST http://localhost:3035/entrypoints \
-  -H "Authorization: Bearer your-secret-token" \
+  -u admin:your-password \
   -H "Content-Type: application/json" \
   -d '{
     "name": "my-api",
@@ -70,11 +105,11 @@ Fetches a single entrypoint.
 
 ### `PUT /entrypoints/:id`
 
-Updates an entrypoint (only those created through the API, not Docker).
+Updates an entrypoint (only those created through the API, not Docker). Admin only.
 
 ### `DELETE /entrypoints/:id`
 
-Deletes an entrypoint.
+Deletes an entrypoint. Admin only.
 
 ## Note
 
