@@ -171,6 +171,28 @@ else
     fail "brotli compression: gzip used instead of brotli ($br_pref_encoding)"
 fi
 
+log "[02] Middleware: zstd compression"
+
+zstd_only_encoding=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_COMPRESS" \
+    -H "Accept-Encoding: zstd" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | grep -i "content-encoding" || echo "")
+if echo "$zstd_only_encoding" | grep -qi "zstd"; then
+    pass "zstd compression: response has Content-Encoding: zstd"
+else
+    fail "zstd compression: no Content-Encoding: zstd header found"
+fi
+
+zstd_pref_encoding=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_COMPRESS" \
+    -H "Accept-Encoding: gzip, br, zstd" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | grep -i "content-encoding" || echo "")
+if echo "$zstd_pref_encoding" | grep -qi "zstd"; then
+    pass "zstd compression: preferred when all three accepted"
+else
+    fail "zstd compression: not preferred over br/gzip ($zstd_pref_encoding)"
+fi
+
 log "[02] Middleware: backend timeout"
 
 wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_TIMEOUT" "200" || true

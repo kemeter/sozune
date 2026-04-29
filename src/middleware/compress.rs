@@ -17,6 +17,7 @@ const COMPRESSIBLE_TYPES: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
+    Zstd,
     Brotli,
     Gzip,
 }
@@ -24,6 +25,7 @@ pub enum Encoding {
 impl Encoding {
     pub fn header_value(self) -> &'static str {
         match self {
+            Encoding::Zstd => "zstd",
             Encoding::Brotli => "br",
             Encoding::Gzip => "gzip",
         }
@@ -31,7 +33,7 @@ impl Encoding {
 }
 
 /// Pick the best supported encoding from the client's Accept-Encoding header.
-/// Brotli is preferred over gzip when both are accepted.
+/// Order of preference: zstd > brotli > gzip.
 pub fn pick_encoding(headers: &HeaderMap) -> Option<Encoding> {
     let raw = headers
         .get("accept-encoding")
@@ -45,7 +47,9 @@ pub fn pick_encoding(headers: &HeaderMap) -> Option<Encoding> {
         })
     };
 
-    if accepts("br") {
+    if accepts("zstd") {
+        Some(Encoding::Zstd)
+    } else if accepts("br") {
         Some(Encoding::Brotli)
     } else if accepts("gzip") {
         Some(Encoding::Gzip)
@@ -69,6 +73,7 @@ pub fn compress(data: &[u8], encoding: Encoding) -> Result<Vec<u8>, std::io::Err
     match encoding {
         Encoding::Gzip => gzip_compress(data),
         Encoding::Brotli => brotli_compress(data),
+        Encoding::Zstd => zstd_compress(data),
     }
 }
 
@@ -84,6 +89,10 @@ fn brotli_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     params.quality = 4;
     brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut out, &params)?;
     Ok(out)
+}
+
+fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    zstd::encode_all(std::io::Cursor::new(data), 3)
 }
 
 #[cfg(test)]
@@ -110,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_brotli_when_both_offered() {
+    fn prefers_brotli_over_gzip() {
         let headers = headers_with("accept-encoding", "gzip, br");
         assert_eq!(pick_encoding(&headers), Some(Encoding::Brotli));
     }
@@ -122,13 +131,25 @@ mod tests {
     }
 
     #[test]
+    fn picks_zstd_when_only_zstd_offered() {
+        let headers = headers_with("accept-encoding", "zstd");
+        assert_eq!(pick_encoding(&headers), Some(Encoding::Zstd));
+    }
+
+    #[test]
+    fn prefers_zstd_over_brotli_and_gzip() {
+        let headers = headers_with("accept-encoding", "gzip, br, zstd");
+        assert_eq!(pick_encoding(&headers), Some(Encoding::Zstd));
+    }
+
+    #[test]
     fn returns_none_without_accept_encoding() {
         assert_eq!(pick_encoding(&HeaderMap::new()), None);
     }
 
     #[test]
     fn returns_none_for_unsupported_encoding() {
-        let headers = headers_with("accept-encoding", "deflate, zstd");
+        let headers = headers_with("accept-encoding", "deflate, snappy");
         assert_eq!(pick_encoding(&headers), None);
     }
 
@@ -195,8 +216,19 @@ mod tests {
     }
 
     #[test]
+    fn zstd_roundtrip() {
+        let original = b"Hello, World! This is a test of zstd compression. \
+                         Repetitive text compresses very well with zstd, \
+                         which usually beats gzip and matches brotli on speed.";
+        let compressed = compress(original, Encoding::Zstd).unwrap();
+        let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
     fn encoding_header_values() {
         assert_eq!(Encoding::Gzip.header_value(), "gzip");
         assert_eq!(Encoding::Brotli.header_value(), "br");
+        assert_eq!(Encoding::Zstd.header_value(), "zstd");
     }
 }
