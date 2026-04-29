@@ -75,6 +75,10 @@
           </div>
           <button class="logout" onclick={logout}>Sign out</button>
         {/if}
+        <a class="doc-link" href="https://sozune.kemeter.io/documentation" target="_blank" rel="noopener noreferrer">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h4a2 2 0 0 1 2 2v9a2 2 0 0 0-2-2H2zM14 3h-4a2 2 0 0 0-2 2v9a2 2 0 0 1 2-2h4z"/></svg>
+          <span>Documentation</span>
+        </a>
         <div class="version mono">v0.10.0</div>
       </div>
     </aside>
@@ -215,6 +219,25 @@
   .logout:hover {
     background: var(--bg-hover);
     color: var(--fg-0);
+  }
+
+  .doc-link {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.625rem;
+    border-radius: var(--radius);
+    color: var(--fg-2);
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+  .doc-link:hover {
+    background: var(--bg-hover);
+    color: var(--fg-0);
+  }
+  .doc-link :global(svg) {
+    width: 14px;
+    height: 14px;
   }
 
   .version {

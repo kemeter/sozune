@@ -26,7 +26,7 @@ export default function Hero() {
           HTTP/2 by default. Hot reload through a REST API.
         </p>
         <div className="hero-actions">
-          <Link to="/documentation/quick-start" className="btn btn-primary">
+          <Link to="/documentation/getting-started/quick-start" className="btn btn-primary">
             Quick start
           </Link>
           <a
