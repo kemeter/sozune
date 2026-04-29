@@ -11,6 +11,13 @@ providers:
 api:
   enabled: true
   listen_address: 0.0.0.0:3035
+  # API users authenticate via HTTP Basic. Hash format is hex(sha256(password)).
+  # Generate with: echo -n "<password>" | sha256sum
+  # Roles: admin (default, full access) or read-only (GET only).
+  users:
+    - name: admin
+      hash: "b630f5d579dfef28c45ddf5e3c7a65f09ebca4d5b064a70c4203578c8667fdeb"  # sha256("admin-pass") — change me
+      role: admin
 
 proxy:
   http:

@@ -60,10 +60,26 @@ pub struct ApiConfig {
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_api_listen_address_with_env")]
     pub listen_address: String,
-    #[serde(default, deserialize_with = "deserialize_api_token_with_env")]
-    pub token: Option<String>,
+    #[serde(default)]
+    pub users: Vec<ApiUser>,
     #[serde(default)]
     pub cors_origins: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ApiUser {
+    pub name: String,
+    pub hash: String,
+    #[serde(default)]
+    pub role: Role,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    #[default]
+    Admin,
+    ReadOnly,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -168,7 +184,7 @@ impl Default for ApiConfig {
         Self {
             enabled: false,
             listen_address: default_api_listen_address(),
-            token: None,
+            users: Vec::new(),
             cors_origins: Vec::new(),
         }
     }
@@ -403,18 +419,6 @@ deserialize_string_with_env!(
     "SOZUNE_API_LISTEN_ADDRESS",
     default_api_listen_address
 );
-
-fn deserialize_api_token_with_env<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer).unwrap_or(None);
-    let result = match std::env::var("SOZUNE_API_TOKEN") {
-        Ok(env_val) if !env_val.is_empty() => Some(env_val),
-        _ => value,
-    };
-    Ok(result)
-}
 
 deserialize_with_env!(
     deserialize_max_buffers_with_env,

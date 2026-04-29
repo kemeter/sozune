@@ -1,4 +1,5 @@
-use crate::config::ApiConfig;
+use crate::api::auth::{AuthOutcome, Identity, check};
+use crate::config::{ApiConfig, ApiUser, Role};
 use crate::model::{Entrypoint, EntrypointConfig, Protocol};
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
@@ -20,7 +21,7 @@ use tracing::{error, info, warn};
 pub struct AppState {
     pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     pub reload_tx: mpsc::Sender<()>,
-    pub token: Option<String>,
+    pub users: Vec<ApiUser>,
 }
 
 #[derive(Deserialize)]
@@ -32,41 +33,82 @@ pub struct CreateEntrypointRequest {
     pub backend_weights: Option<std::collections::HashMap<String, u32>>,
 }
 
-async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let token = match &state.token {
-        Some(t) => t,
-        None => return next.run(req).await,
-    };
+/// Authenticate the request with HTTP Basic, then attach the resolved
+/// `Identity` to request extensions so downstream handlers and the role
+/// guard can read it back.
+async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    if state.users.is_empty() {
+        return unauthorized("API has no users configured, refusing all requests");
+    }
 
-    let auth_header = req
+    let header = req
         .headers()
-        .get("authorization")
+        .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let provided = &header[7..];
-            if provided == token {
-                next.run(req).await
-            } else {
-                warn!("Invalid bearer token from {:?}", req.headers().get("host"));
-                Json(serde_json::json!({"error": "invalid token"}))
-                    .into_response_with_status(StatusCode::UNAUTHORIZED)
-            }
+    match check(header, &state.users) {
+        AuthOutcome::Authenticated(identity) => {
+            req.extensions_mut().insert(identity);
+            next.run(req).await
         }
-        _ => Json(serde_json::json!({"error": "missing or invalid authorization header"}))
-            .into_response_with_status(StatusCode::UNAUTHORIZED),
+        AuthOutcome::Invalid => {
+            warn!(
+                "Rejected API request with invalid credentials from {:?}",
+                req.headers().get("host")
+            );
+            unauthorized("invalid credentials")
+        }
+        AuthOutcome::Missing => unauthorized("missing or invalid authorization header"),
     }
 }
 
-trait IntoResponseWithStatus {
-    fn into_response_with_status(self, status: StatusCode) -> Response;
+/// Block write methods (POST/PUT/DELETE) when the authenticated user is
+/// `read-only`. Runs after `auth_middleware` so the `Identity` is always
+/// present in extensions.
+async fn require_admin(req: Request, next: Next) -> Response {
+    let is_write = !matches!(
+        req.method(),
+        &Method::GET | &Method::HEAD | &Method::OPTIONS
+    );
+    if !is_write {
+        return next.run(req).await;
+    }
+
+    let identity = req.extensions().get::<Identity>().cloned();
+    match identity {
+        Some(id) if id.role == Role::Admin => next.run(req).await,
+        Some(id) => {
+            warn!(
+                "User '{}' (read-only) attempted {} {}",
+                id.name,
+                req.method(),
+                req.uri().path()
+            );
+            forbidden("read-only role cannot perform this operation")
+        }
+        None => unauthorized("missing identity"),
+    }
 }
 
-impl IntoResponseWithStatus for Json<serde_json::Value> {
-    fn into_response_with_status(self, status: StatusCode) -> Response {
-        (status, self).into_response()
-    }
+fn unauthorized(message: &str) -> Response {
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": message})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"sozune\""),
+    );
+    response
+}
+
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": message})),
+    )
+        .into_response()
 }
 
 pub async fn serve(
@@ -74,10 +116,16 @@ pub async fn serve(
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
+    if config.users.is_empty() {
+        anyhow::bail!(
+            "API enabled but no users configured. Add at least one entry under `api.users`."
+        );
+    }
+
     let state = AppState {
         storage,
         reload_tx,
-        token: config.token.clone(),
+        users: config.users.clone(),
     };
 
     let protected = Router::new()
@@ -91,6 +139,7 @@ pub async fn serve(
                 .put(update_entrypoint)
                 .delete(delete_entrypoint),
         )
+        .route_layer(axum_middleware::from_fn(require_admin))
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -337,21 +386,42 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
-    fn test_state() -> AppState {
-        let (reload_tx, _reload_rx) = mpsc::channel(64);
-        AppState {
-            storage: Arc::new(RwLock::new(BTreeMap::new())),
-            reload_tx,
-            token: None,
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use sha2::Digest;
+
+    fn hash_password(password: &str) -> String {
+        let digest = sha2::Sha256::digest(password.as_bytes());
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
+    }
+
+    fn user(name: &str, password: &str, role: Role) -> ApiUser {
+        ApiUser {
+            name: name.into(),
+            hash: hash_password(password),
+            role,
         }
     }
 
-    fn test_state_with_token(token: &str) -> AppState {
+    fn basic(user: &str, password: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
+    }
+
+    fn test_state() -> AppState {
+        test_state_with_users(vec![user("admin", "admin-pass", Role::Admin)])
+    }
+
+    fn test_state_with_users(users: Vec<ApiUser>) -> AppState {
         let (reload_tx, _reload_rx) = mpsc::channel(64);
         AppState {
             storage: Arc::new(RwLock::new(BTreeMap::new())),
             reload_tx,
-            token: Some(token.to_string()),
+            users,
         }
     }
 
@@ -367,6 +437,7 @@ mod tests {
                     .put(update_entrypoint)
                     .delete(delete_entrypoint),
             )
+            .route_layer(axum_middleware::from_fn(require_admin))
             .route_layer(axum_middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
@@ -376,6 +447,11 @@ mod tests {
             .route("/health", get(health))
             .merge(protected)
             .with_state(state)
+    }
+
+    /// Default credential matching `test_state()`'s default admin user.
+    fn admin_auth() -> String {
+        basic("admin", "admin-pass")
     }
 
     fn sample_entrypoint_json() -> serde_json::Value {
@@ -421,7 +497,12 @@ mod tests {
         let app = test_app(test_state());
 
         let response = app
-            .oneshot(Request::get("/entrypoints").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -436,6 +517,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(sample_entrypoint_json().to_string()))
                     .unwrap(),
@@ -463,6 +545,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(sample_entrypoint_json().to_string()))
                     .unwrap(),
@@ -476,6 +559,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::get(&format!("/entrypoints/{}", id))
+                    .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -494,6 +578,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::get("/entrypoints/00000000-0000-0000-0000-000000000000")
+                    .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -513,6 +598,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(sample_entrypoint_json().to_string()))
                     .unwrap(),
@@ -529,6 +615,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::put(&format!("/entrypoints/{}", id))
+                    .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(updated_json.to_string()))
                     .unwrap(),
@@ -551,6 +638,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(sample_entrypoint_json().to_string()))
                     .unwrap(),
@@ -564,6 +652,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::delete(&format!("/entrypoints/{}", id))
+                    .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -623,6 +712,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::put("/entrypoints/550e8400-e29b-41d4-a716-446655440000")
+                    .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(sample_entrypoint_json().to_string()))
                     .unwrap(),
@@ -637,6 +727,7 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/entrypoints/550e8400-e29b-41d4-a716-446655440000")
+                    .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -646,9 +737,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_required_when_token_configured() {
-        let state = test_state_with_token("secret-token");
-        let app = test_app(state);
+    async fn missing_credentials_rejected() {
+        let app = test_app(test_state());
 
         let response = app
             .oneshot(Request::get("/entrypoints").body(Body::empty()).unwrap())
@@ -656,17 +746,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .is_some_and(|v| v.to_str().unwrap_or("").starts_with("Basic"))
+        );
     }
 
     #[tokio::test]
-    async fn test_auth_valid_token() {
-        let state = test_state_with_token("secret-token");
-        let app = test_app(state);
+    async fn valid_credentials_accepted() {
+        let app = test_app(test_state());
 
         let response = app
             .oneshot(
                 Request::get("/entrypoints")
-                    .header("authorization", "Bearer secret-token")
+                    .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -677,14 +772,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_invalid_token() {
-        let state = test_state_with_token("secret-token");
-        let app = test_app(state);
+    async fn invalid_password_rejected() {
+        let app = test_app(test_state());
 
         let response = app
             .oneshot(
                 Request::get("/entrypoints")
-                    .header("authorization", "Bearer wrong-token")
+                    .header("authorization", basic("admin", "wrong"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -695,9 +789,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_not_protected() {
-        let state = test_state_with_token("secret-token");
+    async fn read_only_user_can_read() {
+        let state = test_state_with_users(vec![
+            user("admin", "admin-pass", Role::Admin),
+            user("readonly", "ro-pass", Role::ReadOnly),
+        ]);
         let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", basic("readonly", "ro-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_only_user_cannot_write() {
+        let state = test_state_with_users(vec![user("readonly", "ro-pass", Role::ReadOnly)]);
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", basic("readonly", "ro-pass"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn health_not_protected() {
+        let app = test_app(test_state());
 
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
