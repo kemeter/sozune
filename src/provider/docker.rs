@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 pub struct DockerProvider {
     docker: Docker,
     config: DockerConfig,
+    name: &'static str,
     /// Tracks container_id -> IP so we can clean up when the container stops
     /// (stopped containers no longer expose their network IP via inspect)
     container_ips: std::sync::Mutex<HashMap<String, String>>,
@@ -35,14 +36,14 @@ impl Provider for DockerProvider {
     }
 
     fn name(&self) -> &'static str {
-        "docker"
+        self.name
     }
 }
 
 #[async_trait]
 impl LabelSource for DockerProvider {
     fn provider_name(&self) -> &'static str {
-        "docker"
+        self.name
     }
 
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
@@ -68,7 +69,7 @@ impl LabelSource for DockerProvider {
                 .unwrap_or_else(|| id.clone());
             let networks = self.extract_networks(&id).await;
             candidates.push(Candidate {
-                provider: "docker",
+                provider: self.name,
                 id,
                 display_name,
                 labels,
@@ -82,6 +83,13 @@ impl LabelSource for DockerProvider {
 
 impl DockerProvider {
     pub fn new(config: DockerConfig) -> Result<Self, bollard::errors::Error> {
+        Self::new_named(config, "docker")
+    }
+
+    pub fn new_named(
+        config: DockerConfig,
+        name: &'static str,
+    ) -> Result<Self, bollard::errors::Error> {
         let docker = if config.endpoint.starts_with("unix://") {
             Docker::connect_with_socket(&config.endpoint, 120, bollard::API_DEFAULT_VERSION)?
         } else if config.endpoint.starts_with("/") {
@@ -96,6 +104,7 @@ impl DockerProvider {
         Ok(Self {
             docker,
             config,
+            name,
             container_ips: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -125,7 +134,7 @@ impl DockerProvider {
                         };
 
                         for (key, mut entrypoint) in initial_entrypoints {
-                            entrypoint.source = Some("docker".to_string());
+                            entrypoint.source = Some(self.name.to_string());
 
                             if !storage_write.contains_key(&key) {
                                 info!("Found new container entrypoint: {}", key);
@@ -243,7 +252,7 @@ impl DockerProvider {
                                                     } else {
                                                         let mut entrypoint = entrypoint;
                                                         entrypoint.source =
-                                                            Some("docker".to_string());
+                                                            Some(self.name.to_string());
                                                         storage_write.insert(key, entrypoint);
                                                     }
                                                 }
@@ -337,7 +346,7 @@ impl DockerProvider {
                                                     }
                                                 } else {
                                                     let mut entrypoint = entrypoint;
-                                                    entrypoint.source = Some("docker".to_string());
+                                                    entrypoint.source = Some(self.name.to_string());
                                                     storage_write.insert(key, entrypoint);
                                                 }
                                             }
@@ -486,7 +495,7 @@ impl DockerProvider {
             .unwrap_or_default();
 
         Ok(Some(Candidate {
-            provider: "docker",
+            provider: self.name,
             id: container_id.to_string(),
             display_name,
             labels,
@@ -504,7 +513,7 @@ impl DockerProvider {
         networks: Vec<NetworkInfo>,
     ) -> Candidate {
         Candidate {
-            provider: "docker",
+            provider: self.name,
             display_name: container_id.clone(),
             id: container_id,
             labels,

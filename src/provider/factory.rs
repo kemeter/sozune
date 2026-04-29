@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::model::Entrypoint;
 use crate::provider::{
     Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
+    podman::PodmanProvider,
 };
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -74,10 +75,26 @@ pub async fn start_services(
                 .context("Failed to create Docker provider")?;
 
             if let Err(e) = docker_provider
-                .start_service(Arc::clone(&storage), reload_tx.clone(), acme_notify)
+                .start_service(Arc::clone(&storage), reload_tx.clone(), Arc::clone(&acme_notify))
                 .await
             {
                 error!("Docker service failed: {}", e);
+            }
+        }
+    }
+
+    // Start Podman service if enabled (Docker API-compatible socket)
+    if let Some(podman_config) = &config.providers.podman {
+        if podman_config.enabled {
+            info!("Starting Podman service");
+            let podman_provider = PodmanProvider::new(podman_config.clone())
+                .context("Failed to create Podman provider")?;
+
+            if let Err(e) = podman_provider
+                .start_service(Arc::clone(&storage), reload_tx.clone(), acme_notify)
+                .await
+            {
+                error!("Podman service failed: {}", e);
             }
         }
     }
