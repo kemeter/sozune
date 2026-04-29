@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { listEntrypoints, getToken, type Entrypoint } from '$lib/api';
+  import { goto } from '$app/navigation';
+  import { listEntrypoints, type Entrypoint } from '$lib/api';
+  import { isAuthenticated } from '$lib/auth';
 
   let entrypoints = $state<Entrypoint[]>([]);
   let loading = $state(true);
@@ -53,9 +55,8 @@
   }
 
   onMount(() => {
-    if (!getToken()) {
-      loading = false;
-      error = 'no token configured — open Settings';
+    if (!isAuthenticated()) {
+      goto('./login');
       return;
     }
     void load();

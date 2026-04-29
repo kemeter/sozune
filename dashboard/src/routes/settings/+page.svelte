@@ -1,20 +1,17 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getToken, setToken, getBaseUrl, setBaseUrl, health } from '$lib/api';
+  import { getBaseUrl, setBaseUrl, health } from '$lib/api';
 
-  let token = $state('');
   let baseUrl = $state('');
   let saved = $state(false);
   let testStatus = $state<'idle' | 'pending' | 'ok' | 'fail'>('idle');
   let testMessage = $state('');
 
   onMount(() => {
-    token = getToken() ?? '';
     baseUrl = getBaseUrl();
   });
 
   function save() {
-    setToken(token);
     setBaseUrl(baseUrl);
     saved = true;
     setTimeout(() => (saved = false), 2000);
@@ -24,7 +21,6 @@
     testStatus = 'pending';
     testMessage = '';
     try {
-      setToken(token);
       setBaseUrl(baseUrl);
       await health();
       testStatus = 'ok';
@@ -58,17 +54,10 @@
     <p class="hint">The host:port where the sozune API server listens.</p>
   </div>
 
-  <div class="field">
-    <label for="token">Bearer token</label>
-    <input
-      id="token"
-      type="password"
-      class="mono"
-      placeholder="leave empty if API has no token configured"
-      bind:value={token}
-    />
-    <p class="hint">Matches <code>api.token</code> from your sozune config.yaml.</p>
-  </div>
+  <p class="hint">
+    Credentials are entered on the <a href="./login">sign-in page</a> and stored in this browser
+    tab only.
+  </p>
 
   <div class="actions">
     <button class="btn-primary" onclick={save}>
@@ -148,11 +137,8 @@
     font-size: 0.72rem;
     color: var(--fg-3);
   }
-  .hint code {
-    background: var(--bg-3);
-    padding: 1px 5px;
-    border-radius: 3px;
-    color: var(--fg-1);
+  .hint a {
+    color: var(--accent);
   }
 
   .actions {

@@ -1,24 +1,7 @@
-const TOKEN_KEY = 'sozune.token';
+import { clearAuth, getCredentials } from './auth';
+
 const BASE_URL_KEY = 'sozune.baseUrl';
 const DEFAULT_BASE_URL = 'http://127.0.0.1:3035';
-
-export function getToken(): string | null {
-  if (typeof localStorage === 'undefined') {
-    return null;
-  }
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token: string): void {
-  if (typeof localStorage === 'undefined') {
-    return;
-  }
-  if (token) {
-    localStorage.setItem(TOKEN_KEY, token);
-  } else {
-    localStorage.removeItem(TOKEN_KEY);
-  }
-}
 
 export function getBaseUrl(): string {
   if (typeof localStorage === 'undefined') {
@@ -34,18 +17,31 @@ export function setBaseUrl(url: string): void {
   localStorage.setItem(BASE_URL_KEY, url);
 }
 
+function basicHeader(name: string, password: string): string {
+  return `Basic ${btoa(`${name}:${password}`)}`;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = getToken();
+  const credentials = getCredentials();
   const headers = new Headers(init.headers);
   headers.set('Accept', 'application/json');
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
+  if (credentials) {
+    headers.set('Authorization', basicHeader(credentials.name, credentials.password));
   }
 
   const res = await fetch(`${getBaseUrl()}${path}`, { ...init, headers });
+
+  if (res.status === 401) {
+    clearAuth();
+    if (typeof window !== 'undefined' && !window.location.pathname.endsWith('/login')) {
+      window.location.assign('./login');
+    }
+    throw new Error('401 Unauthorized');
+  }
+
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`${res.status} ${res.statusText}${text ? `: ${text}` : ''}`);
@@ -54,6 +50,28 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     return undefined as T;
   }
   return (await res.json()) as T;
+}
+
+/** Validate a credential pair against `/me`. Used by the login page only —
+ *  callers elsewhere should rely on the persisted credentials. */
+export async function validateCredentials(
+  baseUrl: string,
+  name: string,
+  password: string
+): Promise<{ name: string; role: 'admin' | 'read-only' }> {
+  const res = await fetch(`${baseUrl}/me`, {
+    headers: {
+      Accept: 'application/json',
+      Authorization: basicHeader(name, password)
+    }
+  });
+  if (res.status === 401) {
+    throw new Error('Invalid credentials');
+  }
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as { name: string; role: 'admin' | 'read-only' };
 }
 
 export type Protocol = 'Http' | 'Tcp' | 'Udp';
@@ -92,4 +110,8 @@ export function getEntrypoint(id: string): Promise<Entrypoint> {
 
 export function health(): Promise<unknown> {
   return request<unknown>('/health');
+}
+
+export function me(): Promise<{ name: string; role: 'admin' | 'read-only' }> {
+  return request<{ name: string; role: 'admin' | 'read-only' }>('/me');
 }

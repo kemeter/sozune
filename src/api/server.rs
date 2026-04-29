@@ -139,7 +139,12 @@ pub async fn serve(
                 .put(update_entrypoint)
                 .delete(delete_entrypoint),
         )
-        .route_layer(axum_middleware::from_fn(require_admin))
+        .route_layer(axum_middleware::from_fn(require_admin));
+
+    let me_route = Router::new().route("/me", get(me));
+
+    let authed = protected
+        .merge(me_route)
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -147,7 +152,7 @@ pub async fn serve(
 
     let mut app = Router::new()
         .route("/health", get(health))
-        .merge(protected)
+        .merge(authed)
         .with_state(state);
 
     if !config.cors_origins.is_empty() {
@@ -195,6 +200,28 @@ pub async fn serve(
 
 async fn health() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Returns the authenticated user's identity. The dashboard hits this on
+/// login to validate credentials and learn its role.
+async fn me(req: Request) -> (StatusCode, Json<serde_json::Value>) {
+    let identity = req.extensions().get::<Identity>().cloned();
+    match identity {
+        Some(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": id.name,
+                "role": match id.role {
+                    Role::Admin => "admin",
+                    Role::ReadOnly => "read-only",
+                },
+            })),
+        ),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "missing identity"})),
+        ),
+    }
 }
 
 async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
@@ -437,7 +464,12 @@ mod tests {
                     .put(update_entrypoint)
                     .delete(delete_entrypoint),
             )
-            .route_layer(axum_middleware::from_fn(require_admin))
+            .route_layer(axum_middleware::from_fn(require_admin));
+
+        let me_route = Router::new().route("/me", get(me));
+
+        let authed = protected
+            .merge(me_route)
             .route_layer(axum_middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
@@ -445,7 +477,7 @@ mod tests {
 
         Router::new()
             .route("/health", get(health))
-            .merge(protected)
+            .merge(authed)
             .with_state(state)
     }
 
@@ -838,5 +870,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn me_returns_admin_identity() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::get("/me")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["name"], "admin");
+        assert_eq!(json["role"], "admin");
+    }
+
+    #[tokio::test]
+    async fn me_returns_read_only_identity() {
+        let state = test_state_with_users(vec![user("viewer", "viewer-pass", Role::ReadOnly)]);
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/me")
+                    .header("authorization", basic("viewer", "viewer-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["name"], "viewer");
+        assert_eq!(json["role"], "read-only");
+    }
+
+    #[tokio::test]
+    async fn me_requires_auth() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(Request::get("/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
