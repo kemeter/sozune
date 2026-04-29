@@ -33,6 +33,7 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 flate2 = "1"
+brotli = "8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }

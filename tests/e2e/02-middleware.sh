@@ -149,6 +149,28 @@ else
     pass "gzip compression: no compression without Accept-Encoding"
 fi
 
+log "[02] Middleware: brotli compression"
+
+br_only_encoding=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_COMPRESS" \
+    -H "Accept-Encoding: br" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | grep -i "content-encoding" || echo "")
+if echo "$br_only_encoding" | grep -qi "br"; then
+    pass "brotli compression: response has Content-Encoding: br"
+else
+    fail "brotli compression: no Content-Encoding: br header found"
+fi
+
+br_pref_encoding=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_COMPRESS" \
+    -H "Accept-Encoding: gzip, br" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | grep -i "content-encoding" || echo "")
+if echo "$br_pref_encoding" | grep -qi "br"; then
+    pass "brotli compression: preferred over gzip when both accepted"
+else
+    fail "brotli compression: gzip used instead of brotli ($br_pref_encoding)"
+fi
+
 log "[02] Middleware: backend timeout"
 
 wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_TIMEOUT" "200" || true
