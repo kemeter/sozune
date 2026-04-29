@@ -155,7 +155,9 @@ pub async fn serve(
         .merge(authed)
         .with_state(state);
 
-    if !config.cors_origins.is_empty() {
+    let allow_origin = if config.cors_origins.is_empty() {
+        AllowOrigin::any()
+    } else {
         let origins: Vec<HeaderValue> = config
             .cors_origins
             .iter()
@@ -167,20 +169,21 @@ pub async fn serve(
                 }
             })
             .collect();
+        AllowOrigin::list(origins)
+    };
 
-        let cors = CorsLayer::new()
-            .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]);
+    let cors = CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]);
 
-        app = app.layer(cors);
-    }
+    app = app.layer(cors);
 
     let addr = SocketAddr::from_str(&config.listen_address).map_err(|e| {
         anyhow::anyhow!(
