@@ -54,12 +54,21 @@ async fn asset(Path(path): Path<String>, uri: Uri) -> Response {
     serve_file("index.html")
 }
 
+/// Resolve an embedded asset using the conventions adapter-static produces:
+/// `foo` → `foo`, `foo.html`, or `foo/index.html` (in that order).
 fn try_serve(path: &str) -> Option<Response> {
     if Assets::get(path).is_some() {
-        Some(serve_file(path))
-    } else {
-        None
+        return Some(serve_file(path));
     }
+    let with_html = format!("{path}.html");
+    if Assets::get(&with_html).is_some() {
+        return Some(serve_file(&with_html));
+    }
+    let index = format!("{}/index.html", path.trim_end_matches('/'));
+    if Assets::get(&index).is_some() {
+        return Some(serve_file(&index));
+    }
+    None
 }
 
 fn serve_file(path: &str) -> Response {
