@@ -13,7 +13,10 @@ HTTP_PORT=18080
 HTTPS_PORT=18443
 API_PORT=18888
 MIDDLEWARE_PORT=13037
-API_TOKEN="test-secret-token"
+API_USER="admin"
+API_PASSWORD="test-secret-token"
+API_PASSWORD_HASH=$(printf '%s' "$API_PASSWORD" | sha256sum | cut -d' ' -f1)
+API_BASIC_AUTH=$(printf '%s:%s' "$API_USER" "$API_PASSWORD" | base64 -w0)
 
 STARTUP_DELAY=3
 ROUTE_DELAY=4

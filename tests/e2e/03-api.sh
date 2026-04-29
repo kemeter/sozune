@@ -5,7 +5,7 @@
 log "[03] API: CRUD"
 
 API_URL="http://127.0.0.1:$API_PORT"
-AUTH_HEADER="Authorization: Bearer $API_TOKEN"
+AUTH_HEADER="Authorization: Basic $API_BASIC_AUTH"
 
 health_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$API_URL/health" 2>/dev/null || echo "000")
 if [[ "$health_status" == "200" ]]; then

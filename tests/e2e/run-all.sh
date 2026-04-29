@@ -45,7 +45,10 @@ providers:
 api:
   enabled: true
   listen_address: "127.0.0.1:$API_PORT"
-  token: "$API_TOKEN"
+  users:
+    - name: "$API_USER"
+      hash: "$API_PASSWORD_HASH"
+      role: admin
 
 proxy:
   http:
