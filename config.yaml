@@ -10,6 +10,9 @@ providers:
 
 api:
   enabled: true
+  # WARNING: HTTP Basic sends the password in the clear on every request.
+  # Bind to 127.0.0.1 (default) or front the API with TLS before exposing it.
+  # See documentation/configuration/api.md for the full notes.
   listen_address: 0.0.0.0:3035
   # API users authenticate via HTTP Basic. Hash format is hex(sha256(password)).
   # Generate with: echo -n "<password>" | sha256sum
