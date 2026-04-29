@@ -21,6 +21,7 @@ mod middleware;
 mod model;
 mod provider;
 mod proxy;
+mod util;
 
 pub use model::*;
 

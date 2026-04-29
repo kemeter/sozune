@@ -141,3 +141,12 @@ Every field above can be overridden through an environment variable. The env var
 | `middleware.port` | `SOZUNE_MIDDLEWARE_PORT` |
 
 Booleans accept `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`.
+
+### Standalone variables
+
+These have no YAML counterpart:
+
+| Env var | Effect |
+|---|---|
+| `CONFIG_PATH` | Path to the YAML config file (default: `config.yaml`) |
+| `SOZUNE_DEBUG` | When `true`, routing failures (`502`) include a body listing configured hosts/backends and a did-you-mean suggestion. Off by default to avoid leaking topology. See [Debugging](../advanced/debugging.md). |

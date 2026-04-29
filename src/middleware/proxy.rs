@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use super::MiddlewareAppState;
 use super::compress;
+use super::diag;
 use super::rate_limit::RateLimitResult;
 
 /// Main proxy handler: identifies the route by Host header,
@@ -41,7 +42,7 @@ pub async fn handle_proxy(
         }
     };
 
-    let route = {
+    let (route, known_hosts) = {
         let table = match state.route_table.read() {
             Ok(guard) => guard,
             Err(e) => {
@@ -49,16 +50,18 @@ pub async fn handle_proxy(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-
-        // Route lookup validates Host against configured hostnames
-        table.get_route_by_host(&host)
+        (table.get_route_by_host(&host), table.known_hosts())
     };
 
     let route = match route {
         Some(r) => r,
         None => {
-            debug!("No middleware route for host '{}'", host);
-            return StatusCode::BAD_GATEWAY.into_response();
+            info!(
+                "no route for host '{}' (known: {})",
+                host,
+                known_hosts.len()
+            );
+            return diag::no_route_for_host(&host, &known_hosts).into_response();
         }
     };
 
@@ -83,7 +86,7 @@ pub async fn handle_proxy(
         Some(b) => b.clone(),
         None => {
             error!("No backends configured for host '{}'", host);
-            return StatusCode::BAD_GATEWAY.into_response();
+            return diag::no_healthy_backend(&host, &route.backends).into_response();
         }
     };
 
