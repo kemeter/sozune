@@ -19,10 +19,7 @@ impl HttpProvider {
         let response = reqwest::get(&self.config.url).await?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "HTTP provider returned status {}",
-                response.status()
-            );
+            anyhow::bail!("HTTP provider returned status {}", response.status());
         }
 
         let body = response.text().await?;
@@ -73,19 +70,16 @@ impl HttpProvider {
 
                         let changed = old_ids != new_ids
                             || new_entrypoints.iter().any(|(id, ep)| {
-                                storage_write
-                                    .get(id)
-                                    .map_or(true, |existing| {
-                                        existing.backends != ep.backends
-                                            || existing.config.hostnames != ep.config.hostnames
-                                            || existing.config.port != ep.config.port
-                                    })
+                                storage_write.get(id).map_or(true, |existing| {
+                                    existing.backends != ep.backends
+                                        || existing.config.hostnames != ep.config.hostnames
+                                        || existing.config.port != ep.config.port
+                                })
                             });
 
                         if changed {
                             // Remove old HTTP provider entrypoints
-                            storage_write
-                                .retain(|_, ep| ep.source.as_deref() != Some("http"));
+                            storage_write.retain(|_, ep| ep.source.as_deref() != Some("http"));
 
                             // Add new ones
                             for (id, mut entrypoint) in new_entrypoints {
@@ -116,51 +110,52 @@ impl HttpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{EntrypointConfig, Protocol};
     use axum::{Router, routing::get};
     use std::collections::HashMap;
-    use crate::model::{EntrypointConfig, Protocol};
 
     fn sample_entrypoints_json() -> String {
-        serde_json::to_string(&vec![
-            Entrypoint {
-                id: "web".to_string(),
-                name: "web".to_string(),
-                backends: vec!["127.0.0.1:3000".to_string()],
-                protocol: Protocol::Http,
-                config: EntrypointConfig {
-                    hostnames: vec!["example.com".to_string()],
-                    port: 80,
-                    path: None,
-                    tls: false,
-                    strip_prefix: false,
-                    https_redirect: false,
-                    https_redirect_port: None,
-                    redirect: None,
-                    redirect_scheme: None,
-                    redirect_template: None,
-                    www_authenticate: None,
-                    priority: 0,
-                    auth: None,
-                    headers: Vec::new(),
-                    backend_timeout: None,
-                    rate_limit: None,
-                    sticky_session: false,
-                    compress: false,
-                },
-                source: None,
-                backend_weights: HashMap::new(),
+        serde_json::to_string(&vec![Entrypoint {
+            id: "web".to_string(),
+            name: "web".to_string(),
+            backends: vec!["127.0.0.1:3000".to_string()],
+            protocol: Protocol::Http,
+            config: EntrypointConfig {
+                hostnames: vec!["example.com".to_string()],
+                port: 80,
+                path: None,
+                tls: false,
+                strip_prefix: false,
+                https_redirect: false,
+                https_redirect_port: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                www_authenticate: None,
+                priority: 0,
+                auth: None,
+                headers: Vec::new(),
+                backend_timeout: None,
+                rate_limit: None,
+                sticky_session: false,
+                compress: false,
             },
-        ])
+            source: None,
+            backend_weights: HashMap::new(),
+        }])
         .unwrap()
     }
 
     #[tokio::test]
     async fn test_fetch_entrypoints() {
         let json = sample_entrypoints_json();
-        let app = Router::new().route("/config", get(move || {
-            let json = json.clone();
-            async move { json }
-        }));
+        let app = Router::new().route(
+            "/config",
+            get(move || {
+                let json = json.clone();
+                async move { json }
+            }),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -181,10 +176,13 @@ mod tests {
     #[tokio::test]
     async fn test_polling_updates_storage() {
         let json = sample_entrypoints_json();
-        let app = Router::new().route("/config", get(move || {
-            let json = json.clone();
-            async move { json }
-        }));
+        let app = Router::new().route(
+            "/config",
+            get(move || {
+                let json = json.clone();
+                async move { json }
+            }),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -201,7 +199,10 @@ mod tests {
 
         let storage_clone = Arc::clone(&storage);
         let handle = tokio::spawn(async move {
-            provider.start_polling(storage_clone, reload_tx).await.unwrap();
+            provider
+                .start_polling(storage_clone, reload_tx)
+                .await
+                .unwrap();
         });
 
         // Wait for first poll to trigger reload

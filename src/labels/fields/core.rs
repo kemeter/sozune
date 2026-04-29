@@ -192,7 +192,10 @@ mod tests {
     #[test]
     fn priority_defaults_to_zero_when_absent() {
         let mut diags = Vec::new();
-        assert_eq!(parse_priority(&labels(&[]), "sozune.http.web.", &mut diags), 0);
+        assert_eq!(
+            parse_priority(&labels(&[]), "sozune.http.web.", &mut diags),
+            0
+        );
         assert!(diags.is_empty());
     }
 

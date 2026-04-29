@@ -1,6 +1,6 @@
 use axum::http::HeaderMap;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::io::Write;
 
 /// Content types that benefit from compression
@@ -62,7 +62,10 @@ mod tests {
 
     #[test]
     fn test_accepts_gzip() {
-        assert!(accepts_gzip(&headers_with("accept-encoding", "gzip, deflate")));
+        assert!(accepts_gzip(&headers_with(
+            "accept-encoding",
+            "gzip, deflate"
+        )));
         assert!(accepts_gzip(&headers_with("accept-encoding", "gzip")));
         assert!(!accepts_gzip(&headers_with("accept-encoding", "br")));
         assert!(!accepts_gzip(&HeaderMap::new()));
@@ -70,17 +73,35 @@ mod tests {
 
     #[test]
     fn test_is_compressible() {
-        assert!(is_compressible(&headers_with("content-type", "text/html; charset=utf-8")));
-        assert!(is_compressible(&headers_with("content-type", "application/json")));
-        assert!(is_compressible(&headers_with("content-type", "application/javascript")));
-        assert!(is_compressible(&headers_with("content-type", "image/svg+xml")));
+        assert!(is_compressible(&headers_with(
+            "content-type",
+            "text/html; charset=utf-8"
+        )));
+        assert!(is_compressible(&headers_with(
+            "content-type",
+            "application/json"
+        )));
+        assert!(is_compressible(&headers_with(
+            "content-type",
+            "application/javascript"
+        )));
+        assert!(is_compressible(&headers_with(
+            "content-type",
+            "image/svg+xml"
+        )));
         assert!(!is_compressible(&headers_with("content-type", "image/png")));
-        assert!(!is_compressible(&headers_with("content-type", "application/octet-stream")));
+        assert!(!is_compressible(&headers_with(
+            "content-type",
+            "application/octet-stream"
+        )));
     }
 
     #[test]
     fn test_already_compressed() {
-        assert!(is_already_compressed(&headers_with("content-encoding", "gzip")));
+        assert!(is_already_compressed(&headers_with(
+            "content-encoding",
+            "gzip"
+        )));
         assert!(!is_already_compressed(&HeaderMap::new()));
     }
 

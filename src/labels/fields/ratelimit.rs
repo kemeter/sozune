@@ -122,24 +122,28 @@ mod tests {
     #[test]
     fn burst_without_average_emits_w004() {
         let mut diags = Vec::new();
-        assert!(parse_rate_limit(
-            &labels(&[("sozune.http.web.ratelimit.burst", "200")]),
-            "sozune.http.web.",
-            &mut diags,
-        )
-        .is_none());
+        assert!(
+            parse_rate_limit(
+                &labels(&[("sozune.http.web.ratelimit.burst", "200")]),
+                "sozune.http.web.",
+                &mut diags,
+            )
+            .is_none()
+        );
         assert_eq!(diags[0].code, DiagnosticCode::W004InvalidRateLimit);
     }
 
     #[test]
     fn invalid_average_emits_w004() {
         let mut diags = Vec::new();
-        assert!(parse_rate_limit(
-            &labels(&[("sozune.http.web.ratelimit.average", "abc")]),
-            "sozune.http.web.",
-            &mut diags,
-        )
-        .is_none());
+        assert!(
+            parse_rate_limit(
+                &labels(&[("sozune.http.web.ratelimit.average", "abc")]),
+                "sozune.http.web.",
+                &mut diags,
+            )
+            .is_none()
+        );
         assert_eq!(diags[0].code, DiagnosticCode::W004InvalidRateLimit);
     }
 

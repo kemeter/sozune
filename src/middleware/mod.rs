@@ -81,7 +81,10 @@ pub fn build_middleware_route(
     config: &EntrypointConfig,
     backends: &[String],
 ) -> Arc<MiddlewareRoute> {
-    let rate_limiter = config.rate_limit.as_ref().map(|rl| RateLimiter::new(rl.average, rl.burst));
+    let rate_limiter = config
+        .rate_limit
+        .as_ref()
+        .map(|rl| RateLimiter::new(rl.average, rl.burst));
 
     Arc::new(MiddlewareRoute {
         backends: backends.iter().map(|b| (b.clone(), config.port)).collect(),

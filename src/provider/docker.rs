@@ -90,10 +90,7 @@ impl DockerProvider {
                                 storage_write.insert(key, entrypoint);
                                 changed = true;
                             } else {
-                                info!(
-                                    "Container entrypoint {} already exists in storage",
-                                    key
-                                );
+                                info!("Container entrypoint {} already exists in storage", key);
                             }
                         }
                         changed
@@ -120,7 +117,8 @@ impl DockerProvider {
         }
 
         // Start event listener
-        self.start_event_listener(storage, reload_tx, acme_notify).await
+        self.start_event_listener(storage, reload_tx, acme_notify)
+            .await
     }
 
     /// Start listening for Docker events and update storage directly
@@ -368,11 +366,7 @@ impl DockerProvider {
 
             // Network info is only available via inspect, not list — fetch it.
             let networks = self.extract_networks(&container_id).await;
-            let candidate = self.build_candidate(
-                container_id.clone(),
-                container_labels,
-                networks,
-            );
+            let candidate = self.build_candidate(container_id.clone(), container_labels, networks);
 
             let result = labels::parse(&candidate);
             log_diagnostics(&candidate, &result.diagnostics);
@@ -397,7 +391,10 @@ impl DockerProvider {
                 if let Some(existing) = entrypoints.get_mut(&key) {
                     if !existing.backends.contains(&backend_ip) {
                         existing.backends.push(backend_ip.clone());
-                        info!("Added backend {} to existing entrypoint {}", backend_ip, key);
+                        info!(
+                            "Added backend {} to existing entrypoint {}",
+                            backend_ip, key
+                        );
                     }
                 } else {
                     entrypoints.insert(key.clone(), entrypoint);
@@ -508,7 +505,11 @@ impl DockerProvider {
     /// Resolve a container's backend IP using the shared label parser.
     /// Used by the event listener to track backends for cleanup on stop.
     async fn get_container_ip(&self, container_id: &str) -> Option<String> {
-        let candidate = self.inspect_to_candidate(container_id).await.ok().flatten()?;
+        let candidate = self
+            .inspect_to_candidate(container_id)
+            .await
+            .ok()
+            .flatten()?;
         let mut throwaway = Vec::new();
         let ip = labels::network::resolve_ip(&candidate, &mut throwaway);
         if ip == "127.0.0.1" { None } else { Some(ip) }
@@ -536,13 +537,7 @@ fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
                 d.label.as_deref().unwrap_or("-"),
                 d.value.as_deref().unwrap_or("")
             ),
-            Severity::Info => debug!(
-                "[{}] {}: {}",
-                target,
-                d.code.as_str(),
-                d.message
-            ),
+            Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
         }
     }
 }
-

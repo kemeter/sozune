@@ -125,7 +125,11 @@ mod tests {
         let mut diags = Vec::new();
         let c = candidate(
             &[],
-            vec![net("a", Some("")), net("b", None), net("c", Some("10.0.0.9"))],
+            vec![
+                net("a", Some("")),
+                net("b", None),
+                net("c", Some("10.0.0.9")),
+            ],
         );
         assert_eq!(resolve_ip(&c, &mut diags), "10.0.0.9");
     }

@@ -9,7 +9,7 @@ use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
 };
 use rcgen::{CertificateParams, KeyPair};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AcmeConfig;

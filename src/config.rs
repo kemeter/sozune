@@ -68,7 +68,10 @@ pub struct ApiConfig {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct HttpProviderConfig {
-    #[serde(default, deserialize_with = "deserialize_http_provider_enabled_with_env")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_http_provider_enabled_with_env"
+    )]
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_http_provider_url_with_env")]
     pub url: String,

@@ -3,8 +3,8 @@ use axum::extract::State;
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
 use super::MiddlewareAppState;
@@ -119,8 +119,7 @@ pub async fn handle_proxy(
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     if is_websocket {
-        return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query)
-            .await;
+        return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query).await;
     }
 
     // 5. Build the forwarded request
@@ -175,8 +174,13 @@ pub async fn handle_proxy(
                 match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
                     Ok(bytes) => match compress::gzip_compress(&bytes) {
                         Ok(compressed) => {
-                            parts.headers.insert("content-encoding", "gzip".parse().unwrap());
-                            parts.headers.insert("content-length", compressed.len().to_string().parse().unwrap());
+                            parts
+                                .headers
+                                .insert("content-encoding", "gzip".parse().unwrap());
+                            parts.headers.insert(
+                                "content-length",
+                                compressed.len().to_string().parse().unwrap(),
+                            );
                             parts.headers.remove("transfer-encoding");
                             Response::from_parts(parts, Body::from(compressed)).into_response()
                         }
@@ -206,7 +210,12 @@ pub async fn handle_proxy(
     let duration = start.elapsed();
     info!(
         "{} {} {} {} {} {}ms",
-        source_ip, method, host, path, response.status().as_u16(), duration.as_millis()
+        source_ip,
+        method,
+        host,
+        path,
+        response.status().as_u16(),
+        duration.as_millis()
     );
 
     response
@@ -220,23 +229,26 @@ async fn handle_websocket(
     path: &str,
     query: &str,
 ) -> axum::response::Response {
-    debug!("WebSocket upgrade request to {}:{}{}", backend_host, backend_port, path);
+    debug!(
+        "WebSocket upgrade request to {}:{}{}",
+        backend_host, backend_port, path
+    );
 
     // Connect to backend
     let backend_addr = format!("{}:{}", backend_host, backend_port);
     let mut backend_stream = match tokio::net::TcpStream::connect(&backend_addr).await {
         Ok(s) => s,
         Err(e) => {
-            error!("Failed to connect to backend {} for WebSocket: {}", backend_addr, e);
+            error!(
+                "Failed to connect to backend {} for WebSocket: {}",
+                backend_addr, e
+            );
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
 
     // Build the raw HTTP upgrade request to send to the backend
-    let mut upgrade_request = format!(
-        "GET {}{} HTTP/1.1\r\n",
-        path, query
-    );
+    let mut upgrade_request = format!("GET {}{} HTTP/1.1\r\n", path, query);
 
     for (key, value) in req.headers() {
         if let Ok(v) = value.to_str() {
@@ -265,7 +277,10 @@ async fn handle_websocket(
 
     // Check that backend accepted the upgrade (101 Switching Protocols)
     if !response_str.starts_with("HTTP/1.1 101") {
-        error!("Backend rejected WebSocket upgrade: {}", response_str.lines().next().unwrap_or(""));
+        error!(
+            "Backend rejected WebSocket upgrade: {}",
+            response_str.lines().next().unwrap_or("")
+        );
         return StatusCode::BAD_GATEWAY.into_response();
     }
 

@@ -7,10 +7,10 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, Header, HeaderPosition,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RedirectPolicy as SozuRedirectPolicy,
-        RedirectScheme as SozuRedirectScheme, RemoveBackend, Request, RequestHttpFrontend,
-        ResponseStatus, RulePosition, SocketAddress, Status, TlsVersion, WorkerRequest,
-        WorkerResponse, request::RequestType,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
+        RedirectPolicy as SozuRedirectPolicy, RedirectScheme as SozuRedirectScheme, RemoveBackend,
+        Request, RequestHttpFrontend, ResponseStatus, RulePosition, SocketAddress, Status,
+        TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -648,17 +648,17 @@ fn configure_http_entrypoint(
                 ..Default::default()
             };
 
-            info!("Configuring HTTPS frontend for {} on cluster {}", hostname, cluster_id);
+            info!(
+                "Configuring HTTPS frontend for {} on cluster {}",
+                hostname, cluster_id
+            );
             match send_to_worker(
                 command_channel_https,
                 format!("add-frontend-https-{}-{}", cluster_id, hostname),
                 RequestType::AddHttpsFrontend(https_front),
             ) {
                 Ok(_) => info!("HTTPS frontend added for {}", hostname),
-                Err(e) => error!(
-                    "Failed to add HTTPS frontend for {}: {}",
-                    hostname, e
-                ),
+                Err(e) => error!("Failed to add HTTPS frontend for {}: {}", hostname, e),
             }
         }
     }
@@ -748,17 +748,17 @@ fn configure_http_entrypoint(
             // HTTPS backend only if TLS is enabled
             if entrypoint.config.tls {
                 let backend_id = backend.backend_id.clone();
-                info!("Adding HTTPS backend {} -> {}:{}", backend_id, backend_host, backend_port);
+                info!(
+                    "Adding HTTPS backend {} -> {}:{}",
+                    backend_id, backend_host, backend_port
+                );
                 match send_to_worker(
                     command_channel_https,
                     format!("add-backend-https-{}-{}", cluster_id, backend_index),
                     RequestType::AddBackend(backend),
                 ) {
                     Ok(_) => info!("HTTPS backend {} added successfully", backend_id),
-                    Err(e) => error!(
-                        "Failed to add HTTPS backend {}: {}",
-                        backend_id, e
-                    ),
+                    Err(e) => error!("Failed to add HTTPS backend {}: {}", backend_id, e),
                 }
             }
         }
@@ -819,12 +819,19 @@ fn send_to_worker(
                 if response.id == id {
                     if response.status == ResponseStatus::Failure as i32 {
                         error!("Worker rejected command {}: {}", id, response.message);
-                        return Err(anyhow::anyhow!("Worker rejected {}: {}", id, response.message));
+                        return Err(anyhow::anyhow!(
+                            "Worker rejected {}: {}",
+                            id,
+                            response.message
+                        ));
                     }
                     return Ok(());
                 }
                 // Not our response, keep reading
-                debug!("Received response for {} while waiting for {}", response.id, id);
+                debug!(
+                    "Received response for {} while waiting for {}",
+                    response.id, id
+                );
             }
             Err(_) => {
                 break;

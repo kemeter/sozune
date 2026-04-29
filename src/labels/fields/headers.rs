@@ -63,7 +63,9 @@ pub fn parse_headers(
                 )
                 .with_label(key)
                 .with_value(value)
-                .with_hint("blocked headers can enable request smuggling, SSRF, or host header attacks"),
+                .with_hint(
+                    "blocked headers can enable request smuggling, SSRF, or host header attacks",
+                ),
             );
             continue;
         }

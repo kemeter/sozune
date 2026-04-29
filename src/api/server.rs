@@ -2,6 +2,7 @@ use crate::config::ApiConfig;
 use crate::model::{Entrypoint, EntrypointConfig, Protocol};
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, header};
 use axum::middleware::{self as axum_middleware, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -13,7 +14,6 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use axum::http::{HeaderValue, Method, header};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -32,11 +32,7 @@ pub struct CreateEntrypointRequest {
     pub backend_weights: Option<std::collections::HashMap<String, u32>>,
 }
 
-async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let token = match &state.token {
         Some(t) => t,
         None => return next.run(req).await,
@@ -58,10 +54,8 @@ async fn auth_middleware(
                     .into_response_with_status(StatusCode::UNAUTHORIZED)
             }
         }
-        _ => {
-            Json(serde_json::json!({"error": "missing or invalid authorization header"}))
-                .into_response_with_status(StatusCode::UNAUTHORIZED)
-        }
+        _ => Json(serde_json::json!({"error": "missing or invalid authorization header"}))
+            .into_response_with_status(StatusCode::UNAUTHORIZED),
     }
 }
 
@@ -87,14 +81,20 @@ pub async fn serve(
     };
 
     let protected = Router::new()
-        .route("/entrypoints", get(list_entrypoints).post(create_entrypoint))
+        .route(
+            "/entrypoints",
+            get(list_entrypoints).post(create_entrypoint),
+        )
         .route(
             "/entrypoints/{id}",
             get(get_entrypoint)
                 .put(update_entrypoint)
                 .delete(delete_entrypoint),
         )
-        .route_layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     let mut app = Router::new()
         .route("/health", get(health))
@@ -148,9 +148,7 @@ async fn health() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-async fn list_entrypoints(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let storage = match state.storage.read() {
         Ok(guard) => guard,
         Err(e) => {
@@ -249,7 +247,9 @@ async fn update_entrypoint(
                 if existing.source.as_deref() != Some("api") {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({"error": "cannot modify entrypoint managed by another source"})),
+                        Json(
+                            serde_json::json!({"error": "cannot modify entrypoint managed by another source"}),
+                        ),
                     );
                 }
             }
@@ -304,7 +304,9 @@ async fn delete_entrypoint(
                 if existing.source.as_deref() != Some("api") {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({"error": "cannot delete entrypoint managed by another source"})),
+                        Json(
+                            serde_json::json!({"error": "cannot delete entrypoint managed by another source"}),
+                        ),
                     );
                 }
             }
@@ -355,14 +357,20 @@ mod tests {
 
     fn test_app(state: AppState) -> Router {
         let protected = Router::new()
-            .route("/entrypoints", get(list_entrypoints).post(create_entrypoint))
+            .route(
+                "/entrypoints",
+                get(list_entrypoints).post(create_entrypoint),
+            )
             .route(
                 "/entrypoints/{id}",
                 get(get_entrypoint)
                     .put(update_entrypoint)
                     .delete(delete_entrypoint),
             )
-            .route_layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
+            .route_layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ));
 
         Router::new()
             .route("/health", get(health))
@@ -643,11 +651,7 @@ mod tests {
         let app = test_app(state);
 
         let response = app
-            .oneshot(
-                Request::get("/entrypoints")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/entrypoints").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -696,11 +700,7 @@ mod tests {
         let app = test_app(state);
 
         let response = app
-            .oneshot(
-                Request::get("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
 

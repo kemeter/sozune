@@ -92,12 +92,14 @@ mod tests {
     #[test]
     fn empty_host_value_emits_e002() {
         let mut diags = Vec::new();
-        assert!(parse_hostnames(
-            &labels(&[("sozune.http.web.host", "  , ,  ")]),
-            "sozune.http.web.",
-            &mut diags,
-        )
-        .is_none());
+        assert!(
+            parse_hostnames(
+                &labels(&[("sozune.http.web.host", "  , ,  ")]),
+                "sozune.http.web.",
+                &mut diags,
+            )
+            .is_none()
+        );
         assert_eq!(diags[0].code, DiagnosticCode::E002MissingHost);
     }
 }

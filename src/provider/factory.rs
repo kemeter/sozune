@@ -1,10 +1,12 @@
 use crate::config::AppConfig;
 use crate::model::Entrypoint;
-use crate::provider::{Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider};
+use crate::provider::{
+    Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
+};
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
 pub async fn start_services(

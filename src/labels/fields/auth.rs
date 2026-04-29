@@ -128,12 +128,16 @@ mod tests {
             &mut diags,
         );
         assert!(auth.is_none());
-        assert!(diags
-            .iter()
-            .any(|d| d.code == DiagnosticCode::W007MalformedBasicAuthEntry));
-        assert!(diags
-            .iter()
-            .any(|d| d.code == DiagnosticCode::W011EmptyBasicAuth));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == DiagnosticCode::W007MalformedBasicAuthEntry)
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == DiagnosticCode::W011EmptyBasicAuth)
+        );
     }
 
     #[test]

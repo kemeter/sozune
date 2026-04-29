@@ -40,12 +40,12 @@ impl RateLimiter {
 
         let now = Instant::now();
 
-        let bucket = buckets.entry(source_ip.to_string()).or_insert_with(|| {
-            TokenBucket {
+        let bucket = buckets
+            .entry(source_ip.to_string())
+            .or_insert_with(|| TokenBucket {
                 tokens: self.burst as f64,
                 last_refill: now,
-            }
-        });
+            });
 
         // Refill tokens based on elapsed time
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
@@ -69,9 +69,7 @@ impl RateLimiter {
         };
 
         let now = Instant::now();
-        buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_refill).as_secs() < 3600
-        });
+        buckets.retain(|_, bucket| now.duration_since(bucket.last_refill).as_secs() < 3600);
     }
 }
 

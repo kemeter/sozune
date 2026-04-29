@@ -4,7 +4,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
@@ -98,7 +98,13 @@ async fn main() -> anyhow::Result<()> {
         let config = config.clone();
 
         async move {
-            provider::factory::start_services(&config, storage_providers, reload_tx_providers, acme_notify_providers).await
+            provider::factory::start_services(
+                &config,
+                storage_providers,
+                reload_tx_providers,
+                acme_notify_providers,
+            )
+            .await
         }
     });
 
@@ -160,8 +166,13 @@ async fn main() -> anyhow::Result<()> {
                     });
 
                     // Run the ACME manager
-                    let manager =
-                        acme::AcmeManager::new(acme_config, challenges, storage_acme, cert_tx, Arc::clone(&acme_notify));
+                    let manager = acme::AcmeManager::new(
+                        acme_config,
+                        challenges,
+                        storage_acme,
+                        cert_tx,
+                        Arc::clone(&acme_notify),
+                    );
 
                     if let Err(e) = manager.run().await {
                         error!("ACME manager failed: {}", e);
@@ -197,7 +208,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let secondary_tasks_future = async {
-        tokio::try_join!(api_task, provider_task, acme_task, middleware_task, health_task)
+        tokio::try_join!(
+            api_task,
+            provider_task,
+            acme_task,
+            middleware_task,
+            health_task
+        )
     };
 
     tokio::pin!(proxy_task);

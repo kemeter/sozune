@@ -18,7 +18,9 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
                 "candidate is not enabled for sozune",
             )
             .with_label("sozune.enable")
-            .with_hint("set `sozune.enable=true` or set `expose_by_default: true` in the provider config"),
+            .with_hint(
+                "set `sozune.enable=true` or set `expose_by_default: true` in the provider config",
+            ),
         );
         return ParseResult {
             entrypoints: HashMap::new(),
@@ -89,8 +91,12 @@ fn discover_services(
             continue;
         }
         let mut parts = rest.splitn(3, '.');
-        let Some(protocol) = parts.next() else { continue };
-        let Some(service) = parts.next() else { continue };
+        let Some(protocol) = parts.next() else {
+            continue;
+        };
+        let Some(service) = parts.next() else {
+            continue;
+        };
         if parts.next().is_none() {
             // No third segment means this isn't a service label.
             continue;
@@ -262,10 +268,7 @@ mod tests {
     #[test]
     fn missing_host_emits_e002_and_drops_service() {
         let c = candidate(
-            &[
-                ("sozune.enable", "true"),
-                ("sozune.http.web.port", "8080"),
-            ],
+            &[("sozune.enable", "true"), ("sozune.http.web.port", "8080")],
             vec![net("bridge", "10.0.0.1")],
         );
         let r = parse(&c);
