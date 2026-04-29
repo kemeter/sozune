@@ -1,4 +1,5 @@
 use anyhow::Context;
+use clap::Parser;
 use futures_util::stream::StreamExt;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
@@ -7,10 +8,12 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::cli::{Cli, Command};
 use crate::config::AppConfig;
 
 mod acme;
 mod api;
+mod cli;
 mod config;
 mod labels;
 mod middleware;
@@ -22,6 +25,20 @@ pub use model::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    init_tracing();
+
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => serve().await,
+        Command::Validate(args) => {
+            let exit = cli::validate::run(args).await?;
+            std::process::exit(exit);
+        }
+    }
+}
+
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -31,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive("rustls=warn".parse().expect("valid log directive")),
         )
         .init();
+}
 
+async fn serve() -> anyhow::Result<()> {
     info!("Starting Sozune proxy");
 
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
