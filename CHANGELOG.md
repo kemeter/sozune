@@ -2,7 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] - 2026-04-28
+## [0.11.0] - 2026-04-29
+
+### CLI
+
+- New `sozune` CLI based on `clap` with `serve` and `validate` subcommands.
+- `sozune validate` parses the configuration and renders a tree of entrypoints, routes, backends, and middlewares — without starting the proxy.
+
+### Dashboard
+
+- Read-only SvelteKit dashboard embedded via `rust-embed`, served on its own port.
+- Login page with Basic auth flow against the API.
+- Sidebar with a Documentation link.
+- Configuration documentation page.
+- Biome lint/format, mobile responsive layout.
+
+### API
+
+- Bearer token replaced by **Basic auth + named users + roles**.
+- CORS support via `cors_origins` config; default policy allows any origin.
+- `GET /entrypoints` now returns an array instead of a map.
 
 ### Native middleware migration
 
@@ -32,16 +51,45 @@ New `EntrypointConfig` fields, parsed from Docker labels and passed through to S
 - `redirectTemplate` → `RequestHttpFrontend.redirect_template` (template with `%REDIRECT_LOCATION` / `%STATUS_CODE`)
 - `wwwAuthenticate` → `Cluster.www_authenticate` (realm in the 401 `WWW-Authenticate` header)
 
+### Routing & providers
+
+- Regex-based path matching (`PathRuleKind` aligned with Sōzu proto).
+- New HTTP provider: poll entrypoints from a remote URL (JSON only).
+
+### Middleware
+
+- Gzip response compression for compressible content types, opt-in via `compress` label.
+
+### Labels module
+
+- New `labels` module with a shared parser orchestrating per-field helpers (port, priority, backend timeout, redirect, scheme, ratelimit, auth, headers, host, network, path).
+- `LabelSource` trait wired through the Docker provider.
+
+### Documentation & website
+
+- Public website with prerendered home, mobile-responsive layout, deployed via Pages.
+- README slimmed down to vitrine + quickstart, with details moved under `documentation/`.
+
+### Container & CI
+
+- Container runs as root by default; non-root override documented.
+- CI installs `protoc` to build `sozu-command-lib` and builds the dashboard before cargo.
+- Bumped patched Sōzu fork (wildcard overflow fix) and added `Cluster.http2`.
+
 ### Breaking changes
 
 - **Basic auth password format**: `password_hash` (in `auth.basic` config and `sozune.http.<name>.auth.basic` Docker labels) must now be lowercase **hex(SHA-256)** of the password instead of bcrypt. Bcrypt is rejected by Sozu's native auth path. Generate hashes with `echo -n 'password' | sha256sum`. The `bcrypt` dependency has been removed.
 - `strip_prefix` no longer rejects partial-segment matches (e.g. `/apiv2` against prefix `/api`). The behavior now follows Sozu's `PathRule::Prefix` `starts_with` semantics. Use a trailing slash (`/api/`) or a regex path to enforce segment boundaries.
 - **`headers` field schema**: `EntrypointConfig.headers` changed from `HashMap<String, String>` to `Vec<HeaderConfig>` where `HeaderConfig = { name, value, direction }`. The HTTP provider JSON and REST API payloads must use an array (`"headers": []`) instead of an object (`"headers": {}`).
+- **API authentication**: bearer token replaced by Basic auth with named users and roles. Existing API clients must migrate.
+- **`GET /entrypoints` shape**: returns an array instead of a map.
 
 ### Internals
 
 - Middleware module slimmed down: `auth.rs`, `headers.rs`, `strip_prefix.rs` deleted (~340 LOC removed).
 - `MiddlewareRoute` now only carries `backends`, `backend_counter`, `backend_timeout`, `rate_limiter`, `compress`.
+- `cargo fmt` pass over the codebase.
+- Integration tests added for rate limiting, gzip compression, API CRUD, backend timeout, HTTP provider, plus end-to-end tests.
 
 ## [0.10.0] - 2026-04-07
 

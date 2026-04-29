@@ -1,6 +1,6 @@
 [package]
 name = "sozune"
-version = "0.10.0"
+version = "0.11.0"
 authors = ["mlanawo Mbechezi mlanawo.mbechezi@kemeter.io"]
 edition = "2024"
 
@@ -40,3 +40,8 @@ sha2 = "0.10"
 subtle = "2"
 rust-embed = "8"
 mime_guess = "2"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

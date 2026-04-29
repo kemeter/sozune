@@ -1,4 +1,7 @@
-.PHONY: all build build-dashboard run test fmt clean
+.PHONY: all build build-dashboard docker-build run test fmt clean
+
+IMAGE ?= sozune
+TAG ?= latest
 
 all: build
 
@@ -7,6 +10,9 @@ build: build-dashboard
 
 build-dashboard:
 	cd dashboard && bun install && bun run build
+
+docker-build:
+	docker build -t $(IMAGE):$(TAG) .
 
 run: build-dashboard
 	cargo run
