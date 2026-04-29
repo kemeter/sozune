@@ -1,4 +1,5 @@
 mod compress;
+mod diag;
 mod proxy;
 pub mod rate_limit;
 
@@ -57,6 +58,12 @@ impl MiddlewareRouteTable {
         // Strip port from host header if present (e.g. "example.com:8080" -> "example.com")
         let hostname = host.split(':').next().unwrap_or(host);
         self.routes.get(hostname).cloned()
+    }
+
+    pub fn known_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self.routes.keys().cloned().collect();
+        hosts.sort();
+        hosts
     }
 }
 
