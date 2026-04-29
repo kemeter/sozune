@@ -28,6 +28,7 @@ pub enum DiagnosticCode {
     W010NoIpFellBackToLocalhost,
     W011EmptyBasicAuth,
     W012InvalidProtocol,
+    W013UnknownLabel,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -52,6 +53,7 @@ impl DiagnosticCode {
             DiagnosticCode::W010NoIpFellBackToLocalhost => "W010",
             DiagnosticCode::W011EmptyBasicAuth => "W011",
             DiagnosticCode::W012InvalidProtocol => "W012",
+            DiagnosticCode::W013UnknownLabel => "W013",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }

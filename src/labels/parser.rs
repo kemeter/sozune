@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::labels::candidate::Candidate;
+use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{auth, core, headers, host, path, ratelimit, redirect};
 use crate::labels::network;
@@ -27,6 +28,8 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
             diagnostics,
         };
     }
+
+    catalog::detect_unknown_labels(&candidate.labels, &mut diagnostics);
 
     let services = discover_services(&candidate.labels, &mut diagnostics);
     if services.is_empty() {
@@ -310,6 +313,21 @@ mod tests {
         assert_eq!(r.entrypoints.len(), 1);
         assert!(has_code(&r, DiagnosticCode::W001InvalidPort));
         assert_eq!(r.entrypoints.get("http_web").unwrap().config.port, 80);
+    }
+
+    #[test]
+    fn unknown_label_emits_w013_but_does_not_block_routing() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "example.com"),
+                ("sozune.http.web.timeout", "5s"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        assert_eq!(r.entrypoints.len(), 1);
+        assert!(has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 
     #[test]

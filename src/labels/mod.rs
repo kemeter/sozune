@@ -9,6 +9,7 @@
 //! validate reports cannot drift from what production actually does.
 
 pub mod candidate;
+pub mod catalog;
 pub mod diagnostic;
 pub mod fields;
 pub mod network;
