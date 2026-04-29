@@ -71,7 +71,11 @@ fn serve_file(path: &str) -> Response {
                 .header(header::CONTENT_TYPE, mime.as_ref())
                 .body(Body::from(content.data.into_owned()))
                 .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "failed to build response").into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to build response",
+                    )
+                        .into_response()
                 })
         }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
