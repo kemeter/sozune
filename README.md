@@ -54,6 +54,7 @@ curl -H "Host: whoami.localhost" http://localhost
 
 - [Installation](documentation/getting-started/installation.md) · [Quick start](documentation/getting-started/quick-start.md)
 - [Docker labels reference](documentation/configuration/docker-labels.md)
+- [Swarm provider](documentation/configuration/swarm-provider.md) · [HTTP provider](documentation/configuration/http-provider.md)
 - [Configuration file & env vars](documentation/configuration/overview.md)
 - [REST API](documentation/configuration/api.md)
 - Routing — [Hostnames](documentation/routing/hostnames.md) · [Path matching](documentation/routing/path-matching.md) · [Load balancing](documentation/routing/load-balancing.md) · [TCP](documentation/routing/tcp.md)

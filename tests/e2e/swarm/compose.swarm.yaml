@@ -1,0 +1,32 @@
+version: "3.9"
+
+# Stack used by run-swarm.sh — deployed with `docker stack deploy`.
+# All sozune.* labels live under deploy.labels (service-level), not
+# services.*.labels (task-level), because Sozune reads ServiceSpec.Labels.
+
+networks:
+  sozune-swarm-test:
+    external: true
+
+services:
+  svca:
+    image: traefik/whoami
+    networks:
+      - sozune-swarm-test
+    deploy:
+      replicas: 1
+      labels:
+        sozune.enable: "true"
+        sozune.http.svca.host: "svca.swarm-test.localhost"
+        sozune.network: "sozune-swarm-test"
+
+  svcb:
+    image: traefik/whoami
+    networks:
+      - sozune-swarm-test
+    deploy:
+      replicas: 2
+      labels:
+        sozune.enable: "true"
+        sozune.http.svcb.host: "svcb.swarm-test.localhost"
+        sozune.network: "sozune-swarm-test"
