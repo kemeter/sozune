@@ -50,8 +50,11 @@ impl HttpProvider {
 
             match self.fetch_entrypoints().await {
                 Ok(new_entrypoints) => {
-                    let changed = {
-                        let mut storage_write = match storage.write() {
+                    // Compare under a read lock first; the API server also
+                    // takes read locks on this storage and would otherwise
+                    // contend with our write lock on every poll.
+                    let needs_update = {
+                        let storage_read = match storage.read() {
                             Ok(guard) => guard,
                             Err(e) => {
                                 error!("Storage lock poisoned in HTTP provider: {}", e);
@@ -59,44 +62,48 @@ impl HttpProvider {
                             }
                         };
 
-                        // Collect current HTTP provider entrypoint IDs
-                        let old_ids: Vec<String> = storage_write
+                        let old_ids: std::collections::HashSet<&String> = storage_read
                             .iter()
                             .filter(|(_, ep)| ep.source.as_deref() == Some("http"))
-                            .map(|(id, _)| id.clone())
+                            .map(|(id, _)| id)
                             .collect();
 
-                        let new_ids: Vec<String> = new_entrypoints.keys().cloned().collect();
+                        let new_ids: std::collections::HashSet<&String> =
+                            new_entrypoints.keys().collect();
 
-                        let changed = old_ids != new_ids
+                        old_ids != new_ids
                             || new_entrypoints.iter().any(|(id, ep)| {
-                                storage_write.get(id).map_or(true, |existing| {
+                                storage_read.get(id).map_or(true, |existing| {
                                     existing.backends != ep.backends
                                         || existing.config.hostnames != ep.config.hostnames
                                         || existing.config.port != ep.config.port
                                 })
-                            });
-
-                        if changed {
-                            // Remove old HTTP provider entrypoints
-                            storage_write.retain(|_, ep| ep.source.as_deref() != Some("http"));
-
-                            // Add new ones
-                            for (id, mut entrypoint) in new_entrypoints {
-                                entrypoint.source = Some("http".to_string());
-                                debug!("HTTP provider entrypoint: {}", id);
-                                storage_write.insert(id, entrypoint);
-                            }
-                        }
-
-                        changed
+                            })
                     };
 
-                    if changed {
-                        info!("HTTP provider config changed, triggering reload");
-                        if let Err(e) = reload_tx.send(()).await {
-                            warn!("Failed to send reload signal: {}", e);
+                    if !needs_update {
+                        continue;
+                    }
+
+                    {
+                        let mut storage_write = match storage.write() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                error!("Storage lock poisoned in HTTP provider: {}", e);
+                                continue;
+                            }
+                        };
+                        storage_write.retain(|_, ep| ep.source.as_deref() != Some("http"));
+                        for (id, mut entrypoint) in new_entrypoints {
+                            entrypoint.source = Some("http".to_string());
+                            debug!("HTTP provider entrypoint: {}", id);
+                            storage_write.insert(id, entrypoint);
                         }
+                    }
+
+                    info!("HTTP provider config changed, triggering reload");
+                    if let Err(e) = reload_tx.send(()).await {
+                        warn!("Failed to send reload signal: {}", e);
                     }
                 }
                 Err(e) => {
