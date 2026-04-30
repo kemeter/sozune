@@ -27,22 +27,29 @@ pub async fn start_services(
 
         match config_provider.provide().await {
             Ok(entrypoints) => {
-                let mut storage_write = match storage.write() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        error!("Storage lock poisoned in config file provider: {}", e);
-                        return Ok(());
+                let loaded = entrypoints.len();
+                {
+                    let mut storage_write = match storage.write() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            error!("Storage lock poisoned in config file provider: {}", e);
+                            return Ok(());
+                        }
+                    };
+                    for (id, mut entrypoint) in entrypoints {
+                        if storage_write.contains_key(&id) {
+                            warn!("Duplicate entrypoint ID {} from config file provider", id);
+                        }
+                        entrypoint.source = Some("config".to_string());
+                        info!("Loaded entrypoint from config: {}", id);
+                        storage_write.insert(id, entrypoint);
                     }
-                };
-                for (id, mut entrypoint) in entrypoints {
-                    if storage_write.contains_key(&id) {
-                        warn!("Duplicate entrypoint ID {} from config file provider", id);
-                    }
-                    entrypoint.source = Some("config".to_string());
-                    info!("Loaded entrypoint from config: {}", id);
-                    storage_write.insert(id, entrypoint);
                 }
-                drop(storage_write);
+                if loaded > 0
+                    && let Err(e) = reload_tx.send(()).await
+                {
+                    warn!("Failed to signal reload after config file load: {}", e);
+                }
             }
             Err(e) => {
                 warn!("Config file provider failed: {}", e);
