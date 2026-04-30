@@ -146,6 +146,7 @@ mod tests {
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,
+                entrypoint: None,
             },
             source: None,
             backend_weights: HashMap::new(),
