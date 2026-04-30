@@ -212,8 +212,8 @@ impl AcmeManager {
             // Tell ACME server we're ready
             challenge.set_ready().await?;
         }
-        // Drop authorizations borrow so we can use order again
-        drop(authorizations);
+        // Authorizations holds a borrow on order; let NLL release it here.
+        let _ = authorizations;
 
         // Wait for order to become ready
         let ready_result = Self::poll_order_ready(&mut order).await;

@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware::{self as axum_middleware, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -593,7 +593,7 @@ mod tests {
         // Get
         let response = app
             .oneshot(
-                Request::get(&format!("/entrypoints/{}", id))
+                Request::get(format!("/entrypoints/{}", id))
                     .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),
@@ -649,7 +649,7 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::put(&format!("/entrypoints/{}", id))
+                Request::put(format!("/entrypoints/{}", id))
                     .header("authorization", admin_auth())
                     .header("content-type", "application/json")
                     .body(Body::from(updated_json.to_string()))
@@ -686,7 +686,7 @@ mod tests {
         // Delete
         let response = app
             .oneshot(
-                Request::delete(&format!("/entrypoints/{}", id))
+                Request::delete(format!("/entrypoints/{}", id))
                     .header("authorization", admin_auth())
                     .body(Body::empty())
                     .unwrap(),

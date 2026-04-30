@@ -85,8 +85,10 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 
 fn brotli_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut out = Vec::with_capacity(data.len());
-    let mut params = BrotliEncoderParams::default();
-    params.quality = 4;
+    let params = BrotliEncoderParams {
+        quality: 4,
+        ..Default::default()
+    };
     brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut out, &params)?;
     Ok(out)
 }

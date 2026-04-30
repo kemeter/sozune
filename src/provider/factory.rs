@@ -19,103 +19,113 @@ pub async fn start_services(
     info!("Loading initial entrypoints and starting provider services");
 
     // Load initial entrypoints from config file provider and start watcher if enabled
-    if let Some(config_file) = &config.providers.config_file {
-        if config_file.enabled {
-            info!("Loading initial entrypoints from config file provider");
-            let config_provider = ConfigProvider::new(&config_file.path);
+    if let Some(config_file) = &config.providers.config_file
+        && config_file.enabled
+    {
+        info!("Loading initial entrypoints from config file provider");
+        let config_provider = ConfigProvider::new(&config_file.path);
 
-            match config_provider.provide().await {
-                Ok(entrypoints) => {
-                    let mut storage_write = match storage.write() {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            error!("Storage lock poisoned in config file provider: {}", e);
-                            return Ok(());
-                        }
-                    };
-                    for (id, mut entrypoint) in entrypoints {
-                        if storage_write.contains_key(&id) {
-                            warn!("Duplicate entrypoint ID {} from config file provider", id);
-                        }
-                        entrypoint.source = Some("config".to_string());
-                        info!("Loaded entrypoint from config: {}", id);
-                        storage_write.insert(id, entrypoint);
+        match config_provider.provide().await {
+            Ok(entrypoints) => {
+                let mut storage_write = match storage.write() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        error!("Storage lock poisoned in config file provider: {}", e);
+                        return Ok(());
                     }
-                    drop(storage_write);
-                }
-                Err(e) => {
-                    warn!("Config file provider failed: {}", e);
-                }
-            }
-
-            // Start file watcher if watch is enabled
-            if config_file.watch {
-                info!("Starting file watcher for config file");
-                let config_provider_watcher = ConfigProvider::new(&config_file.path);
-                let storage_watcher = Arc::clone(&storage);
-                let reload_tx_watcher = reload_tx.clone();
-
-                tokio::spawn(async move {
-                    if let Err(e) = config_provider_watcher
-                        .start_file_watcher(storage_watcher, reload_tx_watcher)
-                        .await
-                    {
-                        error!("Config file watcher failed: {}", e);
+                };
+                for (id, mut entrypoint) in entrypoints {
+                    if storage_write.contains_key(&id) {
+                        warn!("Duplicate entrypoint ID {} from config file provider", id);
                     }
-                });
+                    entrypoint.source = Some("config".to_string());
+                    info!("Loaded entrypoint from config: {}", id);
+                    storage_write.insert(id, entrypoint);
+                }
+                drop(storage_write);
             }
+            Err(e) => {
+                warn!("Config file provider failed: {}", e);
+            }
+        }
+
+        // Start file watcher if watch is enabled
+        if config_file.watch {
+            info!("Starting file watcher for config file");
+            let config_provider_watcher = ConfigProvider::new(&config_file.path);
+            let storage_watcher = Arc::clone(&storage);
+            let reload_tx_watcher = reload_tx.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = config_provider_watcher
+                    .start_file_watcher(storage_watcher, reload_tx_watcher)
+                    .await
+                {
+                    error!("Config file watcher failed: {}", e);
+                }
+            });
         }
     }
 
     // Start Docker service if enabled (includes initial scan)
-    if let Some(docker_config) = &config.providers.docker {
-        if docker_config.enabled {
-            info!("Starting Docker service");
-            let docker_provider = DockerProvider::new(docker_config.clone())
-                .context("Failed to create Docker provider")?;
+    if let Some(docker_config) = &config.providers.docker
+        && docker_config.enabled
+    {
+        info!("Starting Docker service");
+        let docker_provider = DockerProvider::new(docker_config.clone())
+            .context("Failed to create Docker provider")?;
+        let storage_docker = Arc::clone(&storage);
+        let reload_tx_docker = reload_tx.clone();
+        let acme_notify_docker = Arc::clone(&acme_notify);
 
+        tokio::spawn(async move {
             if let Err(e) = docker_provider
-                .start_service(Arc::clone(&storage), reload_tx.clone(), Arc::clone(&acme_notify))
+                .start_service(storage_docker, reload_tx_docker, acme_notify_docker)
                 .await
             {
                 error!("Docker service failed: {}", e);
             }
-        }
+        });
     }
 
     // Start Podman service if enabled (Docker API-compatible socket)
-    if let Some(podman_config) = &config.providers.podman {
-        if podman_config.enabled {
-            info!("Starting Podman service");
-            let podman_provider = PodmanProvider::new(podman_config.clone())
-                .context("Failed to create Podman provider")?;
+    if let Some(podman_config) = &config.providers.podman
+        && podman_config.enabled
+    {
+        info!("Starting Podman service");
+        let podman_provider = PodmanProvider::new(podman_config.clone())
+            .context("Failed to create Podman provider")?;
+        let storage_podman = Arc::clone(&storage);
+        let reload_tx_podman = reload_tx.clone();
+        let acme_notify_podman = Arc::clone(&acme_notify);
 
+        tokio::spawn(async move {
             if let Err(e) = podman_provider
-                .start_service(Arc::clone(&storage), reload_tx.clone(), acme_notify)
+                .start_service(storage_podman, reload_tx_podman, acme_notify_podman)
                 .await
             {
                 error!("Podman service failed: {}", e);
             }
-        }
+        });
     }
 
     // Start HTTP provider if enabled
-    if let Some(http_config) = &config.providers.http {
-        if http_config.enabled {
-            info!("Starting HTTP provider");
-            let http_provider = HttpProvider::new(http_config.clone());
-            let storage_http = Arc::clone(&storage);
-            let reload_tx_http = reload_tx.clone();
+    if let Some(http_config) = &config.providers.http
+        && http_config.enabled
+    {
+        info!("Starting HTTP provider");
+        let http_provider = HttpProvider::new(http_config.clone());
+        let storage_http = Arc::clone(&storage);
+        let reload_tx_http = reload_tx.clone();
 
-            tokio::spawn(async move {
-                if let Err(e) = http_provider
-                    .start_polling(storage_http, reload_tx_http)
-                    .await
-                {
-                    error!("HTTP provider failed: {}", e);
-                }
-            });
-        }
+        tokio::spawn(async move {
+            if let Err(e) = http_provider
+                .start_polling(storage_http, reload_tx_http)
+                .await
+            {
+                error!("HTTP provider failed: {}", e);
+            }
+        });
     }
 
     Ok(())

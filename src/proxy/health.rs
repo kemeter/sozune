@@ -69,10 +69,8 @@ impl HealthChecker {
             }
         }
 
-        if changed {
-            if let Err(e) = self.reload_tx.send(()).await {
-                error!("Failed to send reload after health check: {}", e);
-            }
+        if changed && let Err(e) = self.reload_tx.send(()).await {
+            error!("Failed to send reload after health check: {}", e);
         }
     }
 
