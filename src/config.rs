@@ -39,6 +39,7 @@ pub struct AcmeConfig {
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct ProvidersConfig {
     pub docker: Option<DockerConfig>,
+    pub podman: Option<PodmanConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -52,6 +53,19 @@ pub struct DockerConfig {
     #[serde(
         default,
         deserialize_with = "deserialize_docker_expose_by_default_with_env"
+    )]
+    pub expose_by_default: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PodmanConfig {
+    #[serde(default, deserialize_with = "deserialize_podman_enabled_with_env")]
+    pub enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_podman_endpoint_with_env")]
+    pub endpoint: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_podman_expose_by_default_with_env"
     )]
     pub expose_by_default: bool,
 }
@@ -202,6 +216,24 @@ impl Default for DockerConfig {
             endpoint: "/var/run/docker.sock".to_string(),
             expose_by_default: false,
         }
+    }
+}
+
+impl Default for PodmanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_podman_endpoint(),
+            expose_by_default: false,
+        }
+    }
+}
+
+fn default_podman_endpoint() -> String {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{runtime_dir}/podman/podman.sock")
+    } else {
+        "/run/podman/podman.sock".to_string()
     }
 }
 
@@ -420,6 +452,22 @@ deserialize_bool_with_env!(
 );
 
 deserialize_bool_with_env!(
+    deserialize_podman_enabled_with_env,
+    "SOZUNE_PROVIDER_PODMAN_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_podman_endpoint_with_env,
+    "SOZUNE_PROVIDER_PODMAN_ENDPOINT",
+    default_podman_endpoint
+);
+deserialize_bool_with_env!(
+    deserialize_podman_expose_by_default_with_env,
+    "SOZUNE_PROVIDER_PODMAN_EXPOSE_BY_DEFAULT",
+    false
+);
+
+deserialize_bool_with_env!(
     deserialize_config_file_enabled_with_env,
     "SOZUNE_PROVIDER_CONFIG_FILE_ENABLED",
     false
@@ -594,6 +642,27 @@ cluster_setup_delay_ms: 1000
         assert_eq!(config.buffer_size, 32768);
         assert_eq!(config.startup_delay_ms, 2000);
         assert_eq!(config.cluster_setup_delay_ms, 1000);
+    }
+
+    #[test]
+    fn test_podman_config_deserialization() {
+        let yaml = r#"
+enabled: true
+endpoint: /run/podman/podman.sock
+expose_by_default: true
+"#;
+        let config: PodmanConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.endpoint, "/run/podman/podman.sock");
+        assert!(config.expose_by_default);
+    }
+
+    #[test]
+    fn test_podman_config_defaults() {
+        let config = PodmanConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.expose_by_default);
+        assert!(config.endpoint.ends_with("podman.sock"));
     }
 
     #[test]

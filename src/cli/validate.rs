@@ -7,6 +7,7 @@ use crate::labels::diagnostic::Severity;
 use crate::labels::source::LabelSource;
 use crate::labels::{self, Candidate};
 use crate::provider::docker::DockerProvider;
+use crate::provider::podman::PodmanProvider;
 
 #[derive(Args, Debug)]
 pub struct ValidateArgs {
@@ -91,6 +92,20 @@ async fn collect_candidates(
                         Err(e) => eprintln!("docker: failed to collect candidates: {e}"),
                     },
                     Err(e) => eprintln!("docker: failed to connect: {e}"),
+                }
+            }
+        }
+    }
+
+    if want("podman") {
+        if let Some(podman_cfg) = &config.providers.podman {
+            if podman_cfg.enabled {
+                match PodmanProvider::new(podman_cfg.clone()) {
+                    Ok(provider) => match provider.collect().await {
+                        Ok(mut cs) => candidates.append(&mut cs),
+                        Err(e) => eprintln!("podman: failed to collect candidates: {e}"),
+                    },
+                    Err(e) => eprintln!("podman: failed to connect: {e}"),
                 }
             }
         }
