@@ -20,35 +20,24 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-#[derive(Debug, Clone, PartialEq)]
-struct EntrypointSnapshot {
-    hostnames: Vec<String>,
-    path: Option<PathConfig>,
-    strip_prefix: bool,
-    tls: bool,
-    port: u16,
-    backends: Vec<String>,
-}
-
-type RoutingSnapshot = BTreeMap<String, EntrypointSnapshot>;
+/// Snapshot of the storage at the moment of the last successful reload, keyed
+/// by `cluster_id`. Used to compute the diff between two reloads.
+///
+/// We keep the full `Entrypoint` (not a derived subset) so that any change to
+/// the entrypoint — including middleware fields like `headers`, `redirect`,
+/// `auth` — triggers the diff. A subset snapshot has caused silent regressions
+/// before: a new middleware field was added but the snapshot was not updated,
+/// so changes to that field never produced a `RemoveHttpFrontend` and the
+/// subsequent `AddHttpFrontend` was rejected by Sōzu as a duplicate, leaving
+/// the old config in the worker. Full-equality on `Entrypoint` makes that
+/// class of bug impossible.
+type RoutingSnapshot = BTreeMap<String, Entrypoint>;
 
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
     storage
         .iter()
         .filter(|(_, ep)| matches!(ep.protocol, Protocol::Http))
-        .map(|(id, ep)| {
-            (
-                id.clone(),
-                EntrypointSnapshot {
-                    hostnames: ep.config.hostnames.clone(),
-                    path: ep.config.path.clone(),
-                    strip_prefix: ep.config.strip_prefix,
-                    tls: ep.config.tls,
-                    port: ep.config.port,
-                    backends: ep.backends.clone(),
-                },
-            )
-        })
+        .map(|(id, ep)| (id.clone(), ep.clone()))
         .collect()
 }
 
@@ -147,12 +136,85 @@ pub fn start_sozu_proxy(
     let http_port = config.http.listen_address;
     let https_port = config.https.listen_address;
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
+    let reload_throttle = Duration::from_millis(config.reload_throttle_ms);
 
     let reload_handle = thread::spawn(move || {
         handle.block_on(async {
             let mut shutdown_rx = shutdown_rx;
             let mut cert_rx_open = true;
             let mut previous_snapshot: RoutingSnapshot = BTreeMap::new();
+
+            // Apply a reload, then enter a throttle window: discard duplicate
+            // signals, but remember if at least one arrived so we can fold it
+            // into a single follow-up reload at the end. Mirrors Traefik's
+            // `providersThrottleDuration` (default 2 s; we default to 500 ms).
+            // Returns true if shutdown was observed during the window.
+            macro_rules! apply_with_throttle {
+                () => {{
+                    previous_snapshot = handle_reload(
+                        &storage_reload,
+                        &mut command_channel,
+                        &mut command_channel_https,
+                        http_port,
+                        https_port,
+                        cluster_setup_delay_ms,
+                        acme_challenge_port,
+                        &previous_snapshot,
+                        &middleware_state,
+                        middleware_port,
+                    );
+
+                    if !reload_throttle.is_zero() {
+                        let mut pending = false;
+                        let mut coalesced: usize = 0;
+                        let sleep = tokio::time::sleep(reload_throttle);
+                        tokio::pin!(sleep);
+                        let mut shutdown_seen = false;
+                        loop {
+                            tokio::select! {
+                                _ = &mut sleep => break,
+                                _ = &mut shutdown_rx => {
+                                    shutdown_seen = true;
+                                    break;
+                                }
+                                signal = reload_rx.recv() => {
+                                    match signal {
+                                        Some(_) => {
+                                            pending = true;
+                                            coalesced += 1;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                        if coalesced > 0 {
+                            debug!(
+                                "Throttled {} reload signal(s); applying single follow-up",
+                                coalesced
+                            );
+                        }
+                        if pending && !shutdown_seen {
+                            previous_snapshot = handle_reload(
+                                &storage_reload,
+                                &mut command_channel,
+                                &mut command_channel_https,
+                                http_port,
+                                https_port,
+                                cluster_setup_delay_ms,
+                                acme_challenge_port,
+                                &previous_snapshot,
+                                &middleware_state,
+                                middleware_port,
+                            );
+                        }
+                        shutdown_seen
+                    } else {
+                        false
+                    }
+                }};
+            }
+
             loop {
                 if cert_rx_open {
                     tokio::select! {
@@ -163,7 +225,10 @@ pub fn start_sozu_proxy(
                         reload = reload_rx.recv() => {
                             match reload {
                                 Some(_) => {
-                                    previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
+                                    if apply_with_throttle!() {
+                                        info!("Shutdown signal received in reload handler");
+                                        break;
+                                    }
                                 }
                                 None => {
                                     debug!("Reload channel closed");
@@ -179,7 +244,10 @@ pub fn start_sozu_proxy(
                                         error!("Failed to add certificate for {}: {}", cmd.hostname, e);
                                     } else {
                                         // Reload to ensure HTTPS frontends are properly configured with the new cert
-                                        previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
+                                        if apply_with_throttle!() {
+                                            info!("Shutdown signal received in reload handler");
+                                            break;
+                                        }
                                     }
                                 }
                                 None => {
@@ -198,7 +266,10 @@ pub fn start_sozu_proxy(
                         reload = reload_rx.recv() => {
                             match reload {
                                 Some(_) => {
-                                    previous_snapshot = handle_reload(&storage_reload, &mut command_channel, &mut command_channel_https, http_port, https_port, cluster_setup_delay_ms, acme_challenge_port, &previous_snapshot, &middleware_state, middleware_port);
+                                    if apply_with_throttle!() {
+                                        info!("Shutdown signal received in reload handler");
+                                        break;
+                                    }
                                 }
                                 None => {
                                     debug!("Reload channel closed");
@@ -927,14 +998,17 @@ fn remove_http_frontends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     cluster_id: &str,
-    snapshot: &EntrypointSnapshot,
+    entrypoint: &Entrypoint,
     http_port: u16,
     https_port: u16,
 ) {
-    let (path_rule, _) =
-        build_path_and_rewrite(snapshot.path.as_ref(), snapshot.strip_prefix, cluster_id);
+    let (path_rule, _) = build_path_and_rewrite(
+        entrypoint.config.path.as_ref(),
+        entrypoint.config.strip_prefix,
+        cluster_id,
+    );
 
-    for hostname in &snapshot.hostnames {
+    for hostname in &entrypoint.config.hostnames {
         let http_front = RequestHttpFrontend {
             cluster_id: Some(cluster_id.to_string()),
             address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
@@ -954,7 +1028,7 @@ fn remove_http_frontends(
             debug!("Failed to remove HTTP frontend for {}: {}", hostname, e);
         }
 
-        if snapshot.tls {
+        if entrypoint.config.tls {
             let https_front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
                 address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
@@ -981,15 +1055,15 @@ fn remove_backends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     cluster_id: &str,
-    snapshot: &EntrypointSnapshot,
+    entrypoint: &Entrypoint,
 ) {
-    for (i, backend_host) in snapshot.backends.iter().enumerate() {
-        let address = match parse_backend_address(backend_host, snapshot.port) {
+    for (i, backend_host) in entrypoint.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_host, entrypoint.config.port) {
             Ok(addr) => addr,
             Err(e) => {
                 debug!(
                     "Failed to parse backend address {}:{} for removal: {}",
-                    backend_host, snapshot.port, e
+                    backend_host, entrypoint.config.port, e
                 );
                 continue;
             }
@@ -1009,7 +1083,7 @@ fn remove_backends(
             debug!("Failed to remove HTTP backend {}: {}", backend_id, e);
         }
 
-        if snapshot.tls
+        if entrypoint.config.tls
             && let Err(e) = send_to_worker(
                 command_channel_https,
                 format!("rm-backend-https-{}-{}", cluster_id, i),
@@ -1082,54 +1156,45 @@ fn apply_routing_diff(
     acme_challenge_port: Option<u16>,
 ) {
     // Handle removed clusters
-    for (cluster_id, old_snapshot) in previous {
+    for (cluster_id, old) in previous {
         if !current.contains_key(cluster_id) {
             info!("Removing stale cluster: {}", cluster_id);
             remove_http_frontends(
                 command_channel,
                 command_channel_https,
                 cluster_id,
-                old_snapshot,
+                old,
                 http_port,
                 https_port,
             );
-            remove_backends(
-                command_channel,
-                command_channel_https,
-                cluster_id,
-                old_snapshot,
-            );
+            remove_backends(command_channel, command_channel_https, cluster_id, old);
             remove_cluster(command_channel, command_channel_https, cluster_id);
 
             if acme_challenge_port.is_some() {
-                remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
+                remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
             }
         }
     }
 
-    // Handle changed clusters
-    for (cluster_id, old_snapshot) in previous {
-        if let Some(new_snapshot) = current.get(cluster_id)
-            && old_snapshot != new_snapshot
+    // Handle changed clusters: full equality on Entrypoint, so any middleware
+    // change (headers, redirect, auth, …) is caught.
+    for (cluster_id, old) in previous {
+        if let Some(new) = current.get(cluster_id)
+            && old != new
         {
             info!("Updating changed cluster: {}", cluster_id);
             remove_http_frontends(
                 command_channel,
                 command_channel_https,
                 cluster_id,
-                old_snapshot,
+                old,
                 http_port,
                 https_port,
             );
-            remove_backends(
-                command_channel,
-                command_channel_https,
-                cluster_id,
-                old_snapshot,
-            );
+            remove_backends(command_channel, command_channel_https, cluster_id, old);
 
-            if acme_challenge_port.is_some() && old_snapshot.hostnames != new_snapshot.hostnames {
-                remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
+            if acme_challenge_port.is_some() && old.config.hostnames != new.config.hostnames {
+                remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
             }
         }
     }
