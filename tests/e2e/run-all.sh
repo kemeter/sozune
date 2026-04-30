@@ -55,6 +55,11 @@ proxy:
     listen_address: $HTTP_PORT
   https:
     listen_address: $HTTPS_PORT
+  tcp:
+    - name: tcpecho
+      listen: $TCP_ECHO_PORT
+    - name: tcprr
+      listen: $TCP_RR_PORT
   max_buffers: 500
   buffer_size: 16384
   startup_delay_ms: 1000
@@ -190,6 +195,33 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcws.host=$HOST_WS"
       - "sozune.http.svcws.port=8080"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tcpecho:
+    image: alpine/socat
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "EXEC:cat"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.tcpecho.entrypoint=tcpecho"
+      - "sozune.tcp.tcpecho.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tcprr-a:
+    image: alpine/socat
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "SYSTEM:'echo backend-a'"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.tcprr.entrypoint=tcprr"
+      - "sozune.tcp.tcprr.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tcprr-b:
+    image: alpine/socat
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "SYSTEM:'echo backend-b'"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.tcprr.entrypoint=tcprr"
+      - "sozune.tcp.tcprr.port=9000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 
