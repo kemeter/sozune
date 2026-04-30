@@ -9,11 +9,11 @@ use sozu_command_lib::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, Header, HeaderPosition,
         LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
         RedirectPolicy as SozuRedirectPolicy, RedirectScheme as SozuRedirectScheme, RemoveBackend,
-        Request, RequestHttpFrontend, ResponseStatus, RulePosition, SocketAddress, Status,
-        TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
+        Request, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition,
+        SocketAddress, Status, TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
     },
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -33,12 +33,88 @@ use tracing::{debug, error, info};
 /// class of bug impossible.
 type RoutingSnapshot = BTreeMap<String, Entrypoint>;
 
+/// Command channel for a single Sōzu TCP worker, paired with the port it
+/// binds. We need the port at routing time to build `RequestTcpFrontend`.
+struct TcpListenerChannel {
+    port: u16,
+    channel: Channel<WorkerRequest, WorkerResponse>,
+}
+
+/// TCP workers keyed by listener name (matches `proxy.tcp[].name`).
+/// One worker = one listener.
+type TcpChannels = HashMap<String, TcpListenerChannel>;
+
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
     storage
         .iter()
-        .filter(|(_, ep)| matches!(ep.protocol, Protocol::Http))
+        .filter(|(_, ep)| matches!(ep.protocol, Protocol::Http | Protocol::Tcp))
         .map(|(id, ep)| (id.clone(), ep.clone()))
         .collect()
+}
+
+fn spawn_tcp_workers(
+    config: &ProxyConfig,
+) -> anyhow::Result<(TcpChannels, Vec<thread::JoinHandle<()>>)> {
+    let mut channels: TcpChannels = HashMap::new();
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let max_buffers = config.max_buffers;
+    let buffer_size = config.buffer_size;
+    let timeout = Duration::from_millis(config.startup_delay_ms);
+
+    for tcp_cfg in &config.tcp {
+        if channels.contains_key(&tcp_cfg.name) {
+            anyhow::bail!(
+                "duplicate TCP listener name `{}` in proxy.tcp",
+                tcp_cfg.name
+            );
+        }
+
+        let listener_config =
+            ListenerBuilder::new_tcp(SocketAddress::new_v4(0, 0, 0, 0, tcp_cfg.listen))
+                .to_tcp(None)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Could not create TCP listener `{}` on :{}: {}",
+                        tcp_cfg.name,
+                        tcp_cfg.listen,
+                        e
+                    )
+                })?;
+
+        let (mut command, proxy_chan) = Channel::generate(1000, 10000).map_err(|e| {
+            anyhow::anyhow!("Could not create TCP channel for `{}`: {}", tcp_cfg.name, e)
+        })?;
+
+        let listener_name = tcp_cfg.name.clone();
+        let listener_port = tcp_cfg.listen;
+        let handle = thread::spawn(move || {
+            if let Err(e) = sozu_lib::tcp::testing::start_tcp_worker(
+                listener_config,
+                max_buffers,
+                buffer_size,
+                proxy_chan,
+            ) {
+                error!("TCP worker `{}` failed: {}", listener_name, e);
+            }
+        });
+
+        wait_for_worker_ready(&mut command, &format!("TCP[{}]", tcp_cfg.name), timeout)?;
+        info!(
+            "Sōzu TCP worker `{}` running on 0.0.0.0:{}",
+            tcp_cfg.name, listener_port
+        );
+
+        channels.insert(
+            tcp_cfg.name.clone(),
+            TcpListenerChannel {
+                port: listener_port,
+                channel: command,
+            },
+        );
+        handles.push(handle);
+    }
+
+    Ok((channels, handles))
 }
 
 pub fn start_sozu_proxy(
@@ -112,6 +188,9 @@ pub fn start_sozu_proxy(
     wait_for_worker_ready(&mut command_channel, "HTTP", timeout)?;
     wait_for_worker_ready(&mut command_channel_https, "HTTPS", timeout)?;
 
+    // Spawn one Sōzu TCP worker per declared listener.
+    let (mut tcp_channels, tcp_worker_handles) = spawn_tcp_workers(config)?;
+
     // Initial configuration will be handled by provider reload signals
     info!("Waiting for providers to populate configuration");
 
@@ -155,6 +234,7 @@ pub fn start_sozu_proxy(
                         &storage_reload,
                         &mut command_channel,
                         &mut command_channel_https,
+                        &mut tcp_channels,
                         http_port,
                         https_port,
                         cluster_setup_delay_ms,
@@ -199,6 +279,7 @@ pub fn start_sozu_proxy(
                                 &storage_reload,
                                 &mut command_channel,
                                 &mut command_channel_https,
+                                &mut tcp_channels,
                                 http_port,
                                 https_port,
                                 cluster_setup_delay_ms,
@@ -294,6 +375,12 @@ pub fn start_sozu_proxy(
         return Err(anyhow::anyhow!("HTTPS worker failed"));
     }
 
+    for handle in tcp_worker_handles {
+        if let Err(e) = handle.join() {
+            error!("TCP worker thread panicked: {:?}", e);
+        }
+    }
+
     if let Err(e) = reload_handle.join() {
         error!("Reload handler thread panicked: {:?}", e);
     }
@@ -306,6 +393,7 @@ fn handle_reload(
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    tcp_channels: &mut TcpChannels,
     http_port: u16,
     https_port: u16,
     cluster_setup_delay_ms: u64,
@@ -330,6 +418,7 @@ fn handle_reload(
         &current_snapshot,
         command_channel,
         command_channel_https,
+        tcp_channels,
         http_port,
         https_port,
         acme_challenge_port,
@@ -341,6 +430,7 @@ fn handle_reload(
     match configure_sozu_routing(
         command_channel,
         command_channel_https,
+        tcp_channels,
         &storage_read,
         http_port,
         https_port,
@@ -392,6 +482,7 @@ fn update_middleware_routes(
 fn configure_sozu_routing(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    tcp_channels: &mut TcpChannels,
     storage: &BTreeMap<String, Entrypoint>,
     http_port: u16,
     https_port: u16,
@@ -458,10 +549,7 @@ fn configure_sozu_routing(
                 )?;
             }
             Protocol::Tcp => {
-                debug!(
-                    "TCP protocol not yet implemented for entrypoint: {}",
-                    entrypoint.name
-                );
+                configure_tcp_entrypoint(tcp_channels, cluster_id, entrypoint);
             }
             Protocol::Udp => {
                 debug!(
@@ -838,6 +926,117 @@ fn configure_http_entrypoint(
     Ok(())
 }
 
+fn configure_tcp_entrypoint(
+    tcp_channels: &mut TcpChannels,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+) {
+    debug!(
+        "Configuring TCP cluster `{}` (backends: {:?})",
+        entrypoint.name, entrypoint.backends
+    );
+    let listener_name = match entrypoint.config.entrypoint.as_deref() {
+        Some(name) => name,
+        None => {
+            error!(
+                "TCP entrypoint `{}` has no listener reference, skipping",
+                entrypoint.name
+            );
+            return;
+        }
+    };
+
+    let listener = match tcp_channels.get_mut(listener_name) {
+        Some(c) => c,
+        None => {
+            error!(
+                "TCP entrypoint `{}` references undeclared listener `{}`, skipping. \
+                 Declare it under `proxy.tcp` in the config.",
+                entrypoint.name, listener_name
+            );
+            return;
+        }
+    };
+    let listener_port = listener.port;
+    let channel = &mut listener.channel;
+
+    let cluster = Cluster {
+        cluster_id: cluster_id.to_string(),
+        sticky_session: false,
+        https_redirect: false,
+        proxy_protocol: None,
+        load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+        load_metric: None,
+        answer_503: None,
+        http2: None,
+        authorized_hashes: Vec::new(),
+        https_redirect_port: None,
+        www_authenticate: None,
+        ..Default::default()
+    };
+
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("add-cluster-tcp-{}", cluster_id),
+        RequestType::AddCluster(cluster),
+    ) {
+        debug!(
+            "Failed to add TCP cluster {} on listener {} (may already exist): {}",
+            cluster_id, listener_name, e
+        );
+    }
+
+    let tcp_front = RequestTcpFrontend {
+        cluster_id: cluster_id.to_string(),
+        address: SocketAddress::new_v4(0, 0, 0, 0, listener_port),
+        ..Default::default()
+    };
+
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("add-frontend-tcp-{}", cluster_id),
+        RequestType::AddTcpFrontend(tcp_front),
+    ) {
+        debug!(
+            "Failed to add TCP frontend for cluster {} on listener {}: {}",
+            cluster_id, listener_name, e
+        );
+    }
+
+    for (idx, backend_host) in entrypoint.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_host, entrypoint.config.port) {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!(
+                    "Invalid TCP backend address {}:{} for {}: {}",
+                    backend_host, entrypoint.config.port, cluster_id, e
+                );
+                continue;
+            }
+        };
+        let weight = entrypoint
+            .backend_weights
+            .get(backend_host)
+            .copied()
+            .unwrap_or(100) as i32;
+        let backend = AddBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: format!("{}-backend-{}", cluster_id, idx),
+            address,
+            load_balancing_parameters: Some(LoadBalancingParams { weight }),
+            sticky_id: None,
+            backup: None,
+        };
+        if let Err(e) = send_to_worker(
+            channel,
+            format!("add-backend-tcp-{}-{}", cluster_id, idx),
+            RequestType::AddBackend(backend),
+        ) {
+            debug!("Failed to add TCP backend {}-{}: {}", cluster_id, idx, e);
+        }
+    }
+}
+
 fn wait_for_worker_ready(
     channel: &mut Channel<WorkerRequest, WorkerResponse>,
     name: &str,
@@ -1151,6 +1350,7 @@ fn apply_routing_diff(
     current: &RoutingSnapshot,
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    tcp_channels: &mut TcpChannels,
     http_port: u16,
     https_port: u16,
     acme_challenge_port: Option<u16>,
@@ -1159,19 +1359,27 @@ fn apply_routing_diff(
     for (cluster_id, old) in previous {
         if !current.contains_key(cluster_id) {
             info!("Removing stale cluster: {}", cluster_id);
-            remove_http_frontends(
-                command_channel,
-                command_channel_https,
-                cluster_id,
-                old,
-                http_port,
-                https_port,
-            );
-            remove_backends(command_channel, command_channel_https, cluster_id, old);
-            remove_cluster(command_channel, command_channel_https, cluster_id);
+            match old.protocol {
+                Protocol::Http => {
+                    remove_http_frontends(
+                        command_channel,
+                        command_channel_https,
+                        cluster_id,
+                        old,
+                        http_port,
+                        https_port,
+                    );
+                    remove_backends(command_channel, command_channel_https, cluster_id, old);
+                    remove_cluster(command_channel, command_channel_https, cluster_id);
 
-            if acme_challenge_port.is_some() {
-                remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
+                    if acme_challenge_port.is_some() {
+                        remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
+                    }
+                }
+                Protocol::Tcp => {
+                    remove_tcp_entrypoint(tcp_channels, cluster_id, old);
+                }
+                Protocol::Udp => {}
             }
         }
     }
@@ -1183,20 +1391,84 @@ fn apply_routing_diff(
             && old != new
         {
             info!("Updating changed cluster: {}", cluster_id);
-            remove_http_frontends(
-                command_channel,
-                command_channel_https,
-                cluster_id,
-                old,
-                http_port,
-                https_port,
-            );
-            remove_backends(command_channel, command_channel_https, cluster_id, old);
+            match old.protocol {
+                Protocol::Http => {
+                    remove_http_frontends(
+                        command_channel,
+                        command_channel_https,
+                        cluster_id,
+                        old,
+                        http_port,
+                        https_port,
+                    );
+                    remove_backends(command_channel, command_channel_https, cluster_id, old);
 
-            if acme_challenge_port.is_some() && old.config.hostnames != new.config.hostnames {
-                remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
+                    if acme_challenge_port.is_some() && old.config.hostnames != new.config.hostnames
+                    {
+                        remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
+                    }
+                }
+                Protocol::Tcp => {
+                    remove_tcp_entrypoint(tcp_channels, cluster_id, old);
+                }
+                Protocol::Udp => {}
             }
         }
+    }
+}
+
+fn remove_tcp_entrypoint(
+    tcp_channels: &mut TcpChannels,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+) {
+    let Some(listener_name) = entrypoint.config.entrypoint.as_deref() else {
+        return;
+    };
+    let Some(listener) = tcp_channels.get_mut(listener_name) else {
+        return;
+    };
+    let listener_port = listener.port;
+    let channel = &mut listener.channel;
+
+    for (idx, backend_host) in entrypoint.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_host, entrypoint.config.port) {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        let remove = RemoveBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: format!("{}-backend-{}", cluster_id, idx),
+            address,
+        };
+        if let Err(e) = send_to_worker(
+            channel,
+            format!("rm-backend-tcp-{}-{}", cluster_id, idx),
+            RequestType::RemoveBackend(remove),
+        ) {
+            debug!("Failed to remove TCP backend {}-{}: {}", cluster_id, idx, e);
+        }
+    }
+
+    let tcp_front = RequestTcpFrontend {
+        cluster_id: cluster_id.to_string(),
+        address: SocketAddress::new_v4(0, 0, 0, 0, listener_port),
+        ..Default::default()
+    };
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("rm-frontend-tcp-{}", cluster_id),
+        RequestType::RemoveTcpFrontend(tcp_front),
+    ) {
+        debug!("Failed to remove TCP frontend for {}: {}", cluster_id, e);
+    }
+
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("rm-cluster-tcp-{}", cluster_id),
+        RequestType::RemoveCluster(cluster_id.to_string()),
+    ) {
+        debug!("Failed to remove TCP cluster {}: {}", cluster_id, e);
     }
 }
 
