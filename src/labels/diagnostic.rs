@@ -15,6 +15,7 @@ pub enum DiagnosticCode {
     E002MissingHost,
     E003InspectFailed,
     E004NoServices,
+    E005MissingTcpEntrypoint,
     // Warnings — silent fallbacks today
     W001InvalidPort,
     W002InvalidPriority,
@@ -41,6 +42,7 @@ impl DiagnosticCode {
             DiagnosticCode::E002MissingHost => "E002",
             DiagnosticCode::E003InspectFailed => "E003",
             DiagnosticCode::E004NoServices => "E004",
+            DiagnosticCode::E005MissingTcpEntrypoint => "E005",
             DiagnosticCode::W001InvalidPort => "W001",
             DiagnosticCode::W002InvalidPriority => "W002",
             DiagnosticCode::W003InvalidTimeout => "W003",

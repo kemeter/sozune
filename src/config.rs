@@ -128,6 +128,8 @@ pub struct ConfigFileConfig {
 pub struct ProxyConfig {
     pub http: HttpConfig,
     pub https: HttpsConfig,
+    #[serde(default)]
+    pub tcp: Vec<TcpListenerConfig>,
     #[serde(
         default = "default_max_buffers",
         deserialize_with = "deserialize_max_buffers_with_env"
@@ -175,6 +177,12 @@ pub struct HttpsConfig {
         deserialize_with = "deserialize_https_port_with_env"
     )]
     pub listen_address: u16,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct TcpListenerConfig {
+    pub name: String,
+    pub listen: u16,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -278,6 +286,7 @@ impl Default for ProxyConfig {
         Self {
             http: Default::default(),
             https: Default::default(),
+            tcp: Vec::new(),
             max_buffers: default_max_buffers(),
             buffer_size: default_buffer_size(),
             startup_delay_ms: default_startup_delay_ms(),
@@ -692,5 +701,38 @@ https:
         assert_eq!(config.startup_delay_ms, 1000);
         assert_eq!(config.cluster_setup_delay_ms, 500);
         assert_eq!(config.reload_throttle_ms, 500);
+    }
+
+    #[test]
+    fn test_proxy_config_tcp_listeners() {
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+tcp:
+  - name: postgres
+    listen: 5432
+  - name: mysql
+    listen: 3306
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tcp.len(), 2);
+        assert_eq!(config.tcp[0].name, "postgres");
+        assert_eq!(config.tcp[0].listen, 5432);
+        assert_eq!(config.tcp[1].name, "mysql");
+        assert_eq!(config.tcp[1].listen, 3306);
+    }
+
+    #[test]
+    fn test_proxy_config_tcp_defaults_to_empty() {
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.tcp.is_empty());
     }
 }

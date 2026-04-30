@@ -52,6 +52,8 @@ pub struct EntrypointConfig {
     pub sticky_session: bool,
     #[serde(default)]
     pub compress: bool,
+    #[serde(default)]
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

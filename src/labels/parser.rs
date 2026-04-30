@@ -138,6 +138,10 @@ fn build_entrypoint(
     backend_ip: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Entrypoint> {
+    if protocol == "tcp" {
+        return build_tcp_entrypoint(labels, service_name, backend_ip, diagnostics);
+    }
+
     let prefix = format!("sozune.{protocol}.{service_name}.");
 
     let hostnames = host::parse_hostnames(labels, &prefix, diagnostics)?;
@@ -197,6 +201,67 @@ fn build_entrypoint(
             rate_limit,
             sticky_session,
             compress,
+            entrypoint: None,
+        },
+        source: None,
+    })
+}
+
+fn build_tcp_entrypoint(
+    labels: &HashMap<String, String>,
+    service_name: &str,
+    backend_ip: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Entrypoint> {
+    let prefix = format!("sozune.tcp.{service_name}.");
+    let entrypoint_key = format!("{prefix}entrypoint");
+
+    let entrypoint_ref = match labels.get(&entrypoint_key) {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::E005MissingTcpEntrypoint,
+                    "TCP service requires an entrypoint reference",
+                )
+                .with_label(&entrypoint_key)
+                .with_hint(
+                    "set `sozune.tcp.<name>.entrypoint=<listener-name>` matching a listener declared in `proxy.tcp`",
+                ),
+            );
+            return None;
+        }
+    };
+
+    let port = core::parse_port(labels, &prefix, "tcp", diagnostics);
+    let priority = core::parse_priority(labels, &prefix, diagnostics);
+
+    Some(Entrypoint {
+        id: format!("tcp_{service_name}"),
+        backends: vec![backend_ip.to_string()],
+        name: service_name.to_string(),
+        protocol: Protocol::Tcp,
+        backend_weights: HashMap::new(),
+        config: EntrypointConfig {
+            hostnames: Vec::new(),
+            port,
+            path: None,
+            tls: false,
+            strip_prefix: false,
+            https_redirect: false,
+            https_redirect_port: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            www_authenticate: None,
+            priority,
+            auth: None,
+            headers: Vec::new(),
+            backend_timeout: None,
+            rate_limit: None,
+            sticky_session: false,
+            compress: false,
+            entrypoint: Some(entrypoint_ref),
         },
         source: None,
     })
@@ -371,17 +436,49 @@ mod tests {
                 ("sozune.http.web.host", "web.example.com"),
                 ("sozune.http.api.host", "api.example.com"),
                 ("sozune.http.api.port", "9000"),
-                ("sozune.tcp.db.host", "db.example.com"),
+                ("sozune.tcp.db.entrypoint", "postgres"),
+                ("sozune.tcp.db.port", "5432"),
             ],
             vec![net("bridge", "10.0.0.1")],
         );
         let r = parse(&c);
         assert_eq!(r.entrypoints.len(), 3);
         assert_eq!(r.entrypoints.get("http_api").unwrap().config.port, 9000);
-        assert!(matches!(
-            r.entrypoints.get("tcp_db").unwrap().protocol,
-            Protocol::Tcp
-        ));
+        let tcp = r.entrypoints.get("tcp_db").unwrap();
+        assert!(matches!(tcp.protocol, Protocol::Tcp));
+        assert_eq!(tcp.config.entrypoint.as_deref(), Some("postgres"));
+        assert_eq!(tcp.config.port, 5432);
+    }
+
+    #[test]
+    fn tcp_without_entrypoint_label_is_dropped_with_e005() {
+        let c = candidate(
+            &[("sozune.enable", "true"), ("sozune.tcp.db.port", "5432")],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        assert!(r.entrypoints.is_empty());
+        assert!(has_code(&r, DiagnosticCode::E005MissingTcpEntrypoint));
+    }
+
+    #[test]
+    fn tcp_happy_path_minimal() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.tcp.echo.entrypoint", "tcpecho"),
+                ("sozune.tcp.echo.port", "9000"),
+            ],
+            vec![net("bridge", "172.18.0.4")],
+        );
+        let r = parse(&c);
+        assert_eq!(r.entrypoints.len(), 1);
+        let ep = r.entrypoints.get("tcp_echo").unwrap();
+        assert!(matches!(ep.protocol, Protocol::Tcp));
+        assert_eq!(ep.config.entrypoint.as_deref(), Some("tcpecho"));
+        assert_eq!(ep.config.port, 9000);
+        assert_eq!(ep.backends, vec!["172.18.0.4"]);
+        assert!(ep.config.hostnames.is_empty());
     }
 
     #[test]

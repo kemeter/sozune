@@ -733,6 +733,7 @@ mod tests {
                         rate_limit: None,
                         sticky_session: false,
                         compress: false,
+                        entrypoint: None,
                     },
                     source: Some("docker".to_string()),
                     backend_weights: std::collections::HashMap::new(),

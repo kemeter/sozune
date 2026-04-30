@@ -13,6 +13,8 @@ HTTP_PORT=18080
 HTTPS_PORT=18443
 API_PORT=18888
 MIDDLEWARE_PORT=13037
+TCP_ECHO_PORT=15555
+TCP_RR_PORT=15556
 API_USER="admin"
 API_PASSWORD="test-secret-token"
 API_PASSWORD_HASH=$(printf '%s' "$API_PASSWORD" | sha256sum | cut -d' ' -f1)
@@ -62,6 +64,27 @@ wait_for_status() {
         local status
         status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 -H "Host: $host" "$url" 2>/dev/null || echo "000")
         if [[ "$status" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+tcp_send() {
+    local host="$1" port="$2" payload="$3"
+    # `nc -w 2` waits 2s of idle on the socket before closing — gives the
+    # backend time to respond. We avoid socat's shut-down half-close because
+    # Sōzu's TCP path closes the full connection on FIN, racing the response.
+    printf '%s' "$payload" | timeout 5 nc -w 2 "$host" "$port" 2>/dev/null || true
+}
+
+wait_for_tcp_open() {
+    local host="$1" port="$2"
+    local i=0
+    while [[ $i -lt $MAX_RETRIES ]]; do
+        if timeout 1 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
             return 0
         fi
         sleep 0.5

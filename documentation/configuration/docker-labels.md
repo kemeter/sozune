@@ -48,16 +48,19 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | `sozune.http.<svc>.backendTimeout` | [Backend timeout](/documentation/middleware/backend-timeout) |
 | `sozune.http.<svc>.stickySession` | [Sticky sessions](/documentation/routing/load-balancing) |
 
-## Routing — TCP / UDP
+## Routing — TCP
 
-| Label | Description |
-|---|---|
-| `sozune.tcp.<svc>.host` | Hostname for the TCP service |
-| `sozune.tcp.<svc>.port` | Backend port |
-| `sozune.udp.<svc>.host` | Hostname for the UDP service |
-| `sozune.udp.<svc>.port` | Backend port |
+TCP routing requires a listener declared under `proxy.tcp` in the main config. Labels then attach a backend to that listener by name. See [TCP routing](/documentation/routing/tcp) for the full picture.
 
-> **Note:** TCP and UDP entrypoints are recognised at the label-parsing level but are not currently proxied — the Sōzu TCP worker integration is not yet wired in.
+| Label | Example | Description |
+|---|---|---|
+| `sozune.tcp.<svc>.entrypoint` | `postgres` | Listener name declared under `proxy.tcp`. **Required.** |
+| `sozune.tcp.<svc>.port` | `5432` | Backend port on the container. |
+| `sozune.tcp.<svc>.priority` | `100` | Higher wins when multiple services share the same listener (default `0`). |
+
+## Routing — UDP
+
+> **Note:** UDP entrypoints are recognised at the label-parsing level but are not currently proxied — the Sōzu UDP worker integration is not yet wired in.
 
 ## Full example
 
@@ -76,4 +79,11 @@ services:
       - "sozune.http.api.ratelimit.average=100"
       - "sozune.http.api.ratelimit.burst=50"
       - "sozune.http.api.headers.X-Powered-By=sozune"
+
+  db:
+    image: postgres:16
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.db.entrypoint=postgres"
+      - "sozune.tcp.db.port=5432"
 ```
