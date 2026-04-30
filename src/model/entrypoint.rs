@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Entrypoint {
     pub id: String,
     pub backends: Vec<String>,
@@ -14,14 +14,14 @@ pub struct Entrypoint {
     pub backend_weights: HashMap<String, u32>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum Protocol {
     Http,
     Tcp,
     Udp,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct EntrypointConfig {
     pub hostnames: Vec<String>,
     pub port: u16,
@@ -87,7 +87,7 @@ pub enum RedirectScheme {
     UseHttps,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct RateLimitConfig {
     pub average: u64,
     pub burst: u64,
@@ -106,12 +106,12 @@ pub enum PathRuleType {
     Exact,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct AuthConfig {
     pub basic: Option<Vec<BasicAuthUser>>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct BasicAuthUser {
     pub username: String,
     pub password_hash: String,
