@@ -20,6 +20,7 @@ Sozune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). 
 
 - [Configuration overview](/documentation/configuration/overview)
 - [Docker labels](/documentation/configuration/docker-labels)
+- [Swarm provider](/documentation/configuration/swarm-provider)
 - [HTTP provider](/documentation/configuration/http-provider)
 - [REST API](/documentation/configuration/api)
 - [Dashboard](/documentation/configuration/dashboard)

@@ -46,7 +46,7 @@ middleware:
 
 | Section | Purpose |
 |---|---|
-| `providers` | Sources for entrypoint discovery: Docker, HTTP polling, file. |
+| `providers` | Sources for entrypoint discovery: Docker, Swarm, HTTP polling, file. |
 | `api` | REST API for live entrypoint management. |
 | `acme` | Let's Encrypt provisioning. |
 | `proxy` | Sōzu listeners and runtime tuning. |
@@ -60,6 +60,12 @@ providers:
     enabled: true
     endpoint: "/var/run/docker.sock"
     expose_by_default: false
+  swarm:
+    enabled: false
+    endpoint: "/var/run/docker.sock"
+    expose_by_default: false
+    # network: sozune-public   # optional: only consider VIPs on this overlay
+    refresh_interval: 15
   http:
     enabled: false
     url: "https://config.example.com/entrypoints"
@@ -75,6 +81,11 @@ providers:
 | `docker.enabled` | `false` | Enables Docker label discovery |
 | `docker.endpoint` | `/var/run/docker.sock` | Docker socket path |
 | `docker.expose_by_default` | `false` | If true, every container is candidate without `sozune.enable=true` |
+| `swarm.enabled` | `false` | Enables Docker Swarm service discovery (must point to a manager) |
+| `swarm.endpoint` | `/var/run/docker.sock` | Docker socket on a Swarm manager |
+| `swarm.expose_by_default` | `false` | If true, every service is candidate without `sozune.enable=true` |
+| `swarm.network` | `""` | Optional overlay network filter |
+| `swarm.refresh_interval` | `15` | Periodic poll interval, in seconds (safety net behind the event stream) |
 | `http.enabled` | `false` | Enables polling a remote URL for JSON entrypoints |
 | `http.url` | — | URL to poll |
 | `http.poll_interval` | `30` | Polling interval, in seconds |
@@ -131,6 +142,11 @@ Every field above can be overridden through an environment variable. The env var
 | `providers.docker.enabled` | `SOZUNE_PROVIDER_DOCKER_ENABLED` |
 | `providers.docker.endpoint` | `SOZUNE_PROVIDER_DOCKER_ENDPOINT` |
 | `providers.docker.expose_by_default` | `SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT` |
+| `providers.swarm.enabled` | `SOZUNE_PROVIDER_SWARM_ENABLED` |
+| `providers.swarm.endpoint` | `SOZUNE_PROVIDER_SWARM_ENDPOINT` |
+| `providers.swarm.expose_by_default` | `SOZUNE_PROVIDER_SWARM_EXPOSE_BY_DEFAULT` |
+| `providers.swarm.network` | `SOZUNE_PROVIDER_SWARM_NETWORK` |
+| `providers.swarm.refresh_interval` | `SOZUNE_PROVIDER_SWARM_REFRESH_INTERVAL` |
 | `providers.http.enabled` | `SOZUNE_PROVIDER_HTTP_ENABLED` |
 | `providers.http.url` | `SOZUNE_PROVIDER_HTTP_URL` |
 | `providers.http.poll_interval` | `SOZUNE_PROVIDER_HTTP_POLL_INTERVAL` |

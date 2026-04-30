@@ -40,6 +40,7 @@ pub struct AcmeConfig {
 pub struct ProvidersConfig {
     pub docker: Option<DockerConfig>,
     pub podman: Option<PodmanConfig>,
+    pub swarm: Option<SwarmConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -68,6 +69,29 @@ pub struct PodmanConfig {
         deserialize_with = "deserialize_podman_expose_by_default_with_env"
     )]
     pub expose_by_default: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct SwarmConfig {
+    #[serde(default, deserialize_with = "deserialize_swarm_enabled_with_env")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_swarm_endpoint",
+        deserialize_with = "deserialize_swarm_endpoint_with_env"
+    )]
+    pub endpoint: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_swarm_expose_by_default_with_env"
+    )]
+    pub expose_by_default: bool,
+    #[serde(default, deserialize_with = "deserialize_swarm_network_with_env")]
+    pub network: String,
+    #[serde(
+        default = "default_swarm_refresh_interval",
+        deserialize_with = "deserialize_swarm_refresh_interval_with_env"
+    )]
+    pub refresh_interval: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -244,6 +268,26 @@ impl Default for PodmanConfig {
             expose_by_default: false,
         }
     }
+}
+
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "/var/run/docker.sock".to_string(),
+            expose_by_default: false,
+            network: String::new(),
+            refresh_interval: default_swarm_refresh_interval(),
+        }
+    }
+}
+
+fn default_swarm_refresh_interval() -> u64 {
+    15
+}
+
+fn default_swarm_endpoint() -> String {
+    "/var/run/docker.sock".to_string()
 }
 
 fn default_podman_endpoint() -> String {
@@ -478,6 +522,35 @@ deserialize_bool_with_env!(
 );
 
 deserialize_bool_with_env!(
+    deserialize_swarm_enabled_with_env,
+    "SOZUNE_PROVIDER_SWARM_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_swarm_endpoint_with_env,
+    "SOZUNE_PROVIDER_SWARM_ENDPOINT",
+    "/var/run/docker.sock",
+    literal
+);
+deserialize_bool_with_env!(
+    deserialize_swarm_expose_by_default_with_env,
+    "SOZUNE_PROVIDER_SWARM_EXPOSE_BY_DEFAULT",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_swarm_network_with_env,
+    "SOZUNE_PROVIDER_SWARM_NETWORK",
+    "",
+    literal
+);
+deserialize_with_env!(
+    deserialize_swarm_refresh_interval_with_env,
+    "SOZUNE_PROVIDER_SWARM_REFRESH_INTERVAL",
+    u64,
+    default_swarm_refresh_interval
+);
+
+deserialize_bool_with_env!(
     deserialize_config_file_enabled_with_env,
     "SOZUNE_PROVIDER_CONFIG_FILE_ENABLED",
     false
@@ -682,6 +755,46 @@ expose_by_default: true
         assert!(!config.enabled);
         assert!(!config.expose_by_default);
         assert!(config.endpoint.ends_with("podman.sock"));
+    }
+
+    #[test]
+    fn test_swarm_config_deserialization() {
+        let yaml = r#"
+enabled: true
+endpoint: /var/run/docker.sock
+expose_by_default: true
+network: traefik-public
+refresh_interval: 30
+"#;
+        let config: SwarmConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.endpoint, "/var/run/docker.sock");
+        assert!(config.expose_by_default);
+        assert_eq!(config.network, "traefik-public");
+        assert_eq!(config.refresh_interval, 30);
+    }
+
+    #[test]
+    fn test_swarm_config_defaults() {
+        let config = SwarmConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.expose_by_default);
+        assert_eq!(config.endpoint, "/var/run/docker.sock");
+        assert!(config.network.is_empty());
+        assert_eq!(config.refresh_interval, 15);
+    }
+
+    #[test]
+    fn test_swarm_config_partial_yaml_uses_defaults() {
+        let yaml = r#"
+enabled: true
+"#;
+        let config: SwarmConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.endpoint, "/var/run/docker.sock");
+        assert!(!config.expose_by_default);
+        assert!(config.network.is_empty());
+        assert_eq!(config.refresh_interval, 15);
     }
 
     #[test]
