@@ -21,7 +21,7 @@ pub mod fuzzy {
             } else {
                 levenshtein(&needle_lower, &candidate_lower)
             };
-            if d <= max_distance && best.map_or(true, |(_, bd)| d < bd) {
+            if d <= max_distance && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((candidate, d));
             }
         }

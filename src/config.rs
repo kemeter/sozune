@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct AppConfig {
     pub providers: ProvidersConfig,
     pub api: ApiConfig,
@@ -273,19 +273,6 @@ impl Default for ProxyConfig {
             buffer_size: default_buffer_size(),
             startup_delay_ms: default_startup_delay_ms(),
             cluster_setup_delay_ms: default_cluster_setup_delay_ms(),
-        }
-    }
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            providers: Default::default(),
-            api: Default::default(),
-            proxy: Default::default(),
-            acme: None,
-            middleware: Default::default(),
-            dashboard: Default::default(),
         }
     }
 }

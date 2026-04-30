@@ -172,9 +172,7 @@ pub async fn handle_proxy(
             });
 
             if let Some(encoding) = encoding {
-                let body = Body::new(body.map_err(|e| {
-                    axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
-                }));
+                let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
                 match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
                     Ok(bytes) => match compress::compress(&bytes, encoding) {
                         Ok(compressed) => {
@@ -200,9 +198,7 @@ pub async fn handle_proxy(
                     }
                 }
             } else {
-                let body = Body::new(body.map_err(|e| {
-                    axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
-                }));
+                let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
                 Response::from_parts(parts, body).into_response()
             }
         }

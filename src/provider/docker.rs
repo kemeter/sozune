@@ -31,7 +31,7 @@ impl Provider for DockerProvider {
         let hashmap = self
             .get_entrypoints_from_containers()
             .await
-            .map_err(|e| anyhow::Error::new(e))?;
+            .map_err(anyhow::Error::new)?;
         Ok(hashmap.into_iter().collect())
     }
 
@@ -136,12 +136,18 @@ impl DockerProvider {
                         for (key, mut entrypoint) in initial_entrypoints {
                             entrypoint.source = Some(self.name.to_string());
 
-                            if !storage_write.contains_key(&key) {
-                                info!("Found new container entrypoint: {}", key);
-                                storage_write.insert(key, entrypoint);
-                                changed = true;
-                            } else {
-                                info!("Container entrypoint {} already exists in storage", key);
+                            match storage_write.entry(key) {
+                                std::collections::btree_map::Entry::Vacant(slot) => {
+                                    info!("Found new container entrypoint: {}", slot.key());
+                                    slot.insert(entrypoint);
+                                    changed = true;
+                                }
+                                std::collections::btree_map::Entry::Occupied(slot) => {
+                                    info!(
+                                        "Container entrypoint {} already exists in storage",
+                                        slot.key()
+                                    );
+                                }
                             }
                         }
                         changed
@@ -203,68 +209,60 @@ impl DockerProvider {
         while let Some(event_result) = events.next().await {
             match event_result {
                 Ok(event) => {
-                    if let Some(action) = &event.action {
-                        if let Some(actor) = &event.actor {
-                            if let Some(container_id) = &actor.id {
-                                info!("Docker event: {} for container {}", action, container_id);
+                    if let Some(action) = &event.action
+                        && let Some(actor) = &event.actor
+                        && let Some(container_id) = &actor.id
+                    {
+                        info!("Docker event: {} for container {}", action, container_id);
 
-                                let mut storage_changed = false;
+                        let mut storage_changed = false;
 
-                                match action.as_str() {
-                                    "start" => {
-                                        // Track the container IP for later cleanup
-                                        if let Some(ip) = self.get_container_ip(container_id).await
-                                        {
-                                            if let Ok(mut ips) = self.container_ips.lock() {
-                                                ips.insert(container_id.to_string(), ip);
-                                            }
+                        match action.as_str() {
+                            "start" => {
+                                // Track the container IP for later cleanup
+                                if let Some(ip) = self.get_container_ip(container_id).await
+                                    && let Ok(mut ips) = self.container_ips.lock()
+                                {
+                                    ips.insert(container_id.to_string(), ip);
+                                }
+
+                                if let Ok(entrypoints) =
+                                    self.get_container_entrypoints(container_id).await
+                                    && !entrypoints.is_empty()
+                                {
+                                    let mut storage_write = match storage.write() {
+                                        Ok(guard) => guard,
+                                        Err(e) => {
+                                            error!(
+                                                "Storage lock poisoned on container start: {}",
+                                                e
+                                            );
+                                            continue;
                                         }
-
-                                        if let Ok(entrypoints) =
-                                            self.get_container_entrypoints(container_id).await
-                                        {
-                                            if !entrypoints.is_empty() {
-                                                let mut storage_write = match storage.write() {
-                                                    Ok(guard) => guard,
-                                                    Err(e) => {
-                                                        error!(
-                                                            "Storage lock poisoned on container start: {}",
-                                                            e
-                                                        );
-                                                        continue;
-                                                    }
-                                                };
-                                                for (key, entrypoint) in entrypoints {
-                                                    info!(
-                                                        "Adding entrypoint from started container: {}",
-                                                        key
-                                                    );
-                                                    if let Some(existing) =
-                                                        storage_write.get_mut(&key)
-                                                    {
-                                                        // Merge backends
-                                                        for backend in entrypoint.backends {
-                                                            if !existing.backends.contains(&backend)
-                                                            {
-                                                                existing.backends.push(backend);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        let mut entrypoint = entrypoint;
-                                                        entrypoint.source =
-                                                            Some(self.name.to_string());
-                                                        storage_write.insert(key, entrypoint);
-                                                    }
+                                    };
+                                    for (key, entrypoint) in entrypoints {
+                                        info!("Adding entrypoint from started container: {}", key);
+                                        if let Some(existing) = storage_write.get_mut(&key) {
+                                            // Merge backends
+                                            for backend in entrypoint.backends {
+                                                if !existing.backends.contains(&backend) {
+                                                    existing.backends.push(backend);
                                                 }
-                                                storage_changed = true;
                                             }
+                                        } else {
+                                            let mut entrypoint = entrypoint;
+                                            entrypoint.source = Some(self.name.to_string());
+                                            storage_write.insert(key, entrypoint);
                                         }
                                     }
-                                    "stop" | "die" | "destroy" => {
-                                        // Use tracked IP (stopped containers lose their network IP)
-                                        let container_ip = self.container_ips.lock().ok()
+                                    storage_changed = true;
+                                }
+                            }
+                            "stop" | "die" | "destroy" => {
+                                // Use tracked IP (stopped containers lose their network IP)
+                                let container_ip = self.container_ips.lock().ok()
                                             .and_then(|mut ips| ips.remove(container_id.as_str()))
-                                            .or_else(|| {
+                                            .or({
                                                 // Fallback: try inspect (may work for "stop" before network teardown)
                                                 None
                                             })
@@ -272,101 +270,93 @@ impl DockerProvider {
                                                 warn!("No tracked IP for stopped container {}, cleanup may be incomplete", container_id);
                                                 "127.0.0.1".to_string()
                                             });
-                                        let mut storage_write = match storage.write() {
-                                            Ok(guard) => guard,
-                                            Err(e) => {
-                                                error!(
-                                                    "Storage lock poisoned on container stop: {}",
-                                                    e
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        let mut keys_to_remove = Vec::new();
-                                        for (key, entrypoint) in storage_write.iter_mut() {
-                                            // Remove this container's IP from backends
-                                            entrypoint.backends.retain(|ip| ip != &container_ip);
-
-                                            // If no backends left, mark for removal
-                                            if entrypoint.backends.is_empty() {
-                                                keys_to_remove.push(key.clone());
-                                            }
-                                        }
-
-                                        for key in &keys_to_remove {
-                                            info!("Removing entrypoint with no backends: {}", key);
-                                            storage_write.remove(key);
-                                        }
-
-                                        storage_changed = true;
+                                let mut storage_write = match storage.write() {
+                                    Ok(guard) => guard,
+                                    Err(e) => {
+                                        error!("Storage lock poisoned on container stop: {}", e);
+                                        continue;
                                     }
-                                    "update" => {
-                                        // For updates, remove old and add new
-                                        if let Ok(entrypoints) =
-                                            self.get_container_entrypoints(container_id).await
-                                        {
-                                            let container_ip = self
-                                                .get_container_ip(container_id)
-                                                .await
-                                                .unwrap_or_else(|| "127.0.0.1".to_string());
-                                            let mut storage_write = match storage.write() {
-                                                Ok(guard) => guard,
-                                                Err(e) => {
-                                                    error!(
-                                                        "Storage lock poisoned on container update: {}",
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            };
+                                };
 
-                                            // Remove old entries for this container
-                                            let mut keys_to_remove = Vec::new();
-                                            for (key, entrypoint) in storage_write.iter_mut() {
-                                                entrypoint
-                                                    .backends
-                                                    .retain(|ip| ip != &container_ip);
-                                                if entrypoint.backends.is_empty() {
-                                                    keys_to_remove.push(key.clone());
-                                                }
-                                            }
-                                            for key in keys_to_remove {
-                                                storage_write.remove(&key);
-                                            }
+                                let mut keys_to_remove = Vec::new();
+                                for (key, entrypoint) in storage_write.iter_mut() {
+                                    // Remove this container's IP from backends
+                                    entrypoint.backends.retain(|ip| ip != &container_ip);
 
-                                            // Add new entries
-                                            for (key, entrypoint) in entrypoints {
-                                                if let Some(existing) = storage_write.get_mut(&key)
-                                                {
-                                                    for backend in entrypoint.backends {
-                                                        if !existing.backends.contains(&backend) {
-                                                            existing.backends.push(backend);
-                                                        }
-                                                    }
-                                                } else {
-                                                    let mut entrypoint = entrypoint;
-                                                    entrypoint.source = Some(self.name.to_string());
-                                                    storage_write.insert(key, entrypoint);
-                                                }
-                                            }
-                                            storage_changed = true;
-                                        }
-                                    }
-                                    _ => {
-                                        // Other events we don't care about
+                                    // If no backends left, mark for removal
+                                    if entrypoint.backends.is_empty() {
+                                        keys_to_remove.push(key.clone());
                                     }
                                 }
 
-                                if storage_changed {
-                                    info!("Storage updated, triggering reload");
-                                    if let Err(e) = reload_tx.send(()).await {
-                                        error!("Failed to send reload signal: {}", e);
-                                        break;
+                                for key in &keys_to_remove {
+                                    info!("Removing entrypoint with no backends: {}", key);
+                                    storage_write.remove(key);
+                                }
+
+                                storage_changed = true;
+                            }
+                            "update" => {
+                                // For updates, remove old and add new
+                                if let Ok(entrypoints) =
+                                    self.get_container_entrypoints(container_id).await
+                                {
+                                    let container_ip = self
+                                        .get_container_ip(container_id)
+                                        .await
+                                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                                    let mut storage_write = match storage.write() {
+                                        Ok(guard) => guard,
+                                        Err(e) => {
+                                            error!(
+                                                "Storage lock poisoned on container update: {}",
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    // Remove old entries for this container
+                                    let mut keys_to_remove = Vec::new();
+                                    for (key, entrypoint) in storage_write.iter_mut() {
+                                        entrypoint.backends.retain(|ip| ip != &container_ip);
+                                        if entrypoint.backends.is_empty() {
+                                            keys_to_remove.push(key.clone());
+                                        }
                                     }
-                                    acme_notify.notify_one();
+                                    for key in keys_to_remove {
+                                        storage_write.remove(&key);
+                                    }
+
+                                    // Add new entries
+                                    for (key, entrypoint) in entrypoints {
+                                        if let Some(existing) = storage_write.get_mut(&key) {
+                                            for backend in entrypoint.backends {
+                                                if !existing.backends.contains(&backend) {
+                                                    existing.backends.push(backend);
+                                                }
+                                            }
+                                        } else {
+                                            let mut entrypoint = entrypoint;
+                                            entrypoint.source = Some(self.name.to_string());
+                                            storage_write.insert(key, entrypoint);
+                                        }
+                                    }
+                                    storage_changed = true;
                                 }
                             }
+                            _ => {
+                                // Other events we don't care about
+                            }
+                        }
+
+                        if storage_changed {
+                            info!("Storage updated, triggering reload");
+                            if let Err(e) = reload_tx.send(()).await {
+                                error!("Failed to send reload signal: {}", e);
+                                break;
+                            }
+                            acme_notify.notify_one();
                         }
                     }
                 }
@@ -429,12 +419,11 @@ impl DockerProvider {
             // Track the resolved backend IP for cleanup on stop. Every
             // entrypoint produced by a single candidate carries the same
             // backend list, so peek at the first.
-            if let Some(first) = result.entrypoints.values().next() {
-                if let Some(ip) = first.backends.first() {
-                    if let Ok(mut ips) = self.container_ips.lock() {
-                        ips.insert(container_id.clone(), ip.clone());
-                    }
-                }
+            if let Some(first) = result.entrypoints.values().next()
+                && let Some(ip) = first.backends.first()
+                && let Ok(mut ips) = self.container_ips.lock()
+            {
+                ips.insert(container_id.clone(), ip.clone());
             }
 
             for (key, entrypoint) in result.entrypoints {

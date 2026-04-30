@@ -13,7 +13,7 @@ use sozu_command_lib::{
         TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
     },
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -136,10 +136,10 @@ pub fn start_sozu_proxy(
     );
 
     // Register ACME challenge cluster if enabled (routes added per-hostname during reload)
-    if let Some(challenge_port) = acme_challenge_port {
-        if let Err(e) = register_acme_challenge_cluster(&mut command_channel, challenge_port) {
-            error!("Failed to register ACME challenge cluster: {}", e);
-        }
+    if let Some(challenge_port) = acme_challenge_port
+        && let Err(e) = register_acme_challenge_cluster(&mut command_channel, challenge_port)
+    {
+        error!("Failed to register ACME challenge cluster: {}", e);
     }
 
     // Start configuration reload handler
@@ -175,7 +175,7 @@ pub fn start_sozu_proxy(
                             match cert_cmd {
                                 Some(cmd) => {
                                     info!("Adding certificate for {}", cmd.hostname);
-                                    if let Err(e) = add_certificate(&mut command_channel_https, https_port, &cmd.cert_pem, &cmd.chain, &cmd.key_pem, &[cmd.hostname.clone()]) {
+                                    if let Err(e) = add_certificate(&mut command_channel_https, https_port, &cmd.cert_pem, &cmd.chain, &cmd.key_pem, std::slice::from_ref(&cmd.hostname)) {
                                         error!("Failed to add certificate for {}: {}", cmd.hostname, e);
                                     } else {
                                         // Reload to ensure HTTPS frontends are properly configured with the new cert
@@ -252,7 +252,7 @@ fn handle_reload(
         }
     };
 
-    let current_snapshot = snapshot_from_storage(&*storage_read);
+    let current_snapshot = snapshot_from_storage(&storage_read);
 
     apply_routing_diff(
         previous_snapshot,
@@ -265,12 +265,12 @@ fn handle_reload(
     );
 
     // Update middleware route table
-    update_middleware_routes(&*storage_read, middleware_state);
+    update_middleware_routes(&storage_read, middleware_state);
 
     match configure_sozu_routing(
         command_channel,
         command_channel_https,
-        &*storage_read,
+        &storage_read,
         http_port,
         https_port,
         cluster_setup_delay_ms,
@@ -692,17 +692,17 @@ fn configure_http_entrypoint(
                 backend.backend_id, e
             );
         }
-        if entrypoint.config.tls {
-            if let Err(e) = send_to_worker(
+        if entrypoint.config.tls
+            && let Err(e) = send_to_worker(
                 command_channel_https,
                 format!("add-backend-https-{}-0", cluster_id),
                 RequestType::AddBackend(backend),
-            ) {
-                debug!(
-                    "Failed to add HTTPS middleware backend (may already exist): {}",
-                    e
-                );
-            }
+            )
+        {
+            debug!(
+                "Failed to add HTTPS middleware backend (may already exist): {}",
+                e
+            );
         }
     } else {
         debug!(
@@ -1009,14 +1009,14 @@ fn remove_backends(
             debug!("Failed to remove HTTP backend {}: {}", backend_id, e);
         }
 
-        if snapshot.tls {
-            if let Err(e) = send_to_worker(
+        if snapshot.tls
+            && let Err(e) = send_to_worker(
                 command_channel_https,
                 format!("rm-backend-https-{}-{}", cluster_id, i),
                 RequestType::RemoveBackend(remove),
-            ) {
-                debug!("Failed to remove HTTPS backend {}: {}", backend_id, e);
-            }
+            )
+        {
+            debug!("Failed to remove HTTPS backend {}: {}", backend_id, e);
         }
     }
 }
@@ -1109,28 +1109,27 @@ fn apply_routing_diff(
 
     // Handle changed clusters
     for (cluster_id, old_snapshot) in previous {
-        if let Some(new_snapshot) = current.get(cluster_id) {
-            if old_snapshot != new_snapshot {
-                info!("Updating changed cluster: {}", cluster_id);
-                remove_http_frontends(
-                    command_channel,
-                    command_channel_https,
-                    cluster_id,
-                    old_snapshot,
-                    http_port,
-                    https_port,
-                );
-                remove_backends(
-                    command_channel,
-                    command_channel_https,
-                    cluster_id,
-                    old_snapshot,
-                );
+        if let Some(new_snapshot) = current.get(cluster_id)
+            && old_snapshot != new_snapshot
+        {
+            info!("Updating changed cluster: {}", cluster_id);
+            remove_http_frontends(
+                command_channel,
+                command_channel_https,
+                cluster_id,
+                old_snapshot,
+                http_port,
+                https_port,
+            );
+            remove_backends(
+                command_channel,
+                command_channel_https,
+                cluster_id,
+                old_snapshot,
+            );
 
-                if acme_challenge_port.is_some() && old_snapshot.hostnames != new_snapshot.hostnames
-                {
-                    remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
-                }
+            if acme_challenge_port.is_some() && old_snapshot.hostnames != new_snapshot.hostnames {
+                remove_acme_frontends(command_channel, &old_snapshot.hostnames, http_port);
             }
         }
     }

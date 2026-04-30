@@ -174,40 +174,40 @@ async fn serve() -> anyhow::Result<()> {
         let config = config.clone();
 
         async move {
-            if let Some(acme_config) = config.acme {
-                if acme_config.enabled {
-                    if acme_config.email.is_empty() {
-                        warn!("ACME enabled but no email configured, skipping");
-                        return Ok(());
+            if let Some(acme_config) = config.acme
+                && acme_config.enabled
+            {
+                if acme_config.email.is_empty() {
+                    warn!("ACME enabled but no email configured, skipping");
+                    return Ok(());
+                }
+
+                info!("Starting ACME certificate manager");
+
+                let challenges = Arc::new(RwLock::new(HashMap::new()));
+
+                // Start the challenge server
+                let challenge_port = acme_config.challenge_port;
+                let challenges_server = Arc::clone(&challenges);
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        acme::challenge_server::serve(challenge_port, challenges_server).await
+                    {
+                        error!("ACME challenge server failed: {}", e);
                     }
+                });
 
-                    info!("Starting ACME certificate manager");
+                // Run the ACME manager
+                let manager = acme::AcmeManager::new(
+                    acme_config,
+                    challenges,
+                    storage_acme,
+                    cert_tx,
+                    Arc::clone(&acme_notify),
+                );
 
-                    let challenges = Arc::new(RwLock::new(HashMap::new()));
-
-                    // Start the challenge server
-                    let challenge_port = acme_config.challenge_port;
-                    let challenges_server = Arc::clone(&challenges);
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            acme::challenge_server::serve(challenge_port, challenges_server).await
-                        {
-                            error!("ACME challenge server failed: {}", e);
-                        }
-                    });
-
-                    // Run the ACME manager
-                    let manager = acme::AcmeManager::new(
-                        acme_config,
-                        challenges,
-                        storage_acme,
-                        cert_tx,
-                        Arc::clone(&acme_notify),
-                    );
-
-                    if let Err(e) = manager.run().await {
-                        error!("ACME manager failed: {}", e);
-                    }
+                if let Err(e) = manager.run().await {
+                    error!("ACME manager failed: {}", e);
                 }
             }
 
@@ -218,7 +218,7 @@ async fn serve() -> anyhow::Result<()> {
     info!("Starting all servers...");
 
     // Signal handling for graceful shutdown
-    let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
     let signal_handle = signals.handle();
 
     let signal_task = tokio::spawn(async move {

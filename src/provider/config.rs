@@ -66,10 +66,10 @@ impl ConfigProvider {
         let mut watcher = notify::recommended_watcher(
             move |result: Result<Event, notify::Error>| match result {
                 Ok(event) => {
-                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                        if let Err(e) = tx.send(()) {
-                            error!("Failed to send file change notification: {}", e);
-                        }
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+                        && let Err(e) = tx.send(())
+                    {
+                        error!("Failed to send file change notification: {}", e);
                     }
                 }
                 Err(e) => error!("File watcher error: {}", e),
@@ -84,7 +84,7 @@ impl ConfigProvider {
         watcher.watch(watch_path, RecursiveMode::NonRecursive)?;
 
         // Handle file change events
-        while let Some(_) = rx.recv().await {
+        while rx.recv().await.is_some() {
             info!("Config file changed, reloading entrypoints");
 
             match self.provide().await {
@@ -101,7 +101,7 @@ impl ConfigProvider {
 
                         // Remove existing config entrypoints
                         storage_write.retain(|_, entrypoint| {
-                            !entrypoint.source.as_ref().map_or(false, |s| s == "config")
+                            entrypoint.source.as_ref().is_none_or(|s| s != "config")
                         });
 
                         // Add new config entrypoints

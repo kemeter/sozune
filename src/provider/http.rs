@@ -73,7 +73,7 @@ impl HttpProvider {
 
                         old_ids != new_ids
                             || new_entrypoints.iter().any(|(id, ep)| {
-                                storage_read.get(id).map_or(true, |existing| {
+                                storage_read.get(id).is_none_or(|existing| {
                                     existing.backends != ep.backends
                                         || existing.config.hostnames != ep.config.hostnames
                                         || existing.config.port != ep.config.port

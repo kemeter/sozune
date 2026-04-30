@@ -81,33 +81,31 @@ async fn collect_candidates(
     provider_filter: Option<&str>,
 ) -> anyhow::Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
-    let want = |name: &str| provider_filter.map_or(true, |p| p == name);
+    let want = |name: &str| provider_filter.is_none_or(|p| p == name);
 
-    if want("docker") {
-        if let Some(docker_cfg) = &config.providers.docker {
-            if docker_cfg.enabled {
-                match DockerProvider::new(docker_cfg.clone()) {
-                    Ok(provider) => match provider.collect().await {
-                        Ok(mut cs) => candidates.append(&mut cs),
-                        Err(e) => eprintln!("docker: failed to collect candidates: {e}"),
-                    },
-                    Err(e) => eprintln!("docker: failed to connect: {e}"),
-                }
-            }
+    if want("docker")
+        && let Some(docker_cfg) = &config.providers.docker
+        && docker_cfg.enabled
+    {
+        match DockerProvider::new(docker_cfg.clone()) {
+            Ok(provider) => match provider.collect().await {
+                Ok(mut cs) => candidates.append(&mut cs),
+                Err(e) => eprintln!("docker: failed to collect candidates: {e}"),
+            },
+            Err(e) => eprintln!("docker: failed to connect: {e}"),
         }
     }
 
-    if want("podman") {
-        if let Some(podman_cfg) = &config.providers.podman {
-            if podman_cfg.enabled {
-                match PodmanProvider::new(podman_cfg.clone()) {
-                    Ok(provider) => match provider.collect().await {
-                        Ok(mut cs) => candidates.append(&mut cs),
-                        Err(e) => eprintln!("podman: failed to collect candidates: {e}"),
-                    },
-                    Err(e) => eprintln!("podman: failed to connect: {e}"),
-                }
-            }
+    if want("podman")
+        && let Some(podman_cfg) = &config.providers.podman
+        && podman_cfg.enabled
+    {
+        match PodmanProvider::new(podman_cfg.clone()) {
+            Ok(provider) => match provider.collect().await {
+                Ok(mut cs) => candidates.append(&mut cs),
+                Err(e) => eprintln!("podman: failed to collect candidates: {e}"),
+            },
+            Err(e) => eprintln!("podman: failed to connect: {e}"),
         }
     }
 
