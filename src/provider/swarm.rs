@@ -7,7 +7,7 @@ use crate::model::Entrypoint;
 use crate::provider::Provider;
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::models::EndpointSpecModeEnum;
+use bollard::models::{EndpointSpecModeEnum, LocalNodeState};
 use bollard::query_parameters::{EventsOptions, ListNetworksOptions, ListServicesOptions};
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, HashMap};
@@ -119,6 +119,36 @@ impl SwarmProvider {
         Ok(candidates)
     }
 
+    /// Verify the configured endpoint points to an active Swarm manager.
+    /// Returns a descriptive error when the daemon is not in Swarm mode or
+    /// when this node is a worker — both surface as cryptic 503s on every
+    /// list_services call otherwise.
+    async fn verify_swarm_manager(&self) -> anyhow::Result<()> {
+        let info = self.docker.info().await.map_err(|e| {
+            anyhow::anyhow!("docker info failed on '{}': {}", self.config.endpoint, e)
+        })?;
+        let swarm = info
+            .swarm
+            .ok_or_else(|| anyhow::anyhow!("docker info returned no Swarm section"))?;
+
+        match swarm.local_node_state {
+            Some(LocalNodeState::ACTIVE) => {}
+            other => anyhow::bail!(
+                "endpoint '{}' is not in Swarm mode (LocalNodeState={:?}); run `docker swarm init` or point endpoint to a manager",
+                self.config.endpoint,
+                other
+            ),
+        }
+
+        if swarm.control_available != Some(true) {
+            anyhow::bail!(
+                "endpoint '{}' is a Swarm worker, not a manager; the swarm provider must talk to a manager node",
+                self.config.endpoint
+            );
+        }
+        Ok(())
+    }
+
     /// Start the Swarm provider: initial sync, then run the event stream and
     /// the periodic poll concurrently. The poll catches up on anything the
     /// event stream may have dropped (reconnections, missed messages).
@@ -128,6 +158,11 @@ impl SwarmProvider {
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
     ) -> anyhow::Result<()> {
+        if let Err(e) = self.verify_swarm_manager().await {
+            error!("Swarm provider disabled: {}", e);
+            return Ok(());
+        }
+
         // Initial sync: run one poll iteration's worth of work synchronously
         // before kicking off the loops, so storage is populated by the time
         // start_services() returns.
