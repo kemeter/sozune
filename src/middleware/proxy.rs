@@ -105,7 +105,7 @@ pub async fn handle_proxy(
         backend_host, backend_port, forwarded_path, query
     );
 
-    let client_accepts_gzip = compress::accepts_gzip(req.headers());
+    let client_encoding = compress::pick_encoding(req.headers());
 
     debug!(
         "Proxying {} {} -> {}",
@@ -165,21 +165,23 @@ pub async fn handle_proxy(
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
 
-            let should_compress = route.compress
-                && client_accepts_gzip
-                && compress::is_compressible(&parts.headers)
-                && !compress::is_already_compressed(&parts.headers);
+            let encoding = client_encoding.filter(|_| {
+                route.compress
+                    && compress::is_compressible(&parts.headers)
+                    && !compress::is_already_compressed(&parts.headers)
+            });
 
-            if should_compress {
+            if let Some(encoding) = encoding {
                 let body = Body::new(body.map_err(|e| {
                     axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
                 }));
                 match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                    Ok(bytes) => match compress::gzip_compress(&bytes) {
+                    Ok(bytes) => match compress::compress(&bytes, encoding) {
                         Ok(compressed) => {
-                            parts
-                                .headers
-                                .insert("content-encoding", "gzip".parse().unwrap());
+                            parts.headers.insert(
+                                "content-encoding",
+                                encoding.header_value().parse().unwrap(),
+                            );
                             parts.headers.insert(
                                 "content-length",
                                 compressed.len().to_string().parse().unwrap(),

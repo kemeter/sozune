@@ -44,7 +44,7 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | `sozune.http.<svc>.wwwAuthenticate` | [Basic auth](/documentation/middleware/auth) |
 | `sozune.http.<svc>.ratelimit.average` | [Rate limit](/documentation/middleware/rate-limit) |
 | `sozune.http.<svc>.ratelimit.burst` | [Rate limit](/documentation/middleware/rate-limit) |
-| `sozune.http.<svc>.compress` | [Gzip compression](/documentation/middleware/compress) |
+| `sozune.http.<svc>.compress` | [Response compression](/documentation/middleware/compress) (zstd, br, gzip) |
 | `sozune.http.<svc>.backendTimeout` | [Backend timeout](/documentation/middleware/backend-timeout) |
 | `sozune.http.<svc>.stickySession` | [Sticky sessions](/documentation/routing/load-balancing) |
 
