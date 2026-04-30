@@ -30,6 +30,9 @@ proxy:
     listen_address: 80
   https:
     listen_address: 443
+  tcp:
+    - name: postgres
+      listen: 5432
   max_buffers: 500
   buffer_size: 16384
   startup_delay_ms: 1000
@@ -94,6 +97,7 @@ providers:
 |---|---|---|
 | `proxy.http.listen_address` | `80` | Port for the HTTP listener |
 | `proxy.https.listen_address` | `443` | Port for the HTTPS listener |
+| `proxy.tcp` | `[]` | List of TCP listeners. Each entry has `name` (referenced by labels) and `listen` (port). See [TCP routing](../routing/tcp.md). |
 | `proxy.max_buffers` | `500` | Max number of buffers in the Sōzu pool |
 | `proxy.buffer_size` | `16384` | Buffer size, in bytes |
 | `proxy.startup_delay_ms` | `1000` | Delay before applying the initial config (gives Sōzu workers time to boot) |

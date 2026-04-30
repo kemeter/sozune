@@ -29,6 +29,7 @@ Sozune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). 
 - [Hostnames](/documentation/routing/hostnames)
 - [Path matching](/documentation/routing/path-matching)
 - [Load balancing](/documentation/routing/load-balancing)
+- [TCP](/documentation/routing/tcp)
 
 ## TLS
 
