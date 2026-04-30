@@ -73,13 +73,18 @@ pub async fn start_services(
             info!("Starting Docker service");
             let docker_provider = DockerProvider::new(docker_config.clone())
                 .context("Failed to create Docker provider")?;
+            let storage_docker = Arc::clone(&storage);
+            let reload_tx_docker = reload_tx.clone();
+            let acme_notify_docker = Arc::clone(&acme_notify);
 
-            if let Err(e) = docker_provider
-                .start_service(Arc::clone(&storage), reload_tx.clone(), Arc::clone(&acme_notify))
-                .await
-            {
-                error!("Docker service failed: {}", e);
-            }
+            tokio::spawn(async move {
+                if let Err(e) = docker_provider
+                    .start_service(storage_docker, reload_tx_docker, acme_notify_docker)
+                    .await
+                {
+                    error!("Docker service failed: {}", e);
+                }
+            });
         }
     }
 
@@ -89,13 +94,18 @@ pub async fn start_services(
             info!("Starting Podman service");
             let podman_provider = PodmanProvider::new(podman_config.clone())
                 .context("Failed to create Podman provider")?;
+            let storage_podman = Arc::clone(&storage);
+            let reload_tx_podman = reload_tx.clone();
+            let acme_notify_podman = Arc::clone(&acme_notify);
 
-            if let Err(e) = podman_provider
-                .start_service(Arc::clone(&storage), reload_tx.clone(), acme_notify)
-                .await
-            {
-                error!("Podman service failed: {}", e);
-            }
+            tokio::spawn(async move {
+                if let Err(e) = podman_provider
+                    .start_service(storage_podman, reload_tx_podman, acme_notify_podman)
+                    .await
+                {
+                    error!("Podman service failed: {}", e);
+                }
+            });
         }
     }
 
