@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::model::Entrypoint;
 use crate::provider::{
     Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
-    podman::PodmanProvider,
+    podman::PodmanProvider, swarm::SwarmProvider,
 };
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -112,6 +112,28 @@ pub async fn start_services(
                 .await
             {
                 error!("Podman service failed: {}", e);
+            }
+        });
+    }
+
+    // Start Swarm service if enabled
+    if let Some(swarm_config) = &config.providers.swarm
+        && swarm_config.enabled
+    {
+        info!("Starting Swarm service");
+        let swarm_provider = Arc::new(
+            SwarmProvider::new(swarm_config.clone()).context("Failed to create Swarm provider")?,
+        );
+        let storage_swarm = Arc::clone(&storage);
+        let reload_tx_swarm = reload_tx.clone();
+        let acme_notify_swarm = Arc::clone(&acme_notify);
+
+        tokio::spawn(async move {
+            if let Err(e) = swarm_provider
+                .start_service(storage_swarm, reload_tx_swarm, acme_notify_swarm)
+                .await
+            {
+                error!("Swarm service failed: {}", e);
             }
         });
     }
