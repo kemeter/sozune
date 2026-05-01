@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { getEntrypoint, type Entrypoint } from '$lib/api';
+  import { getEntrypoint, backendKey, type Backend, type Entrypoint } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
   let entrypoint = $state<Entrypoint | null>(null);
@@ -13,8 +13,8 @@
 
   const id = $derived($page.params.id ?? '');
 
-  function isBackendDown(ep: Entrypoint, backend: string): boolean {
-    return (ep.unhealthy_backends ?? []).includes(`${backend}:${ep.config.port}`);
+  function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
+    return (ep.unhealthy_backends ?? []).includes(backendKey(backend));
   }
 
   async function load(silent = false) {
@@ -94,8 +94,6 @@
       <dl>
         <dt>Protocol</dt>
         <dd><span class="badge badge-{entrypoint.protocol.toLowerCase()}">{entrypoint.protocol.toUpperCase()}</span></dd>
-        <dt>Port</dt>
-        <dd class="mono">{entrypoint.config.port}</dd>
         <dt>Priority</dt>
         <dd class="mono">{entrypoint.config.priority}</dd>
         <dt>Source</dt>
@@ -169,8 +167,8 @@
         <tbody>
           {#each entrypoint.backends as backend}
             <tr>
-              <td class="mono">{backend}</td>
-              <td class="mono">{entrypoint.backend_weights?.[backend] ?? 1}</td>
+              <td class="mono">{backendKey(backend)}</td>
+              <td class="mono">{backend.weight}</td>
               <td>
                 {#if isBackendDown(entrypoint, backend)}
                   <span class="status-pill down">down</span>

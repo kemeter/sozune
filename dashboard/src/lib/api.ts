@@ -78,7 +78,6 @@ export type Protocol = 'Http' | 'Tcp' | 'Udp';
 
 export interface EntrypointConfig {
   hostnames: string[];
-  port: number;
   tls: boolean;
   strip_prefix: boolean;
   https_redirect?: boolean;
@@ -90,14 +89,24 @@ export interface EntrypointConfig {
   [key: string]: unknown;
 }
 
+export interface Backend {
+  address: string;
+  port: number;
+  weight: number;
+}
+
+/** Backend identifier as serialized in `unhealthy_backends`: `address:port`. */
+export function backendKey(b: Backend): string {
+  return `${b.address}:${b.port}`;
+}
+
 export interface Entrypoint {
   id: string;
   name: string;
   protocol: Protocol;
-  backends: string[];
+  backends: Backend[];
   config: EntrypointConfig;
   source?: string | null;
-  backend_weights?: Record<string, number>;
   /** Backend addresses (`host:port`) currently marked down by the health checker. */
   unhealthy_backends?: string[];
 }
