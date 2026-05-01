@@ -7,9 +7,9 @@ interface Feature {
 const FEATURES: Feature[] = [
   {
     number: '01',
-    title: 'Docker auto-discovery',
+    title: 'Multi-platform discovery',
     description:
-      'Declare your routes through container labels. Sozune picks them up, adds them, removes them automatically.',
+      'Docker, Swarm, Kubernetes, Nomad, an HTTP endpoint, or a YAML file. Routes are picked up, added, and removed automatically.',
   },
   {
     number: '02',

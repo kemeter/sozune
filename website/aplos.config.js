@@ -38,10 +38,10 @@ module.exports = {
     defaultTitle: 'Sozune — The modern reverse proxy',
     titleTemplate: '%s | Sozune',
     meta: [
-      { name: 'description', content: 'The modern reverse proxy, without the painful config. Docker auto-discovery, automatic HTTPS, HTTP/2 by default, hot reload through REST API.' },
+      { name: 'description', content: 'The modern reverse proxy, without the painful config. Service discovery for Docker, Swarm, Kubernetes and Nomad, automatic HTTPS, HTTP/2 by default, hot reload through REST API.' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
       { property: 'og:title', content: 'Sozune — The modern reverse proxy' },
-      { property: 'og:description', content: 'Docker auto-discovery, automatic HTTPS, HTTP/2 by default, hot reload through REST API.' },
+      { property: 'og:description', content: 'Service discovery for Docker, Swarm, Kubernetes and Nomad, automatic HTTPS, HTTP/2 by default, hot reload through REST API.' },
       { property: 'og:type', content: 'website' },
     ],
   },
