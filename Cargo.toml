@@ -42,6 +42,8 @@ sha2 = "0.10"
 subtle = "2"
 rust-embed = "8"
 mime_guess = "2"
+kube = { version = "0.96", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.23", features = ["latest"] }
 
 [profile.release]
 strip = true

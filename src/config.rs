@@ -41,6 +41,7 @@ pub struct ProvidersConfig {
     pub docker: Option<DockerConfig>,
     pub podman: Option<PodmanConfig>,
     pub swarm: Option<SwarmConfig>,
+    pub kubernetes: Option<KubernetesConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -92,6 +93,35 @@ pub struct SwarmConfig {
         deserialize_with = "deserialize_swarm_refresh_interval_with_env"
     )]
     pub refresh_interval: u64,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct KubernetesConfig {
+    #[serde(default, deserialize_with = "deserialize_kubernetes_enabled_with_env")]
+    pub enabled: bool,
+    /// Path to a kubeconfig file. Empty string means in-cluster (ServiceAccount).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_kubernetes_kubeconfig_with_env"
+    )]
+    pub kubeconfig: String,
+    /// Restrict discovery to a single namespace. Empty string means all namespaces.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_kubernetes_namespace_with_env"
+    )]
+    pub namespace: String,
+    /// Ingress class name to filter on (only Ingresses with this class are picked up).
+    #[serde(
+        default = "default_kubernetes_ingress_class",
+        deserialize_with = "deserialize_kubernetes_ingress_class_with_env"
+    )]
+    pub ingress_class: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_kubernetes_expose_by_default_with_env"
+    )]
+    pub expose_by_default: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -284,6 +314,22 @@ impl Default for SwarmConfig {
 
 fn default_swarm_refresh_interval() -> u64 {
     15
+}
+
+impl Default for KubernetesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kubeconfig: String::new(),
+            namespace: String::new(),
+            ingress_class: default_kubernetes_ingress_class(),
+            expose_by_default: false,
+        }
+    }
+}
+
+fn default_kubernetes_ingress_class() -> String {
+    "sozune".to_string()
 }
 
 fn default_swarm_endpoint() -> String {
@@ -551,6 +597,34 @@ deserialize_with_env!(
 );
 
 deserialize_bool_with_env!(
+    deserialize_kubernetes_enabled_with_env,
+    "SOZUNE_PROVIDER_KUBERNETES_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_kubernetes_kubeconfig_with_env,
+    "SOZUNE_PROVIDER_KUBERNETES_KUBECONFIG",
+    "",
+    literal
+);
+deserialize_string_with_env!(
+    deserialize_kubernetes_namespace_with_env,
+    "SOZUNE_PROVIDER_KUBERNETES_NAMESPACE",
+    "",
+    literal
+);
+deserialize_string_with_env!(
+    deserialize_kubernetes_ingress_class_with_env,
+    "SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS",
+    default_kubernetes_ingress_class
+);
+deserialize_bool_with_env!(
+    deserialize_kubernetes_expose_by_default_with_env,
+    "SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT",
+    false
+);
+
+deserialize_bool_with_env!(
     deserialize_config_file_enabled_with_env,
     "SOZUNE_PROVIDER_CONFIG_FILE_ENABLED",
     false
@@ -755,6 +829,33 @@ expose_by_default: true
         assert!(!config.enabled);
         assert!(!config.expose_by_default);
         assert!(config.endpoint.ends_with("podman.sock"));
+    }
+
+    #[test]
+    fn test_kubernetes_config_deserialization() {
+        let yaml = r#"
+enabled: true
+kubeconfig: /home/user/.kube/config
+namespace: default
+ingress_class: sozune
+expose_by_default: false
+"#;
+        let config: KubernetesConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.kubeconfig, "/home/user/.kube/config");
+        assert_eq!(config.namespace, "default");
+        assert_eq!(config.ingress_class, "sozune");
+        assert!(!config.expose_by_default);
+    }
+
+    #[test]
+    fn test_kubernetes_config_defaults() {
+        let config = KubernetesConfig::default();
+        assert!(!config.enabled);
+        assert!(config.kubeconfig.is_empty());
+        assert!(config.namespace.is_empty());
+        assert_eq!(config.ingress_class, "sozune");
+        assert!(!config.expose_by_default);
     }
 
     #[test]
