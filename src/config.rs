@@ -260,7 +260,7 @@ impl Default for DashboardConfig {
 }
 
 fn default_dashboard_listen_address() -> String {
-    "127.0.0.1:8081".to_string()
+    "127.0.0.1:3038".to_string()
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -431,11 +431,11 @@ fn default_http_provider_poll_interval() -> u64 {
 }
 
 fn default_http_port() -> u16 {
-    8080
+    80
 }
 
 fn default_https_port() -> u16 {
-    8443
+    443
 }
 
 fn get_env_port<T: std::str::FromStr>(var: &str, default: T) -> T {
@@ -752,8 +752,8 @@ mod tests {
 
     #[test]
     fn test_default_values() {
-        assert_eq!(default_http_port(), 8080);
-        assert_eq!(default_https_port(), 8443);
+        assert_eq!(default_http_port(), 80);
+        assert_eq!(default_https_port(), 443);
         assert_eq!(default_max_buffers(), 500);
         assert_eq!(default_buffer_size(), 16384);
         assert_eq!(default_startup_delay_ms(), 1000);
