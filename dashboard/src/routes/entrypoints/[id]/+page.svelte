@@ -13,6 +13,10 @@
 
   const id = $derived($page.params.id ?? '');
 
+  function isBackendDown(ep: Entrypoint, backend: string): boolean {
+    return (ep.unhealthy_backends ?? []).includes(`${backend}:${ep.config.port}`);
+  }
+
   async function load(silent = false) {
     if (!id) {
       return;
@@ -159,6 +163,7 @@
           <tr>
             <th>Address</th>
             <th>Weight</th>
+            <th>Status</th>
           </tr>
         </thead>
         <tbody>
@@ -166,6 +171,13 @@
             <tr>
               <td class="mono">{backend}</td>
               <td class="mono">{entrypoint.backend_weights?.[backend] ?? 1}</td>
+              <td>
+                {#if isBackendDown(entrypoint, backend)}
+                  <span class="status-pill down">down</span>
+                {:else}
+                  <span class="status-pill up">healthy</span>
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -373,6 +385,24 @@
     padding: 0.55rem 0.5rem;
     border-bottom: 1px solid var(--border);
     font-size: 0.8rem;
+  }
+  .status-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+  }
+  .status-pill.up {
+    background: var(--success-bg);
+    color: var(--success);
+  }
+  .status-pill.down {
+    background: var(--danger-bg);
+    color: var(--danger);
   }
   .backends-table tbody tr:last-child td,
   .kv-table tbody tr:last-child td {

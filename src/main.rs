@@ -129,13 +129,19 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         }
     });
 
+    // Build the health checker up-front so its unhealthy-backend state can be
+    // shared with the API (read by `GET /entrypoints`) and the runtime task.
+    let health_checker = proxy::health::HealthChecker::new(Arc::clone(&storage), reload_tx.clone());
+    let unhealthy_backends = health_checker.unhealthy_backends();
+
     let storage_server = storage.clone();
     let reload_tx_api = reload_tx.clone();
     let api_config = config.api.clone();
+    let unhealthy_api = Arc::clone(&unhealthy_backends);
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
-            api::server::serve(api_config, storage_server, reload_tx_api).await?;
+            api::server::serve(api_config, storage_server, reload_tx_api, unhealthy_api).await?;
         }
 
         Ok::<(), anyhow::Error>(())
@@ -152,14 +158,9 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     });
 
     // Start backend health checker
-    let health_task = tokio::spawn({
-        let storage_health = Arc::clone(&storage);
-        let reload_tx_health = reload_tx.clone();
-        async move {
-            let checker = proxy::health::HealthChecker::new(storage_health, reload_tx_health);
-            checker.run().await;
-            Ok::<(), anyhow::Error>(())
-        }
+    let health_task = tokio::spawn(async move {
+        health_checker.run().await;
+        Ok::<(), anyhow::Error>(())
     });
 
     // Start middleware server
