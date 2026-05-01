@@ -31,10 +31,12 @@ async fn main() -> anyhow::Result<()> {
 
     init_tracing();
 
+    let config_path = cli::resolve_config_path(cli.config.as_deref());
+
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve().await,
+        Command::Serve => serve(&config_path).await,
         Command::Validate(args) => {
-            let exit = cli::validate::run(args).await?;
+            let exit = cli::validate::run(args, &config_path).await?;
             std::process::exit(exit);
         }
     }
@@ -52,14 +54,12 @@ fn init_tracing() {
         .init();
 }
 
-async fn serve() -> anyhow::Result<()> {
+async fn serve(config_path: &str) -> anyhow::Result<()> {
     info!("Starting Sozune proxy");
 
-    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
-
-    let config = if tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
+    let config = if tokio::fs::try_exists(config_path).await.unwrap_or(false) {
         info!("Loading configuration from: {}", config_path);
-        let config_content = tokio::fs::read_to_string(&config_path)
+        let config_content = tokio::fs::read_to_string(config_path)
             .await
             .context("Failed to read a config file")?;
 
