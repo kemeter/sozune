@@ -2,7 +2,8 @@ use crate::config::AppConfig;
 use crate::model::Entrypoint;
 use crate::provider::{
     Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
-    kubernetes::KubernetesProvider, podman::PodmanProvider, swarm::SwarmProvider,
+    kubernetes::KubernetesProvider, nomad::NomadProvider, podman::PodmanProvider,
+    swarm::SwarmProvider,
 };
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -161,6 +162,27 @@ pub async fn start_services(
                 .await
             {
                 error!("Kubernetes service failed: {}", e);
+            }
+        });
+    }
+
+    // Start Nomad provider if enabled
+    if let Some(nomad_config) = &config.providers.nomad
+        && nomad_config.enabled
+    {
+        info!("Starting Nomad provider");
+        let nomad_provider =
+            NomadProvider::new(nomad_config.clone()).context("Failed to create Nomad provider")?;
+        let storage_nomad = Arc::clone(&storage);
+        let reload_tx_nomad = reload_tx.clone();
+        let acme_notify_nomad = Arc::clone(&acme_notify);
+
+        tokio::spawn(async move {
+            if let Err(e) = nomad_provider
+                .start_polling(storage_nomad, reload_tx_nomad, acme_notify_nomad)
+                .await
+            {
+                error!("Nomad provider failed: {}", e);
             }
         });
     }

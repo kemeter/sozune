@@ -42,6 +42,7 @@ pub struct ProvidersConfig {
     pub podman: Option<PodmanConfig>,
     pub swarm: Option<SwarmConfig>,
     pub kubernetes: Option<KubernetesConfig>,
+    pub nomad: Option<NomadConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -120,6 +121,35 @@ pub struct KubernetesConfig {
     #[serde(
         default,
         deserialize_with = "deserialize_kubernetes_expose_by_default_with_env"
+    )]
+    pub expose_by_default: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct NomadConfig {
+    #[serde(default, deserialize_with = "deserialize_nomad_enabled_with_env")]
+    pub enabled: bool,
+    /// Nomad HTTP API endpoint (e.g. `http://127.0.0.1:4646`).
+    #[serde(
+        default = "default_nomad_endpoint",
+        deserialize_with = "deserialize_nomad_endpoint_with_env"
+    )]
+    pub endpoint: String,
+    /// Optional ACL token sent as the `X-Nomad-Token` header.
+    #[serde(default, deserialize_with = "deserialize_nomad_token_with_env")]
+    pub token: String,
+    /// Restrict discovery to a single namespace. Empty means cluster-wide.
+    #[serde(default, deserialize_with = "deserialize_nomad_namespace_with_env")]
+    pub namespace: String,
+    /// Polling interval, in seconds.
+    #[serde(
+        default = "default_nomad_poll_interval",
+        deserialize_with = "deserialize_nomad_poll_interval_with_env"
+    )]
+    pub poll_interval: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nomad_expose_by_default_with_env"
     )]
     pub expose_by_default: bool,
 }
@@ -330,6 +360,27 @@ impl Default for KubernetesConfig {
 
 fn default_kubernetes_ingress_class() -> String {
     "sozune".to_string()
+}
+
+impl Default for NomadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_nomad_endpoint(),
+            token: String::new(),
+            namespace: String::new(),
+            poll_interval: default_nomad_poll_interval(),
+            expose_by_default: false,
+        }
+    }
+}
+
+fn default_nomad_endpoint() -> String {
+    "http://127.0.0.1:4646".to_string()
+}
+
+fn default_nomad_poll_interval() -> u64 {
+    15
 }
 
 fn default_swarm_endpoint() -> String {
@@ -621,6 +672,40 @@ deserialize_string_with_env!(
 deserialize_bool_with_env!(
     deserialize_kubernetes_expose_by_default_with_env,
     "SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT",
+    false
+);
+
+deserialize_bool_with_env!(
+    deserialize_nomad_enabled_with_env,
+    "SOZUNE_PROVIDER_NOMAD_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_nomad_endpoint_with_env,
+    "SOZUNE_PROVIDER_NOMAD_ENDPOINT",
+    default_nomad_endpoint
+);
+deserialize_string_with_env!(
+    deserialize_nomad_token_with_env,
+    "SOZUNE_PROVIDER_NOMAD_TOKEN",
+    "",
+    literal
+);
+deserialize_string_with_env!(
+    deserialize_nomad_namespace_with_env,
+    "SOZUNE_PROVIDER_NOMAD_NAMESPACE",
+    "",
+    literal
+);
+deserialize_with_env!(
+    deserialize_nomad_poll_interval_with_env,
+    "SOZUNE_PROVIDER_NOMAD_POLL_INTERVAL",
+    u64,
+    default_nomad_poll_interval
+);
+deserialize_bool_with_env!(
+    deserialize_nomad_expose_by_default_with_env,
+    "SOZUNE_PROVIDER_NOMAD_EXPOSE_BY_DEFAULT",
     false
 );
 
