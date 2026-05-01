@@ -54,4 +54,5 @@ Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu).
 
 - [Health checks](/documentation/advanced/health-checks)
 - [WebSocket](/documentation/advanced/websocket)
+- [Server-Sent Events](/documentation/advanced/sse)
 - [Access logs](/documentation/advanced/access-logs)
