@@ -969,4 +969,369 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // ---- Payload validation ---------------------------------------------------
+
+    #[tokio::test]
+    async fn create_with_malformed_json_returns_400() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not valid json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_with_missing_required_field_returns_422() {
+        let app = test_app(test_state());
+
+        // Missing `name` (required)
+        let payload = serde_json::json!({
+            "backends": [{ "address": "127.0.0.1", "port": 3000, "weight": 100 }],
+            "protocol": "Http",
+            "config": {
+                "hostnames": ["example.com"],
+                "path": null,
+                "tls": false,
+                "strip_prefix": false,
+                "https_redirect": false,
+                "priority": 0,
+                "auth": null,
+                "headers": []
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn create_with_wrong_field_type_returns_422() {
+        let app = test_app(test_state());
+
+        // backends is a string instead of a list of Backend objects
+        let payload = serde_json::json!({
+            "name": "web",
+            "backends": "127.0.0.1:3000",
+            "protocol": "Http",
+            "config": {
+                "hostnames": ["example.com"],
+                "path": null,
+                "tls": false,
+                "strip_prefix": false,
+                "https_redirect": false,
+                "priority": 0,
+                "auth": null,
+                "headers": []
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn create_with_empty_body_returns_415() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // axum returns 415 when content-type is missing on Json<...> extractor
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // ---- Backend serialization ------------------------------------------------
+
+    #[tokio::test]
+    async fn created_entrypoint_serializes_backends_as_objects() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let json = body_to_json(response.into_body()).await;
+        let backends = json["backends"].as_array().expect("backends array");
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0]["address"], "127.0.0.1");
+        assert_eq!(backends[0]["port"], 3000);
+        assert_eq!(backends[0]["weight"], 100);
+    }
+
+    // ---- unhealthy_backends ---------------------------------------------------
+
+    #[tokio::test]
+    async fn unhealthy_backends_field_lists_marked_down_addresses() {
+        let state = test_state();
+        // Create an entrypoint via the API.
+        let app = test_app(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_to_json(response.into_body()).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Mark the backend down.
+        state
+            .unhealthy_backends
+            .write()
+            .unwrap()
+            .insert("127.0.0.1:3000".to_string());
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/entrypoints/{id}"))
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        let unhealthy = json["unhealthy_backends"]
+            .as_array()
+            .expect("unhealthy_backends array");
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0], "127.0.0.1:3000");
+    }
+
+    #[tokio::test]
+    async fn unhealthy_backends_field_is_empty_when_all_healthy() {
+        let app = test_app(test_state());
+
+        // Create
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_to_json(response.into_body()).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/entrypoints/{id}"))
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let json = body_to_json(response.into_body()).await;
+        let unhealthy = json["unhealthy_backends"]
+            .as_array()
+            .expect("unhealthy_backends array");
+        assert!(unhealthy.is_empty());
+    }
+
+    // ---- List + listing semantics ---------------------------------------------
+
+    #[tokio::test]
+    async fn list_returns_all_entrypoints_regardless_of_source() {
+        let state = test_state();
+
+        // Pre-seed one Docker-sourced entrypoint that the API can't modify.
+        {
+            let mut storage = state.storage.write().unwrap();
+            storage.insert(
+                "docker-1".to_string(),
+                Entrypoint {
+                    id: "docker-1".to_string(),
+                    name: "docker-svc".to_string(),
+                    backends: vec![Backend::new("172.17.0.2", 8080)],
+                    protocol: Protocol::Http,
+                    config: EntrypointConfig {
+                        hostnames: vec!["docker.local".to_string()],
+                        path: None,
+                        tls: false,
+                        strip_prefix: false,
+                        https_redirect: false,
+                        https_redirect_port: None,
+                        redirect: None,
+                        redirect_scheme: None,
+                        redirect_template: None,
+                        www_authenticate: None,
+                        priority: 0,
+                        auth: None,
+                        headers: Vec::new(),
+                        backend_timeout: None,
+                        rate_limit: None,
+                        sticky_session: false,
+                        compress: false,
+                        entrypoint: None,
+                    },
+                    source: Some("docker".to_string()),
+                },
+            );
+        }
+
+        // Create one through the API too.
+        let app = test_app(state);
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        let entries = json.as_array().expect("entrypoints array");
+        assert_eq!(entries.len(), 2);
+        let sources: Vec<&str> = entries
+            .iter()
+            .map(|e| e["source"].as_str().unwrap())
+            .collect();
+        assert!(sources.contains(&"docker"));
+        assert!(sources.contains(&"api"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_404_for_unknown_id() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::delete("/entrypoints/does-not-exist")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cannot_delete_entrypoint_managed_by_another_source() {
+        let state = test_state();
+        {
+            let mut storage = state.storage.write().unwrap();
+            storage.insert(
+                "docker-1".to_string(),
+                Entrypoint {
+                    id: "docker-1".to_string(),
+                    name: "docker-svc".to_string(),
+                    backends: vec![Backend::new("172.17.0.2", 8080)],
+                    protocol: Protocol::Http,
+                    config: EntrypointConfig {
+                        hostnames: vec!["docker.local".to_string()],
+                        path: None,
+                        tls: false,
+                        strip_prefix: false,
+                        https_redirect: false,
+                        https_redirect_port: None,
+                        redirect: None,
+                        redirect_scheme: None,
+                        redirect_template: None,
+                        www_authenticate: None,
+                        priority: 0,
+                        auth: None,
+                        headers: Vec::new(),
+                        backend_timeout: None,
+                        rate_limit: None,
+                        sticky_session: false,
+                        compress: false,
+                        entrypoint: None,
+                    },
+                    source: Some("docker".to_string()),
+                },
+            );
+        }
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::delete("/entrypoints/docker-1")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
