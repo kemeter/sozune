@@ -22,9 +22,11 @@ use tracing::{debug, error, info, warn};
 const PROVIDER_NAME: &str = "kubernetes";
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
-/// Maps `namespace/service` → list of ready pod IPs, populated from
-/// EndpointSlice watch events. Used to resolve backends for Services.
-type EndpointsCache = Arc<RwLock<HashMap<String, Vec<String>>>>;
+/// Maps `namespace/service` → (slice name → ready pod IPs from that slice).
+/// We track per-slice attribution so an Apply that shrinks a slice (e.g.
+/// scale-down) correctly drops the IPs that left, instead of accumulating
+/// stale endpoints across events.
+type EndpointsCache = Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>;
 
 pub struct KubernetesProvider {
     config: KubernetesConfig,
@@ -168,13 +170,27 @@ impl KubernetesProvider {
         })
     }
 
-    /// Read all ready pod IPs known for a `namespace/service` from the cache.
+    /// Read all ready pod IPs known for a `namespace/service`, flattened
+    /// across every EndpointSlice attached to that service. IPs are
+    /// deduplicated to avoid double-listing if two slices overlap (rare but
+    /// permitted by the API).
     fn pod_ips_for(&self, svc_id: &str) -> Vec<String> {
-        self.endpoints
-            .read()
-            .ok()
-            .and_then(|cache| cache.get(svc_id).cloned())
-            .unwrap_or_default()
+        let Ok(cache) = self.endpoints.read() else {
+            return Vec::new();
+        };
+        let Some(slices) = cache.get(svc_id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for ips in slices.values() {
+            for ip in ips {
+                if !out.contains(ip) {
+                    out.push(ip.clone());
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     pub async fn start_service(
@@ -346,6 +362,8 @@ impl KubernetesProvider {
             .filter(|ip| !ip.is_empty())
             .collect();
 
+        let slice_name = slice.metadata.name.as_deref()?.to_string();
+
         let mut cache = match self.endpoints.write() {
             Ok(guard) => guard,
             Err(e) => {
@@ -354,32 +372,39 @@ impl KubernetesProvider {
             }
         };
 
-        // Aggregate across multiple slices for the same service: rebuild the
-        // bucket for this slice but merge with other slices we've seen.
-        let slice_key = slice.metadata.name.as_deref().unwrap_or("");
-        let bucket = cache.entry(svc_id.clone()).or_default();
-        // Strategy: store unique IPs across all slices. Slice deletes will
-        // rebuild from a full re-list, so a per-slice diff is not needed here.
-        for ip in ips {
-            if !bucket.contains(&ip) {
-                bucket.push(ip);
-            }
-        }
+        let slices = cache.entry(svc_id.clone()).or_default();
+        let total_after = if ips.is_empty() {
+            slices.remove(&slice_name);
+            slices.values().map(|v| v.len()).sum::<usize>()
+        } else {
+            let count = ips.len();
+            slices.insert(slice_name.clone(), ips);
+            count
+                + slices
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if k != &slice_name {
+                            Some(v.len())
+                        } else {
+                            None
+                        }
+                    })
+                    .sum::<usize>()
+        };
 
         debug!(
-            "EndpointSlice {} applied: {} ready endpoint(s) for {}",
-            slice_key,
-            bucket.len(),
-            svc_id
+            "EndpointSlice {} applied: {} ready endpoint(s) for {} (total across slices: {})",
+            slice_name,
+            slices.get(&slice_name).map(|v| v.len()).unwrap_or(0),
+            svc_id,
+            total_after
         );
 
         Some(svc_id)
     }
 
-    /// Drop a slice's contribution from the cache. Because we don't track
-    /// per-slice IPs, we simply clear the service's bucket — the surviving
-    /// slices will repopulate it on their next Apply (kube re-emits Apply for
-    /// every slice the service still owns when one is deleted).
+    /// Drop a slice's contribution from the cache. Surviving slices for the
+    /// same service stay intact — their attribution is keyed by slice name.
     fn remove_slice(&self, slice: &EndpointSlice) -> Option<String> {
         let namespace = slice.metadata.namespace.as_deref()?;
         let service_name = slice
@@ -387,11 +412,17 @@ impl KubernetesProvider {
             .labels
             .as_ref()
             .and_then(|l| l.get(SERVICE_NAME_LABEL))?;
+        let slice_name = slice.metadata.name.as_deref()?;
 
         let svc_id = format!("{namespace}/{service_name}");
 
-        if let Ok(mut cache) = self.endpoints.write() {
-            cache.remove(&svc_id);
+        if let Ok(mut cache) = self.endpoints.write()
+            && let Some(slices) = cache.get_mut(&svc_id)
+        {
+            slices.remove(slice_name);
+            if slices.is_empty() {
+                cache.remove(&svc_id);
+            }
         }
 
         Some(svc_id)
@@ -760,6 +791,64 @@ mod tests {
                 .read()
                 .unwrap()
                 .contains_key("default/api")
+        );
+    }
+
+    #[test]
+    fn shrinking_slice_drops_stale_ips() {
+        let provider = make_provider(true);
+        let initial = make_slice(
+            "api-abc",
+            "default",
+            "api",
+            vec![
+                (vec!["10.244.0.5"], Some(true)),
+                (vec!["10.244.0.6"], Some(true)),
+                (vec!["10.244.0.7"], Some(true)),
+            ],
+        );
+        provider.apply_slice(&initial);
+        assert_eq!(provider.pod_ips_for("default/api").len(), 3);
+
+        let shrunk = make_slice(
+            "api-abc",
+            "default",
+            "api",
+            vec![(vec!["10.244.0.5"], Some(true))],
+        );
+        provider.apply_slice(&shrunk);
+        assert_eq!(
+            provider.pod_ips_for("default/api"),
+            vec!["10.244.0.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn multiple_slices_for_same_service_are_merged() {
+        let provider = make_provider(true);
+        let slice_a = make_slice(
+            "api-aaa",
+            "default",
+            "api",
+            vec![(vec!["10.244.0.5"], Some(true))],
+        );
+        let slice_b = make_slice(
+            "api-bbb",
+            "default",
+            "api",
+            vec![(vec!["10.244.0.6"], Some(true))],
+        );
+        provider.apply_slice(&slice_a);
+        provider.apply_slice(&slice_b);
+        assert_eq!(
+            provider.pod_ips_for("default/api"),
+            vec!["10.244.0.5".to_string(), "10.244.0.6".to_string()]
+        );
+
+        provider.remove_slice(&slice_a);
+        assert_eq!(
+            provider.pod_ips_for("default/api"),
+            vec!["10.244.0.6".to_string()]
         );
     }
 }
