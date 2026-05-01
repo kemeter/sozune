@@ -83,8 +83,8 @@ impl HealthChecker {
         let mut backends = HashMap::new();
         for entrypoint in storage.values() {
             for backend in &entrypoint.backends {
-                let key = format!("{}:{}", backend, entrypoint.config.port);
-                backends.insert(key, format!("{}:{}", backend, entrypoint.config.port));
+                let key = backend.to_string();
+                backends.insert(key.clone(), key);
             }
         }
         backends

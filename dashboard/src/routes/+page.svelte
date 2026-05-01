@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
-  import { listEntrypoints, type Entrypoint } from '$lib/api';
+  import { listEntrypoints, backendKey, type Backend, type Entrypoint } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
   let entrypoints = $state<Entrypoint[]>([]);
@@ -22,7 +22,7 @@
         ep.name.toLowerCase().includes(q) ||
         ep.id.toLowerCase().includes(q) ||
         ep.config.hostnames.some((h) => h.toLowerCase().includes(q)) ||
-        ep.backends.some((b) => b.toLowerCase().includes(q))
+        ep.backends.some((b) => backendKey(b).toLowerCase().includes(q))
       );
     })
   );
@@ -36,8 +36,8 @@
     tls: entrypoints.filter((e) => e.config.tls).length
   });
 
-  function isBackendDown(ep: Entrypoint, backend: string): boolean {
-    return (ep.unhealthy_backends ?? []).includes(`${backend}:${ep.config.port}`);
+  function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
+    return (ep.unhealthy_backends ?? []).includes(backendKey(backend));
   }
 
   function downCount(ep: Entrypoint): number {

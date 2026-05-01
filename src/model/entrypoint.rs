@@ -1,17 +1,49 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Entrypoint {
     pub id: String,
-    pub backends: Vec<String>,
+    pub backends: Vec<Backend>,
     pub name: String,
     pub protocol: Protocol,
     pub config: EntrypointConfig,
     #[serde(default)]
     pub source: Option<String>,
-    #[serde(default)]
-    pub backend_weights: HashMap<String, u32>,
+}
+
+/// One backend instance: an address (IP or hostname), the port it listens
+/// on, and an optional load-balancing weight (defaults to 100).
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Backend {
+    pub address: String,
+    pub port: u16,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    100
+}
+
+impl Backend {
+    pub fn new(address: impl Into<String>, port: u16) -> Self {
+        Self {
+            address: address.into(),
+            port,
+            weight: default_weight(),
+        }
+    }
+
+    pub fn with_weight(mut self, weight: u32) -> Self {
+        self.weight = weight;
+        self
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.address, self.port)
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -24,7 +56,6 @@ pub enum Protocol {
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct EntrypointConfig {
     pub hostnames: Vec<String>,
-    pub port: u16,
     pub path: Option<PathConfig>,
     pub tls: bool,
     pub strip_prefix: bool,

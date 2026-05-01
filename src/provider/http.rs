@@ -76,7 +76,6 @@ impl HttpProvider {
                                 storage_read.get(id).is_none_or(|existing| {
                                     existing.backends != ep.backends
                                         || existing.config.hostnames != ep.config.hostnames
-                                        || existing.config.port != ep.config.port
                                 })
                             })
                     };
@@ -117,19 +116,17 @@ impl HttpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EntrypointConfig, Protocol};
+    use crate::model::{Backend, EntrypointConfig, Protocol};
     use axum::{Router, routing::get};
-    use std::collections::HashMap;
 
     fn sample_entrypoints_json() -> String {
         serde_json::to_string(&vec![Entrypoint {
             id: "web".to_string(),
             name: "web".to_string(),
-            backends: vec!["127.0.0.1:3000".to_string()],
+            backends: vec![Backend::new("127.0.0.1", 3000)],
             protocol: Protocol::Http,
             config: EntrypointConfig {
                 hostnames: vec!["example.com".to_string()],
-                port: 80,
                 path: None,
                 tls: false,
                 strip_prefix: false,
@@ -149,7 +146,6 @@ mod tests {
                 entrypoint: None,
             },
             source: None,
-            backend_weights: HashMap::new(),
         }])
         .unwrap()
     }

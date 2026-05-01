@@ -10,20 +10,15 @@ else
     return 0
 fi
 
-log "[01] Round-robin across allocations"
-# In Nomad `-dev` mode every allocation runs on 127.0.0.1 with a different
-# dynamically-assigned port. Sozune's current Entrypoint model carries a
-# single port per route, so multi-allocation routing on the same host only
-# reaches one backend reliably. Skip the round-robin assertion in dev mode;
-# a multi-host Nomad cluster (each allocation on its own IP) routes correctly.
-distinct=$(count_distinct_hostnames "$HOST_WHOAMI" 12)
-if [[ "$distinct" -ge 1 ]]; then
-    pass "service routed via Sozune ($distinct distinct backend(s) over 12 reqs)"
-    if [[ "$distinct" -lt 3 ]]; then
-        skip "round-robin across 3 allocations not asserted in -dev mode (single-host port-per-alloc limitation)"
-    fi
+log "[01] Round-robin hits all 3 allocations"
+# Each allocation in Nomad `-dev` runs on 127.0.0.1 with its own dynamic port.
+# Now that Sozune carries a port per backend, the three allocations each show
+# up as distinct routing targets even on a single host.
+distinct=$(wait_for_distinct_backends "$HOST_WHOAMI" 3 30 || true)
+if [[ "$distinct" -ge 3 ]]; then
+    pass "round-robin hits $distinct distinct allocations"
 else
-    fail "no successful backend response over 12 requests"
+    fail "expected >=3 distinct allocations after 30s, got $distinct"
 fi
 
 log "[01] Sozune-Id header is present (proves Sōzu, not host network, served the request)"

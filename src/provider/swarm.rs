@@ -241,7 +241,6 @@ impl SwarmProvider {
                     storage_read.get(id).is_none_or(|existing| {
                         existing.backends != ep.backends
                             || existing.config.hostnames != ep.config.hostnames
-                            || existing.config.port != ep.config.port
                     })
                 })
         };
@@ -372,7 +371,6 @@ impl SwarmProvider {
                         storage_read.get(id).is_none_or(|existing| {
                             existing.backends != ep.backends
                                 || existing.config.hostnames != ep.config.hostnames
-                                || existing.config.port != ep.config.port
                         })
                     })
             };
@@ -417,10 +415,12 @@ impl Provider for SwarmProvider {
             log_diagnostics(&candidate, &result.diagnostics);
 
             for (key, entrypoint) in result.entrypoints {
-                let backend_ip = entrypoint.backends.first().cloned().unwrap_or_default();
+                let Some(backend) = entrypoint.backends.first().cloned() else {
+                    continue;
+                };
                 if let Some(existing) = entrypoints.get_mut(&key) {
-                    if !backend_ip.is_empty() && !existing.backends.contains(&backend_ip) {
-                        existing.backends.push(backend_ip);
+                    if !existing.backends.contains(&backend) {
+                        existing.backends.push(backend);
                     }
                 } else {
                     entrypoints.insert(key, entrypoint);

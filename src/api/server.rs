@@ -1,6 +1,6 @@
 use crate::api::auth::{AuthOutcome, Identity, check};
 use crate::config::{ApiConfig, ApiUser, Role};
-use crate::model::{Entrypoint, EntrypointConfig, Protocol};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Method, header};
@@ -32,7 +32,7 @@ fn entrypoint_payload(entrypoint: &Entrypoint, unhealthy: &HashSet<String>) -> s
     let unhealthy_for_ep: Vec<String> = entrypoint
         .backends
         .iter()
-        .map(|b| format!("{}:{}", b, entrypoint.config.port))
+        .map(|b| b.to_string())
         .filter(|key| unhealthy.contains(key))
         .collect();
 
@@ -49,10 +49,9 @@ fn entrypoint_payload(entrypoint: &Entrypoint, unhealthy: &HashSet<String>) -> s
 #[derive(Deserialize)]
 pub struct CreateEntrypointRequest {
     pub name: String,
-    pub backends: Vec<String>,
+    pub backends: Vec<Backend>,
     pub protocol: Protocol,
     pub config: EntrypointConfig,
-    pub backend_weights: Option<std::collections::HashMap<String, u32>>,
 }
 
 /// Authenticate the request with HTTP Basic, then attach the resolved
@@ -323,7 +322,6 @@ async fn create_entrypoint(
         protocol: payload.protocol,
         config: payload.config,
         source: Some("api".to_string()),
-        backend_weights: payload.backend_weights.unwrap_or_default(),
     };
 
     {
@@ -391,7 +389,6 @@ async fn update_entrypoint(
             protocol: payload.protocol,
             config: payload.config,
             source: Some("api".to_string()),
-            backend_weights: payload.backend_weights.unwrap_or_default(),
         };
         storage.insert(id.clone(), entrypoint);
     }
@@ -537,11 +534,12 @@ mod tests {
     fn sample_entrypoint_json() -> serde_json::Value {
         serde_json::json!({
             "name": "web",
-            "backends": ["127.0.0.1:3000"],
+            "backends": [
+                { "address": "127.0.0.1", "port": 3000, "weight": 100 }
+            ],
             "protocol": "Http",
             "config": {
                 "hostnames": ["example.com"],
-                "port": 80,
                 "path": null,
                 "tls": false,
                 "strip_prefix": false,
@@ -757,11 +755,10 @@ mod tests {
                 Entrypoint {
                     id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                     name: "docker-service".to_string(),
-                    backends: vec!["172.17.0.2:8080".to_string()],
+                    backends: vec![Backend::new("172.17.0.2", 8080)],
                     protocol: Protocol::Http,
                     config: EntrypointConfig {
                         hostnames: vec!["docker.local".to_string()],
-                        port: 80,
                         path: None,
                         tls: false,
                         strip_prefix: false,
@@ -781,7 +778,6 @@ mod tests {
                         entrypoint: None,
                     },
                     source: Some("docker".to_string()),
-                    backend_weights: std::collections::HashMap::new(),
                 },
             );
         }
