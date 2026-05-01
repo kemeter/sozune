@@ -21,7 +21,7 @@ labels:
 
 ## Algorithm selection
 
-Sozune picks the best encoding the client accepts, in this order of preference:
+Sōzune picks the best encoding the client accepts, in this order of preference:
 
 1. `zstd`
 2. `br` (Brotli)
@@ -59,7 +59,7 @@ Anything else (binary, images, video, archives) is forwarded as-is.
 
 ## Headers added
 
-When a response is compressed, Sozune:
+When a response is compressed, Sōzune:
 
 - Sets `Content-Encoding` to the chosen algorithm (`zstd`, `br`, or `gzip`).
 - Recomputes `Content-Length`.
@@ -73,7 +73,7 @@ If you serve large compressible payloads (long log streams, large JSON dumps), t
 
 ## Compression levels
 
-Sozune favours speed over ratio for live traffic:
+Sōzune favours speed over ratio for live traffic:
 
 | Algorithm | Level | Notes |
 |---|---|---|

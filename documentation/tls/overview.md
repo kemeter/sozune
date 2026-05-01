@@ -1,6 +1,6 @@
 # TLS overview
 
-Sozune terminates TLS on its HTTPS listener. Certificates come from [ACME / Let's Encrypt](/documentation/tls/acme).
+Sōzune terminates TLS on its HTTPS listener. Certificates come from [ACME / Let's Encrypt](/documentation/tls/acme).
 
 ## Enable TLS for a service
 
@@ -10,7 +10,7 @@ labels:
   - "sozune.http.app.tls=true"
 ```
 
-When `tls=true`, Sozune:
+When `tls=true`, Sōzune:
 
 1. Adds the hostname to the list of names needing a certificate.
 2. Triggers ACME provisioning for the hostname (HTTP-01 challenge).
@@ -19,11 +19,11 @@ When `tls=true`, Sozune:
 
 ## HTTP/2
 
-HTTP/2 is enabled out of the box: TLS ALPN advertises both `h2` and `http/1.1`, so clients that support h2 get h2 and the rest fall back to HTTP/1.1. ALPN behaviour is delegated to Sōzu's listener defaults — Sozune does not currently expose ALPN configuration of its own.
+HTTP/2 is enabled out of the box: TLS ALPN advertises both `h2` and `http/1.1`, so clients that support h2 get h2 and the rest fall back to HTTP/1.1. ALPN behaviour is delegated to Sōzu's listener defaults — Sōzune does not currently expose ALPN configuration of its own.
 
 ## SNI
 
-Sozune supports SNI natively (inherited from Sōzu). Many domains, each with its own certificate, share the same listener.
+Sōzune supports SNI natively (inherited from Sōzu). Many domains, each with its own certificate, share the same listener.
 
 ## HTTPS redirect
 
@@ -31,7 +31,7 @@ Force HTTP traffic to HTTPS — see [Redirects](/documentation/middleware/redire
 
 ## What's not configurable
 
-The following are not currently exposed by Sozune; they fall back to Sōzu defaults:
+The following are not currently exposed by Sōzune; they fall back to Sōzu defaults:
 
 - Cipher suites
 - Minimum TLS version

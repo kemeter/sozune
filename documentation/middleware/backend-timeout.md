@@ -1,6 +1,6 @@
 # Backend timeout
 
-Cap the time Sozune waits for a backend response before giving up. Useful to avoid stuck connections from blocking workers, or — set to zero — to allow long-lived streams.
+Cap the time Sōzune waits for a backend response before giving up. Useful to avoid stuck connections from blocking workers, or — set to zero — to allow long-lived streams.
 
 ## Label
 

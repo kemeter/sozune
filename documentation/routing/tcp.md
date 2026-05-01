@@ -1,11 +1,11 @@
 # TCP routing
 
-Sozune can forward raw TCP traffic to your services. The model mirrors Traefik's:
+Sōzune can forward raw TCP traffic to your services. Two pieces:
 
 - **Listeners are declared statically** in `config.yaml`. Each listener binds a port at startup.
 - **Backends attach dynamically** through Docker labels and reference a listener by name.
 
-A label that points at an undeclared listener is ignored with a warning. Sozune does not open ports on the fly from labels alone — by design, to keep startup state predictable.
+A label that points at an undeclared listener is ignored with a warning. Sōzune does not open ports on the fly from labels alone — by design, to keep startup state predictable.
 
 ## Declare listeners
 
@@ -45,13 +45,13 @@ services:
 | `sozune.tcp.<svc>.port` | Backend port on the container. Defaults to `8080` (informational diagnostic emitted). |
 | `sozune.tcp.<svc>.priority` | Higher wins when multiple services share the same listener (default `0`). |
 
-The container's IP is resolved through the same network rules as HTTP — see [Docker labels](../configuration/docker-labels.md) and `sozune.network` to pick a network when the container is on several.
+The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/configuration/docker-labels) and `sozune.network` to pick a network when the container is on several.
 
 ## Limitations
 
 - **No TLS termination.** Sōzu's TCP path is pure passthrough — TLS bytes flow as-is. For client-side STARTTLS protocols (PostgreSQL, MySQL) this is fine; for terminating TLS, use an HTTPS entrypoint instead.
 - **No half-close.** Sōzu treats a client `FIN` as a full disconnect, so protocols that rely on half-closing one direction to signal end-of-stream may misbehave. Most request/response and long-lived stream protocols are unaffected.
-- **No IP allowlist or connection-rate limit yet.** Track the [roadmap](https://github.com/kemeter/sozune/blob/main/ROADMAP.md) for `IP allowlist / denylist` and TCP-level rate limiting.
+- **No IP allowlist or connection-rate limit yet.** Both are not currently implemented for TCP entrypoints.
 
 ## Errors and diagnostics
 

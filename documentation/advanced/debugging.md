@@ -2,7 +2,7 @@
 
 When a request can't be routed, sozune returns `502 Bad Gateway`. By default the response body is empty so configured hostnames and backend addresses don't leak to the public. Setting `SOZUNE_DEBUG=true` adds a plain-text body explaining what went wrong, including a did-you-mean suggestion when the request `Host` looks like a typo of a configured host.
 
-## The `X-Sozune-Diagnostic` header
+## The `X-Sōzune-Diagnostic` header
 
 The header is **always** set on routing failures, regardless of `SOZUNE_DEBUG`. It carries one of the following reasons:
 
@@ -49,8 +49,8 @@ Configured backends:
 
 - **Local development** — instantly see why a `Host`/route doesn't match, without tailing logs.
 - **Staging** — leave it on so QA gets immediate feedback on misconfigured services.
-- **Production** — leave it **off**. The `X-Sozune-Diagnostic` header is enough to diagnose from the operator side, and the server-side log line (`info` level) records the same information without exposing it to clients.
+- **Production** — leave it **off**. The `X-Sōzune-Diagnostic` header is enough to diagnose from the operator side, and the server-side log line (`info` level) records the same information without exposing it to clients.
 
 ## Configuration validation at boot
 
-`SOZUNE_DEBUG` only affects runtime responses. For diagnostics that surface at config-load time (typos in Docker labels, missing required fields, unknown protocols), use [`sozune validate`](../configuration/docker-labels.md). Both paths share the same diagnostic codes (`E001` … `W013`, `I001` …), so what `validate` reports cannot drift from what the proxy actually does.
+`SOZUNE_DEBUG` only affects runtime responses. For diagnostics that surface at config-load time (typos in Docker labels, missing required fields, unknown protocols), use `sozune validate`. Both paths share the same diagnostic codes (`E001` … `W013`, `I001` …), so what `validate` reports cannot drift from what the proxy actually does.

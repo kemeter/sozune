@@ -1,10 +1,10 @@
 # Access logs
 
-Sozune logs every request that flows through its internal middleware proxy (compress, rate limit, backend timeout) via the standard `tracing` infrastructure. There is no separate access log file — logs go to stdout.
+Sōzune logs every request that flows through its internal middleware proxy (compress, rate limit, backend timeout) via the standard `tracing` infrastructure. There is no separate access log file — logs go to stdout.
 
 ## What is and isn't logged
 
-The Sozune access log is emitted by the middleware proxy. A request reaches that proxy only if its entrypoint uses one of the middleware features that still run in Axum: `compress`, `ratelimit.*`, `backendTimeout`. Entrypoints that use only natively-handled features (basic auth, custom headers, strip prefix, redirects) bypass the middleware proxy entirely and **do not produce a Sozune access log line**. Sōzu itself still logs at the listener level, but in its own format.
+The Sōzune access log is emitted by the middleware proxy. A request reaches that proxy only if its entrypoint uses one of the middleware features that still run in Axum: `compress`, `ratelimit.*`, `backendTimeout`. Entrypoints that use only natively-handled features (basic auth, custom headers, strip prefix, redirects) bypass the middleware proxy entirely and **do not produce a Sōzune access log line**. Sōzu itself still logs at the listener level, but in its own format.
 
 ## Format
 
@@ -39,7 +39,7 @@ Example:
 
 ## Configuring log output
 
-Sozune respects the `RUST_LOG` environment variable.
+Sōzune respects the `RUST_LOG` environment variable.
 
 ```bash
 # Default — info for sozune, warn for noisy deps

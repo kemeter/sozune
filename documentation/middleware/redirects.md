@@ -1,6 +1,6 @@
 # Redirects
 
-Sozune exposes a few flavors of HTTP redirect, all handled natively by Sōzu (no extra hop, no middleware overhead).
+Sōzune exposes a few flavors of HTTP redirect, all handled natively by Sōzu (no extra hop, no middleware overhead).
 
 | Goal | Label |
 |---|---|
@@ -12,7 +12,7 @@ Sozune exposes a few flavors of HTTP redirect, all handled natively by Sōzu (no
 
 ## HTTPS redirect
 
-Force HTTP traffic to HTTPS for a given service. Sozune answers `301 Moved Permanently` on the HTTP listener and points the client to the matching HTTPS URL.
+Force HTTP traffic to HTTPS for a given service. Sōzune answers `301 Moved Permanently` on the HTTP listener and points the client to the matching HTTPS URL.
 
 ```yaml
 labels:
@@ -81,5 +81,5 @@ The default template (when `redirectTemplate` is unset) produces a standard `Loc
 
 ## Behaviour
 
-- Redirects are applied by Sōzu, not by a Sozune middleware. There is no extra processing cost.
+- Redirects are applied by Sōzu, not by a Sōzune middleware. There is no extra processing cost.
 - For HTTPS redirects, the service still needs to be declared on the HTTP entry to receive the request that gets redirected. If you only declare the service on HTTPS, the HTTP listener has no rule for it and the request returns `404` instead.

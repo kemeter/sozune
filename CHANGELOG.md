@@ -27,7 +27,7 @@ All notable changes to this project will be documented in this file.
 
 The `headers`, `auth`, and `strip_prefix` middlewares no longer pass through the internal Axum proxy — they are configured directly on the Sozu cluster/frontend, removing one network hop.
 
-- **Headers**: `RequestHttpFrontend.headers` (request-side) replaces `headers::inject_headers`. Empty header value performs a delete (HAProxy parity).
+- **Headers**: `RequestHttpFrontend.headers` (request-side) replaces `headers::inject_headers`. Empty header value performs a delete.
 - **Basic auth**: `Cluster.authorized_hashes` + `RequestHttpFrontend.required_auth` replace the Axum `auth::check_basic_auth` chain.
 - **Strip prefix**: `RequestHttpFrontend.rewrite_path` replaces `strip_prefix::strip`. `Prefix` paths use `$PATH[1]`, `Exact` paths use `/`. `Regex` paths are not auto-converted.
 - `needs_middleware()` no longer returns `true` for entrypoints that only use these three; they bypass the middleware proxy entirely.
@@ -39,7 +39,7 @@ The `headers.*` Docker label gains support for response-side and bidirectional e
 - `headers.<name>=<value>` — request-side (default, unchanged)
 - `headers.response.<name>=<value>` — response-side
 - `headers.both.<name>=<value>` — both directions
-- `headers.<name>=` (empty value) — deletes the header (HAProxy `del-header` parity)
+- `headers.<name>=` (empty value) — deletes the header
 
 ### Redirect & auth knobs
 
@@ -346,21 +346,6 @@ impl Middleware for MyMiddleware {
                    │  Response    │
                    └──────────────┘
 ```
-
-### 🔮 Future Roadmap
-
-#### Planned Middleware
-- **Authentication**: JWT/OAuth middleware
-- **Rate Limiting**: Request throttling middleware  
-- **Compression**: Gzip/Brotli response middleware
-- **Caching**: Response caching middleware
-- **Metrics**: Request/response monitoring middleware
-
-#### Enhanced Features
-- **Configuration**: YAML-based middleware configuration
-- **Hot Reload**: Dynamic middleware chain updates
-- **WebSocket**: Middleware support for WebSocket upgrades
-- **TLS**: Request inspection for HTTPS traffic
 
 ---
 

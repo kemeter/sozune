@@ -1,6 +1,6 @@
 # HTTP provider
 
-The HTTP provider polls a remote URL for entrypoint definitions in JSON. Useful when you don't run on Docker, or when an external control plane needs to push routes to Sozune.
+The HTTP provider polls a remote URL for entrypoint definitions in JSON. Useful when you don't run on Docker, or when an external control plane needs to push routes to Sōzune.
 
 ## Configuration
 
@@ -55,9 +55,9 @@ A JSON array of entrypoints with the same schema as the [REST API](/documentatio
 
 ## Behaviour
 
-- **JSON only.** YAML is rejected — Sozune only parses `application/json`-compatible bodies.
+- **JSON only.** YAML is rejected — Sōzune only parses `application/json`-compatible bodies.
 - **Polling cadence:** every `poll_interval` seconds.
-- **Reload trigger:** Sozune diffs the new payload against the current state. A reload is triggered only when **at least one** of `backends`, `hostnames`, `port` changes for any entrypoint, or when entrypoints are added/removed.
+- **Reload trigger:** Sōzune diffs the new payload against the current state. A reload is triggered only when **at least one** of `backends`, `hostnames`, `port` changes for any entrypoint, or when entrypoints are added/removed.
 - **Failure handling:** a non-2xx response or unparseable JSON is logged as a warning. The previous state is preserved; no entrypoints are removed on failure.
 - **Source tag:** entrypoints from the HTTP provider are tagged with `source: "http"` internally. This isolates them from Docker-discovered or API-managed entrypoints — the HTTP provider replaces only its own subset on each successful poll.
 

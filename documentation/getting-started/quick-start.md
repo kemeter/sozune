@@ -1,6 +1,6 @@
 # Quick start
 
-Expose a service through Sozune with Docker Compose in two minutes.
+Expose a service through Sōzune with Docker Compose in two minutes.
 
 ## 1. Minimal compose file
 
@@ -22,7 +22,7 @@ services:
       - "sozune.http.whoami.host=whoami.localhost"
 ```
 
-## 2. Sozune config
+## 2. Sōzune config
 
 `config.yaml`:
 

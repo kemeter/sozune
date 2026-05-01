@@ -1,10 +1,10 @@
 # Backend health checks
 
-Sozune actively probes every backend in the background and reconfigures Sōzu when their status changes. This runs automatically — no configuration needed.
+Sōzune actively probes every backend in the background and reconfigures Sōzu when their status changes. This runs automatically — no configuration needed.
 
 ## How it works
 
-Every **10 seconds**, Sozune opens a TCP connection to each backend (`<backend-host>:<backend-port>`) with a **5-second timeout**.
+Every **10 seconds**, Sōzune opens a TCP connection to each backend (`<backend-host>:<backend-port>`) with a **5-second timeout**.
 
 | Result | Action |
 |---|---|
@@ -12,11 +12,11 @@ Every **10 seconds**, Sozune opens a TCP connection to each backend (`<backend-h
 | TCP connect refused | Backend marked unhealthy |
 | Timeout | Backend marked unhealthy |
 
-When a backend transitions between healthy and unhealthy, Sozune triggers a Sōzu reload. Unhealthy backends are removed from rotation; they come back as soon as the probe succeeds again.
+When a backend transitions between healthy and unhealthy, Sōzune triggers a Sōzu reload. Unhealthy backends are removed from rotation; they come back as soon as the probe succeeds again.
 
 ## What it checks
 
-- **Layer 4 only** (TCP). Sozune does not send an HTTP request, doesn't check status codes, doesn't follow redirects.
+- **Layer 4 only** (TCP). Sōzune does not send an HTTP request, doesn't check status codes, doesn't follow redirects.
 - The probed address is the same one used for traffic — host and port from the entrypoint config.
 
 ## What it does not do

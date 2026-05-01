@@ -1,6 +1,6 @@
 # Docker labels
 
-Sozune discovers your services through Docker container labels. Each label has the form:
+When run against the Docker provider, Sōzune discovers your services through container labels. Each label has the form:
 
 ```
 sozune.<protocol>.<service>.<key>=<value>

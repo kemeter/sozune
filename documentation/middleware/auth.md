@@ -1,6 +1,6 @@
 # Basic auth
 
-Protect a route with HTTP Basic Authentication. Sozune validates credentials against a list of `username:password_hash` pairs configured per service.
+Protect a route with HTTP Basic Authentication. Sōzune validates credentials against a list of `username:password_hash` pairs configured per service.
 
 ## Label
 

@@ -1,6 +1,6 @@
 # Dashboard
 
-Sozune ships with a built-in web dashboard to inspect entrypoints, check health, and manage settings without hitting the REST API by hand.
+Sōzune ships with a built-in web dashboard to inspect entrypoints, check health, and manage settings without hitting the REST API by hand.
 
 ## Configuration
 
@@ -39,3 +39,7 @@ If you need it reachable on a LAN without going through a proxy, switch `listen_
 ## CORS
 
 The dashboard runs on its own origin (e.g. `http://dashboard.example.com`) and calls the API on another (`http://localhost:3035`). The API allows any origin by default; restrict with `api.cors_origins` if you need to.
+
+## Preview
+
+![Sōzune dashboard](/documentation/assets/dashboard-entrypoints.png)

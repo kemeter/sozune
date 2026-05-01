@@ -1,6 +1,6 @@
 # Hostnames
 
-The `host` label accepts a comma-separated list. Sozune passes each entry as-is to Sōzu, which classifies it as exact, wildcard, or regex based on its shape. The matching rules below are Sōzu's.
+The `host` label accepts a comma-separated list. Sōzune passes each entry as-is to Sōzu, which classifies it as exact, wildcard, or regex based on its shape. The matching rules below are Sōzu's.
 
 ## Exact
 
@@ -48,7 +48,7 @@ Each item in the list is parsed on its own — you can mix exact, wildcard and r
 
 ## Priority
 
-When several entrypoints could match the same request, Sozune applies them in `priority` descending order.
+When several entrypoints could match the same request, Sōzune applies them in `priority` descending order.
 
 ```yaml
 labels:
@@ -64,5 +64,5 @@ The default priority is `0`. Higher numbers win.
 
 ## Notes
 
-- **Wildcard quirk**: due to an upstream issue ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)), wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds. Sozune ships a patched build that guards against this.
+- **Wildcard quirk**: due to an upstream issue ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)), wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds. Sōzune ships a patched build that guards against this.
 - Hostnames are passed as-is to Sōzu, which is responsible for the actual matching at request time.

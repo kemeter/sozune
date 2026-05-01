@@ -45,7 +45,7 @@ X-Trace-Id: abc-123
 
 ## Deleting a header
 
-An empty value deletes the header (HAProxy `del-header` parity). Useful to strip headers added by an upstream component, or hide implementation details from the response.
+An empty value deletes the header. Useful to strip headers added by an upstream component, or hide implementation details from the response.
 
 ```yaml
 labels:

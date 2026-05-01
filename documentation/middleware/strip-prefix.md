@@ -37,5 +37,5 @@ labels:
 ## Notes
 
 - The `path` and `prefix` labels are interchangeable for this purpose.
-- Under the hood, Sozune turns the prefix into an anchored regex matcher on the Sōzu side. This is what enforces the segment boundary and guarantees a valid path is forwarded in every case.
-- **`stripPrefix` is not supported with `pathRegex`.** When the path is declared via `pathRegex`, Sozune skips the strip and logs a debug message — write your own rewrite via the `path`/`prefix` form if you need it.
+- Internally, Sōzune turns the prefix into an anchored regex matcher on the Sōzu side. This is what enforces the segment boundary and guarantees a valid path is forwarded in every case.
+- **`stripPrefix` is not supported with `pathRegex`.** When the path is declared via `pathRegex`, Sōzune skips the strip and logs a debug message — write your own rewrite via the `path`/`prefix` form if you need it.

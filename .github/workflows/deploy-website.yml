@@ -38,6 +38,11 @@ jobs:
         env:
           NODE_ENV: production
 
+      - name: Copy documentation assets
+        run: |
+          mkdir -p website/public/dist/documentation/assets
+          cp -r documentation/assets/. website/public/dist/documentation/assets/
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3

@@ -1,6 +1,6 @@
 # Load balancing
 
-Sozune balances traffic across multiple backends with round-robin. Weighted distribution and sticky sessions are opt-in.
+Sōzune balances traffic across multiple backends with round-robin. Weighted distribution and sticky sessions are opt-in.
 
 ## Default — round-robin
 
@@ -8,7 +8,7 @@ Sōzu spreads requests evenly across all healthy backends of a cluster. No confi
 
 ## Multiple backends from Docker
 
-Several containers can serve the same Sozune service. They are merged into a single cluster when they share the same `<service_name>` in their labels.
+Several containers can serve the same Sōzune service. They are merged into a single cluster when they share the same `<service_name>` in their labels.
 
 ```yaml
 services:
@@ -27,7 +27,7 @@ services:
 
 Both containers register as backends of the `app` service (the part of `sozune.http.app.host`). Traffic for `app.example.com` is balanced between them.
 
-The Compose service name (`app-instance-1`, `app-instance-2`) is irrelevant — only the Sozune service name in the label matters.
+The Compose service name (`app-instance-1`, `app-instance-2`) is irrelevant — only the Sōzune service name in the label matters.
 
 ## Multiple backends from the API
 
@@ -81,4 +81,4 @@ Sticky sessions are best-effort affinity, not absolute pinning.
 - **Power-of-two-choices** algorithm (available in Sōzu, not exposed here)
 - **Custom hashing** (consistent hashing, IP hash)
 
-Round-robin is the only algorithm currently exposed by Sozune.
+Round-robin is the only algorithm currently exposed by Sōzune.

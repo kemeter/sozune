@@ -1,6 +1,6 @@
 # REST API
 
-Sozune exposes a REST API to manage entrypoints on the fly, without restarting.
+Sōzune exposes a REST API to manage entrypoints on the fly, without restarting.
 
 ## Configuration
 
@@ -54,7 +54,7 @@ The hash format matches what sozune accepts in route-level basic auth (`sozune.h
 
 > **HTTP Basic over plaintext HTTP sends the password in the clear on every request.** It is only safe when the connection is encrypted.
 
-Sozune's API listens in HTTP. If you bind it to anything other than `127.0.0.1`, put it behind TLS yourself. Two common patterns:
+Sōzune's API listens in HTTP. If you bind it to anything other than `127.0.0.1`, put it behind TLS yourself. Two common patterns:
 
 - **Behind sozune itself** — declare an entrypoint that points at `127.0.0.1:3035` with `tls: true` and an ACME-issued certificate, and only the TLS-fronted hostname is reachable from outside.
 - **Behind another reverse proxy** that already terminates TLS (nginx, Caddy, an ingress controller).

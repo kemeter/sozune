@@ -1,8 +1,8 @@
 # Configuration overview
 
-Sozune reads its main configuration from a YAML file. Path: `config.yaml` in the working directory by default, overridable through the `CONFIG_PATH` environment variable.
+Sōzune reads its main configuration from a YAML file. Path: `config.yaml` in the working directory by default, overridable through the `CONFIG_PATH` environment variable.
 
-If the file is missing, Sozune falls back to a built-in default configuration (everything disabled, both listeners on default ports).
+If the file is missing, Sōzune falls back to a built-in default configuration (everything disabled, both listeners on default ports).
 
 ## Example
 
@@ -15,7 +15,10 @@ providers:
 api:
   enabled: true
   listen_address: "127.0.0.1:3035"
-  token: "your-secret-token"
+  users:
+    - name: admin
+      hash: "<sha256 hex of password>"
+      role: admin
   cors_origins: []
 
 acme:
@@ -46,7 +49,7 @@ middleware:
 
 | Section | Purpose |
 |---|---|
-| `providers` | Sources for entrypoint discovery: Docker, Swarm, HTTP polling, file. |
+| `providers` | Sources for entrypoint discovery: Docker, Podman, Swarm, Kubernetes, Nomad, HTTP polling, or a YAML file. |
 | `api` | REST API for live entrypoint management. |
 | `acme` | Let's Encrypt provisioning. |
 | `proxy` | Sōzu listeners and runtime tuning. |
@@ -99,7 +102,7 @@ providers:
 |---|---|---|
 | `api.enabled` | `false` | Enables the REST API |
 | `api.listen_address` | `127.0.0.1:3035` | Bind address |
-| `api.token` | none | Bearer token. **If absent, the API runs without authentication** — every route is publicly reachable on `listen_address`. |
+| `api.users` | `[]` | List of API users. Each entry has `name`, `hash` (hex sha256 of the password) and `role` (`admin` or `read-only`). The API refuses to start if this list is empty when `api.enabled: true`. |
 | `api.cors_origins` | `[]` | Allowed origins for CORS |
 
 ## Proxy
@@ -108,7 +111,7 @@ providers:
 |---|---|---|
 | `proxy.http.listen_address` | `80` | Port for the HTTP listener |
 | `proxy.https.listen_address` | `443` | Port for the HTTPS listener |
-| `proxy.tcp` | `[]` | List of TCP listeners. Each entry has `name` (referenced by labels) and `listen` (port). See [TCP routing](../routing/tcp.md). |
+| `proxy.tcp` | `[]` | List of TCP listeners. Each entry has `name` (referenced by labels) and `listen` (port). See [TCP routing](/documentation/routing/tcp). |
 | `proxy.max_buffers` | `500` | Max number of buffers in the Sōzu pool |
 | `proxy.buffer_size` | `16384` | Buffer size, in bytes |
 | `proxy.startup_delay_ms` | `1000` | Delay before applying the initial config (gives Sōzu workers time to boot) |
@@ -136,17 +139,27 @@ Every field above can be overridden through an environment variable. The env var
 | `proxy.buffer_size` | `SOZUNE_PROXY_BUFFER_SIZE` |
 | `proxy.startup_delay_ms` | `SOZUNE_PROXY_STARTUP_DELAY_MS` |
 | `proxy.cluster_setup_delay_ms` | `SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS` |
+| `proxy.reload_throttle_ms` | `SOZUNE_PROXY_RELOAD_THROTTLE_MS` |
 | `api.enabled` | `SOZUNE_API_ENABLED` |
 | `api.listen_address` | `SOZUNE_API_LISTEN_ADDRESS` |
-| `api.token` | `SOZUNE_API_TOKEN` |
+| `dashboard.enabled` | `SOZUNE_DASHBOARD_ENABLED` |
+| `dashboard.listen_address` | `SOZUNE_DASHBOARD_LISTEN_ADDRESS` |
 | `providers.docker.enabled` | `SOZUNE_PROVIDER_DOCKER_ENABLED` |
 | `providers.docker.endpoint` | `SOZUNE_PROVIDER_DOCKER_ENDPOINT` |
 | `providers.docker.expose_by_default` | `SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT` |
+| `providers.podman.enabled` | `SOZUNE_PROVIDER_PODMAN_ENABLED` |
+| `providers.podman.endpoint` | `SOZUNE_PROVIDER_PODMAN_ENDPOINT` |
+| `providers.podman.expose_by_default` | `SOZUNE_PROVIDER_PODMAN_EXPOSE_BY_DEFAULT` |
 | `providers.swarm.enabled` | `SOZUNE_PROVIDER_SWARM_ENABLED` |
 | `providers.swarm.endpoint` | `SOZUNE_PROVIDER_SWARM_ENDPOINT` |
 | `providers.swarm.expose_by_default` | `SOZUNE_PROVIDER_SWARM_EXPOSE_BY_DEFAULT` |
 | `providers.swarm.network` | `SOZUNE_PROVIDER_SWARM_NETWORK` |
 | `providers.swarm.refresh_interval` | `SOZUNE_PROVIDER_SWARM_REFRESH_INTERVAL` |
+| `providers.kubernetes.enabled` | `SOZUNE_PROVIDER_KUBERNETES_ENABLED` |
+| `providers.kubernetes.kubeconfig` | `SOZUNE_PROVIDER_KUBERNETES_KUBECONFIG` |
+| `providers.kubernetes.namespace` | `SOZUNE_PROVIDER_KUBERNETES_NAMESPACE` |
+| `providers.kubernetes.ingress_class` | `SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS` |
+| `providers.kubernetes.expose_by_default` | `SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT` |
 | `providers.http.enabled` | `SOZUNE_PROVIDER_HTTP_ENABLED` |
 | `providers.http.url` | `SOZUNE_PROVIDER_HTTP_URL` |
 | `providers.http.poll_interval` | `SOZUNE_PROVIDER_HTTP_POLL_INTERVAL` |
@@ -169,4 +182,4 @@ These have no YAML counterpart:
 | Env var | Effect |
 |---|---|
 | `CONFIG_PATH` | Path to the YAML config file (default: `config.yaml`) |
-| `SOZUNE_DEBUG` | When `true`, routing failures (`502`) include a body listing configured hosts/backends and a did-you-mean suggestion. Off by default to avoid leaking topology. See [Debugging](../advanced/debugging.md). |
+| `SOZUNE_DEBUG` | When `true`, routing failures (`502`) include a body listing configured hosts/backends and a did-you-mean suggestion. Off by default to avoid leaking topology. See [Debugging](/documentation/advanced/debugging). |
