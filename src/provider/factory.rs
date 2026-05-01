@@ -143,8 +143,10 @@ pub async fn start_services(
         && kubernetes_config.enabled
     {
         info!("Starting Kubernetes service");
-        let kubernetes_provider = KubernetesProvider::new(kubernetes_config.clone())
-            .context("Failed to create Kubernetes provider")?;
+        let kubernetes_provider = Arc::new(
+            KubernetesProvider::new(kubernetes_config.clone())
+                .context("Failed to create Kubernetes provider")?,
+        );
         let storage_kubernetes = Arc::clone(&storage);
         let reload_tx_kubernetes = reload_tx.clone();
         let acme_notify_kubernetes = Arc::clone(&acme_notify);
