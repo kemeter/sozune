@@ -3,18 +3,19 @@ use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
 use crate::labels::{self};
-use crate::model::{Backend, Entrypoint};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol};
 use crate::provider::Provider;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::networking::v1::{HTTPIngressPath, Ingress, IngressBackend};
 use kube::api::ListParams;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, Config, Resource};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
@@ -28,10 +29,16 @@ const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 /// stale endpoints across events.
 type EndpointsCache = Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>;
 
+/// Maps `namespace/ingress` → set of entrypoint keys it owns. Lets us remove
+/// only the entrypoints belonging to a deleted/updated Ingress without
+/// touching what other Ingresses or annotated Services produced.
+type IngressOwnership = Arc<RwLock<HashMap<String, HashSet<String>>>>;
+
 pub struct KubernetesProvider {
     config: KubernetesConfig,
     name: &'static str,
     endpoints: EndpointsCache,
+    ingress_keys: IngressOwnership,
 }
 
 #[async_trait]
@@ -84,6 +91,7 @@ impl KubernetesProvider {
             config,
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
+            ingress_keys: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -259,7 +267,21 @@ impl KubernetesProvider {
             }
         });
 
-        let _ = tokio::try_join!(svc_handle, ep_handle);
+        let ing_provider = Arc::clone(&self);
+        let ing_storage = Arc::clone(&storage);
+        let ing_reload = reload_tx.clone();
+        let ing_acme = Arc::clone(&acme_notify);
+        let ing_client = client.clone();
+        let ing_handle = tokio::spawn(async move {
+            if let Err(e) = ing_provider
+                .watch_ingresses(ing_client, ing_storage, ing_reload, ing_acme)
+                .await
+            {
+                error!("Kubernetes Ingress watcher failed: {}", e);
+            }
+        });
+
+        let _ = tokio::try_join!(svc_handle, ep_handle, ing_handle);
         warn!("Kubernetes watchers stopped");
         Ok(())
     }
@@ -460,6 +482,49 @@ impl KubernetesProvider {
                 );
             }
         }
+
+        self.refresh_ingresses_for_service(
+            client,
+            namespace,
+            name,
+            storage,
+            reload_tx,
+            acme_notify,
+        )
+        .await;
+    }
+
+    /// Re-apply every Ingress in `namespace` whose backend references `svc_name`.
+    /// Called when an EndpointSlice changes so that Ingress entrypoints pick up
+    /// the freshest pod IPs the same way Service entrypoints do.
+    async fn refresh_ingresses_for_service(
+        &self,
+        client: &Client,
+        namespace: &str,
+        svc_name: &str,
+        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+        reload_tx: &mpsc::Sender<()>,
+        acme_notify: &Arc<Notify>,
+    ) {
+        let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+        let list = match api.list(&ListParams::default()).await {
+            Ok(l) => l,
+            Err(e) => {
+                debug!(
+                    "Failed to list ingresses in {} during endpoint refresh: {}",
+                    namespace, e
+                );
+                return;
+            }
+        };
+
+        for ing in list.items {
+            if !ingress_references_service(&ing, svc_name) {
+                continue;
+            }
+            self.apply_ingress(&ing, storage, reload_tx, acme_notify)
+                .await;
+        }
     }
 
     async fn upsert_service(
@@ -581,6 +646,384 @@ impl KubernetesProvider {
             );
         }
     }
+
+    async fn watch_ingresses(
+        &self,
+        client: Client,
+        storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+        reload_tx: mpsc::Sender<()>,
+        acme_notify: Arc<Notify>,
+    ) -> anyhow::Result<()> {
+        let ingresses: Api<Ingress> = self.scoped_api(&client);
+        let stream = watcher::watcher(ingresses, watcher::Config::default());
+        tokio::pin!(stream);
+
+        info!(
+            "Kubernetes Ingress watcher started (class={})",
+            self.config.ingress_class
+        );
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(Event::Apply(ing)) | Ok(Event::InitApply(ing)) => {
+                    self.apply_ingress(&ing, &storage, &reload_tx, &acme_notify)
+                        .await;
+                }
+                Ok(Event::Delete(ing)) => {
+                    self.remove_ingress(&ing, &storage, &reload_tx).await;
+                }
+                Ok(Event::Init) | Ok(Event::InitDone) => {}
+                Err(e) => {
+                    error!("Ingress watcher error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        warn!("Kubernetes Ingress watcher stopped");
+        Ok(())
+    }
+
+    async fn apply_ingress(
+        &self,
+        ing: &Ingress,
+        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+        reload_tx: &mpsc::Sender<()>,
+        acme_notify: &Arc<Notify>,
+    ) {
+        let Some(ing_id) = ingress_id(ing) else {
+            return;
+        };
+
+        // Filter by ingressClassName. An Ingress without a class (or with a
+        // different class) is ignored — and if we used to own it, drop it.
+        let class_match = ing
+            .spec
+            .as_ref()
+            .and_then(|s| s.ingress_class_name.as_deref())
+            .map(|c| c == self.config.ingress_class)
+            .unwrap_or(false);
+        if !class_match {
+            self.remove_ingress(ing, storage, reload_tx).await;
+            return;
+        }
+
+        let new_entries = self.ingress_to_entrypoints(ing);
+        let new_keys: HashSet<String> = new_entries.iter().map(|(k, _)| k.clone()).collect();
+
+        let old_keys = self
+            .ingress_keys
+            .read()
+            .ok()
+            .and_then(|m| m.get(&ing_id).cloned())
+            .unwrap_or_default();
+
+        let mut storage_changed = false;
+        let mut tls_added = false;
+        {
+            let mut storage_write = match storage.write() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!("Storage lock poisoned in Ingress apply: {}", e);
+                    return;
+                }
+            };
+
+            // Remove keys this Ingress used to own that aren't there anymore.
+            for stale in old_keys.difference(&new_keys) {
+                if storage_write.remove(stale).is_some() {
+                    info!("Ingress {} drops stale entrypoint {}", ing_id, stale);
+                    storage_changed = true;
+                }
+            }
+
+            // Upsert the current set.
+            for (key, mut entrypoint) in new_entries {
+                entrypoint.source = Some(self.name.to_string());
+                let changed = match storage_write.get(&key) {
+                    Some(existing) => existing != &entrypoint,
+                    None => true,
+                };
+                if changed {
+                    info!(
+                        "Ingress {} upsert entrypoint {} ({} backend(s))",
+                        ing_id,
+                        key,
+                        entrypoint.backends.len()
+                    );
+                    if entrypoint.config.tls {
+                        tls_added = true;
+                    }
+                    storage_write.insert(key, entrypoint);
+                    storage_changed = true;
+                }
+            }
+        }
+
+        if let Ok(mut owned) = self.ingress_keys.write() {
+            owned.insert(ing_id, new_keys);
+        }
+
+        if storage_changed {
+            if let Err(e) = reload_tx.send(()).await {
+                error!("Failed to send reload signal after Ingress apply: {}", e);
+            }
+            if tls_added {
+                acme_notify.notify_one();
+            }
+        }
+    }
+
+    async fn remove_ingress(
+        &self,
+        ing: &Ingress,
+        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+        reload_tx: &mpsc::Sender<()>,
+    ) {
+        let Some(ing_id) = ingress_id(ing) else {
+            return;
+        };
+
+        let keys = match self.ingress_keys.write() {
+            Ok(mut owned) => owned.remove(&ing_id).unwrap_or_default(),
+            Err(e) => {
+                error!("ingress_keys lock poisoned: {}", e);
+                return;
+            }
+        };
+
+        if keys.is_empty() {
+            return;
+        }
+
+        let mut storage_changed = false;
+        {
+            let mut storage_write = match storage.write() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!("Storage lock poisoned in Ingress remove: {}", e);
+                    return;
+                }
+            };
+            for key in &keys {
+                if storage_write.remove(key).is_some() {
+                    info!("Ingress {} remove entrypoint {}", ing_id, key);
+                    storage_changed = true;
+                }
+            }
+        }
+
+        if storage_changed && let Err(e) = reload_tx.send(()).await {
+            error!("Failed to send reload signal after Ingress remove: {}", e);
+        }
+    }
+
+    /// Convert an Ingress into entrypoints. Each (rule, path) becomes one
+    /// entrypoint; `defaultBackend` becomes a catch-all entrypoint with no
+    /// hostname filter. Backend pod IPs are read from the EndpointSlice cache;
+    /// if none are known yet the entrypoint is registered with an empty
+    /// backend list and a later EndpointSlice event will populate it.
+    fn ingress_to_entrypoints(&self, ing: &Ingress) -> Vec<(String, Entrypoint)> {
+        let Some(ing_id) = ingress_id(ing) else {
+            return Vec::new();
+        };
+        let namespace = ing.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(spec) = ing.spec.as_ref() else {
+            return Vec::new();
+        };
+
+        // Hosts that should get TLS termination via ACME.
+        let tls_hosts: HashSet<String> = spec
+            .tls
+            .as_ref()
+            .map(|tls_list| {
+                tls_list
+                    .iter()
+                    .flat_map(|t| t.hosts.clone().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut entries: Vec<(String, Entrypoint)> = Vec::new();
+
+        if let Some(rules) = spec.rules.as_ref() {
+            for (rule_idx, rule) in rules.iter().enumerate() {
+                let host = rule.host.clone();
+                let Some(http) = rule.http.as_ref() else {
+                    continue;
+                };
+                for (path_idx, path) in http.paths.iter().enumerate() {
+                    if let Some(entry) = self.path_to_entrypoint(
+                        &ing_id,
+                        namespace,
+                        rule_idx,
+                        path_idx,
+                        host.as_deref(),
+                        path,
+                        &tls_hosts,
+                    ) {
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+
+        if let Some(default) = spec.default_backend.as_ref()
+            && let Some(entry) = self
+                .backend_to_entrypoint(&ing_id, namespace, "default", None, None, default, false)
+        {
+            entries.push(entry);
+        }
+
+        entries
+    }
+
+    fn path_to_entrypoint(
+        &self,
+        ing_id: &str,
+        namespace: &str,
+        rule_idx: usize,
+        path_idx: usize,
+        host: Option<&str>,
+        path: &HTTPIngressPath,
+        tls_hosts: &HashSet<String>,
+    ) -> Option<(String, Entrypoint)> {
+        let suffix = format!("r{rule_idx}p{path_idx}");
+        let tls = host.map(|h| tls_hosts.contains(h)).unwrap_or(false);
+
+        let path_config = match path.path.as_deref() {
+            Some(p) if !p.is_empty() => Some(PathConfig {
+                rule_type: match path.path_type.as_str() {
+                    "Exact" => PathRuleType::Exact,
+                    // Both `Prefix` and `ImplementationSpecific` map to Prefix:
+                    // K8s lets implementations choose for the latter.
+                    _ => PathRuleType::Prefix,
+                },
+                value: p.to_string(),
+            }),
+            _ => None,
+        };
+
+        self.backend_to_entrypoint(
+            ing_id,
+            namespace,
+            &suffix,
+            host,
+            path_config,
+            &path.backend,
+            tls,
+        )
+    }
+
+    fn backend_to_entrypoint(
+        &self,
+        ing_id: &str,
+        namespace: &str,
+        suffix: &str,
+        host: Option<&str>,
+        path: Option<PathConfig>,
+        backend: &IngressBackend,
+        tls: bool,
+    ) -> Option<(String, Entrypoint)> {
+        let svc_ref = backend.service.as_ref()?;
+        let port = match svc_ref.port.as_ref() {
+            Some(p) => p.number.unwrap_or(80) as u16,
+            None => 80,
+        };
+        let svc_id = format!("{namespace}/{}", svc_ref.name);
+
+        let pod_ips = self.pod_ips_for(&svc_id);
+        let backends: Vec<Backend> = if pod_ips.is_empty() {
+            warn!(
+                "Ingress {} references service {} but no ready endpoints are known yet",
+                ing_id, svc_id
+            );
+            Vec::new()
+        } else {
+            pod_ips
+                .into_iter()
+                .map(|ip| Backend::new(ip, port))
+                .collect()
+        };
+
+        let key = format!("ingress_{}_{}", sanitise(ing_id), suffix);
+        let hostnames = host.map(|h| vec![h.to_string()]).unwrap_or_default();
+
+        let entrypoint = Entrypoint {
+            id: key.clone(),
+            backends,
+            name: key.clone(),
+            protocol: Protocol::Http,
+            config: EntrypointConfig {
+                hostnames,
+                path,
+                tls,
+                strip_prefix: false,
+                https_redirect: false,
+                https_redirect_port: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                www_authenticate: None,
+                priority: 0,
+                auth: None,
+                headers: Vec::new(),
+                backend_timeout: None,
+                rate_limit: None,
+                sticky_session: false,
+                compress: false,
+                entrypoint: None,
+            },
+            source: Some(self.name.to_string()),
+        };
+
+        Some((key, entrypoint))
+    }
+}
+
+fn ingress_id(ing: &Ingress) -> Option<String> {
+    let ns = ing.metadata.namespace.as_deref()?;
+    let name = ing.metadata.name.as_deref()?;
+    Some(format!("{ns}/{name}"))
+}
+
+/// Make an Ingress id safe to use inside an entrypoint key (which is also a
+/// Sōzu cluster id). Replace `/` and `.` with `-`.
+fn sanitise(id: &str) -> String {
+    id.replace(['/', '.'], "-")
+}
+
+/// Whether any rule path or `defaultBackend` of `ing` points at the given
+/// in-namespace service. Used to know which Ingresses to re-apply when an
+/// EndpointSlice for that service changes.
+fn ingress_references_service(ing: &Ingress, svc_name: &str) -> bool {
+    let Some(spec) = ing.spec.as_ref() else {
+        return false;
+    };
+
+    if let Some(default) = spec.default_backend.as_ref()
+        && let Some(svc) = default.service.as_ref()
+        && svc.name == svc_name
+    {
+        return true;
+    }
+
+    let Some(rules) = spec.rules.as_ref() else {
+        return false;
+    };
+    for rule in rules {
+        let Some(http) = rule.http.as_ref() else {
+            continue;
+        };
+        for path in &http.paths {
+            if let Some(svc) = path.backend.service.as_ref()
+                && svc.name == svc_name
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -602,6 +1045,7 @@ mod tests {
             },
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
+            ingress_keys: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -861,6 +1305,229 @@ mod tests {
             provider.pod_ips_for("default/api"),
             vec!["10.244.0.6".to_string()]
         );
+    }
+
+    fn make_ingress(
+        name: &str,
+        namespace: &str,
+        class: Option<&str>,
+        rules: Vec<(Option<&str>, Vec<(&str, &str, &str, i32)>)>,
+        tls_hosts: Vec<&str>,
+    ) -> Ingress {
+        use k8s_openapi::api::networking::v1::{
+            HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressSpec,
+            IngressTLS, ServiceBackendPort,
+        };
+
+        let rule_objs: Vec<IngressRule> = rules
+            .into_iter()
+            .map(|(host, paths)| IngressRule {
+                host: host.map(|s| s.to_string()),
+                http: Some(HTTPIngressRuleValue {
+                    paths: paths
+                        .into_iter()
+                        .map(|(path, path_type, svc, port)| HTTPIngressPath {
+                            path: Some(path.to_string()),
+                            path_type: path_type.to_string(),
+                            backend: IngressBackend {
+                                service: Some(
+                                    k8s_openapi::api::networking::v1::IngressServiceBackend {
+                                        name: svc.to_string(),
+                                        port: Some(ServiceBackendPort {
+                                            number: Some(port),
+                                            name: None,
+                                        }),
+                                    },
+                                ),
+                                resource: None,
+                            },
+                        })
+                        .collect(),
+                }),
+            })
+            .collect();
+
+        let tls = if tls_hosts.is_empty() {
+            None
+        } else {
+            Some(vec![IngressTLS {
+                hosts: Some(tls_hosts.into_iter().map(|s| s.to_string()).collect()),
+                secret_name: None,
+            }])
+        };
+
+        Ingress {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: class.map(|s| s.to_string()),
+                rules: Some(rule_objs),
+                tls,
+                default_backend: None,
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn ingress_with_wrong_class_is_filtered_out() {
+        let provider = make_provider(false);
+        let ing = make_ingress(
+            "web",
+            "default",
+            Some("nginx"),
+            vec![(Some("api.test"), vec![("/", "Prefix", "api", 80)])],
+            vec![],
+        );
+        // ingress_to_entrypoints itself doesn't filter — the class check
+        // lives in apply_ingress. We verify the predicate logic the way
+        // apply_ingress evaluates it.
+        let class_match = ing
+            .spec
+            .as_ref()
+            .and_then(|s| s.ingress_class_name.as_deref())
+            .map(|c| c == provider.config.ingress_class)
+            .unwrap_or(false);
+        assert!(!class_match);
+    }
+
+    #[test]
+    fn ingress_converts_rules_to_entrypoints() {
+        let provider = make_provider(false);
+        provider.apply_slice(&make_slice(
+            "api-abc",
+            "default",
+            "api",
+            vec![
+                (vec!["10.244.0.5"], Some(true)),
+                (vec!["10.244.0.6"], Some(true)),
+            ],
+        ));
+
+        let ing = make_ingress(
+            "web",
+            "default",
+            Some("sozune"),
+            vec![(
+                Some("api.test"),
+                vec![
+                    ("/api", "Prefix", "api", 80),
+                    ("/exact", "Exact", "api", 80),
+                ],
+            )],
+            vec![],
+        );
+
+        let entries = provider.ingress_to_entrypoints(&ing);
+        assert_eq!(entries.len(), 2);
+
+        let prefix_entry = entries.iter().find(|(k, _)| k.ends_with("r0p0")).unwrap();
+        assert_eq!(prefix_entry.1.config.hostnames, vec!["api.test"]);
+        assert_eq!(
+            prefix_entry.1.config.path.as_ref().unwrap().rule_type,
+            PathRuleType::Prefix
+        );
+        assert_eq!(prefix_entry.1.config.path.as_ref().unwrap().value, "/api");
+        assert_eq!(prefix_entry.1.backends.len(), 2);
+        assert!(prefix_entry.1.backends.iter().all(|b| b.port == 80));
+        assert!(!prefix_entry.1.config.tls);
+
+        let exact_entry = entries.iter().find(|(k, _)| k.ends_with("r0p1")).unwrap();
+        assert_eq!(
+            exact_entry.1.config.path.as_ref().unwrap().rule_type,
+            PathRuleType::Exact
+        );
+    }
+
+    #[test]
+    fn ingress_tls_block_enables_tls_on_matching_hosts() {
+        let provider = make_provider(false);
+        let ing = make_ingress(
+            "web",
+            "default",
+            Some("sozune"),
+            vec![
+                (Some("api.test"), vec![("/", "Prefix", "api", 80)]),
+                (Some("public.test"), vec![("/", "Prefix", "api", 80)]),
+            ],
+            vec!["api.test"],
+        );
+
+        let entries = provider.ingress_to_entrypoints(&ing);
+        let api_entry = entries
+            .iter()
+            .find(|(_, e)| e.config.hostnames == vec!["api.test"])
+            .unwrap();
+        let public_entry = entries
+            .iter()
+            .find(|(_, e)| e.config.hostnames == vec!["public.test"])
+            .unwrap();
+        assert!(api_entry.1.config.tls);
+        assert!(!public_entry.1.config.tls);
+    }
+
+    #[test]
+    fn ingress_implementation_specific_path_falls_back_to_prefix() {
+        let provider = make_provider(false);
+        let ing = make_ingress(
+            "web",
+            "default",
+            Some("sozune"),
+            vec![(
+                Some("api.test"),
+                vec![("/", "ImplementationSpecific", "api", 80)],
+            )],
+            vec![],
+        );
+        let entries = provider.ingress_to_entrypoints(&ing);
+        assert_eq!(
+            entries[0].1.config.path.as_ref().unwrap().rule_type,
+            PathRuleType::Prefix
+        );
+    }
+
+    #[test]
+    fn ingress_keys_are_unique_per_rule_and_path() {
+        let provider = make_provider(false);
+        let ing = make_ingress(
+            "web",
+            "default",
+            Some("sozune"),
+            vec![
+                (Some("a.test"), vec![("/", "Prefix", "api", 80)]),
+                (Some("b.test"), vec![("/", "Prefix", "api", 80)]),
+            ],
+            vec![],
+        );
+        let entries = provider.ingress_to_entrypoints(&ing);
+        let keys: HashSet<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn ingress_without_known_endpoints_registers_with_empty_backends() {
+        let provider = make_provider(false);
+        // No EndpointSlice applied for this Service — the entry is still
+        // produced so that a later EndpointSlice apply can populate it.
+        let ing = make_ingress(
+            "web",
+            "default",
+            Some("sozune"),
+            vec![(Some("api.test"), vec![("/", "Prefix", "missing", 80)])],
+            vec![],
+        );
+        let entries = provider.ingress_to_entrypoints(&ing);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].1.backends.is_empty());
+    }
+
+    #[test]
+    fn sanitise_replaces_path_separators() {
+        assert_eq!(sanitise("default/web"), "default-web");
+        assert_eq!(sanitise("ns.test/web.app"), "ns-test-web-app");
     }
 }
 
