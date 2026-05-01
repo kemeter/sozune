@@ -45,7 +45,7 @@ services:
 | `sozune.tcp.<svc>.port` | Backend port on the container. Defaults to `8080` (informational diagnostic emitted). |
 | `sozune.tcp.<svc>.priority` | Higher wins when multiple services share the same listener (default `0`). |
 
-The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/configuration/docker-labels) and `sozune.network` to pick a network when the container is on several.
+The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/providers/docker) and `sozune.network` to pick a network when the container is on several.
 
 ## Limitations
 

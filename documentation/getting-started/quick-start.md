@@ -48,6 +48,6 @@ curl -H "Host: whoami.localhost" http://localhost
 
 ## What's next
 
-- [Full Docker labels reference](/documentation/configuration/docker-labels)
+- [Full Docker labels reference](/documentation/providers/docker)
 - [REST API](/documentation/configuration/api)
 - [TCP routing](/documentation/routing/tcp) for non-HTTP services
