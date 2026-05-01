@@ -129,11 +129,13 @@ fn format_route(ep: &Entrypoint) -> String {
     };
     let host = ep.config.hostnames.first().cloned().unwrap_or_default();
     let path_str = ep.config.path.as_ref().map(format_path).unwrap_or_default();
-    let backends = ep.backends.join(", ");
-    format!(
-        "{}://{}:{}{}  →  {}",
-        scheme, host, ep.config.port, path_str, backends
-    )
+    let backends = ep
+        .backends
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}://{}{}  →  {}", scheme, host, path_str, backends)
 }
 
 fn format_path(p: &PathConfig) -> String {
@@ -220,8 +222,8 @@ mod tests {
         let out = render(&report, Severity::Warn);
         assert!(out.contains("docker"));
         assert!(out.contains("✓ my-api"));
-        assert!(out.contains("http://example.com:8080"));
-        assert!(out.contains("172.18.0.4"));
+        assert!(out.contains("http://example.com"));
+        assert!(out.contains("172.18.0.4:8080"));
         assert!(out.contains("1 routed · 0 degraded · 0 skipped"));
     }
 

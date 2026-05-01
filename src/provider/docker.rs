@@ -281,7 +281,7 @@ impl DockerProvider {
                                 let mut keys_to_remove = Vec::new();
                                 for (key, entrypoint) in storage_write.iter_mut() {
                                     // Remove this container's IP from backends
-                                    entrypoint.backends.retain(|ip| ip != &container_ip);
+                                    entrypoint.backends.retain(|b| b.address != container_ip);
 
                                     // If no backends left, mark for removal
                                     if entrypoint.backends.is_empty() {
@@ -319,7 +319,7 @@ impl DockerProvider {
                                     // Remove old entries for this container
                                     let mut keys_to_remove = Vec::new();
                                     for (key, entrypoint) in storage_write.iter_mut() {
-                                        entrypoint.backends.retain(|ip| ip != &container_ip);
+                                        entrypoint.backends.retain(|b| b.address != container_ip);
                                         if entrypoint.backends.is_empty() {
                                             keys_to_remove.push(key.clone());
                                         }
@@ -420,21 +420,20 @@ impl DockerProvider {
             // entrypoint produced by a single candidate carries the same
             // backend list, so peek at the first.
             if let Some(first) = result.entrypoints.values().next()
-                && let Some(ip) = first.backends.first()
+                && let Some(backend) = first.backends.first()
                 && let Ok(mut ips) = self.container_ips.lock()
             {
-                ips.insert(container_id.clone(), ip.clone());
+                ips.insert(container_id.clone(), backend.address.clone());
             }
 
             for (key, entrypoint) in result.entrypoints {
-                let backend_ip = entrypoint.backends.first().cloned().unwrap_or_default();
+                let Some(backend) = entrypoint.backends.first().cloned() else {
+                    continue;
+                };
                 if let Some(existing) = entrypoints.get_mut(&key) {
-                    if !existing.backends.contains(&backend_ip) {
-                        existing.backends.push(backend_ip.clone());
-                        info!(
-                            "Added backend {} to existing entrypoint {}",
-                            backend_ip, key
-                        );
+                    if !existing.backends.contains(&backend) {
+                        info!("Added backend {} to existing entrypoint {}", backend, key);
+                        existing.backends.push(backend);
                     }
                 } else {
                     entrypoints.insert(key.clone(), entrypoint);

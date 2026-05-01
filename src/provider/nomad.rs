@@ -31,10 +31,12 @@ impl Provider for NomadProvider {
             let result = labels::parse(&candidate);
             log_diagnostics(&candidate, &result.diagnostics);
             for (key, mut entrypoint) in result.entrypoints {
-                let backend_ip = entrypoint.backends.first().cloned().unwrap_or_default();
+                let Some(backend) = entrypoint.backends.first().cloned() else {
+                    continue;
+                };
                 if let Some(existing) = entrypoints.get_mut(&key) {
-                    if !existing.backends.contains(&backend_ip) {
-                        existing.backends.push(backend_ip);
+                    if !existing.backends.contains(&backend) {
+                        existing.backends.push(backend);
                     }
                 } else {
                     entrypoint.source = Some(PROVIDER_NAME.to_string());

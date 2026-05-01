@@ -1,7 +1,7 @@
 use crate::acme::CertCommand;
 use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
-use crate::model::{Entrypoint, PathConfig, PathRuleType, Protocol};
+use crate::model::{Backend, Entrypoint, PathConfig, PathRuleType, Protocol};
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
@@ -880,15 +880,9 @@ fn configure_http_entrypoint(
             entrypoint.name,
             entrypoint.backends
         );
-        for (backend_index, backend_host) in entrypoint.backends.iter().enumerate() {
-            let backend_port = entrypoint.config.port;
-            let address = parse_backend_address(backend_host, backend_port)?;
-
-            let weight = entrypoint
-                .backend_weights
-                .get(backend_host)
-                .copied()
-                .unwrap_or(100) as i32;
+        for (backend_index, backend_entry) in entrypoint.backends.iter().enumerate() {
+            let address = parse_backend_address(backend_entry)?;
+            let weight = backend_entry.weight as i32;
 
             let backend = AddBackend {
                 cluster_id: cluster_id.to_string(),
@@ -899,10 +893,7 @@ fn configure_http_entrypoint(
                 backup: None,
             };
 
-            debug!(
-                "Adding backend {}: {}:{}",
-                backend.backend_id, backend_host, backend_port
-            );
+            debug!("Adding backend {}: {}", backend.backend_id, backend_entry);
             if let Err(e) = send_to_worker(
                 command_channel,
                 format!("add-backend-http-{}-{}", cluster_id, backend_index),
@@ -917,10 +908,7 @@ fn configure_http_entrypoint(
             // HTTPS backend only if TLS is enabled
             if entrypoint.config.tls {
                 let backend_id = backend.backend_id.clone();
-                info!(
-                    "Adding HTTPS backend {} -> {}:{}",
-                    backend_id, backend_host, backend_port
-                );
+                info!("Adding HTTPS backend {} -> {}", backend_id, backend_entry);
                 match send_to_worker(
                     command_channel_https,
                     format!("add-backend-https-{}-{}", cluster_id, backend_index),
@@ -1013,22 +1001,18 @@ fn configure_tcp_entrypoint(
         );
     }
 
-    for (idx, backend_host) in entrypoint.backends.iter().enumerate() {
-        let address = match parse_backend_address(backend_host, entrypoint.config.port) {
+    for (idx, backend_entry) in entrypoint.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_entry) {
             Ok(addr) => addr,
             Err(e) => {
                 error!(
-                    "Invalid TCP backend address {}:{} for {}: {}",
-                    backend_host, entrypoint.config.port, cluster_id, e
+                    "Invalid TCP backend address {} for {}: {}",
+                    backend_entry, cluster_id, e
                 );
                 continue;
             }
         };
-        let weight = entrypoint
-            .backend_weights
-            .get(backend_host)
-            .copied()
-            .unwrap_or(100) as i32;
+        let weight = backend_entry.weight as i32;
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: format!("{}-backend-{}", cluster_id, idx),
@@ -1266,13 +1250,13 @@ fn remove_backends(
     cluster_id: &str,
     entrypoint: &Entrypoint,
 ) {
-    for (i, backend_host) in entrypoint.backends.iter().enumerate() {
-        let address = match parse_backend_address(backend_host, entrypoint.config.port) {
+    for (i, backend_entry) in entrypoint.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_entry) {
             Ok(addr) => addr,
             Err(e) => {
                 debug!(
-                    "Failed to parse backend address {}:{} for removal: {}",
-                    backend_host, entrypoint.config.port, e
+                    "Failed to parse backend address {} for removal: {}",
+                    backend_entry, e
                 );
                 continue;
             }
@@ -1441,8 +1425,8 @@ fn remove_tcp_entrypoint(
     let listener_port = listener.port;
     let channel = &mut listener.channel;
 
-    for (idx, backend_host) in entrypoint.backends.iter().enumerate() {
-        let address = match parse_backend_address(backend_host, entrypoint.config.port) {
+    for (idx, backend_entry) in entrypoint.backends.iter().enumerate() {
+        let address = match parse_backend_address(backend_entry) {
             Ok(addr) => addr,
             Err(_) => continue,
         };
@@ -1482,8 +1466,8 @@ fn remove_tcp_entrypoint(
     }
 }
 
-fn parse_backend_address(host: &str, port: u16) -> anyhow::Result<SocketAddress> {
-    let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
+fn parse_backend_address(backend: &Backend) -> anyhow::Result<SocketAddress> {
+    let addr: std::net::SocketAddr = format!("{}:{}", backend.address, backend.port).parse()?;
 
     match addr {
         std::net::SocketAddr::V4(addr_v4) => {
@@ -1508,20 +1492,19 @@ mod tests {
 
     #[test]
     fn test_parse_backend_address_ipv4() {
-        let result = parse_backend_address("192.168.1.100", 8080);
+        let result = parse_backend_address(&Backend::new("192.168.1.100", 8080));
         assert!(result.is_ok(), "Failed to parse IPv4 address: {:?}", result);
-        // No need to test exact format, just that it parses
     }
 
     #[test]
     fn test_parse_backend_address_localhost() {
-        let result = parse_backend_address("127.0.0.1", 3000);
+        let result = parse_backend_address(&Backend::new("127.0.0.1", 3000));
         assert!(result.is_ok(), "Failed to parse localhost: {:?}", result);
     }
 
     #[test]
     fn test_parse_backend_address_hostname() {
-        let result = parse_backend_address("localhost", 80);
+        let result = parse_backend_address(&Backend::new("localhost", 80));
         // Localhost may not resolve in all test environments
         // Just verify we get a consistent result
         match result {
@@ -1537,13 +1520,14 @@ mod tests {
 
     #[test]
     fn test_parse_backend_address_invalid() {
-        let result = parse_backend_address("invalid-host-name-that-does-not-exist", 80);
+        let result =
+            parse_backend_address(&Backend::new("invalid-host-name-that-does-not-exist", 80));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_backend_address_invalid_port() {
-        let result = parse_backend_address("127.0.0.1", 0);
+        let result = parse_backend_address(&Backend::new("127.0.0.1", 0));
         assert!(result.is_ok()); // Port 0 is technically valid
     }
 }

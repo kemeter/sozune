@@ -5,7 +5,7 @@ use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{auth, core, headers, host, path, ratelimit, redirect};
 use crate::labels::network;
-use crate::model::{Entrypoint, EntrypointConfig, Protocol};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
@@ -178,13 +178,11 @@ fn build_entrypoint(
 
     Some(Entrypoint {
         id: format!("{protocol}_{service_name}"),
-        backends: vec![backend_ip.to_string()],
+        backends: vec![Backend::new(backend_ip, port)],
         name: service_name.to_string(),
         protocol: protocol_enum,
-        backend_weights: HashMap::new(),
         config: EntrypointConfig {
             hostnames,
-            port,
             path,
             tls,
             strip_prefix,
@@ -238,13 +236,11 @@ fn build_tcp_entrypoint(
 
     Some(Entrypoint {
         id: format!("tcp_{service_name}"),
-        backends: vec![backend_ip.to_string()],
+        backends: vec![Backend::new(backend_ip, port)],
         name: service_name.to_string(),
         protocol: Protocol::Tcp,
-        backend_weights: HashMap::new(),
         config: EntrypointConfig {
             hostnames: Vec::new(),
-            port,
             path: None,
             tls: false,
             strip_prefix: false,
@@ -359,9 +355,8 @@ mod tests {
         assert_eq!(r.entrypoints.len(), 1);
         assert!(!r.has_errors());
         let ep = r.entrypoints.get("http_web").unwrap();
-        assert_eq!(ep.config.port, 8080);
+        assert_eq!(ep.backends, vec![Backend::new("172.18.0.4", 8080)]);
         assert_eq!(ep.config.hostnames, vec!["example.com"]);
-        assert_eq!(ep.backends, vec!["172.18.0.4"]);
     }
 
     #[test]
@@ -377,7 +372,7 @@ mod tests {
         let r = parse(&c);
         assert_eq!(r.entrypoints.len(), 1);
         assert!(has_code(&r, DiagnosticCode::W001InvalidPort));
-        assert_eq!(r.entrypoints.get("http_web").unwrap().config.port, 80);
+        assert_eq!(r.entrypoints.get("http_web").unwrap().backends[0].port, 80);
     }
 
     #[test]
@@ -424,7 +419,7 @@ mod tests {
         assert!(has_code(&r, DiagnosticCode::W010NoIpFellBackToLocalhost));
         assert_eq!(
             r.entrypoints.get("http_web").unwrap().backends,
-            vec!["127.0.0.1"]
+            vec![Backend::new("127.0.0.1", 80)]
         );
     }
 
@@ -443,11 +438,14 @@ mod tests {
         );
         let r = parse(&c);
         assert_eq!(r.entrypoints.len(), 3);
-        assert_eq!(r.entrypoints.get("http_api").unwrap().config.port, 9000);
+        assert_eq!(
+            r.entrypoints.get("http_api").unwrap().backends[0].port,
+            9000
+        );
         let tcp = r.entrypoints.get("tcp_db").unwrap();
         assert!(matches!(tcp.protocol, Protocol::Tcp));
         assert_eq!(tcp.config.entrypoint.as_deref(), Some("postgres"));
-        assert_eq!(tcp.config.port, 5432);
+        assert_eq!(tcp.backends[0].port, 5432);
     }
 
     #[test]
@@ -476,8 +474,7 @@ mod tests {
         let ep = r.entrypoints.get("tcp_echo").unwrap();
         assert!(matches!(ep.protocol, Protocol::Tcp));
         assert_eq!(ep.config.entrypoint.as_deref(), Some("tcpecho"));
-        assert_eq!(ep.config.port, 9000);
-        assert_eq!(ep.backends, vec!["172.18.0.4"]);
+        assert_eq!(ep.backends, vec![Backend::new("172.18.0.4", 9000)]);
         assert!(ep.config.hostnames.is_empty());
     }
 
@@ -494,7 +491,7 @@ mod tests {
         let r = parse(&c);
         assert_eq!(
             r.entrypoints.get("http_web").unwrap().backends,
-            vec!["10.0.0.5"]
+            vec![Backend::new("10.0.0.5", 80)]
         );
     }
 }

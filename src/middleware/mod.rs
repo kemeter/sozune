@@ -11,7 +11,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::info;
 
-use crate::model::EntrypointConfig;
+use crate::model::{Backend, EntrypointConfig};
 use rate_limit::RateLimiter;
 
 /// Shared state for the middleware server
@@ -86,7 +86,7 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
 /// Build middleware route from entrypoint config
 pub fn build_middleware_route(
     config: &EntrypointConfig,
-    backends: &[String],
+    backends: &[Backend],
 ) -> Arc<MiddlewareRoute> {
     let rate_limiter = config
         .rate_limit
@@ -94,7 +94,10 @@ pub fn build_middleware_route(
         .map(|rl| RateLimiter::new(rl.average, rl.burst));
 
     Arc::new(MiddlewareRoute {
-        backends: backends.iter().map(|b| (b.clone(), config.port)).collect(),
+        backends: backends
+            .iter()
+            .map(|b| (b.address.clone(), b.port))
+            .collect(),
         backend_counter: AtomicUsize::new(0),
         backend_timeout: config.backend_timeout,
         rate_limiter,

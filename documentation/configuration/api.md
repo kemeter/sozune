@@ -86,11 +86,12 @@ curl -X POST http://localhost:3035/entrypoints \
   -H "Content-Type: application/json" \
   -d '{
     "name": "my-api",
-    "backends": ["10.0.0.5:8080"],
+    "backends": [
+      { "address": "10.0.0.5", "port": 8080, "weight": 100 }
+    ],
     "protocol": "Http",
     "config": {
       "hostnames": ["api.example.com"],
-      "port": 8080,
       "tls": true,
       "https_redirect": true
     }

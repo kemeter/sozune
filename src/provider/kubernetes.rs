@@ -3,7 +3,7 @@ use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
 use crate::labels::{self};
-use crate::model::Entrypoint;
+use crate::model::{Backend, Entrypoint};
 use crate::provider::Provider;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -497,8 +497,19 @@ impl KubernetesProvider {
 
             for (key, mut entrypoint) in result.entrypoints {
                 entrypoint.source = Some(self.name.to_string());
+                // Replace the parser's single-pod placeholder with one
+                // Backend per ready pod IP, all targeting the same port the
+                // parser resolved from the labels.
                 if !pod_ips.is_empty() {
-                    entrypoint.backends = pod_ips.clone();
+                    let port = entrypoint
+                        .backends
+                        .first()
+                        .map(|b| b.port)
+                        .unwrap_or_default();
+                    entrypoint.backends = pod_ips
+                        .iter()
+                        .map(|ip| Backend::new(ip.clone(), port))
+                        .collect();
                 }
                 let backends = entrypoint.backends.len();
                 let existing_changed = match storage_write.get(&key) {

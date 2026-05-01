@@ -35,29 +35,29 @@ The Compose service name (`app-instance-1`, `app-instance-2`) is irrelevant — 
 POST /entrypoints
 {
   "name": "app",
-  "backends": ["10.0.0.5:8080", "10.0.0.6:8080"],
+  "backends": [
+    { "address": "10.0.0.5", "port": 8080, "weight": 100 },
+    { "address": "10.0.0.6", "port": 8080, "weight": 100 }
+  ],
   "protocol": "Http",
-  "config": { "hostnames": ["app.example.com"], "port": 8080, ... }
+  "config": { "hostnames": ["app.example.com"] }
 }
 ```
 
 ## Weighted load balancing
 
-Weights are exposed only through the [REST API](/documentation/configuration/api), via the `backend_weights` map:
+Weights live on each backend via the `weight` field (default `100`). Higher weight = more traffic.
 
 ```json
 {
   "name": "app",
-  "backends": ["10.0.0.5:8080", "10.0.0.6:8080"],
-  "backend_weights": {
-    "10.0.0.5:8080": 80,
-    "10.0.0.6:8080": 20
-  },
+  "backends": [
+    { "address": "10.0.0.5", "port": 8080, "weight": 80 },
+    { "address": "10.0.0.6", "port": 8080, "weight": 20 }
+  ],
   ...
 }
 ```
-
-Backends without an explicit weight default to `100`. Higher weights receive proportionally more traffic.
 
 There is currently no Docker label to set per-backend weights.
 
