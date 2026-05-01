@@ -32,8 +32,17 @@
     http: entrypoints.filter((e) => e.protocol === 'Http').length,
     tcp: entrypoints.filter((e) => e.protocol === 'Tcp').length,
     backends: entrypoints.reduce((n, e) => n + e.backends.length, 0),
+    backendsDown: entrypoints.reduce((n, e) => n + (e.unhealthy_backends?.length ?? 0), 0),
     tls: entrypoints.filter((e) => e.config.tls).length
   });
+
+  function isBackendDown(ep: Entrypoint, backend: string): boolean {
+    return (ep.unhealthy_backends ?? []).includes(`${backend}:${ep.config.port}`);
+  }
+
+  function downCount(ep: Entrypoint): number {
+    return ep.backends.filter((b) => isBackendDown(ep, b)).length;
+  }
 
   async function load(silent = false) {
     if (!silent) loading = true;
@@ -94,7 +103,13 @@
   <div class="stat-card">
     <div class="stat-label">Backends</div>
     <div class="stat-value">{stats.backends}</div>
-    <div class="stat-sub">across all entrypoints</div>
+    <div class="stat-sub">
+      {#if stats.backendsDown > 0}
+        <span class="stat-down">{stats.backendsDown} down</span> · {stats.backends - stats.backendsDown} healthy
+      {:else}
+        across all entrypoints
+      {/if}
+    </div>
   </div>
   <div class="stat-card">
     <div class="stat-label">TLS enabled</div>
@@ -178,9 +193,18 @@
             <td>
               <div class="backends-cell">
                 <span class="backend-count mono">{ep.backends.length}</span>
-                <div class="health-bar" title="{ep.backends.length} backends">
-                  {#each ep.backends as _b, i}
-                    <span class="health-seg" style="animation-delay: {i * 40}ms"></span>
+                <div
+                  class="health-bar"
+                  title={downCount(ep) > 0
+                    ? `${ep.backends.length - downCount(ep)}/${ep.backends.length} healthy`
+                    : `${ep.backends.length} backends, all healthy`}
+                >
+                  {#each ep.backends as b, i}
+                    <span
+                      class="health-seg"
+                      class:down={isBackendDown(ep, b)}
+                      style="animation-delay: {i * 40}ms"
+                    ></span>
                   {/each}
                 </div>
               </div>
@@ -506,6 +530,13 @@
     border-radius: 2px;
     opacity: 0;
     animation: fade-in 0.4s forwards;
+  }
+  .health-seg.down {
+    background: var(--danger);
+  }
+  .stat-down {
+    color: var(--danger);
+    font-weight: 600;
   }
   @keyframes fade-in {
     to { opacity: 1; }

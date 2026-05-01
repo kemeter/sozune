@@ -98,6 +98,8 @@ export interface Entrypoint {
   config: EntrypointConfig;
   source?: string | null;
   backend_weights?: Record<string, number>;
+  /** Backend addresses (`host:port`) currently marked down by the health checker. */
+  unhealthy_backends?: string[];
 }
 
 export function listEntrypoints(): Promise<Entrypoint[]> {

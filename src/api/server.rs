@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -22,6 +22,28 @@ pub struct AppState {
     pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     pub reload_tx: mpsc::Sender<()>,
     pub users: Vec<ApiUser>,
+    pub unhealthy_backends: Arc<RwLock<HashSet<String>>>,
+}
+
+/// Build the JSON payload for an entrypoint, augmenting it with the
+/// `unhealthy_backends` list (subset of `backends` that the health checker
+/// has marked down). Empty when every backend is reachable.
+fn entrypoint_payload(entrypoint: &Entrypoint, unhealthy: &HashSet<String>) -> serde_json::Value {
+    let unhealthy_for_ep: Vec<String> = entrypoint
+        .backends
+        .iter()
+        .map(|b| format!("{}:{}", b, entrypoint.config.port))
+        .filter(|key| unhealthy.contains(key))
+        .collect();
+
+    let mut value = serde_json::json!(entrypoint);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "unhealthy_backends".to_string(),
+            serde_json::json!(unhealthy_for_ep),
+        );
+    }
+    value
 }
 
 #[derive(Deserialize)]
@@ -115,6 +137,7 @@ pub async fn serve(
     config: ApiConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
+    unhealthy_backends: Arc<RwLock<HashSet<String>>>,
 ) -> anyhow::Result<()> {
     if config.users.is_empty() {
         anyhow::bail!(
@@ -126,6 +149,7 @@ pub async fn serve(
         storage,
         reload_tx,
         users: config.users.clone(),
+        unhealthy_backends,
     };
 
     let protected = Router::new()
@@ -238,7 +262,17 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
             );
         }
     };
-    let list: Vec<&Entrypoint> = storage.values().collect();
+    let unhealthy = match state.unhealthy_backends.read() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            error!("Unhealthy-backends lock poisoned: {}", e);
+            HashSet::new()
+        }
+    };
+    let list: Vec<serde_json::Value> = storage
+        .values()
+        .map(|ep| entrypoint_payload(ep, &unhealthy))
+        .collect();
     (StatusCode::OK, Json(serde_json::json!(list)))
 }
 
@@ -256,9 +290,19 @@ async fn get_entrypoint(
             );
         }
     };
+    let unhealthy = match state.unhealthy_backends.read() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            error!("Unhealthy-backends lock poisoned: {}", e);
+            HashSet::new()
+        }
+    };
 
     match storage.get(&id) {
-        Some(entrypoint) => (StatusCode::OK, Json(serde_json::json!(entrypoint))),
+        Some(entrypoint) => (
+            StatusCode::OK,
+            Json(entrypoint_payload(entrypoint, &unhealthy)),
+        ),
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "entrypoint not found"})),
@@ -452,6 +496,7 @@ mod tests {
             storage: Arc::new(RwLock::new(BTreeMap::new())),
             reload_tx,
             users,
+            unhealthy_backends: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
