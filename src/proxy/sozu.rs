@@ -432,6 +432,7 @@ fn handle_reload(
         command_channel_https,
         tcp_channels,
         &storage_read,
+        previous_snapshot,
         http_port,
         https_port,
         cluster_setup_delay_ms,
@@ -484,6 +485,7 @@ fn configure_sozu_routing(
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     tcp_channels: &mut TcpChannels,
     storage: &BTreeMap<String, Entrypoint>,
+    previous: &RoutingSnapshot,
     http_port: u16,
     https_port: u16,
     cluster_setup_delay_ms: u64,
@@ -502,6 +504,14 @@ fn configure_sozu_routing(
     sorted_entrypoints.sort_by(|a, b| b.1.config.priority.cmp(&a.1.config.priority));
 
     for (cluster_id, entrypoint) in sorted_entrypoints {
+        // Skip entrypoints that are byte-for-byte identical to the previous
+        // snapshot. apply_routing_diff() only removes stale/changed entries,
+        // so anything still in `previous` is already live in the workers and
+        // re-adding it makes Sōzu reject the command as a duplicate.
+        if previous.get(cluster_id) == Some(entrypoint) {
+            continue;
+        }
+
         // Only process HTTP entrypoints for Sozu
         match entrypoint.protocol {
             Protocol::Http => {
