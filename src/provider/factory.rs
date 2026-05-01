@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::model::Entrypoint;
 use crate::provider::{
     Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
-    podman::PodmanProvider, swarm::SwarmProvider,
+    kubernetes::KubernetesProvider, podman::PodmanProvider, swarm::SwarmProvider,
 };
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -134,6 +134,31 @@ pub async fn start_services(
                 .await
             {
                 error!("Swarm service failed: {}", e);
+            }
+        });
+    }
+
+    // Start Kubernetes service if enabled
+    if let Some(kubernetes_config) = &config.providers.kubernetes
+        && kubernetes_config.enabled
+    {
+        info!("Starting Kubernetes service");
+        let kubernetes_provider = KubernetesProvider::new(kubernetes_config.clone())
+            .context("Failed to create Kubernetes provider")?;
+        let storage_kubernetes = Arc::clone(&storage);
+        let reload_tx_kubernetes = reload_tx.clone();
+        let acme_notify_kubernetes = Arc::clone(&acme_notify);
+
+        tokio::spawn(async move {
+            if let Err(e) = kubernetes_provider
+                .start_service(
+                    storage_kubernetes,
+                    reload_tx_kubernetes,
+                    acme_notify_kubernetes,
+                )
+                .await
+            {
+                error!("Kubernetes service failed: {}", e);
             }
         });
     }
