@@ -45,8 +45,8 @@ impl SeverityFilter {
     }
 }
 
-pub async fn run(args: ValidateArgs) -> anyhow::Result<i32> {
-    let config = load_config().await?;
+pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
+    let config = load_config(config_path).await?;
     let candidates = collect_candidates(&config, args.provider.as_deref()).await?;
     let mut report = build_report(candidates);
 
@@ -66,13 +66,11 @@ pub async fn run(args: ValidateArgs) -> anyhow::Result<i32> {
     Ok(exit_code(&report))
 }
 
-async fn load_config() -> anyhow::Result<AppConfig> {
-    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
-
-    if !tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
+async fn load_config(config_path: &str) -> anyhow::Result<AppConfig> {
+    if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
         return Ok(AppConfig::default());
     }
-    let content = tokio::fs::read_to_string(&config_path).await?;
+    let content = tokio::fs::read_to_string(config_path).await?;
     Ok(serde_yaml::from_str(&content)?)
 }
 
