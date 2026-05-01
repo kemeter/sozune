@@ -2,6 +2,8 @@
 
 Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Swarm, Kubernetes, Nomad, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
 
+![Sōzune dashboard](documentation/assets/dashboard-entrypoints.png)
+
 ## Features
 
 - **Multi-platform service discovery** — Docker, Swarm, Kubernetes, Nomad, an HTTP endpoint, or a YAML file.
