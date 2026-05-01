@@ -62,22 +62,34 @@ impl ConfigProvider {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Canonicalize the watched file so we can match it against event paths,
+        // which the OS reports as canonical (resolved symlinks, no `.`/`..`).
+        let watched_file = tokio::fs::canonicalize(&config_path)
+            .await
+            .unwrap_or_else(|_| std::path::PathBuf::from(&config_path));
+
         // Create file watcher
-        let mut watcher = notify::recommended_watcher(
+        let mut watcher = notify::recommended_watcher({
+            let watched_file = watched_file.clone();
             move |result: Result<Event, notify::Error>| match result {
                 Ok(event) => {
-                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-                        && let Err(e) = tx.send(())
-                    {
+                    if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                        return;
+                    }
+                    if !event.paths.iter().any(|p| p == &watched_file) {
+                        return;
+                    }
+                    if let Err(e) = tx.send(()) {
                         error!("Failed to send file change notification: {}", e);
                     }
                 }
                 Err(e) => error!("File watcher error: {}", e),
-            },
-        )?;
+            }
+        })?;
 
-        // Watch the config file directory (not the file directly, to handle renames/recreates)
-        let watch_path = std::path::Path::new(&config_path)
+        // Watch the config file directory (not the file directly, to handle renames/recreates).
+        // Events for unrelated files in the same directory are filtered out above.
+        let watch_path = watched_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
 
