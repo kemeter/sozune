@@ -41,6 +41,7 @@ HOST_MIXED_SUFFIX="mixed-test.localhost"
 HOST_HOSTREGEX_SUFFIX="hostregex-test.localhost"
 HOST_TLS="tls.func-test.localhost"
 HOST_WS="ws.func-test.localhost"
+HOST_SSE="sse.func-test.localhost"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -197,6 +197,22 @@ services:
       - "sozune.http.svcws.port=8080"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-sse:
+    image: dunglas/mercure:v0.16
+    environment:
+      SERVER_NAME: ":80"
+      MERCURE_PUBLISHER_JWT_KEY: "!ChangeThisMercureHubJWTSecretKey!"
+      MERCURE_SUBSCRIBER_JWT_KEY: "!ChangeThisMercureHubJWTSecretKey!"
+      MERCURE_EXTRA_DIRECTIVES: |
+        cors_origins *
+        anonymous
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcsse.host=$HOST_SSE"
+      - "sozune.http.svcsse.port=80"
+      - "sozune.http.svcsse.backendTimeout=0"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-tcpecho:
     image: alpine/socat
     command: ["TCP-LISTEN:9000,fork,reuseaddr", "EXEC:cat"]

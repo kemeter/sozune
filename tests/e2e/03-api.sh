@@ -33,7 +33,7 @@ create_response=$(curl -s -w "\n%{http_code}" --max-time 5 \
     -H "$AUTH_HEADER" \
     -H "Content-Type: application/json" \
     -X POST "$API_URL/entrypoints" \
-    -d '{"name":"api-test","backends":["127.0.0.1:9999"],"protocol":"Http","config":{"hostnames":["apitest.localhost"],"port":9999,"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":[],"backend_timeout":null,"rate_limit":null,"sticky_session":false}}' \
+    -d '{"name":"api-test","backends":[{"address":"127.0.0.1","port":9999,"weight":100}],"protocol":"Http","config":{"hostnames":["apitest.localhost"],"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":[],"backend_timeout":null,"rate_limit":null,"sticky_session":false}}' \
     2>/dev/null || echo "000")
 create_status=$(echo "$create_response" | tail -1)
 create_body=$(echo "$create_response" | sed '$d')
@@ -58,7 +58,7 @@ if [[ -n "$ep_id" ]]; then
         -H "$AUTH_HEADER" \
         -H "Content-Type: application/json" \
         -X PUT "$API_URL/entrypoints/$ep_id" \
-        -d '{"name":"api-test-updated","backends":["127.0.0.1:9999"],"protocol":"Http","config":{"hostnames":["apitest.localhost"],"port":9999,"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":[],"backend_timeout":null,"rate_limit":null,"sticky_session":false}}' \
+        -d '{"name":"api-test-updated","backends":[{"address":"127.0.0.1","port":9999,"weight":100}],"protocol":"Http","config":{"hostnames":["apitest.localhost"],"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":[],"backend_timeout":null,"rate_limit":null,"sticky_session":false}}' \
         2>/dev/null || echo "000")
     if [[ "$update_status" == "200" ]]; then
         pass "API update entrypoint returns 200"
