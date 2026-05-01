@@ -22,8 +22,8 @@ export default function Hero() {
           <span className="hero-title-accent">without the painful config.</span>
         </h1>
         <p className="hero-subtitle">
-          Auto-discovery from Docker labels. Automatic HTTPS with Let&apos;s Encrypt.
-          HTTP/2 by default. Hot reload through a REST API.
+          Service discovery for Docker, Swarm, Kubernetes, and Nomad. Automatic HTTPS
+          with Let&apos;s Encrypt. HTTP/2 by default. Hot reload through a REST API.
         </p>
         <div className="hero-actions">
           <Link to="/documentation/getting-started/quick-start" className="btn btn-primary">
