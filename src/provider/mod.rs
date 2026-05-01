@@ -12,5 +12,6 @@ pub mod config;
 pub mod docker;
 pub mod factory;
 pub mod http;
+pub mod kubernetes;
 pub mod podman;
 pub mod swarm;
