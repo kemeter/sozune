@@ -94,6 +94,23 @@ wait_for_tcp_open() {
     return 1
 }
 
+wait_for_not_404() {
+    local url="$1" host="$2"
+    local i=0
+    while [[ $i -lt $MAX_RETRIES ]]; do
+        local status
+        status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 -H "Host: $host" "$url" 2>/dev/null || echo "000")
+        if [[ "$status" != "404" ]]; then
+            echo "$status"
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "404"
+    return 1
+}
+
 wait_for_not_200() {
     local url="$1" host="$2"
     local i=0
