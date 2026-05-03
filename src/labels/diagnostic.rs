@@ -1,7 +1,9 @@
 use crate::model::Entrypoint;
+use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
     Warn,
@@ -80,6 +82,12 @@ impl DiagnosticCode {
     }
 }
 
+impl Serialize for DiagnosticCode {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub code: DiagnosticCode,
@@ -87,6 +95,36 @@ pub struct Diagnostic {
     pub value: Option<String>,
     pub message: String,
     pub hint: Option<String>,
+}
+
+impl Serialize for Diagnostic {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut len = 3; // code, severity, message
+        if self.label.is_some() {
+            len += 1;
+        }
+        if self.value.is_some() {
+            len += 1;
+        }
+        if self.hint.is_some() {
+            len += 1;
+        }
+        let mut m = s.serialize_map(Some(len))?;
+        m.serialize_entry("code", self.code.as_str())?;
+        m.serialize_entry("severity", &self.severity())?;
+        m.serialize_entry("message", &self.message)?;
+        if let Some(label) = &self.label {
+            m.serialize_entry("label", label)?;
+        }
+        if let Some(value) = &self.value {
+            m.serialize_entry("value", value)?;
+        }
+        if let Some(hint) = &self.hint {
+            m.serialize_entry("hint", hint)?;
+        }
+        m.end()
+    }
 }
 
 impl Diagnostic {

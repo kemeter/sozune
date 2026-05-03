@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::diagnostics::DiagnosticsStore;
 use crate::model::Entrypoint;
 use crate::provider::{
     Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
@@ -16,6 +17,7 @@ pub async fn start_services(
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
     acme_notify: Arc<Notify>,
+    diagnostics: DiagnosticsStore,
 ) -> anyhow::Result<()> {
     info!("Loading initial entrypoints and starting provider services");
 
@@ -88,10 +90,16 @@ pub async fn start_services(
         let storage_docker = Arc::clone(&storage);
         let reload_tx_docker = reload_tx.clone();
         let acme_notify_docker = Arc::clone(&acme_notify);
+        let diagnostics_docker = Arc::clone(&diagnostics);
 
         tokio::spawn(async move {
             if let Err(e) = docker_provider
-                .start_service(storage_docker, reload_tx_docker, acme_notify_docker)
+                .start_service(
+                    storage_docker,
+                    reload_tx_docker,
+                    acme_notify_docker,
+                    diagnostics_docker,
+                )
                 .await
             {
                 error!("Docker service failed: {}", e);
@@ -109,10 +117,16 @@ pub async fn start_services(
         let storage_podman = Arc::clone(&storage);
         let reload_tx_podman = reload_tx.clone();
         let acme_notify_podman = Arc::clone(&acme_notify);
+        let diagnostics_podman = Arc::clone(&diagnostics);
 
         tokio::spawn(async move {
             if let Err(e) = podman_provider
-                .start_service(storage_podman, reload_tx_podman, acme_notify_podman)
+                .start_service(
+                    storage_podman,
+                    reload_tx_podman,
+                    acme_notify_podman,
+                    diagnostics_podman,
+                )
                 .await
             {
                 error!("Podman service failed: {}", e);
@@ -131,10 +145,16 @@ pub async fn start_services(
         let storage_swarm = Arc::clone(&storage);
         let reload_tx_swarm = reload_tx.clone();
         let acme_notify_swarm = Arc::clone(&acme_notify);
+        let diagnostics_swarm = Arc::clone(&diagnostics);
 
         tokio::spawn(async move {
             if let Err(e) = swarm_provider
-                .start_service(storage_swarm, reload_tx_swarm, acme_notify_swarm)
+                .start_service(
+                    storage_swarm,
+                    reload_tx_swarm,
+                    acme_notify_swarm,
+                    diagnostics_swarm,
+                )
                 .await
             {
                 error!("Swarm service failed: {}", e);
@@ -154,6 +174,7 @@ pub async fn start_services(
         let storage_kubernetes = Arc::clone(&storage);
         let reload_tx_kubernetes = reload_tx.clone();
         let acme_notify_kubernetes = Arc::clone(&acme_notify);
+        let diagnostics_kubernetes = Arc::clone(&diagnostics);
 
         tokio::spawn(async move {
             if let Err(e) = kubernetes_provider
@@ -161,6 +182,7 @@ pub async fn start_services(
                     storage_kubernetes,
                     reload_tx_kubernetes,
                     acme_notify_kubernetes,
+                    diagnostics_kubernetes,
                 )
                 .await
             {
@@ -179,10 +201,16 @@ pub async fn start_services(
         let storage_nomad = Arc::clone(&storage);
         let reload_tx_nomad = reload_tx.clone();
         let acme_notify_nomad = Arc::clone(&acme_notify);
+        let diagnostics_nomad = Arc::clone(&diagnostics);
 
         tokio::spawn(async move {
             if let Err(e) = nomad_provider
-                .start_polling(storage_nomad, reload_tx_nomad, acme_notify_nomad)
+                .start_polling(
+                    storage_nomad,
+                    reload_tx_nomad,
+                    acme_notify_nomad,
+                    diagnostics_nomad,
+                )
                 .await
             {
                 error!("Nomad provider failed: {}", e);

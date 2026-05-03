@@ -100,6 +100,17 @@ export function backendKey(b: Backend): string {
   return `${b.address}:${b.port}`;
 }
 
+export type Severity = 'error' | 'warn' | 'info';
+
+export interface Diagnostic {
+  code: string;
+  severity: Severity;
+  message: string;
+  label?: string;
+  value?: string;
+  hint?: string;
+}
+
 export interface Entrypoint {
   id: string;
   name: string;
@@ -109,10 +120,24 @@ export interface Entrypoint {
   source?: string | null;
   /** Backend addresses (`host:port`) currently marked down by the health checker. */
   unhealthy_backends?: string[];
+  /** Diagnostics produced for this entrypoint by the label parser. */
+  diagnostics?: Diagnostic[];
+}
+
+export interface DiagnosticsResponse {
+  total: number;
+  /** Diagnostics not attached to any single candidate (e.g. ACME-without-TLS).
+   *  Optional: older API responses may omit this field. */
+  global?: Diagnostic[];
+  items: { candidate_id: string; diagnostics: Diagnostic[] }[];
 }
 
 export function listEntrypoints(): Promise<Entrypoint[]> {
   return request<Entrypoint[]>('/entrypoints');
+}
+
+export function listDiagnostics(): Promise<DiagnosticsResponse> {
+  return request<DiagnosticsResponse>('/diagnostics');
 }
 
 export function getEntrypoint(id: string): Promise<Entrypoint> {
