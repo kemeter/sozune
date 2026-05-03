@@ -141,22 +141,21 @@ impl DockerProvider {
                             }
                         };
 
-                        for (key, mut entrypoint) in initial_entrypoints {
-                            entrypoint.source = Some(self.name.to_string());
-
-                            match storage_write.entry(key) {
-                                std::collections::btree_map::Entry::Vacant(slot) => {
-                                    info!("Found new container entrypoint: {}", slot.key());
-                                    slot.insert(entrypoint);
-                                    changed = true;
-                                }
-                                std::collections::btree_map::Entry::Occupied(slot) => {
-                                    info!(
-                                        "Container entrypoint {} already exists in storage",
-                                        slot.key()
-                                    );
-                                }
-                            }
+                        for (key, entrypoint) in initial_entrypoints {
+                            let source_id = entrypoint
+                                .backends
+                                .first()
+                                .map(|b| b.address.clone())
+                                .unwrap_or_default();
+                            info!("Loading container entrypoint: {}", key);
+                            merge_or_insert_entrypoint_btree(
+                                &mut storage_write,
+                                key,
+                                entrypoint,
+                                &source_id,
+                                self.name,
+                            );
+                            changed = true;
                         }
                         changed
                     };
@@ -255,18 +254,13 @@ impl DockerProvider {
                                     };
                                     for (key, entrypoint) in entrypoints {
                                         info!("Adding entrypoint from started container: {}", key);
-                                        if let Some(existing) = storage_write.get_mut(&key) {
-                                            // Merge backends
-                                            for backend in entrypoint.backends {
-                                                if !existing.backends.contains(&backend) {
-                                                    existing.backends.push(backend);
-                                                }
-                                            }
-                                        } else {
-                                            let mut entrypoint = entrypoint;
-                                            entrypoint.source = Some(self.name.to_string());
-                                            storage_write.insert(key, entrypoint);
-                                        }
+                                        merge_or_insert_entrypoint_btree(
+                                            &mut storage_write,
+                                            key,
+                                            entrypoint,
+                                            container_id,
+                                            self.name,
+                                        );
                                     }
                                     storage_changed = true;
                                 }
@@ -349,17 +343,13 @@ impl DockerProvider {
 
                                     // Add new entries
                                     for (key, entrypoint) in entrypoints {
-                                        if let Some(existing) = storage_write.get_mut(&key) {
-                                            for backend in entrypoint.backends {
-                                                if !existing.backends.contains(&backend) {
-                                                    existing.backends.push(backend);
-                                                }
-                                            }
-                                        } else {
-                                            let mut entrypoint = entrypoint;
-                                            entrypoint.source = Some(self.name.to_string());
-                                            storage_write.insert(key, entrypoint);
-                                        }
+                                        merge_or_insert_entrypoint_btree(
+                                            &mut storage_write,
+                                            key,
+                                            entrypoint,
+                                            container_id,
+                                            self.name,
+                                        );
                                     }
                                     storage_changed = true;
                                 }
@@ -451,18 +441,10 @@ impl DockerProvider {
             }
 
             for (key, entrypoint) in result.entrypoints {
-                let Some(backend) = entrypoint.backends.first().cloned() else {
+                if entrypoint.backends.first().is_none() {
                     continue;
-                };
-                if let Some(existing) = entrypoints.get_mut(&key) {
-                    if !existing.backends.contains(&backend) {
-                        info!("Added backend {} to existing entrypoint {}", backend, key);
-                        existing.backends.push(backend);
-                    }
-                } else {
-                    entrypoints.insert(key.clone(), entrypoint);
-                    info!("Created new entrypoint {}", key);
                 }
+                merge_or_insert_entrypoint(&mut entrypoints, key, entrypoint, &container_id);
             }
         }
 
@@ -602,5 +584,202 @@ fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
             ),
             Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
         }
+    }
+}
+
+/// Decide whether two entrypoints sharing the same key (`<protocol>_<service>`)
+/// are actually the same route (i.e. legitimate replicas of the same service).
+/// Two entrypoints are compatible when they expose the **same routing surface**
+/// — same set of hostnames and same path rule. Other fields (headers, auth,
+/// rate limits, …) are ignored on purpose: containers in a deployment may
+/// drift on those for a short time during a rolling update, and refusing the
+/// merge there would create transient W018 collisions on every push.
+fn entrypoints_are_replicas(a: &Entrypoint, b: &Entrypoint) -> bool {
+    let mut a_hosts = a.config.hostnames.clone();
+    let mut b_hosts = b.config.hostnames.clone();
+    a_hosts.sort();
+    b_hosts.sort();
+    a_hosts == b_hosts && a.config.path == b.config.path
+}
+
+/// Insert `incoming` under `key` in `dest`, or merge backends into the existing
+/// entry when both entrypoints look like replicas of the same service.
+///
+/// When the incoming entrypoint shares a key with an existing one but its
+/// routing surface differs (different hostnames or path), this is an
+/// **accidental collision** — two unrelated workloads happen to share a
+/// `<protocol>.<service-name>` segment. We keep the first one in place under
+/// the canonical key and re-insert the loser under a disambiguated key
+/// (`<key>_<short-source>`) so it stays visible to the rest of the system
+/// (W018 will surface the resulting host+path collision if any).
+///
+/// `source_id` is the candidate id (container id for Docker) used to build the
+/// disambiguated key.
+fn merge_or_insert_entrypoint(
+    dest: &mut HashMap<String, Entrypoint>,
+    key: String,
+    incoming: Entrypoint,
+    source_id: &str,
+) {
+    let Some(existing) = dest.get_mut(&key) else {
+        dest.insert(key, incoming);
+        return;
+    };
+
+    if entrypoints_are_replicas(existing, &incoming) {
+        for backend in incoming.backends {
+            if !existing.backends.contains(&backend) {
+                existing.backends.push(backend);
+            }
+        }
+        return;
+    }
+
+    let suffix: String = source_id.chars().take(12).collect();
+    let alt_key = format!("{key}_{suffix}");
+    warn!(
+        "service-name collision on `{key}`: existing entrypoint exposes {:?} {:?}, incoming exposes {:?} {:?}; storing the new one as `{alt_key}` to keep both visible — rename the `sozune.<protocol>.<service-name>` segment to silence this",
+        existing.config.hostnames,
+        existing.config.path,
+        incoming.config.hostnames,
+        incoming.config.path,
+    );
+    dest.insert(alt_key, incoming);
+}
+
+/// Same as `merge_or_insert_entrypoint` but operates on a `BTreeMap` (the
+/// runtime storage) instead of a `HashMap` (used during the initial scan).
+fn merge_or_insert_entrypoint_btree(
+    dest: &mut BTreeMap<String, Entrypoint>,
+    key: String,
+    incoming: Entrypoint,
+    source_id: &str,
+    source_label: &str,
+) {
+    let Some(existing) = dest.get_mut(&key) else {
+        let mut entrypoint = incoming;
+        entrypoint.source = Some(source_label.to_string());
+        dest.insert(key, entrypoint);
+        return;
+    };
+
+    if entrypoints_are_replicas(existing, &incoming) {
+        for backend in incoming.backends {
+            if !existing.backends.contains(&backend) {
+                existing.backends.push(backend);
+            }
+        }
+        return;
+    }
+
+    let suffix: String = source_id.chars().take(12).collect();
+    let alt_key = format!("{key}_{suffix}");
+    warn!(
+        "service-name collision on `{key}`: existing entrypoint exposes {:?} {:?}, incoming exposes {:?} {:?}; storing the new one as `{alt_key}` to keep both visible — rename the `sozune.<protocol>.<service-name>` segment to silence this",
+        existing.config.hostnames,
+        existing.config.path,
+        incoming.config.hostnames,
+        incoming.config.path,
+    );
+    let mut entrypoint = incoming;
+    entrypoint.source = Some(source_label.to_string());
+    dest.insert(alt_key, entrypoint);
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::model::{Backend, EntrypointConfig, PathConfig, PathRuleType, Protocol};
+
+    fn ep(host: &str, path: Option<&str>, ip: &str) -> Entrypoint {
+        Entrypoint {
+            id: "x".into(),
+            backends: vec![Backend::new(ip, 80)],
+            name: "svc".into(),
+            protocol: Protocol::Http,
+            config: EntrypointConfig {
+                hostnames: vec![host.into()],
+                path: path.map(|p| PathConfig {
+                    rule_type: PathRuleType::Prefix,
+                    value: p.into(),
+                }),
+                tls: false,
+                strip_prefix: false,
+                https_redirect: false,
+                https_redirect_port: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                www_authenticate: None,
+                priority: 0,
+                auth: None,
+                headers: Vec::new(),
+                backend_timeout: None,
+                rate_limit: None,
+                sticky_session: false,
+                compress: false,
+                entrypoint: None,
+                methods: Vec::new(),
+            },
+            source: None,
+        }
+    }
+
+    #[test]
+    fn replicas_with_same_route_are_merged() {
+        let mut map: HashMap<String, Entrypoint> = HashMap::new();
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_web".into(),
+            ep("app.example.com", Some("/"), "10.0.0.1"),
+            "container-aaaa",
+        );
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_web".into(),
+            ep("app.example.com", Some("/"), "10.0.0.2"),
+            "container-bbbb",
+        );
+        assert_eq!(map.len(), 1);
+        let merged = &map["http_web"];
+        assert_eq!(merged.backends.len(), 2);
+    }
+
+    #[test]
+    fn collision_on_hostnames_creates_disambiguated_key() {
+        let mut map: HashMap<String, Entrypoint> = HashMap::new();
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_api".into(),
+            ep("app1.example.com", None, "10.0.0.1"),
+            "container-aaaa-very-long",
+        );
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_api".into(),
+            ep("app2.example.com", None, "10.0.0.2"),
+            "container-bbbb-very-long",
+        );
+        assert_eq!(map.len(), 2, "incompatible configs must not be merged");
+        assert!(map.contains_key("http_api"));
+        assert!(map.contains_key("http_api_container-bb"));
+    }
+
+    #[test]
+    fn collision_on_path_creates_disambiguated_key() {
+        let mut map: HashMap<String, Entrypoint> = HashMap::new();
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_api".into(),
+            ep("app.example.com", Some("/v1"), "10.0.0.1"),
+            "container-aaaa",
+        );
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_api".into(),
+            ep("app.example.com", Some("/v2"), "10.0.0.2"),
+            "container-bbbb",
+        );
+        assert_eq!(map.len(), 2);
     }
 }
