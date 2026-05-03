@@ -1,10 +1,18 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
-  import { listEntrypoints, backendKey, type Backend, type Entrypoint } from '$lib/api';
+  import {
+    listEntrypoints,
+    listDiagnostics,
+    backendKey,
+    type Backend,
+    type Diagnostic,
+    type Entrypoint
+  } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
   let entrypoints = $state<Entrypoint[]>([]);
+  let globalDiagnostics = $state<Diagnostic[]>([]);
   let error = $state<string | null>(null);
   let loading = $state(true);
   let lastRefresh = $state<Date | null>(null);
@@ -69,7 +77,9 @@
   async function load(silent = false) {
     if (!silent) loading = true;
     try {
-      entrypoints = await listEntrypoints();
+      const [eps, diags] = await Promise.all([listEntrypoints(), listDiagnostics()]);
+      entrypoints = eps;
+      globalDiagnostics = diags.global ?? [];
       error = null;
       lastRefresh = new Date();
     } catch (e) {
@@ -155,6 +165,23 @@
     </div>
   </div>
 </section>
+
+{#if globalDiagnostics.length > 0}
+  <section class="global-diags">
+    {#each globalDiagnostics as diag}
+      <div class="global-diag global-diag-{diag.severity}">
+        <span class="global-diag-glyph">
+          {#if diag.severity === 'error'}✗{:else if diag.severity === 'warn'}⚠{:else}ℹ{/if}
+        </span>
+        <span class="global-diag-code mono">{diag.code}</span>
+        <span class="global-diag-message">{diag.message}</span>
+        {#if diag.hint}
+          <span class="global-diag-hint">→ {diag.hint}</span>
+        {/if}
+      </div>
+    {/each}
+  </section>
+{/if}
 
 <section class="toolbar">
   <div class="search">
@@ -602,6 +629,64 @@
     background: var(--danger-bg);
     color: var(--danger);
     cursor: help;
+  }
+
+  .global-diags {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 1.25rem;
+  }
+  .global-diag {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.625rem 0.875rem;
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+    background: var(--bg-1);
+    font-size: 0.825rem;
+    flex-wrap: wrap;
+  }
+  .global-diag-error {
+    border-left-color: var(--danger);
+  }
+  .global-diag-warn {
+    border-left-color: var(--warning);
+  }
+  .global-diag-info {
+    border-left-color: var(--accent);
+  }
+  .global-diag-glyph {
+    font-size: 0.95rem;
+    line-height: 1;
+  }
+  .global-diag-error .global-diag-glyph {
+    color: var(--danger);
+  }
+  .global-diag-warn .global-diag-glyph {
+    color: var(--warning);
+  }
+  .global-diag-info .global-diag-glyph {
+    color: var(--accent);
+  }
+  .global-diag-code {
+    background: var(--bg-3);
+    color: var(--fg-1);
+    padding: 1px 7px;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-weight: 600;
+  }
+  .global-diag-message {
+    color: var(--fg-0);
+  }
+  .global-diag-hint {
+    color: var(--fg-2);
+    font-size: 0.78rem;
+    width: 100%;
+    margin-left: 1.55rem;
   }
 
   .source {

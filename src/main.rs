@@ -165,6 +165,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let api_config = config.api.clone();
     let unhealthy_api = Arc::clone(&unhealthy_backends);
     let diagnostics_api = Arc::clone(&diagnostics_store);
+    let acme_enabled_api = acme_enabled;
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
@@ -174,6 +175,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 reload_tx_api,
                 unhealthy_api,
                 diagnostics_api,
+                acme_enabled_api,
             )
             .await?;
         }
