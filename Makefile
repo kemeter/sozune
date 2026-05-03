@@ -1,6 +1,6 @@
 .PHONY: all build build-dashboard docker-build run test fmt clean
 
-IMAGE ?= sozune
+IMAGE ?= kemeter/sozune
 TAG ?= latest
 
 all: build

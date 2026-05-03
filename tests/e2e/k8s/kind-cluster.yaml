@@ -1,0 +1,17 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Expose Sozune HTTP/HTTPS/API ports from the node container
+      # back to the host. The Sozune Pod runs with hostNetwork: true
+      # so binding on the node port is enough.
+      - containerPort: 18180
+        hostPort: 18180
+        protocol: TCP
+      - containerPort: 18443
+        hostPort: 18443
+        protocol: TCP
+      - containerPort: 18181
+        hostPort: 18181
+        protocol: TCP

@@ -9,13 +9,8 @@ K8S_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CLUSTER_NAME="sozune-k8s-test"
 KUBECONFIG_FILE="$K8S_DIR/kubeconfig.k8s.yaml"
-KUBECONFIG_INTERNAL="$K8S_DIR/kubeconfig.k8s.internal.yaml"
-CONFIG_FILE="$K8S_DIR/config.k8s.yaml"
 MANIFESTS_FILE="$K8S_DIR/manifests.yaml"
-SOZUNE_CONTAINER="sozune-k8s-runner"
-KIND_NETWORK="kind"
-# Image whose glibc is recent enough for the host-built binary.
-SOZUNE_IMAGE="ubuntu:rolling"
+KIND_CLUSTER_CONFIG="$K8S_DIR/kind-cluster.yaml"
 
 HTTP_PORT=18180
 HTTPS_PORT=18443
@@ -60,7 +55,12 @@ ensure_cluster() {
         log "Reusing existing kind cluster '$CLUSTER_NAME'"
     else
         log "Creating kind cluster '$CLUSTER_NAME'..."
-        kind create cluster --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG_FILE" >/dev/null
+        # The cluster config maps Sozune's HTTP/HTTPS/API ports from the
+        # node container back to the developer's host so curl can hit them.
+        kind create cluster \
+            --name "$CLUSTER_NAME" \
+            --config "$KIND_CLUSTER_CONFIG" \
+            --kubeconfig "$KUBECONFIG_FILE" >/dev/null
         CLUSTER_CREATED_BY_US=1
     fi
     kind get kubeconfig --name "$CLUSTER_NAME" > "$KUBECONFIG_FILE"

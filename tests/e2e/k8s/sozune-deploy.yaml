@@ -1,0 +1,113 @@
+---
+# RBAC: Sozune watches Ingresses, Services and EndpointSlices to build its
+# routing table. ConfigMap read is for its own config; namespaces list is
+# used by the connectivity self-check.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sozune
+  namespace: sozune-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sozune
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sozune
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sozune
+subjects:
+  - kind: ServiceAccount
+    name: sozune
+    namespace: sozune-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sozune-config
+  namespace: sozune-test
+data:
+  config.yaml: |
+    providers:
+      kubernetes:
+        enabled: true
+        namespace: "sozune-test"
+        ingress_class: "sozune"
+
+    api:
+      enabled: true
+      listen_address: "0.0.0.0:18181"
+
+    proxy:
+      http:
+        listen_address: 18180
+      https:
+        listen_address: 18443
+
+    middleware:
+      port: 13180
+---
+# Pod runs with hostNetwork so it shares the kind node's network namespace.
+# That gives it access to the pod CIDR (typically 10.244.0.0/16) for
+# direct pod-IP routing, AND lets the kind extraPortMappings expose the
+# listen ports back to the developer host.
+#
+# In-cluster ServiceAccount auth is picked up automatically by kube-rs:
+# when no kubeconfig is provided, it reads the SA token + CA from
+# /var/run/secrets/kubernetes.io/serviceaccount/.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sozune
+  namespace: sozune-test
+  labels:
+    app: sozune
+spec:
+  serviceAccountName: sozune
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+    - name: sozune
+      image: kemeter/sozune:latest
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: CONFIG_PATH
+          value: /etc/sozune/config.yaml
+        - name: RUST_LOG
+          value: sozune=debug
+      ports:
+        - containerPort: 18180
+          hostPort: 18180
+          name: http
+        - containerPort: 18443
+          hostPort: 18443
+          name: https
+        - containerPort: 18181
+          hostPort: 18181
+          name: api
+      volumeMounts:
+        - name: config
+          mountPath: /etc/sozune
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: sozune-config
