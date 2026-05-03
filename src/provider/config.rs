@@ -106,7 +106,10 @@ impl ConfigProvider {
                         let mut storage_write = match storage_clone.write() {
                             Ok(guard) => guard,
                             Err(e) => {
-                                error!("Storage lock poisoned during config reload: {}", e);
+                                error!(
+                                    "internal state corrupted (configuration store), restart required: {}",
+                                    e
+                                );
                                 continue;
                             }
                         };
@@ -126,7 +129,10 @@ impl ConfigProvider {
 
                     // Trigger proxy reload
                     if let Err(e) = reload_tx.send(()).await {
-                        warn!("Failed to send a reload signal: {}", e);
+                        warn!(
+                            "could not apply configuration update; will retry on next change: {}",
+                            e
+                        );
                     } else {
                         info!("Config entrypoints reloaded successfully");
                     }

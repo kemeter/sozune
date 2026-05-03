@@ -57,7 +57,10 @@ impl HttpProvider {
                         let storage_read = match storage.read() {
                             Ok(guard) => guard,
                             Err(e) => {
-                                error!("Storage lock poisoned in HTTP provider: {}", e);
+                                error!(
+                                    "internal state corrupted (configuration store), restart required: {}",
+                                    e
+                                );
                                 continue;
                             }
                         };
@@ -88,7 +91,10 @@ impl HttpProvider {
                         let mut storage_write = match storage.write() {
                             Ok(guard) => guard,
                             Err(e) => {
-                                error!("Storage lock poisoned in HTTP provider: {}", e);
+                                error!(
+                                    "internal state corrupted (configuration store), restart required: {}",
+                                    e
+                                );
                                 continue;
                             }
                         };
@@ -102,7 +108,10 @@ impl HttpProvider {
 
                     info!("HTTP provider config changed, triggering reload");
                     if let Err(e) = reload_tx.send(()).await {
-                        warn!("Failed to send reload signal: {}", e);
+                        warn!(
+                            "could not apply configuration update; will retry on next change: {}",
+                            e
+                        );
                     }
                 }
                 Err(e) => {

@@ -15,6 +15,7 @@ mod acme;
 mod api;
 mod cli;
 mod config;
+mod config_load;
 mod dashboard;
 mod labels;
 mod middleware;
@@ -39,6 +40,14 @@ async fn main() -> anyhow::Result<()> {
             let exit = cli::validate::run(args, &config_path).await?;
             std::process::exit(exit);
         }
+        Command::Explain(args) => {
+            let exit = cli::explain::run(args);
+            std::process::exit(exit);
+        }
+        Command::Doctor(args) => {
+            let exit = cli::doctor::run(args, &config_path).await;
+            std::process::exit(exit);
+        }
     }
 }
 
@@ -49,7 +58,18 @@ fn init_tracing() {
                 .add_directive("sozune=info".parse().expect("valid log directive"))
                 .add_directive("bollard=warn".parse().expect("valid log directive"))
                 .add_directive("hyper=warn".parse().expect("valid log directive"))
-                .add_directive("rustls=warn".parse().expect("valid log directive")),
+                .add_directive("hyper_util=warn".parse().expect("valid log directive"))
+                .add_directive("rustls=warn".parse().expect("valid log directive"))
+                .add_directive("sozu_lib=warn".parse().expect("valid log directive"))
+                .add_directive(
+                    "sozu_command_lib=warn"
+                        .parse()
+                        .expect("valid log directive"),
+                )
+                .add_directive("mio=warn".parse().expect("valid log directive"))
+                .add_directive("h2=warn".parse().expect("valid log directive"))
+                .add_directive("kube=warn".parse().expect("valid log directive"))
+                .add_directive("tower=warn".parse().expect("valid log directive")),
         )
         .init();
 }
@@ -61,9 +81,9 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         info!("Loading configuration from: {}", config_path);
         let config_content = tokio::fs::read_to_string(config_path)
             .await
-            .context("Failed to read a config file")?;
+            .with_context(|| format!("could not read config file at {config_path}"))?;
 
-        serde_yaml::from_str(&config_content).context("Failed to parse a config file")?
+        config_load::parse_yaml(std::path::Path::new(config_path), &config_content)?
     } else {
         info!("Configuration file not found, using the default configuration");
         AppConfig::default()
@@ -179,7 +199,9 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 && acme_config.enabled
             {
                 if acme_config.email.is_empty() {
-                    warn!("ACME enabled but no email configured, skipping");
+                    warn!(
+                        "ACME is enabled but no contact email is set; certificate provisioning will be skipped (set acme.email in the config file to enable it)"
+                    );
                     return Ok(());
                 }
 

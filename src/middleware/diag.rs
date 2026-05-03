@@ -20,6 +20,70 @@ pub fn no_healthy_backend(host: &str, configured_backends: &[(String, u16)]) -> 
     no_healthy_backend_inner(host, configured_backends, debug_enabled())
 }
 
+/// 502 Bad Gateway — backend connection failed. `detail` is included in the
+/// body when SOZUNE_DEBUG=true.
+pub fn backend_unreachable(detail: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::BAD_GATEWAY,
+        "backend-unreachable",
+        format!("sozune: backend unreachable.\n\n{detail}\n"),
+    )
+}
+
+/// 504 Gateway Timeout — backend did not respond within the configured deadline.
+pub fn backend_timeout(target: &str, secs: u64) -> Response<Body> {
+    diag_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        "backend-timeout",
+        format!("sozune: backend at {target} did not respond within {secs}s.\n"),
+    )
+}
+
+/// 502 Bad Gateway — generic forwarding error (compression, body read, malformed URI).
+pub fn forwarding_failed(reason: &str, detail: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::BAD_GATEWAY,
+        reason,
+        format!("sozune: request could not be forwarded ({reason}).\n\n{detail}\n"),
+    )
+}
+
+/// 500 Internal Server Error — sozune itself is in a bad state.
+pub fn internal_error(reason: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        reason,
+        format!("sozune: internal error ({reason}). The service may need to be restarted.\n"),
+    )
+}
+
+/// 400 Bad Request — request itself is malformed before any routing.
+pub fn bad_request(reason: &str, detail: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::BAD_REQUEST,
+        reason,
+        format!("sozune: bad request ({reason}).\n\n{detail}\n"),
+    )
+}
+
+/// 429 Too Many Requests — rate limit triggered.
+pub fn rate_limited(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate-limited",
+        format!("sozune: too many requests for host '{host}'.\n"),
+    )
+}
+
+fn diag_response(status: StatusCode, reason: &str, debug_body: String) -> Response<Body> {
+    let body = if debug_enabled() {
+        debug_body
+    } else {
+        String::new()
+    };
+    build(status, reason, body)
+}
+
 fn no_route_for_host_inner(host: &str, known_hosts: &[String], debug: bool) -> Response<Body> {
     let body = if debug {
         let mut out =

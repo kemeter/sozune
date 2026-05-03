@@ -389,7 +389,10 @@ impl KubernetesProvider {
         let mut cache = match self.endpoints.write() {
             Ok(guard) => guard,
             Err(e) => {
-                error!("Endpoints cache poisoned: {}", e);
+                error!(
+                    "internal state corrupted (configuration store), restart required: {}",
+                    e
+                );
                 return None;
             }
         };
@@ -555,7 +558,10 @@ impl KubernetesProvider {
             let mut storage_write = match storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
-                    error!("Storage lock poisoned in Kubernetes upsert: {}", e);
+                    error!(
+                        "internal state corrupted (configuration store), restart required: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -595,7 +601,7 @@ impl KubernetesProvider {
         if storage_changed {
             if let Err(e) = reload_tx.send(()).await {
                 error!(
-                    "Failed to send reload signal after Kubernetes upsert: {}",
+                    "could not apply configuration update; will retry on next change: {}",
                     e
                 );
             }
@@ -623,7 +629,10 @@ impl KubernetesProvider {
             let mut storage_write = match storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
-                    error!("Storage lock poisoned in Kubernetes remove: {}", e);
+                    error!(
+                        "internal state corrupted (configuration store), restart required: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -641,7 +650,7 @@ impl KubernetesProvider {
 
         if storage_changed && let Err(e) = reload_tx.send(()).await {
             error!(
-                "Failed to send reload signal after Kubernetes remove: {}",
+                "could not apply configuration update; will retry on next change: {}",
                 e
             );
         }
@@ -724,7 +733,10 @@ impl KubernetesProvider {
             let mut storage_write = match storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
-                    error!("Storage lock poisoned in Ingress apply: {}", e);
+                    error!(
+                        "internal state corrupted (configuration store), restart required: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -766,7 +778,10 @@ impl KubernetesProvider {
 
         if storage_changed {
             if let Err(e) = reload_tx.send(()).await {
-                error!("Failed to send reload signal after Ingress apply: {}", e);
+                error!(
+                    "could not apply configuration update; will retry on next change: {}",
+                    e
+                );
             }
             if tls_added {
                 acme_notify.notify_one();
@@ -787,7 +802,10 @@ impl KubernetesProvider {
         let keys = match self.ingress_keys.write() {
             Ok(mut owned) => owned.remove(&ing_id).unwrap_or_default(),
             Err(e) => {
-                error!("ingress_keys lock poisoned: {}", e);
+                error!(
+                    "internal state corrupted (ingress tracking), restart required: {}",
+                    e
+                );
                 return;
             }
         };
@@ -801,7 +819,10 @@ impl KubernetesProvider {
             let mut storage_write = match storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
-                    error!("Storage lock poisoned in Ingress remove: {}", e);
+                    error!(
+                        "internal state corrupted (configuration store), restart required: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -814,7 +835,10 @@ impl KubernetesProvider {
         }
 
         if storage_changed && let Err(e) = reload_tx.send(()).await {
-            error!("Failed to send reload signal after Ingress remove: {}", e);
+            error!(
+                "could not apply configuration update; will retry on next change: {}",
+                e
+            );
         }
     }
 

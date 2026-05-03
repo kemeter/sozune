@@ -391,7 +391,10 @@ fn handle_reload(
     let storage_read = match storage.read() {
         Ok(guard) => guard,
         Err(e) => {
-            error!("Storage lock poisoned during reload: {}", e);
+            error!(
+                "internal state corrupted (configuration store), restart required: {}",
+                e
+            );
             return previous_snapshot.clone();
         }
     };
@@ -439,7 +442,10 @@ fn update_middleware_routes(
     let mut table = match middleware_state.write() {
         Ok(guard) => guard,
         Err(e) => {
-            error!("Middleware state lock poisoned: {}", e);
+            error!(
+                "internal state corrupted (middleware routing), restart required: {}",
+                e
+            );
             return;
         }
     };

@@ -16,7 +16,10 @@ async fn handle_challenge(
     Path(token): Path<String>,
 ) -> Result<String, StatusCode> {
     let challenges = challenges.read().map_err(|e| {
-        error!("Challenge state lock poisoned: {}", e);
+        error!(
+            "internal state corrupted (ACME challenges), restart required: {}",
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 

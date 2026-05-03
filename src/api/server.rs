@@ -254,7 +254,10 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
     let storage = match state.storage.read() {
         Ok(guard) => guard,
         Err(e) => {
-            error!("Storage lock poisoned: {}", e);
+            error!(
+                "internal state corrupted (configuration store), restart required: {}",
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal server error"})),
@@ -264,7 +267,10 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
     let unhealthy = match state.unhealthy_backends.read() {
         Ok(guard) => guard.clone(),
         Err(e) => {
-            error!("Unhealthy-backends lock poisoned: {}", e);
+            error!(
+                "internal state corrupted (health tracking), restart required: {}",
+                e
+            );
             HashSet::new()
         }
     };
@@ -282,7 +288,10 @@ async fn get_entrypoint(
     let storage = match state.storage.read() {
         Ok(guard) => guard,
         Err(e) => {
-            error!("Storage lock poisoned: {}", e);
+            error!(
+                "internal state corrupted (configuration store), restart required: {}",
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal server error"})),
@@ -292,7 +301,10 @@ async fn get_entrypoint(
     let unhealthy = match state.unhealthy_backends.read() {
         Ok(guard) => guard.clone(),
         Err(e) => {
-            error!("Unhealthy-backends lock poisoned: {}", e);
+            error!(
+                "internal state corrupted (health tracking), restart required: {}",
+                e
+            );
             HashSet::new()
         }
     };
@@ -328,7 +340,10 @@ async fn create_entrypoint(
         let mut storage = match state.storage.write() {
             Ok(guard) => guard,
             Err(e) => {
-                error!("Storage lock poisoned: {}", e);
+                error!(
+                    "internal state corrupted (configuration store), restart required: {}",
+                    e
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "internal server error"})),
@@ -339,7 +354,10 @@ async fn create_entrypoint(
     }
 
     if let Err(e) = state.reload_tx.send(()).await {
-        error!("Failed to send reload signal: {}", e);
+        error!(
+            "could not apply configuration update; will retry on next change: {}",
+            e
+        );
     }
 
     info!("Created entrypoint: {}", entrypoint.id);
@@ -355,7 +373,10 @@ async fn update_entrypoint(
         let mut storage = match state.storage.write() {
             Ok(guard) => guard,
             Err(e) => {
-                error!("Storage lock poisoned: {}", e);
+                error!(
+                    "internal state corrupted (configuration store), restart required: {}",
+                    e
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "internal server error"})),
@@ -394,7 +415,10 @@ async fn update_entrypoint(
     }
 
     if let Err(e) = state.reload_tx.send(()).await {
-        error!("Failed to send reload signal: {}", e);
+        error!(
+            "could not apply configuration update; will retry on next change: {}",
+            e
+        );
     }
 
     let storage = state.storage.read().unwrap();
@@ -411,7 +435,10 @@ async fn delete_entrypoint(
         let mut storage = match state.storage.write() {
             Ok(guard) => guard,
             Err(e) => {
-                error!("Storage lock poisoned: {}", e);
+                error!(
+                    "internal state corrupted (configuration store), restart required: {}",
+                    e
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "internal server error"})),
@@ -442,7 +469,10 @@ async fn delete_entrypoint(
     }
 
     if let Err(e) = state.reload_tx.send(()).await {
-        error!("Failed to send reload signal: {}", e);
+        error!(
+            "could not apply configuration update; will retry on next change: {}",
+            e
+        );
     }
 
     info!("Deleted entrypoint: {}", id);

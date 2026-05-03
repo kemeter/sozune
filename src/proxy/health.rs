@@ -70,7 +70,10 @@ impl HealthChecker {
         }
 
         if changed && let Err(e) = self.reload_tx.send(()).await {
-            error!("Failed to send reload after health check: {}", e);
+            error!(
+                "could not apply configuration update; will retry on next change: {}",
+                e
+            );
         }
     }
 

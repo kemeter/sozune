@@ -128,7 +128,10 @@ impl DockerProvider {
                         let mut storage_write = match storage.write() {
                             Ok(guard) => guard,
                             Err(e) => {
-                                error!("Storage lock poisoned during initial scan: {}", e);
+                                error!(
+                                    "internal state corrupted (configuration store), restart required: {}",
+                                    e
+                                );
                                 return Ok(());
                             }
                         };
@@ -156,7 +159,10 @@ impl DockerProvider {
                     // Only trigger reload if configuration actually changed
                     if storage_changed {
                         if let Err(e) = reload_tx.send(()).await {
-                            warn!("Failed to send initial reload signal: {}", e);
+                            warn!(
+                                "could not apply configuration update; will retry on next change: {}",
+                                e
+                            );
                         } else {
                             info!("Initial configuration loaded from running containers");
                         }
@@ -234,7 +240,7 @@ impl DockerProvider {
                                         Ok(guard) => guard,
                                         Err(e) => {
                                             error!(
-                                                "Storage lock poisoned on container start: {}",
+                                                "internal state corrupted (configuration store), restart required: {}",
                                                 e
                                             );
                                             continue;
@@ -273,7 +279,10 @@ impl DockerProvider {
                                 let mut storage_write = match storage.write() {
                                     Ok(guard) => guard,
                                     Err(e) => {
-                                        error!("Storage lock poisoned on container stop: {}", e);
+                                        error!(
+                                            "internal state corrupted (configuration store), restart required: {}",
+                                            e
+                                        );
                                         continue;
                                     }
                                 };
@@ -309,7 +318,7 @@ impl DockerProvider {
                                         Ok(guard) => guard,
                                         Err(e) => {
                                             error!(
-                                                "Storage lock poisoned on container update: {}",
+                                                "internal state corrupted (configuration store), restart required: {}",
                                                 e
                                             );
                                             continue;
@@ -353,7 +362,10 @@ impl DockerProvider {
                         if storage_changed {
                             info!("Storage updated, triggering reload");
                             if let Err(e) = reload_tx.send(()).await {
-                                error!("Failed to send reload signal: {}", e);
+                                error!(
+                                    "could not apply configuration update; will retry on next change: {}",
+                                    e
+                                );
                                 break;
                             }
                             acme_notify.notify_one();

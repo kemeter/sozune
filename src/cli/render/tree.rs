@@ -36,7 +36,7 @@ pub fn render(report: &ValidationReport, min_severity: Severity) -> String {
     if has_diagnostics(report, min_severity) {
         writeln!(
             &mut out,
-            "Run `sozune validate --explain <CODE>` for details on a diagnostic code."
+            "Run `sozune explain <CODE>` for details on a diagnostic code."
         )
         .unwrap();
     }

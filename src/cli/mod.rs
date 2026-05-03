@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+pub mod doctor;
+pub mod explain;
 pub mod render;
 pub mod report;
 pub mod validate;
@@ -34,4 +36,9 @@ pub enum Command {
     /// Inspect what sozune would route from configured providers, with
     /// per-candidate diagnostics explaining any silent skip or fallback.
     Validate(validate::ValidateArgs),
+    /// Print a detailed explanation for a diagnostic code (e.g. E002, W009).
+    Explain(explain::ExplainArgs),
+    /// Diagnose the runtime environment: ports, providers, ACME directory,
+    /// privileges. Use this before `sozune serve` to catch setup issues early.
+    Doctor(doctor::DoctorArgs),
 }

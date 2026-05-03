@@ -71,8 +71,10 @@ async fn load_config(config_path: &str) -> anyhow::Result<AppConfig> {
     if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
         return Ok(AppConfig::default());
     }
-    let content = tokio::fs::read_to_string(config_path).await?;
-    Ok(serde_yaml::from_str(&content)?)
+    let content = tokio::fs::read_to_string(config_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not read config file at {config_path}: {e}"))?;
+    crate::config_load::parse_yaml(std::path::Path::new(config_path), &content)
 }
 
 async fn collect_candidates(
@@ -89,9 +91,13 @@ async fn collect_candidates(
         match DockerProvider::new(docker_cfg.clone()) {
             Ok(provider) => match provider.collect().await {
                 Ok(mut cs) => candidates.append(&mut cs),
-                Err(e) => eprintln!("docker: failed to collect candidates: {e}"),
+                Err(e) => eprintln!(
+                    "docker: could not list containers: {e}\n  → check that the Docker daemon is running and that the socket is readable (try: `docker ps`)"
+                ),
             },
-            Err(e) => eprintln!("docker: failed to connect: {e}"),
+            Err(e) => eprintln!(
+                "docker: could not connect: {e}\n  → check the endpoint in providers.docker.endpoint (default: unix:///var/run/docker.sock) and that the user has access to it"
+            ),
         }
     }
 
@@ -102,9 +108,13 @@ async fn collect_candidates(
         match PodmanProvider::new(podman_cfg.clone()) {
             Ok(provider) => match provider.collect().await {
                 Ok(mut cs) => candidates.append(&mut cs),
-                Err(e) => eprintln!("podman: failed to collect candidates: {e}"),
+                Err(e) => eprintln!(
+                    "podman: could not list containers: {e}\n  → check that the Podman API socket is running (try: `systemctl --user start podman.socket`)"
+                ),
             },
-            Err(e) => eprintln!("podman: failed to connect: {e}"),
+            Err(e) => eprintln!(
+                "podman: could not connect: {e}\n  → check the endpoint in providers.podman.endpoint and that the API socket is enabled"
+            ),
         }
     }
 
@@ -115,9 +125,13 @@ async fn collect_candidates(
         match NomadProvider::new(nomad_cfg.clone()) {
             Ok(provider) => match provider.collect().await {
                 Ok(mut cs) => candidates.append(&mut cs),
-                Err(e) => eprintln!("nomad: failed to collect candidates: {e}"),
+                Err(e) => eprintln!(
+                    "nomad: could not list services: {e}\n  → check the address in providers.nomad.address (default: http://127.0.0.1:4646) and that the agent is reachable"
+                ),
             },
-            Err(e) => eprintln!("nomad: failed to create provider: {e}"),
+            Err(e) => eprintln!(
+                "nomad: invalid configuration: {e}\n  → check providers.nomad.address and providers.nomad.token in the config file"
+            ),
         }
     }
 

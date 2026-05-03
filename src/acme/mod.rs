@@ -114,7 +114,10 @@ impl AcmeManager {
         let storage = match self.storage.read() {
             Ok(guard) => guard,
             Err(e) => {
-                error!("Storage lock poisoned: {}", e);
+                error!(
+                    "internal state corrupted (configuration store), restart required: {}",
+                    e
+                );
                 return Vec::new();
             }
         };
@@ -199,10 +202,12 @@ impl AcmeManager {
 
             // Store token → key_authorization in shared challenge state
             {
-                let mut challenges = self
-                    .challenges
-                    .write()
-                    .map_err(|e| anyhow::anyhow!("Challenge state lock poisoned: {}", e))?;
+                let mut challenges = self.challenges.write().map_err(|e| {
+                    anyhow::anyhow!(
+                        "internal state corrupted (ACME challenges), restart required: {}",
+                        e
+                    )
+                })?;
                 challenges.insert(token.clone(), key_auth.as_str().to_string());
             }
 
@@ -336,7 +341,10 @@ impl AcmeManager {
                 debug!("Cleaned up {} challenge token(s)", tokens.len());
             }
             Err(e) => {
-                error!("Challenge state lock poisoned during cleanup: {}", e);
+                error!(
+                    "internal state corrupted (ACME challenges), restart required: {}",
+                    e
+                );
             }
         }
     }

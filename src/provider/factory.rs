@@ -33,7 +33,10 @@ pub async fn start_services(
                     let mut storage_write = match storage.write() {
                         Ok(guard) => guard,
                         Err(e) => {
-                            error!("Storage lock poisoned in config file provider: {}", e);
+                            error!(
+                                "internal state corrupted (configuration store), restart required: {}",
+                                e
+                            );
                             return Ok(());
                         }
                     };

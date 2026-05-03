@@ -38,7 +38,11 @@ pub async fn handle_proxy(
         Some(h) => h.to_string(),
         None => {
             warn!("Request with missing or invalid Host header");
-            return StatusCode::BAD_REQUEST.into_response();
+            return diag::bad_request(
+                "missing-host-header",
+                "the request did not include a usable Host header",
+            )
+            .into_response();
         }
     };
 
@@ -46,8 +50,11 @@ pub async fn handle_proxy(
         let table = match state.route_table.read() {
             Ok(guard) => guard,
             Err(e) => {
-                error!("Middleware route table lock poisoned: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                error!(
+                    "internal state corrupted (middleware routing), restart required: {}",
+                    e
+                );
+                return diag::internal_error("middleware-routing-corrupted").into_response();
             }
         };
         (table.get_route_by_host(&host), table.known_hosts())
@@ -77,7 +84,7 @@ pub async fn handle_proxy(
 
         if matches!(limiter.check(&source_ip), RateLimitResult::Limited) {
             warn!("Rate limited request from {} to {}", source_ip, host);
-            return (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
+            return diag::rate_limited(&host).into_response();
         }
     }
 
@@ -133,7 +140,7 @@ pub async fn handle_proxy(
         Ok(uri) => uri,
         Err(e) => {
             error!("Failed to parse target URI '{}': {}", target_uri, e);
-            return StatusCode::BAD_GATEWAY.into_response();
+            return diag::forwarding_failed("invalid-target-uri", &e.to_string()).into_response();
         }
     };
 
@@ -156,7 +163,7 @@ pub async fn handle_proxy(
             Ok(result) => result.map_err(|e| e.to_string()),
             Err(_) => {
                 error!("Backend request to {} timed out", target_uri);
-                return StatusCode::GATEWAY_TIMEOUT.into_response();
+                return diag::backend_timeout(&target_uri, timeout_secs).into_response();
             }
         }
     };
@@ -194,7 +201,8 @@ pub async fn handle_proxy(
                     },
                     Err(e) => {
                         error!("Failed to read response body for compression: {}", e);
-                        StatusCode::BAD_GATEWAY.into_response()
+                        diag::forwarding_failed("response-body-read-failed", &e.to_string())
+                            .into_response()
                     }
                 }
             } else {
@@ -204,7 +212,7 @@ pub async fn handle_proxy(
         }
         Err(e) => {
             error!("Failed to forward request to {}: {}", target_uri, e);
-            StatusCode::BAD_GATEWAY.into_response()
+            diag::backend_unreachable(&format!("backend at {target_uri}: {e}")).into_response()
         }
     };
 
@@ -244,7 +252,10 @@ async fn handle_websocket(
                 "Failed to connect to backend {} for WebSocket: {}",
                 backend_addr, e
             );
-            return StatusCode::BAD_GATEWAY.into_response();
+            return diag::backend_unreachable(&format!(
+                "websocket: cannot connect to {backend_addr}: {e}"
+            ))
+            .into_response();
         }
     };
 
@@ -261,7 +272,7 @@ async fn handle_websocket(
     // Send upgrade request to backend
     if let Err(e) = backend_stream.write_all(upgrade_request.as_bytes()).await {
         error!("Failed to send WebSocket upgrade to backend: {}", e);
-        return StatusCode::BAD_GATEWAY.into_response();
+        return diag::forwarding_failed("websocket-write-failed", &e.to_string()).into_response();
     }
 
     // Read the backend's response header
@@ -270,7 +281,10 @@ async fn handle_websocket(
         Ok(n) if n > 0 => n,
         _ => {
             error!("No response from backend for WebSocket upgrade");
-            return StatusCode::BAD_GATEWAY.into_response();
+            return diag::backend_unreachable(
+                "websocket: backend closed connection without responding",
+            )
+            .into_response();
         }
     };
 
@@ -278,11 +292,13 @@ async fn handle_websocket(
 
     // Check that backend accepted the upgrade (101 Switching Protocols)
     if !response_str.starts_with("HTTP/1.1 101") {
-        error!(
-            "Backend rejected WebSocket upgrade: {}",
-            response_str.lines().next().unwrap_or("")
-        );
-        return StatusCode::BAD_GATEWAY.into_response();
+        let first_line = response_str.lines().next().unwrap_or("").to_string();
+        error!("Backend rejected WebSocket upgrade: {}", first_line);
+        return diag::forwarding_failed(
+            "websocket-upgrade-rejected",
+            &format!("backend response: {first_line}"),
+        )
+        .into_response();
     }
 
     // Parse the response headers to forward to the client
