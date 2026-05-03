@@ -1,9 +1,10 @@
 <script lang="ts">
   import '../app.css';
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { clearAuth, identity, isAuthenticated } from '$lib/auth';
+  import { listDiagnostics } from '$lib/api';
 
   let { children } = $props();
 
@@ -15,6 +16,12 @@
     { href: './settings', label: 'Settings', icon: 'gear' }
   ];
 
+  /** Number of error+warn diagnostics; shown as a badge on the Diagnostics
+   *  nav entry. Polled here so any page benefits from it without each page
+   *  having to fetch it separately. */
+  let diagBadge = $state(0);
+  let diagPoll: ReturnType<typeof setInterval> | null = null;
+
   function isActive(href: string): boolean {
     const current = $page.url.pathname.replace(/\/$/, '');
     const target = href.replace(/^\.\//, '/').replace(/\/$/, '');
@@ -24,10 +31,29 @@
 
   let onLoginPage = $derived($page.url.pathname.endsWith('/login'));
 
+  async function refreshDiagBadge() {
+    try {
+      const r = await listDiagnostics();
+      const all = [...(r.global ?? []), ...r.items.flatMap((i) => i.diagnostics)];
+      diagBadge = all.filter((d) => d.severity === 'error' || d.severity === 'warn').length;
+    } catch {
+      diagBadge = 0;
+    }
+  }
+
   onMount(() => {
     if (!onLoginPage && !isAuthenticated()) {
       goto('./login');
+      return;
     }
+    if (!onLoginPage) {
+      void refreshDiagBadge();
+      diagPoll = setInterval(() => void refreshDiagBadge(), 5000);
+    }
+  });
+
+  onDestroy(() => {
+    if (diagPoll) clearInterval(diagPoll);
   });
 
   function logout() {
@@ -66,6 +92,9 @@
               {/if}
             </span>
             <span>{item.label}</span>
+            {#if item.label === 'Diagnostics' && diagBadge > 0}
+              <span class="nav-badge">{diagBadge}</span>
+            {/if}
           </a>
         {/each}
       </nav>
@@ -181,6 +210,18 @@
   .nav-icon :global(svg) {
     width: 16px;
     height: 16px;
+  }
+
+  .nav-badge {
+    margin-left: auto;
+    background: var(--warning);
+    color: #1a1a1a;
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 999px;
+    line-height: 1.4;
+    font-variant-numeric: tabular-nums;
   }
 
   .sidebar-footer {
