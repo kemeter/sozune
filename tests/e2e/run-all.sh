@@ -160,7 +160,7 @@ services:
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-timeout:
-    image: traefik/whoami
+    image: kennethreitz/httpbin
     labels:
       - "sozune.enable=true"
       - "sozune.http.svctimeout.host=$HOST_TIMEOUT"
@@ -316,6 +316,15 @@ echo ""
 echo "=============================="
 echo -e "  ${GREEN}Passed: $PASSED${NC}  ${RED}Failed: $FAILED${NC}  ${YELLOW}Skipped: $SKIPPED${NC}"
 echo "=============================="
+
+# Extended suites with heavier prerequisites (separate orchestrators).
+# Not run by default — list them so a contributor knows they exist.
+echo ""
+echo "Extended suites (run separately, require extra setup):"
+echo "  - bash tests/e2e/swarm/run-swarm.sh           (needs: docker swarm init)"
+echo "  - bash tests/e2e/swarm-multinode/run-multinode.sh  (needs: multi-node swarm)"
+echo "  - bash tests/e2e/nomad/run-nomad.sh           (needs: nomad agent + docker driver)"
+echo "  - bash tests/e2e/k8s/run-k8s.sh               (needs: kind + kubectl)"
 
 if [[ $FAILED -gt 0 ]]; then
     exit 1

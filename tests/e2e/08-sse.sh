@@ -29,7 +29,7 @@ trap "rm -f $sub_out" RETURN
     curl -s -N --max-time 8 -H "Host: $HOST_SSE" \
         "http://127.0.0.1:$HTTP_PORT/.well-known/mercure?topic=e2e-sse-test" 2>/dev/null \
     | while IFS= read -r line; do
-        printf '%s.%03d %s\n' "$(date +%s)" "$(($(date +%N) / 1000000))" "$line"
+        printf '%s.%03d %s\n' "$(date +%s)" "$((10#$(date +%N) / 1000000))" "$line"
     done
 ) > "$sub_out" &
 sub_pid=$!
@@ -37,7 +37,7 @@ sub_pid=$!
 # Give the subscriber time to connect (first keepalive sets up the stream).
 sleep 1.5
 
-publish_ts=$(($(date +%s) * 1000 + $(date +%N) / 1000000))
+publish_ts=$(($(date +%s) * 1000 + 10#$(date +%N) / 1000000))
 
 # Mercure's `anonymous` directive only allows anonymous SUBSCRIBE; publish
 # always requires a publisher JWT. This token is signed with the same
