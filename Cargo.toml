@@ -11,8 +11,8 @@ axum-server = "0.7.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 
-sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "41b69cc" }
-sozu-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "41b69cc" }
+sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "282bb93" }
+sozu-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "282bb93" }
 anyhow = "1.0.99"
 bollard = "0.20"
 async-trait = "0.1.89"
