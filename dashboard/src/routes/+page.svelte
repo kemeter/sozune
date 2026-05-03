@@ -60,10 +60,19 @@
     };
   }
 
-  function diagTooltip(ep: Entrypoint): string {
-    return (ep.diagnostics ?? [])
-      .map((d) => `${d.code} ${d.message}${d.hint ? `\n  → ${d.hint}` : ''}`)
-      .join('\n\n');
+  /** Entrypoint id whose diagnostic popover is currently open. Click on a
+   *  badge toggles; click anywhere else closes. */
+  let openDiagFor = $state<string | null>(null);
+
+  function toggleDiagPopover(epId: string, ev: Event) {
+    // Stop both the row's `goto` handler and the window-level closer.
+    ev.stopPropagation();
+    ev.preventDefault();
+    openDiagFor = openDiagFor === epId ? null : epId;
+  }
+
+  function closeDiagPopover() {
+    openDiagFor = null;
   }
 
   function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
@@ -96,10 +105,12 @@
     }
     void load();
     poll = setInterval(() => void load(true), 5000);
+    window.addEventListener('click', closeDiagPopover);
   });
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
+    window.removeEventListener('click', closeDiagPopover);
   });
 
   function timeAgo(d: Date | null): string {
@@ -274,11 +285,49 @@
                 {#if ep.config.sticky_session}<span class="chip">sticky</span>{/if}
                 {#if ep.config.compress}<span class="chip">gzip</span>{/if}
                 {#if ep.config.strip_prefix}<span class="chip">strip</span>{/if}
-                {#if diagSummary(ep).err > 0}
-                  <span class="chip chip-err" title={diagTooltip(ep)}>✗ {diagSummary(ep).err}</span>
-                {/if}
-                {#if diagSummary(ep).warn > 0}
-                  <span class="chip chip-warn" title={diagTooltip(ep)}>⚠ {diagSummary(ep).warn}</span>
+                {#if diagSummary(ep).err + diagSummary(ep).warn > 0}
+                  <span class="diag-anchor">
+                    {#if diagSummary(ep).err > 0}
+                      <button
+                        type="button"
+                        class="chip chip-err"
+                        onclick={(ev) => toggleDiagPopover(ep.id, ev)}
+                      >
+                        ✗ {diagSummary(ep).err}
+                      </button>
+                    {/if}
+                    {#if diagSummary(ep).warn > 0}
+                      <button
+                        type="button"
+                        class="chip chip-warn"
+                        onclick={(ev) => toggleDiagPopover(ep.id, ev)}
+                      >
+                        ⚠ {diagSummary(ep).warn}
+                      </button>
+                    {/if}
+                    {#if openDiagFor === ep.id}
+                      <div
+                        class="diag-popover"
+                        role="dialog"
+                        onclick={(ev) => ev.stopPropagation()}
+                      >
+                        {#each ep.diagnostics ?? [] as diag}
+                          <div class="pop-diag pop-diag-{diag.severity}">
+                            <div class="pop-head">
+                              <span class="pop-glyph">
+                                {#if diag.severity === 'error'}✗{:else if diag.severity === 'warn'}⚠{:else}ℹ{/if}
+                              </span>
+                              <span class="pop-code mono">{diag.code}</span>
+                              <span class="pop-message">{diag.message}</span>
+                            </div>
+                            {#if diag.hint}
+                              <div class="pop-hint">→ {diag.hint}</div>
+                            {/if}
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                  </span>
                 {/if}
               </div>
             </td>
@@ -623,12 +672,78 @@
   .chip-warn {
     background: rgba(240, 180, 41, 0.18);
     color: var(--warning);
-    cursor: help;
+    cursor: pointer;
+    border: none;
+    font-family: inherit;
   }
   .chip-err {
     background: var(--danger-bg);
     color: var(--danger);
-    cursor: help;
+    cursor: pointer;
+    border: none;
+    font-family: inherit;
+  }
+
+  .diag-anchor {
+    position: relative;
+    display: inline-flex;
+    gap: 3px;
+  }
+  .diag-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    min-width: 320px;
+    max-width: 480px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 0.5rem;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    cursor: default;
+    text-align: left;
+    white-space: normal;
+  }
+  .pop-diag {
+    border-left: 3px solid var(--border);
+    padding: 0.45rem 0.625rem;
+    background: var(--bg-2);
+    border-radius: 4px;
+  }
+  .pop-diag-error { border-left-color: var(--danger); }
+  .pop-diag-warn { border-left-color: var(--warning); }
+  .pop-diag-info { border-left-color: var(--accent); }
+  .pop-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+  }
+  .pop-glyph { line-height: 1; }
+  .pop-diag-error .pop-glyph { color: var(--danger); }
+  .pop-diag-warn .pop-glyph { color: var(--warning); }
+  .pop-diag-info .pop-glyph { color: var(--accent); }
+  .pop-code {
+    background: var(--bg-3);
+    color: var(--fg-1);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    font-weight: 600;
+  }
+  .pop-message {
+    color: var(--fg-0);
+    flex: 1;
+  }
+  .pop-hint {
+    color: var(--fg-2);
+    font-size: 0.72rem;
+    margin-top: 0.25rem;
+    margin-left: 1.3rem;
   }
 
   .global-diags {
