@@ -2,6 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+UX overhaul. Full audit of every user-facing message; new self-documenting CLI surface.
+
+### CLI
+
+- `sozune explain <CODE>` — detailed cause / effect / fix / example for every diagnostic code (E001-E005, W001-W018, I001-I002).
+- `sozune doctor [--offline]` — environment health-check: config readability, port bindability, provider sockets, ACME directory writability, privileges (CAP_NET_BIND_SERVICE detection).
+
+### Routing
+
+- Method-based routing via `sozune.http.<svc>.methods=GET,POST,...` (case-insensitive, dedup, one Sōzu frontend per method).
+
+### Diagnostics
+
+New diagnostic codes surfaced by `sozune validate`:
+
+- `W014` invalid HTTP method in `methods=...`
+- `W015` ACME enabled but no entrypoint declares `tls=true`
+- `W016` `httpsRedirect=true` without `tls=true`
+- `W017` `rate_limit.burst < average` (burst window disabled)
+- `W018` route collision: same `(host, path)` declared by multiple candidates
+
+### Runtime errors
+
+- HTTP error responses in the middleware reverse-proxy now carry an `X-Sozune-Diagnostic` header on every 4xx/5xx (no more empty 502/504 bodies). Helpers cover `backend-unreachable`, `backend-timeout`, `forwarding-failed`, `internal-error`, `bad-request`, `rate-limited`, in addition to the existing `no-route-for-host` / `no-healthy-backend`.
+
+### Logs
+
+- Default log filter silences `sozu_lib`, `sozu_command_lib`, `mio`, `h2`, `kube`, `tower`, `hyper_util`. Override via `RUST_LOG`.
+- 47 internal-jargon log messages reformulated into user-facing language (no more `Storage lock poisoned`, `Failed to send reload signal`, `Challenge state lock poisoned`, …).
+
+### Config errors
+
+- YAML parse failures report the file path and `line:column`.
+- Provider errors in `validate` include actionable hints (Docker socket perms, Podman API socket, Nomad endpoint).
+- ACME warning suggests setting `acme.email` instead of just stating it is missing.
+
+## [0.12.0] - 2026-05-03
+
+Cluster ops & reliability. Hardening of the Kubernetes provider and the e2e suites.
+
+### Kubernetes
+
+- Run sozune as in-cluster Pod with `hostNetwork` for the k8s e2e suite (4/4 passing).
+- Kubernetes Ingress e2e suite scaffold (network plumbing pending).
+- Route Kubernetes Ingress resources to pod IP backends.
+- Track per-slice attribution to drop stale endpoints on shrink.
+
+### Reliability
+
+- Reload signals are debounced to coalesce container start bursts.
+- E2E suites wait for all routes to be live simultaneously before running.
+- Tightened e2e suites: real backend timeout, SSE octal fix.
+- New SSE e2e suite + documented SSE pattern through Sozune.
+- New API tests for payload validation, backend serialization, source guards.
+
+### Vendor
+
+- Sōzu pinned to `282bb93` (TLS chain dedup, 302/308 redirects, 30 commits upstream).
+
+### Repo
+
+- `.dockerignore` skips `target/`, `node_modules`, dev junk (Docker build context: 8.8 GB → 439 MB).
+
 ## [0.11.0] - 2026-04-29
 
 ### CLI
@@ -53,8 +118,15 @@ New `EntrypointConfig` fields, parsed from Docker labels and passed through to S
 
 ### Routing & providers
 
+- **Kubernetes provider**: discovery via Service annotations and watch stream, EndpointSlice ready-pod IP resolution, Ingress routing with class filtering.
+- **Nomad provider**: blocking-query discovery, services API polling, tag→label mapping, port synthesis.
+- **Swarm provider**: VIP discovery, event stream, manager verification at startup, e2e suite.
+- **Podman provider**: Docker-API-compatible socket.
+- **HTTP provider**: poll entrypoints from a remote URL (JSON only).
 - Regex-based path matching (`PathRuleKind` aligned with Sōzu proto).
-- New HTTP provider: poll entrypoints from a remote URL (JSON only).
+- Per-backend port and weight on `Backend` (replaces `config.port` and `backend_weights`).
+- TCP entrypoints: listener config block, label parsing, Sōzu TCP worker wiring, e2e suite.
+- Provider factory spawns Docker so other providers can start in parallel.
 
 ### Middleware
 
