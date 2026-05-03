@@ -197,11 +197,23 @@ log "[02] Middleware: backend timeout"
 
 wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_TIMEOUT" "200" || true
 
+# Happy path: /get returns instantly, well under the 2s timeout.
 timeout_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
     -H "Host: $HOST_TIMEOUT" \
-    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "000")
+    "http://127.0.0.1:$HTTP_PORT/get" 2>/dev/null || echo "000")
 if [[ "$timeout_status" == "200" ]]; then
     pass "backend timeout: normal request succeeds within timeout"
 else
     fail "backend timeout: normal request returned $timeout_status instead of 200"
+fi
+
+# Slow path: /delay/5 sleeps 5s, well past the 2s backendTimeout. The
+# middleware proxy must abort and surface 504 Gateway Timeout.
+slow_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
+    -H "Host: $HOST_TIMEOUT" \
+    "http://127.0.0.1:$HTTP_PORT/delay/5" 2>/dev/null || echo "000")
+if [[ "$slow_status" == "504" ]]; then
+    pass "backend timeout: slow request (5s) aborted with 504 after 2s timeout"
+else
+    fail "backend timeout: slow request returned $slow_status instead of 504"
 fi

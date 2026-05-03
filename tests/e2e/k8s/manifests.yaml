@@ -1,0 +1,109 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sozune-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svca
+  namespace: sozune-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svca
+  template:
+    metadata:
+      labels:
+        app: svca
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svca
+  namespace: sozune-test
+spec:
+  selector:
+    app: svca
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svcb
+  namespace: sozune-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svcb
+  template:
+    metadata:
+      labels:
+        app: svcb
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svcb
+  namespace: sozune-test
+spec:
+  selector:
+    app: svcb
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: svca-ingress
+  namespace: sozune-test
+spec:
+  ingressClassName: sozune
+  rules:
+    - host: svca.k8s-test.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: svca
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: svcb-ingress
+  namespace: sozune-test
+spec:
+  ingressClassName: sozune
+  rules:
+    - host: svcb.k8s-test.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: svcb
+                port:
+                  number: 80

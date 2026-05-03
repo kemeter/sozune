@@ -160,7 +160,7 @@ services:
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-timeout:
-    image: traefik/whoami
+    image: kennethreitz/httpbin
     labels:
       - "sozune.enable=true"
       - "sozune.http.svctimeout.host=$HOST_TIMEOUT"
@@ -257,7 +257,53 @@ if ! kill -0 "$SOZUNE_PID" 2>/dev/null; then
 fi
 
 log "Waiting for routes to propagate..."
-sleep "$ROUTE_DELAY"
+# When the suite starts, Sozune is still emitting reload events triggered
+# by individual Docker container `start` events. A naïve sleep, or even
+# a per-host wait that returns as soon as the FIRST host responds, races
+# against in-flight reloads — a route that was 200 a moment ago may be
+# briefly 404 again as Sozune re-applies a cluster.
+#
+# We require every test host to respond non-404 SIMULTANEOUSLY in the
+# same poll cycle. Any 404 restarts the cycle, capped at ~30s total.
+declare -A WAIT_PATHS=(
+    ["$HOST_A"]="/"
+    ["$HOST_B"]="/"
+    ["$HOST_AUTH"]="/"
+    ["$HOST_HEADERS"]="/"
+    ["$HOST_HEADERS_RESPONSE"]="/"
+    ["$HOST_HEADERS_BOTH"]="/"
+    ["$HOST_HEADERS_DELETE"]="/"
+    ["$HOST_STRIP"]="/api"
+    ["$HOST_REDIRECT"]="/"
+    ["$HOST_RATELIMIT"]="/"
+    ["$HOST_COMPRESS"]="/"
+    ["$HOST_TIMEOUT"]="/"
+    ["$HOST_REGEX"]="/users/0"
+    ["$HOST_WS"]="/"
+    ["$HOST_SSE"]="/.well-known/mercure?topic=ready"
+)
+ready=0
+for _ in $(seq 1 60); do
+    all_ok=1
+    for host in "${!WAIT_PATHS[@]}"; do
+        path="${WAIT_PATHS[$host]}"
+        status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+            -H "Host: $host" "http://127.0.0.1:$HTTP_PORT$path" 2>/dev/null || echo "000")
+        if [[ "$status" == "404" ]] || [[ "$status" == "000" ]]; then
+            all_ok=0
+            break
+        fi
+    done
+    if [[ "$all_ok" == "1" ]]; then
+        ready=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$ready" != "1" ]]; then
+    fail "not all routes reached non-404 within 30s — Sozune did not finish reloading"
+    exit 1
+fi
 
 # -- Run suites --
 for suite in "$E2E_DIR"/[0-9][0-9]-*.sh; do
@@ -270,6 +316,15 @@ echo ""
 echo "=============================="
 echo -e "  ${GREEN}Passed: $PASSED${NC}  ${RED}Failed: $FAILED${NC}  ${YELLOW}Skipped: $SKIPPED${NC}"
 echo "=============================="
+
+# Extended suites with heavier prerequisites (separate orchestrators).
+# Not run by default — list them so a contributor knows they exist.
+echo ""
+echo "Extended suites (run separately, require extra setup):"
+echo "  - bash tests/e2e/swarm/run-swarm.sh           (needs: docker swarm init)"
+echo "  - bash tests/e2e/swarm-multinode/run-multinode.sh  (needs: multi-node swarm)"
+echo "  - bash tests/e2e/nomad/run-nomad.sh           (needs: nomad agent + docker driver)"
+echo "  - bash tests/e2e/k8s/run-k8s.sh               (needs: kind + kubectl)"
 
 if [[ $FAILED -gt 0 ]]; then
     exit 1

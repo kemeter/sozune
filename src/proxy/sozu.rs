@@ -215,7 +215,7 @@ pub fn start_sozu_proxy(
     let http_port = config.http.listen_address;
     let https_port = config.https.listen_address;
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
-    let reload_throttle = Duration::from_millis(config.reload_throttle_ms);
+    let reload_debounce = Duration::from_millis(config.reload_debounce_ms);
 
     let reload_handle = thread::spawn(move || {
         handle.block_on(async {
@@ -223,143 +223,128 @@ pub fn start_sozu_proxy(
             let mut cert_rx_open = true;
             let mut previous_snapshot: RoutingSnapshot = BTreeMap::new();
 
-            // Apply a reload, then enter a throttle window: discard duplicate
-            // signals, but remember if at least one arrived so we can fold it
-            // into a single follow-up reload at the end. Mirrors Traefik's
-            // `providersThrottleDuration` (default 2 s; we default to 500 ms).
-            // Returns true if shutdown was observed during the window.
-            macro_rules! apply_with_throttle {
-                () => {{
-                    previous_snapshot = handle_reload(
-                        &storage_reload,
-                        &mut command_channel,
-                        &mut command_channel_https,
-                        &mut tcp_channels,
-                        http_port,
-                        https_port,
-                        cluster_setup_delay_ms,
-                        acme_challenge_port,
-                        &previous_snapshot,
-                        &middleware_state,
-                        middleware_port,
-                    );
-
-                    if !reload_throttle.is_zero() {
-                        let mut pending = false;
-                        let mut coalesced: usize = 0;
-                        let sleep = tokio::time::sleep(reload_throttle);
-                        tokio::pin!(sleep);
-                        let mut shutdown_seen = false;
-                        loop {
-                            tokio::select! {
-                                _ = &mut sleep => break,
-                                _ = &mut shutdown_rx => {
-                                    shutdown_seen = true;
-                                    break;
-                                }
-                                signal = reload_rx.recv() => {
-                                    match signal {
-                                        Some(_) => {
-                                            pending = true;
-                                            coalesced += 1;
-                                        }
-                                        None => break,
-                                    }
-                                }
-                            }
-                        }
-                        if coalesced > 0 {
-                            debug!(
-                                "Throttled {} reload signal(s); applying single follow-up",
-                                coalesced
-                            );
-                        }
-                        if pending && !shutdown_seen {
-                            previous_snapshot = handle_reload(
-                                &storage_reload,
-                                &mut command_channel,
-                                &mut command_channel_https,
-                                &mut tcp_channels,
-                                http_port,
-                                https_port,
-                                cluster_setup_delay_ms,
-                                acme_challenge_port,
-                                &previous_snapshot,
-                                &middleware_state,
-                                middleware_port,
-                            );
-                        }
-                        shutdown_seen
-                    } else {
-                        false
+            // Debounce-then-apply loop. A burst of reload signals (e.g. from
+            // `docker compose up` starting many containers at once) is
+            // coalesced into a single `handle_reload` call once the channel
+            // has been silent for `reload_debounce`. Each new signal during
+            // the window resets the silence timer, so we only ever read the
+            // storage snapshot when it has stopped changing. Mirrors
+            // Traefik's `providersThrottleDuration` semantics.
+            //
+            // Cert commands take the same path: applying the cert immediately
+            // (so the HTTPS worker has the material) and then folding the
+            // follow-up reload into the same debounce window.
+            'outer: loop {
+                // Wait for the first event of a new burst.
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => {
+                        info!("Shutdown signal received in reload handler");
+                        break 'outer;
                     }
-                }};
-            }
-
-            loop {
-                if cert_rx_open {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => {
-                            info!("Shutdown signal received in reload handler");
-                            break;
+                    reload = reload_rx.recv() => match reload {
+                        Some(()) => {}
+                        None => {
+                            debug!("Reload channel closed");
+                            break 'outer;
                         }
-                        reload = reload_rx.recv() => {
-                            match reload {
-                                Some(_) => {
-                                    if apply_with_throttle!() {
-                                        info!("Shutdown signal received in reload handler");
-                                        break;
-                                    }
-                                }
-                                None => {
-                                    debug!("Reload channel closed");
-                                    break;
-                                }
+                    },
+                    cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
+                        Some(cmd) => {
+                            info!("Adding certificate for {}", cmd.hostname);
+                            if let Err(e) = add_certificate(
+                                &mut command_channel_https,
+                                https_port,
+                                &cmd.cert_pem,
+                                &cmd.chain,
+                                &cmd.key_pem,
+                                std::slice::from_ref(&cmd.hostname),
+                            ) {
+                                error!(
+                                    "Failed to add certificate for {}: {}",
+                                    cmd.hostname, e
+                                );
+                                continue 'outer;
                             }
                         }
-                        cert_cmd = cert_rx.recv() => {
-                            match cert_cmd {
+                        None => {
+                            debug!("Cert channel closed, falling back to reload-only mode");
+                            cert_rx_open = false;
+                            continue 'outer;
+                        }
+                    },
+                }
+
+                // Drain anything else already queued, then enter the silence
+                // wait. `try_recv` collapses an in-flight burst without an
+                // extra wakeup per signal.
+                while reload_rx.try_recv().is_ok() {}
+                let mut coalesced: usize = 1;
+                let mut deadline = tokio::time::Instant::now() + reload_debounce;
+
+                if !reload_debounce.is_zero() {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown_rx => {
+                                info!("Shutdown signal received in reload handler");
+                                break 'outer;
+                            }
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            reload = reload_rx.recv() => match reload {
+                                Some(()) => {
+                                    coalesced += 1;
+                                    while reload_rx.try_recv().is_ok() {
+                                        coalesced += 1;
+                                    }
+                                    deadline = tokio::time::Instant::now() + reload_debounce;
+                                }
+                                None => break,
+                            },
+                            cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                                 Some(cmd) => {
                                     info!("Adding certificate for {}", cmd.hostname);
-                                    if let Err(e) = add_certificate(&mut command_channel_https, https_port, &cmd.cert_pem, &cmd.chain, &cmd.key_pem, std::slice::from_ref(&cmd.hostname)) {
-                                        error!("Failed to add certificate for {}: {}", cmd.hostname, e);
-                                    } else {
-                                        // Reload to ensure HTTPS frontends are properly configured with the new cert
-                                        if apply_with_throttle!() {
-                                            info!("Shutdown signal received in reload handler");
-                                            break;
-                                        }
+                                    if let Err(e) = add_certificate(
+                                        &mut command_channel_https,
+                                        https_port,
+                                        &cmd.cert_pem,
+                                        &cmd.chain,
+                                        &cmd.key_pem,
+                                        std::slice::from_ref(&cmd.hostname),
+                                    ) {
+                                        error!(
+                                            "Failed to add certificate for {}: {}",
+                                            cmd.hostname, e
+                                        );
                                     }
+                                    deadline = tokio::time::Instant::now() + reload_debounce;
                                 }
                                 None => {
                                     debug!("Cert channel closed, falling back to reload-only mode");
                                     cert_rx_open = false;
                                 }
-                            }
-                        }
-                    }
-                } else {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => {
-                            info!("Shutdown signal received in reload handler");
-                            break;
-                        }
-                        reload = reload_rx.recv() => {
-                            match reload {
-                                Some(_) => {
-                                    if apply_with_throttle!() {
-                                        info!("Shutdown signal received in reload handler");
-                                        break;
-                                    }
-                                }
-                                None => {
-                                    debug!("Reload channel closed");
-                                    break;
-                                }
-                            }
+                            },
                         }
                     }
                 }
+
+                if coalesced > 1 {
+                    debug!("Coalesced {} reload signals into a single apply", coalesced);
+                }
+
+                previous_snapshot = handle_reload(
+                    &storage_reload,
+                    &mut command_channel,
+                    &mut command_channel_https,
+                    &mut tcp_channels,
+                    http_port,
+                    https_port,
+                    cluster_setup_delay_ms,
+                    acme_challenge_port,
+                    &previous_snapshot,
+                    &middleware_state,
+                    middleware_port,
+                );
             }
         });
     });

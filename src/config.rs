@@ -234,15 +234,16 @@ pub struct ProxyConfig {
         deserialize_with = "deserialize_cluster_setup_delay_ms_with_env"
     )]
     pub cluster_setup_delay_ms: u64,
-    /// Minimum time, in milliseconds, between two reloads. After applying a
-    /// reload, additional reload signals received within this window are
-    /// coalesced into a single follow-up pass. Mirrors Traefik's
+    /// Debounce window, in milliseconds, applied to reload signals. The reload
+    /// is only triggered after this many ms of silence on the reload channel,
+    /// each new signal resetting the timer. Coalesces bursts of container
+    /// start/stop events into a single reload. Mirrors Traefik's
     /// `providersThrottleDuration` (default there: 2 s; we default to 500 ms).
     #[serde(
-        default = "default_reload_throttle_ms",
-        deserialize_with = "deserialize_reload_throttle_ms_with_env"
+        default = "default_reload_debounce_ms",
+        deserialize_with = "deserialize_reload_debounce_ms_with_env"
     )]
-    pub reload_throttle_ms: u64,
+    pub reload_debounce_ms: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -432,7 +433,7 @@ impl Default for ProxyConfig {
             buffer_size: default_buffer_size(),
             startup_delay_ms: default_startup_delay_ms(),
             cluster_setup_delay_ms: default_cluster_setup_delay_ms(),
-            reload_throttle_ms: default_reload_throttle_ms(),
+            reload_debounce_ms: default_reload_debounce_ms(),
         }
     }
 }
@@ -453,7 +454,7 @@ fn default_cluster_setup_delay_ms() -> u64 {
     500
 }
 
-fn default_reload_throttle_ms() -> u64 {
+fn default_reload_debounce_ms() -> u64 {
     500
 }
 
@@ -762,10 +763,10 @@ deserialize_with_env!(
     default_cluster_setup_delay_ms
 );
 deserialize_with_env!(
-    deserialize_reload_throttle_ms_with_env,
-    "SOZUNE_PROXY_RELOAD_THROTTLE_MS",
+    deserialize_reload_debounce_ms_with_env,
+    "SOZUNE_PROXY_RELOAD_DEBOUNCE_MS",
     u64,
-    default_reload_throttle_ms
+    default_reload_debounce_ms
 );
 
 deserialize_bool_with_env!(
@@ -843,7 +844,7 @@ mod tests {
         assert_eq!(default_buffer_size(), 16384);
         assert_eq!(default_startup_delay_ms(), 1000);
         assert_eq!(default_cluster_setup_delay_ms(), 500);
-        assert_eq!(default_reload_throttle_ms(), 500);
+        assert_eq!(default_reload_debounce_ms(), 500);
     }
 
     #[test]
@@ -883,7 +884,7 @@ max_buffers: 1000
 buffer_size: 32768
 startup_delay_ms: 2000
 cluster_setup_delay_ms: 1000
-reload_throttle_ms: 750
+reload_debounce_ms: 750
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.http.listen_address, 9080);
@@ -892,7 +893,7 @@ reload_throttle_ms: 750
         assert_eq!(config.buffer_size, 32768);
         assert_eq!(config.startup_delay_ms, 2000);
         assert_eq!(config.cluster_setup_delay_ms, 1000);
-        assert_eq!(config.reload_throttle_ms, 750);
+        assert_eq!(config.reload_debounce_ms, 750);
     }
 
     #[test]
@@ -999,7 +1000,7 @@ https:
         assert_eq!(config.buffer_size, 16384);
         assert_eq!(config.startup_delay_ms, 1000);
         assert_eq!(config.cluster_setup_delay_ms, 500);
-        assert_eq!(config.reload_throttle_ms, 500);
+        assert_eq!(config.reload_debounce_ms, 500);
     }
 
     #[test]

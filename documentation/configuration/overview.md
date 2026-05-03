@@ -139,7 +139,7 @@ Every field above can be overridden through an environment variable. The env var
 | `proxy.buffer_size` | `SOZUNE_PROXY_BUFFER_SIZE` |
 | `proxy.startup_delay_ms` | `SOZUNE_PROXY_STARTUP_DELAY_MS` |
 | `proxy.cluster_setup_delay_ms` | `SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS` |
-| `proxy.reload_throttle_ms` | `SOZUNE_PROXY_RELOAD_THROTTLE_MS` |
+| `proxy.reload_debounce_ms` | `SOZUNE_PROXY_RELOAD_DEBOUNCE_MS` |
 | `api.enabled` | `SOZUNE_API_ENABLED` |
 | `api.listen_address` | `SOZUNE_API_LISTEN_ADDRESS` |
 | `dashboard.enabled` | `SOZUNE_DASHBOARD_ENABLED` |
