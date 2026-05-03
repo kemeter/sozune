@@ -46,3 +46,7 @@ labels:
 - **Lower than 30s** for user-facing APIs where a slow backend should fail fast.
 - **`0`** for SSE, long-polling, file uploads/downloads of unknown size, or any use case where 30s is too aggressive.
 - **Around 30s** is fine as a default for typical request/response APIs.
+
+## Long-polling
+
+If your client passes a `timeout` parameter expecting the server to hold the request — Matrix `/_matrix/client/v3/sync?timeout=30000`, CometD, custom JSON long-poll — the default 30 s cut lands right when the response is about to come back. Raise `backendTimeout` past the longest poll, or set it to `0`. See [Long-polling](/documentation/advanced/long-polling) for the full pattern.
