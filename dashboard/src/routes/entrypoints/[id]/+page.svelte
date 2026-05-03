@@ -183,6 +183,37 @@
     {/if}
   </section>
 
+  {#if (entrypoint.diagnostics ?? []).length > 0}
+    <section class="card">
+      <h2>
+        Diagnostics
+        <span class="diag-count">{(entrypoint.diagnostics ?? []).length}</span>
+      </h2>
+      <ul class="diag-list">
+        {#each entrypoint.diagnostics ?? [] as diag}
+          <li class="diag diag-{diag.severity}">
+            <div class="diag-head">
+              <span class="diag-glyph">
+                {#if diag.severity === 'error'}✗{:else if diag.severity === 'warn'}⚠{:else}ℹ{/if}
+              </span>
+              <span class="diag-code mono">{diag.code}</span>
+              <span class="diag-message">{diag.message}</span>
+            </div>
+            {#if diag.label || diag.value}
+              <div class="diag-meta mono">
+                {#if diag.label}<span>{diag.label}</span>{/if}
+                {#if diag.value}<span class="diag-value">= {diag.value}</span>{/if}
+              </div>
+            {/if}
+            {#if diag.hint}
+              <div class="diag-hint">→ {diag.hint}</div>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+
   {#if entrypoint.config.headers && Object.keys(entrypoint.config.headers).length > 0}
     <section class="card">
       <h2>Custom headers</h2>
@@ -466,5 +497,89 @@
     .feature-grid {
       grid-template-columns: 1fr;
     }
+  }
+
+  .diag-count {
+    display: inline-block;
+    background: var(--bg-3);
+    color: var(--fg-2);
+    font-size: 0.7rem;
+    font-weight: 500;
+    padding: 1px 7px;
+    border-radius: 999px;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+  .diag-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .diag {
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-2);
+  }
+  .diag-error {
+    border-left-color: var(--danger);
+  }
+  .diag-warn {
+    border-left-color: var(--warning);
+  }
+  .diag-info {
+    border-left-color: var(--accent);
+  }
+  .diag-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.825rem;
+  }
+  .diag-glyph {
+    font-size: 0.95rem;
+    line-height: 1;
+  }
+  .diag-error .diag-glyph {
+    color: var(--danger);
+  }
+  .diag-warn .diag-glyph {
+    color: var(--warning);
+  }
+  .diag-info .diag-glyph {
+    color: var(--accent);
+  }
+  .diag-code {
+    background: var(--bg-3);
+    color: var(--fg-1);
+    padding: 1px 7px;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-weight: 600;
+  }
+  .diag-message {
+    color: var(--fg-0);
+    flex: 1;
+  }
+  .diag-meta {
+    color: var(--fg-3);
+    font-size: 0.72rem;
+    margin-top: 0.35rem;
+    margin-left: 1.45rem;
+    display: flex;
+    gap: 0.4rem;
+  }
+  .diag-value {
+    color: var(--fg-2);
+  }
+  .diag-hint {
+    color: var(--fg-2);
+    font-size: 0.78rem;
+    margin-top: 0.35rem;
+    margin-left: 1.45rem;
   }
 </style>

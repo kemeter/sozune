@@ -126,6 +126,9 @@ export interface Entrypoint {
 
 export interface DiagnosticsResponse {
   total: number;
+  /** Diagnostics not attached to any single candidate (e.g. ACME-without-TLS).
+   *  Optional: older API responses may omit this field. */
+  global?: Diagnostic[];
   items: { candidate_id: string; diagnostics: Diagnostic[] }[];
 }
 
