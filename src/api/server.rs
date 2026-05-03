@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -23,12 +23,22 @@ pub struct AppState {
     pub reload_tx: mpsc::Sender<()>,
     pub users: Vec<ApiUser>,
     pub unhealthy_backends: Arc<RwLock<HashSet<String>>>,
+    pub diagnostics: crate::diagnostics::DiagnosticsStore,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
 /// `unhealthy_backends` list (subset of `backends` that the health checker
-/// has marked down). Empty when every backend is reachable.
-fn entrypoint_payload(entrypoint: &Entrypoint, unhealthy: &HashSet<String>) -> serde_json::Value {
+/// has marked down) and the `diagnostics` produced for this entrypoint by the
+/// label parser (empty when none).
+///
+/// Diagnostics are looked up by `entrypoint.id` first (the cluster_id used at
+/// runtime), then by `entrypoint.source` which is set to the candidate id by
+/// most providers. The first non-empty match wins.
+fn entrypoint_payload(
+    entrypoint: &Entrypoint,
+    unhealthy: &HashSet<String>,
+    diagnostics: &HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>>,
+) -> serde_json::Value {
     let unhealthy_for_ep: Vec<String> = entrypoint
         .backends
         .iter()
@@ -36,12 +46,24 @@ fn entrypoint_payload(entrypoint: &Entrypoint, unhealthy: &HashSet<String>) -> s
         .filter(|key| unhealthy.contains(key))
         .collect();
 
+    let diags_for_ep: Vec<crate::labels::diagnostic::Diagnostic> = diagnostics
+        .get(&entrypoint.id)
+        .or_else(|| {
+            entrypoint
+                .source
+                .as_ref()
+                .and_then(|s| diagnostics.get(s.as_str()))
+        })
+        .cloned()
+        .unwrap_or_default();
+
     let mut value = serde_json::json!(entrypoint);
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "unhealthy_backends".to_string(),
             serde_json::json!(unhealthy_for_ep),
         );
+        obj.insert("diagnostics".to_string(), serde_json::json!(diags_for_ep));
     }
     value
 }
@@ -137,6 +159,7 @@ pub async fn serve(
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
     unhealthy_backends: Arc<RwLock<HashSet<String>>>,
+    diagnostics: crate::diagnostics::DiagnosticsStore,
 ) -> anyhow::Result<()> {
     if config.users.is_empty() {
         anyhow::bail!(
@@ -149,6 +172,7 @@ pub async fn serve(
         reload_tx,
         users: config.users.clone(),
         unhealthy_backends,
+        diagnostics,
     };
 
     let protected = Router::new()
@@ -162,6 +186,7 @@ pub async fn serve(
                 .put(update_entrypoint)
                 .delete(delete_entrypoint),
         )
+        .route("/diagnostics", get(list_diagnostics))
         .route_layer(axum_middleware::from_fn(require_admin));
 
     let me_route = Router::new().route("/me", get(me));
@@ -274,11 +299,49 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
             HashSet::new()
         }
     };
+    let diagnostics = read_diagnostics(&state);
     let list: Vec<serde_json::Value> = storage
         .values()
-        .map(|ep| entrypoint_payload(ep, &unhealthy))
+        .map(|ep| entrypoint_payload(ep, &unhealthy, &diagnostics))
         .collect();
     (StatusCode::OK, Json(serde_json::json!(list)))
+}
+
+fn read_diagnostics(
+    state: &AppState,
+) -> HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>> {
+    match state.diagnostics.read() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            error!(
+                "internal state corrupted (diagnostics store), restart required: {}",
+                e
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// `GET /diagnostics` — flat snapshot of all diagnostics by candidate id.
+async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = crate::diagnostics::snapshot(&state.diagnostics);
+    let total: usize = snapshot.iter().map(|(_, v)| v.len()).sum();
+    let by_candidate: Vec<serde_json::Value> = snapshot
+        .into_iter()
+        .map(|(id, diags)| {
+            serde_json::json!({
+                "candidate_id": id,
+                "diagnostics": diags,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "total": total,
+            "items": by_candidate,
+        })),
+    )
 }
 
 async fn get_entrypoint(
@@ -309,10 +372,12 @@ async fn get_entrypoint(
         }
     };
 
+    let diagnostics = read_diagnostics(&state);
+
     match storage.get(&id) {
         Some(entrypoint) => (
             StatusCode::OK,
-            Json(entrypoint_payload(entrypoint, &unhealthy)),
+            Json(entrypoint_payload(entrypoint, &unhealthy, &diagnostics)),
         ),
         None => (
             StatusCode::NOT_FOUND,
@@ -524,6 +589,7 @@ mod tests {
             reload_tx,
             users,
             unhealthy_backends: Arc::new(RwLock::new(HashSet::new())),
+            diagnostics: crate::diagnostics::new_store(),
         }
     }
 

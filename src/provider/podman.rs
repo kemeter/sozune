@@ -1,4 +1,5 @@
 use crate::config::{DockerConfig, PodmanConfig};
+use crate::diagnostics::DiagnosticsStore;
 use crate::labels::candidate::Candidate;
 use crate::labels::source::LabelSource;
 use crate::model::Entrypoint;
@@ -30,9 +31,10 @@ impl PodmanProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<tokio::sync::Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         self.inner
-            .start_service(storage, reload_tx, acme_notify)
+            .start_service(storage, reload_tx, acme_notify, diagnostics)
             .await
     }
 }

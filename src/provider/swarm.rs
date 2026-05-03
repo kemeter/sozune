@@ -1,8 +1,8 @@
 use crate::config::SwarmConfig;
+use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
-use crate::labels::{self};
 use crate::model::Entrypoint;
 use crate::provider::Provider;
 use async_trait::async_trait;
@@ -157,6 +157,7 @@ impl SwarmProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         if let Err(e) = self.verify_swarm_manager().await {
             error!("Swarm provider disabled: {}", e);
@@ -167,7 +168,7 @@ impl SwarmProvider {
         // before kicking off the loops, so storage is populated by the time
         // start_services() returns.
         if let Err(e) = self
-            .sync_once(&storage, &reload_tx, &acme_notify, true)
+            .sync_once(&storage, &reload_tx, &acme_notify, &diagnostics, true)
             .await
         {
             warn!("Swarm provider initial sync failed: {}", e);
@@ -178,9 +179,10 @@ impl SwarmProvider {
             let storage = Arc::clone(&storage);
             let reload_tx = reload_tx.clone();
             let acme_notify = Arc::clone(&acme_notify);
+            let diagnostics = Arc::clone(&diagnostics);
             tokio::spawn(async move {
                 if let Err(e) = provider
-                    .start_polling(storage, reload_tx, acme_notify)
+                    .start_polling(storage, reload_tx, acme_notify, diagnostics)
                     .await
                 {
                     error!("Swarm polling loop failed: {}", e);
@@ -193,9 +195,10 @@ impl SwarmProvider {
             let storage = Arc::clone(&storage);
             let reload_tx = reload_tx.clone();
             let acme_notify = Arc::clone(&acme_notify);
+            let diagnostics = Arc::clone(&diagnostics);
             tokio::spawn(async move {
                 if let Err(e) = provider
-                    .start_event_listener(storage, reload_tx, acme_notify)
+                    .start_event_listener(storage, reload_tx, acme_notify, diagnostics)
                     .await
                 {
                     error!("Swarm event listener failed: {}", e);
@@ -215,9 +218,10 @@ impl SwarmProvider {
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
+        diagnostics: &DiagnosticsStore,
         log_when_idle: bool,
     ) -> anyhow::Result<bool> {
-        let new_entrypoints = self.provide().await?;
+        let new_entrypoints = self.provide_into(diagnostics).await?;
 
         let needs_update = {
             let storage_read = match storage.read() {
@@ -293,6 +297,7 @@ impl SwarmProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         info!("Starting Swarm event listener");
 
@@ -312,7 +317,7 @@ impl SwarmProvider {
                         if let Some(action) = &event.action {
                             debug!("Swarm event: {} (actor={:?})", action, event.actor);
                             if let Err(e) = self
-                                .sync_once(&storage, &reload_tx, &acme_notify, false)
+                                .sync_once(&storage, &reload_tx, &acme_notify, &diagnostics, false)
                                 .await
                             {
                                 warn!("Swarm sync after event failed: {}", e);
@@ -339,6 +344,7 @@ impl SwarmProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         info!(
             "Starting Swarm provider polling on {} every {}s",
@@ -350,7 +356,7 @@ impl SwarmProvider {
         loop {
             interval.tick().await;
 
-            let new_entrypoints = match self.provide().await {
+            let new_entrypoints = match self.provide_into(&diagnostics).await {
                 Ok(eps) => eps,
                 Err(e) => {
                     warn!("Swarm provider poll failed: {}", e);
@@ -425,11 +431,28 @@ impl SwarmProvider {
 #[async_trait]
 impl Provider for SwarmProvider {
     async fn provide(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
+        // Trait callers don't share the runtime store; use a throwaway so
+        // diagnostics are at least logged.
+        let throwaway = diagnostics::new_store();
+        self.provide_into(&throwaway).await
+    }
+
+    fn name(&self) -> &'static str {
+        SOURCE
+    }
+}
+
+impl SwarmProvider {
+    /// Same as `provide()` but writes diagnostics into the supplied store.
+    async fn provide_into(
+        &self,
+        diagnostics: &DiagnosticsStore,
+    ) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
         let candidates = self.build_candidates().await.map_err(anyhow::Error::new)?;
         let mut entrypoints: BTreeMap<String, Entrypoint> = BTreeMap::new();
 
         for candidate in candidates {
-            let result = labels::parse(&candidate);
+            let result = diagnostics::parse_and_store(diagnostics, &candidate);
             log_diagnostics(&candidate, &result.diagnostics);
 
             for (key, entrypoint) in result.entrypoints {
@@ -447,10 +470,6 @@ impl Provider for SwarmProvider {
         }
 
         Ok(entrypoints)
-    }
-
-    fn name(&self) -> &'static str {
-        SOURCE
     }
 }
 

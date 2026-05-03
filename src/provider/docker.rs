@@ -1,4 +1,5 @@
 use crate::config::DockerConfig;
+use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
@@ -28,8 +29,11 @@ pub struct DockerProvider {
 #[async_trait]
 impl Provider for DockerProvider {
     async fn provide(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
+        // Throwaway store: trait callers (CLI, validate) don't share the
+        // runtime store; diagnostics get logged either way.
+        let throwaway = diagnostics::new_store();
         let hashmap = self
-            .get_entrypoints_from_containers()
+            .get_entrypoints_from_containers(&throwaway)
             .await
             .map_err(anyhow::Error::new)?;
         Ok(hashmap.into_iter().collect())
@@ -115,12 +119,13 @@ impl DockerProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<tokio::sync::Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         info!("Starting Docker service");
 
         // Initial scan of existing containers
         info!("Performing initial scan of running containers");
-        match self.get_entrypoints_from_containers().await {
+        match self.get_entrypoints_from_containers(&diagnostics).await {
             Ok(initial_entrypoints) => {
                 if !initial_entrypoints.is_empty() {
                     let storage_changed = {
@@ -180,7 +185,7 @@ impl DockerProvider {
         }
 
         // Start event listener
-        self.start_event_listener(storage, reload_tx, acme_notify)
+        self.start_event_listener(storage, reload_tx, acme_notify, diagnostics)
             .await
     }
 
@@ -190,6 +195,7 @@ impl DockerProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<tokio::sync::Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         info!("Starting Docker event listener");
 
@@ -232,8 +238,9 @@ impl DockerProvider {
                                     ips.insert(container_id.to_string(), ip);
                                 }
 
-                                if let Ok(entrypoints) =
-                                    self.get_container_entrypoints(container_id).await
+                                if let Ok(entrypoints) = self
+                                    .get_container_entrypoints(container_id, &diagnostics)
+                                    .await
                                     && !entrypoints.is_empty()
                                 {
                                     let mut storage_write = match storage.write() {
@@ -265,6 +272,8 @@ impl DockerProvider {
                                 }
                             }
                             "stop" | "die" | "destroy" => {
+                                // Drop any cached diagnostics for this container — it's gone.
+                                diagnostics::remove(&diagnostics, container_id);
                                 // Use tracked IP (stopped containers lose their network IP)
                                 let container_ip = self.container_ips.lock().ok()
                                             .and_then(|mut ips| ips.remove(container_id.as_str()))
@@ -307,8 +316,9 @@ impl DockerProvider {
                             }
                             "update" => {
                                 // For updates, remove old and add new
-                                if let Ok(entrypoints) =
-                                    self.get_container_entrypoints(container_id).await
+                                if let Ok(entrypoints) = self
+                                    .get_container_entrypoints(container_id, &diagnostics)
+                                    .await
                                 {
                                     let container_ip = self
                                         .get_container_ip(container_id)
@@ -387,19 +397,21 @@ impl DockerProvider {
     async fn get_container_entrypoints(
         &self,
         container_id: &str,
+        diagnostics: &DiagnosticsStore,
     ) -> Result<HashMap<String, Entrypoint>, bollard::errors::Error> {
         let candidate = match self.inspect_to_candidate(container_id).await? {
             Some(c) => c,
             None => return Ok(HashMap::new()),
         };
 
-        let result = labels::parse(&candidate);
+        let result = diagnostics::parse_and_store(diagnostics, &candidate);
         log_diagnostics(&candidate, &result.diagnostics);
         Ok(result.entrypoints)
     }
 
     pub async fn get_entrypoints_from_containers(
         &self,
+        diagnostics: &DiagnosticsStore,
     ) -> Result<HashMap<String, Entrypoint>, bollard::errors::Error> {
         let mut entrypoints: HashMap<String, Entrypoint> = HashMap::new();
 
@@ -421,7 +433,7 @@ impl DockerProvider {
             let networks = self.extract_networks(&container_id).await;
             let candidate = self.build_candidate(container_id.clone(), container_labels, networks);
 
-            let result = labels::parse(&candidate);
+            let result = diagnostics::parse_and_store(diagnostics, &candidate);
             log_diagnostics(&candidate, &result.diagnostics);
 
             if result.entrypoints.is_empty() {

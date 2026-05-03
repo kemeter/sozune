@@ -1,8 +1,8 @@
 use crate::config::NomadConfig;
+use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
-use crate::labels::{self};
 use crate::model::Entrypoint;
 use crate::provider::Provider;
 use anyhow::Context;
@@ -25,10 +25,27 @@ pub struct NomadProvider {
 #[async_trait]
 impl Provider for NomadProvider {
     async fn provide(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
+        // Trait callers don't share the runtime store; use a throwaway so
+        // diagnostics are at least logged.
+        let throwaway = diagnostics::new_store();
+        self.provide_into(&throwaway).await
+    }
+
+    fn name(&self) -> &'static str {
+        PROVIDER_NAME
+    }
+}
+
+impl NomadProvider {
+    /// Same as `provide()` but writes diagnostics into the supplied store.
+    async fn provide_into(
+        &self,
+        diagnostics: &DiagnosticsStore,
+    ) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
         let candidates = self.collect().await?;
         let mut entrypoints: BTreeMap<String, Entrypoint> = BTreeMap::new();
         for candidate in candidates {
-            let result = labels::parse(&candidate);
+            let result = diagnostics::parse_and_store(diagnostics, &candidate);
             log_diagnostics(&candidate, &result.diagnostics);
             for (key, mut entrypoint) in result.entrypoints {
                 let Some(backend) = entrypoint.backends.first().cloned() else {
@@ -45,10 +62,6 @@ impl Provider for NomadProvider {
             }
         }
         Ok(entrypoints)
-    }
-
-    fn name(&self) -> &'static str {
-        PROVIDER_NAME
     }
 }
 
@@ -170,8 +183,9 @@ impl NomadProvider {
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
+        diagnostics: &DiagnosticsStore,
     ) {
-        let new_entrypoints = match self.provide().await {
+        let new_entrypoints = match self.provide_into(diagnostics).await {
             Ok(map) => map,
             Err(e) => {
                 warn!("Nomad poll failed: {e}");
@@ -241,6 +255,7 @@ impl NomadProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         info!(
             "Starting Nomad provider against {} (namespace={}, expose_by_default={}, blocking-wait={}s)",
@@ -255,7 +270,8 @@ impl NomadProvider {
         );
 
         // Initial pull (`index = None` → immediate response).
-        self.poll_once(&storage, &reload_tx, &acme_notify).await;
+        self.poll_once(&storage, &reload_tx, &acme_notify, &diagnostics)
+            .await;
         let mut last_index = self
             .list_services(None)
             .await
@@ -269,7 +285,8 @@ impl NomadProvider {
                 Ok((_, new_index)) => {
                     if new_index != last_index {
                         last_index = new_index;
-                        self.poll_once(&storage, &reload_tx, &acme_notify).await;
+                        self.poll_once(&storage, &reload_tx, &acme_notify, &diagnostics)
+                            .await;
                     }
                     // Same index = wait timed out with no change. Loop right
                     // back into another blocking call — no sleep needed.

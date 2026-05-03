@@ -17,6 +17,7 @@ mod cli;
 mod config;
 mod config_load;
 mod dashboard;
+mod diagnostics;
 mod labels;
 mod middleware;
 mod model;
@@ -93,6 +94,9 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let storage = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
     let storage_proxy = Arc::clone(&storage);
 
+    // Diagnostics store, populated by providers at parse time and read by the API.
+    let diagnostics_store = diagnostics::new_store();
+
     // Create bounded channels to prevent memory exhaustion
     let (reload_tx, reload_rx) = mpsc::channel(64);
     let (cert_tx, cert_rx) = mpsc::channel(64);
@@ -136,6 +140,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         let storage_providers = Arc::clone(&storage);
         let reload_tx_providers = reload_tx.clone();
         let acme_notify_providers = Arc::clone(&acme_notify);
+        let diagnostics_providers = Arc::clone(&diagnostics_store);
         let config = config.clone();
 
         async move {
@@ -144,6 +149,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 storage_providers,
                 reload_tx_providers,
                 acme_notify_providers,
+                diagnostics_providers,
             )
             .await
         }
@@ -158,10 +164,18 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let reload_tx_api = reload_tx.clone();
     let api_config = config.api.clone();
     let unhealthy_api = Arc::clone(&unhealthy_backends);
+    let diagnostics_api = Arc::clone(&diagnostics_store);
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
-            api::server::serve(api_config, storage_server, reload_tx_api, unhealthy_api).await?;
+            api::server::serve(
+                api_config,
+                storage_server,
+                reload_tx_api,
+                unhealthy_api,
+                diagnostics_api,
+            )
+            .await?;
         }
 
         Ok::<(), anyhow::Error>(())

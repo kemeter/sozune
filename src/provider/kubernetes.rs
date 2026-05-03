@@ -1,8 +1,8 @@
 use crate::config::KubernetesConfig;
+use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
-use crate::labels::{self};
 use crate::model::{Backend, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol};
 use crate::provider::Provider;
 use anyhow::Context;
@@ -44,10 +44,13 @@ pub struct KubernetesProvider {
 #[async_trait]
 impl Provider for KubernetesProvider {
     async fn provide(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
+        // Trait callers don't share the runtime store; use a throwaway so
+        // diagnostics are at least logged.
+        let throwaway = diagnostics::new_store();
         let candidates = self.collect().await?;
         let mut entrypoints: BTreeMap<String, Entrypoint> = BTreeMap::new();
         for candidate in candidates {
-            let result = labels::parse(&candidate);
+            let result = diagnostics::parse_and_store(&throwaway, &candidate);
             log_diagnostics(&candidate, &result.diagnostics);
             for (key, entrypoint) in result.entrypoints {
                 entrypoints.insert(key, entrypoint);
@@ -206,6 +209,7 @@ impl KubernetesProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         info!(
             "Starting Kubernetes provider (namespace={}, ingress_class={}, expose_by_default={})",
@@ -244,9 +248,16 @@ impl KubernetesProvider {
         let svc_reload = reload_tx.clone();
         let svc_acme = Arc::clone(&acme_notify);
         let svc_client = client.clone();
+        let svc_diagnostics = Arc::clone(&diagnostics);
         let svc_handle = tokio::spawn(async move {
             if let Err(e) = svc_provider
-                .watch_services(svc_client, svc_storage, svc_reload, svc_acme)
+                .watch_services(
+                    svc_client,
+                    svc_storage,
+                    svc_reload,
+                    svc_acme,
+                    svc_diagnostics,
+                )
                 .await
             {
                 error!("Kubernetes Service watcher failed: {}", e);
@@ -258,9 +269,10 @@ impl KubernetesProvider {
         let ep_reload = reload_tx.clone();
         let ep_acme = Arc::clone(&acme_notify);
         let ep_client = client.clone();
+        let ep_diagnostics = Arc::clone(&diagnostics);
         let ep_handle = tokio::spawn(async move {
             if let Err(e) = ep_provider
-                .watch_endpoint_slices(ep_client, ep_storage, ep_reload, ep_acme)
+                .watch_endpoint_slices(ep_client, ep_storage, ep_reload, ep_acme, ep_diagnostics)
                 .await
             {
                 error!("Kubernetes EndpointSlice watcher failed: {}", e);
@@ -272,9 +284,16 @@ impl KubernetesProvider {
         let ing_reload = reload_tx.clone();
         let ing_acme = Arc::clone(&acme_notify);
         let ing_client = client.clone();
+        let ing_diagnostics = Arc::clone(&diagnostics);
         let ing_handle = tokio::spawn(async move {
             if let Err(e) = ing_provider
-                .watch_ingresses(ing_client, ing_storage, ing_reload, ing_acme)
+                .watch_ingresses(
+                    ing_client,
+                    ing_storage,
+                    ing_reload,
+                    ing_acme,
+                    ing_diagnostics,
+                )
                 .await
             {
                 error!("Kubernetes Ingress watcher failed: {}", e);
@@ -292,6 +311,7 @@ impl KubernetesProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         let services: Api<Service> = self.scoped_api(&client);
         let stream = watcher::watcher(services, watcher::Config::default());
@@ -302,11 +322,12 @@ impl KubernetesProvider {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::Apply(svc)) | Ok(Event::InitApply(svc)) => {
-                    self.upsert_service(&svc, &storage, &reload_tx, &acme_notify)
+                    self.upsert_service(&svc, &storage, &reload_tx, &acme_notify, &diagnostics)
                         .await;
                 }
                 Ok(Event::Delete(svc)) => {
-                    self.remove_service(&svc, &storage, &reload_tx).await;
+                    self.remove_service(&svc, &storage, &reload_tx, &diagnostics)
+                        .await;
                 }
                 Ok(Event::Init) => {
                     debug!("Service watcher restart: reinitialising");
@@ -331,6 +352,7 @@ impl KubernetesProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         let slices: Api<EndpointSlice> = self.scoped_api(&client);
         let stream = watcher::watcher(slices, watcher::Config::default());
@@ -342,14 +364,28 @@ impl KubernetesProvider {
             match event {
                 Ok(Event::Apply(slice)) | Ok(Event::InitApply(slice)) => {
                     if let Some(svc_id) = self.apply_slice(&slice) {
-                        self.refresh_service(&client, &svc_id, &storage, &reload_tx, &acme_notify)
-                            .await;
+                        self.refresh_service(
+                            &client,
+                            &svc_id,
+                            &storage,
+                            &reload_tx,
+                            &acme_notify,
+                            &diagnostics,
+                        )
+                        .await;
                     }
                 }
                 Ok(Event::Delete(slice)) => {
                     if let Some(svc_id) = self.remove_slice(&slice) {
-                        self.refresh_service(&client, &svc_id, &storage, &reload_tx, &acme_notify)
-                            .await;
+                        self.refresh_service(
+                            &client,
+                            &svc_id,
+                            &storage,
+                            &reload_tx,
+                            &acme_notify,
+                            &diagnostics,
+                        )
+                        .await;
                     }
                 }
                 Ok(Event::Init) | Ok(Event::InitDone) => {}
@@ -462,6 +498,7 @@ impl KubernetesProvider {
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
+        diagnostics: &DiagnosticsStore,
     ) {
         let Some((namespace, name)) = svc_id.split_once('/') else {
             return;
@@ -469,7 +506,7 @@ impl KubernetesProvider {
         let api: Api<Service> = Api::namespaced(client.clone(), namespace);
         match api.get(name).await {
             Ok(svc) => {
-                self.upsert_service(&svc, storage, reload_tx, acme_notify)
+                self.upsert_service(&svc, storage, reload_tx, acme_notify, diagnostics)
                     .await;
             }
             Err(kube::Error::Api(err)) if err.code == 404 => {
@@ -493,6 +530,7 @@ impl KubernetesProvider {
             storage,
             reload_tx,
             acme_notify,
+            diagnostics,
         )
         .await;
     }
@@ -508,6 +546,7 @@ impl KubernetesProvider {
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
+        diagnostics: &DiagnosticsStore,
     ) {
         let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
         let list = match api.list(&ListParams::default()).await {
@@ -525,7 +564,7 @@ impl KubernetesProvider {
             if !ingress_references_service(&ing, svc_name) {
                 continue;
             }
-            self.apply_ingress(&ing, storage, reload_tx, acme_notify)
+            self.apply_ingress(&ing, storage, reload_tx, acme_notify, diagnostics)
                 .await;
         }
     }
@@ -536,12 +575,13 @@ impl KubernetesProvider {
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
+        diagnostics: &DiagnosticsStore,
     ) {
         let Some(candidate) = self.service_to_candidate(svc) else {
             return;
         };
 
-        let result = labels::parse(&candidate);
+        let result = diagnostics::parse_and_store(diagnostics, &candidate);
         log_diagnostics(&candidate, &result.diagnostics);
 
         if result.entrypoints.is_empty() {
@@ -614,12 +654,16 @@ impl KubernetesProvider {
         svc: &Service,
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
+        diagnostics: &DiagnosticsStore,
     ) {
         let Some(candidate) = self.service_to_candidate(svc) else {
             return;
         };
 
-        let result = labels::parse(&candidate);
+        // Service is gone — drop its diagnostics. We still need to know which
+        // entrypoint keys it produced, so re-parse without writing to the store.
+        let result = crate::labels::parse(&candidate);
+        diagnostics::remove(diagnostics, &candidate.id);
         if result.entrypoints.is_empty() {
             return;
         }
@@ -662,6 +706,7 @@ impl KubernetesProvider {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
         acme_notify: Arc<Notify>,
+        diagnostics: DiagnosticsStore,
     ) -> anyhow::Result<()> {
         let ingresses: Api<Ingress> = self.scoped_api(&client);
         let stream = watcher::watcher(ingresses, watcher::Config::default());
@@ -675,11 +720,12 @@ impl KubernetesProvider {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::Apply(ing)) | Ok(Event::InitApply(ing)) => {
-                    self.apply_ingress(&ing, &storage, &reload_tx, &acme_notify)
+                    self.apply_ingress(&ing, &storage, &reload_tx, &acme_notify, &diagnostics)
                         .await;
                 }
                 Ok(Event::Delete(ing)) => {
-                    self.remove_ingress(&ing, &storage, &reload_tx).await;
+                    self.remove_ingress(&ing, &storage, &reload_tx, &diagnostics)
+                        .await;
                 }
                 Ok(Event::Init) | Ok(Event::InitDone) => {}
                 Err(e) => {
@@ -699,6 +745,7 @@ impl KubernetesProvider {
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
+        diagnostics: &DiagnosticsStore,
     ) {
         let Some(ing_id) = ingress_id(ing) else {
             return;
@@ -713,7 +760,8 @@ impl KubernetesProvider {
             .map(|c| c == self.config.ingress_class)
             .unwrap_or(false);
         if !class_match {
-            self.remove_ingress(ing, storage, reload_tx).await;
+            self.remove_ingress(ing, storage, reload_tx, diagnostics)
+                .await;
             return;
         }
 
@@ -794,6 +842,9 @@ impl KubernetesProvider {
         ing: &Ingress,
         storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: &mpsc::Sender<()>,
+        // Threaded for symmetry with apply_ingress; Ingress entries don't
+        // produce diagnostic entries (they don't go through `labels::parse`).
+        _diagnostics: &DiagnosticsStore,
     ) {
         let Some(ing_id) = ingress_id(ing) else {
             return;

@@ -33,8 +33,30 @@
     tcp: entrypoints.filter((e) => e.protocol === 'Tcp').length,
     backends: entrypoints.reduce((n, e) => n + e.backends.length, 0),
     backendsDown: entrypoints.reduce((n, e) => n + (e.unhealthy_backends?.length ?? 0), 0),
-    tls: entrypoints.filter((e) => e.config.tls).length
+    tls: entrypoints.filter((e) => e.config.tls).length,
+    warnings: entrypoints.reduce(
+      (n, e) => n + (e.diagnostics?.filter((d) => d.severity === 'warn').length ?? 0),
+      0
+    ),
+    errors: entrypoints.reduce(
+      (n, e) => n + (e.diagnostics?.filter((d) => d.severity === 'error').length ?? 0),
+      0
+    )
   });
+
+  function diagSummary(ep: Entrypoint): { warn: number; err: number } {
+    const diags = ep.diagnostics ?? [];
+    return {
+      warn: diags.filter((d) => d.severity === 'warn').length,
+      err: diags.filter((d) => d.severity === 'error').length
+    };
+  }
+
+  function diagTooltip(ep: Entrypoint): string {
+    return (ep.diagnostics ?? [])
+      .map((d) => `${d.code} ${d.message}${d.hint ? `\n  → ${d.hint}` : ''}`)
+      .join('\n\n');
+  }
 
   function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
     return (ep.unhealthy_backends ?? []).includes(backendKey(backend));
@@ -117,11 +139,20 @@
     <div class="stat-sub">{stats.total ? Math.round((stats.tls / stats.total) * 100) : 0}% of routes</div>
   </div>
   <div class="stat-card">
-    <div class="stat-label">Status</div>
-    <div class="stat-value healthy">
-      <span class="dot"></span> live
+    <div class="stat-label">Diagnostics</div>
+    <div class="stat-value">
+      {stats.warnings + stats.errors}
     </div>
-    <div class="stat-sub">polling every 5s</div>
+    <div class="stat-sub">
+      {#if stats.errors > 0}
+        <span class="stat-down">{stats.errors} error{stats.errors === 1 ? '' : 's'}</span>
+        {#if stats.warnings > 0}· {stats.warnings} warning{stats.warnings === 1 ? '' : 's'}{/if}
+      {:else if stats.warnings > 0}
+        {stats.warnings} warning{stats.warnings === 1 ? '' : 's'}
+      {:else}
+        no issues
+      {/if}
+    </div>
   </div>
 </section>
 
@@ -216,6 +247,12 @@
                 {#if ep.config.sticky_session}<span class="chip">sticky</span>{/if}
                 {#if ep.config.compress}<span class="chip">gzip</span>{/if}
                 {#if ep.config.strip_prefix}<span class="chip">strip</span>{/if}
+                {#if diagSummary(ep).err > 0}
+                  <span class="chip chip-err" title={diagTooltip(ep)}>✗ {diagSummary(ep).err}</span>
+                {/if}
+                {#if diagSummary(ep).warn > 0}
+                  <span class="chip chip-warn" title={diagTooltip(ep)}>⚠ {diagSummary(ep).warn}</span>
+                {/if}
               </div>
             </td>
             <td>
@@ -555,6 +592,16 @@
     font-size: 0.68rem;
     font-family: var(--font-mono);
     font-weight: 500;
+  }
+  .chip-warn {
+    background: rgba(240, 180, 41, 0.18);
+    color: var(--warning);
+    cursor: help;
+  }
+  .chip-err {
+    background: var(--danger-bg);
+    color: var(--danger);
+    cursor: help;
   }
 
   .source {
