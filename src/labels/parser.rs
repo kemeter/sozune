@@ -16,11 +16,11 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
         diagnostics.push(
             Diagnostic::new(
                 DiagnosticCode::E001Disabled,
-                "candidate is not enabled for sozune",
+                "this workload has no `sozune.enable=true` label, so sozune ignores it",
             )
             .with_label("sozune.enable")
             .with_hint(
-                "set `sozune.enable=true` or set `expose_by_default: true` in the provider config",
+                "add the label `sozune.enable=true` to opt this workload in, or set `expose_by_default: true` in the provider config to opt every workload in by default",
             ),
         );
         return ParseResult {
@@ -36,9 +36,9 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
         diagnostics.push(
             Diagnostic::new(
                 DiagnosticCode::E004NoServices,
-                "candidate is enabled but declares no sozune.<protocol>.<service>.* labels",
+                "this workload is enabled but does not declare any service to expose",
             )
-            .with_hint("add labels like `sozune.http.web.host=<your-domain>`"),
+            .with_hint("add at least one label of the form `sozune.http.<service-name>.host=<your-domain>` (or `sozune.tcp.<service-name>.entrypoint=<listener>` for raw TCP)"),
         );
         return ParseResult {
             entrypoints: HashMap::new(),
