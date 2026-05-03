@@ -12,6 +12,7 @@ pub mod candidate;
 pub mod catalog;
 pub mod diagnostic;
 pub mod fields;
+pub mod lint;
 pub mod network;
 pub mod parser;
 pub mod source;

@@ -51,6 +51,8 @@ pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
     let candidates = collect_candidates(&config, args.provider.as_deref()).await?;
     let mut report = build_report(candidates);
 
+    apply_collection_lints(&mut report);
+
     if let Some(id) = &args.id {
         report
             .candidates
@@ -61,10 +63,55 @@ pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
     }
 
     let min_severity = args.severity.to_severity();
+
+    if let Some(diag) = global_acme_lint(&config, &report) {
+        println!("global");
+        println!("├─ ⚠ {}", diag.message);
+        if let Some(hint) = &diag.hint {
+            println!("│      → {hint}");
+        }
+        println!();
+    }
+
     let output = render::tree::render(&report, min_severity);
     print!("{output}");
 
     Ok(exit_code(&report))
+}
+
+/// Run cross-cutting lints (collisions) and attach the resulting diagnostics
+/// to the candidates that own the offending routes.
+fn apply_collection_lints(report: &mut ValidationReport) {
+    let pairs: Vec<(&str, &crate::model::Entrypoint)> = report
+        .candidates
+        .iter()
+        .flat_map(|c| {
+            let id = c.id.as_str();
+            c.entrypoints.values().map(move |ep| (id, ep))
+        })
+        .collect();
+
+    let extra = crate::labels::lint::lint_collection(&pairs);
+
+    for (cand_id, diag) in extra {
+        if let Some(c) = report.candidates.iter_mut().find(|c| c.id == cand_id) {
+            c.diagnostics.push(diag);
+        }
+    }
+}
+
+/// Detect ACME-enabled-but-no-TLS as a global warning.
+fn global_acme_lint(
+    config: &AppConfig,
+    report: &ValidationReport,
+) -> Option<crate::labels::diagnostic::Diagnostic> {
+    let acme_on = config.acme.as_ref().is_some_and(|a| a.enabled);
+    let all_eps: Vec<&crate::model::Entrypoint> = report
+        .candidates
+        .iter()
+        .flat_map(|c| c.entrypoints.values())
+        .collect();
+    crate::labels::lint::lint_acme_without_tls(acme_on, &all_eps)
 }
 
 async fn load_config(config_path: &str) -> anyhow::Result<AppConfig> {

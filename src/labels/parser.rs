@@ -57,6 +57,7 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
             &backend_ip,
             &mut diagnostics,
         ) {
+            crate::labels::lint::lint_entrypoint(&entrypoint, &mut diagnostics);
             let key = format!("{protocol}_{service_name}");
             entrypoints.insert(key, entrypoint);
         }

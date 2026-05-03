@@ -31,6 +31,10 @@ pub enum DiagnosticCode {
     W012InvalidProtocol,
     W013UnknownLabel,
     W014InvalidMethod,
+    W015AcmeWithoutTls,
+    W016HttpsRedirectWithoutTls,
+    W017RateLimitBurstBelowAverage,
+    W018RouteCollision,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -58,6 +62,10 @@ impl DiagnosticCode {
             DiagnosticCode::W012InvalidProtocol => "W012",
             DiagnosticCode::W013UnknownLabel => "W013",
             DiagnosticCode::W014InvalidMethod => "W014",
+            DiagnosticCode::W015AcmeWithoutTls => "W015",
+            DiagnosticCode::W016HttpsRedirectWithoutTls => "W016",
+            DiagnosticCode::W017RateLimitBurstBelowAverage => "W017",
+            DiagnosticCode::W018RouteCollision => "W018",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
