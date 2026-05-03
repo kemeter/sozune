@@ -24,6 +24,7 @@ pub struct AppState {
     pub users: Vec<ApiUser>,
     pub unhealthy_backends: Arc<RwLock<HashSet<String>>>,
     pub diagnostics: crate::diagnostics::DiagnosticsStore,
+    pub acme_enabled: bool,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
@@ -160,6 +161,7 @@ pub async fn serve(
     reload_tx: mpsc::Sender<()>,
     unhealthy_backends: Arc<RwLock<HashSet<String>>>,
     diagnostics: crate::diagnostics::DiagnosticsStore,
+    acme_enabled: bool,
 ) -> anyhow::Result<()> {
     if config.users.is_empty() {
         anyhow::bail!(
@@ -173,6 +175,7 @@ pub async fn serve(
         users: config.users.clone(),
         unhealthy_backends,
         diagnostics,
+        acme_enabled,
     };
 
     let protected = Router::new()
@@ -299,12 +302,28 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
             HashSet::new()
         }
     };
-    let diagnostics = read_diagnostics(&state);
+    let mut diagnostics = read_diagnostics(&state);
+    merge_collision_lints(&storage, &mut diagnostics);
     let list: Vec<serde_json::Value> = storage
         .values()
         .map(|ep| entrypoint_payload(ep, &unhealthy, &diagnostics))
         .collect();
     (StatusCode::OK, Json(serde_json::json!(list)))
+}
+
+/// Compute W018 route-collision diagnostics on the live storage and append
+/// them to the diagnostics map under the entrypoint id so they show up next to
+/// the per-candidate diagnostics. Idempotent — duplicate codes are not
+/// deduplicated, callers should treat the map as additive.
+fn merge_collision_lints(
+    storage: &BTreeMap<String, Entrypoint>,
+    diagnostics: &mut HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>>,
+) {
+    let pairs: Vec<(&str, &Entrypoint)> =
+        storage.iter().map(|(id, ep)| (id.as_str(), ep)).collect();
+    for (ep_id, diag) in crate::labels::lint::lint_collection(&pairs) {
+        diagnostics.entry(ep_id).or_default().push(diag);
+    }
 }
 
 fn read_diagnostics(
@@ -322,11 +341,21 @@ fn read_diagnostics(
     }
 }
 
-/// `GET /diagnostics` — flat snapshot of all diagnostics by candidate id.
+/// `GET /diagnostics` — snapshot of every per-entrypoint diagnostic plus
+/// recomputed global lints (e.g. ACME-without-TLS) and runtime collision
+/// lints (W018) that are not stored at parse time.
 async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let snapshot = crate::diagnostics::snapshot(&state.diagnostics);
-    let total: usize = snapshot.iter().map(|(_, v)| v.len()).sum();
-    let by_candidate: Vec<serde_json::Value> = snapshot
+    let mut grouped: HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>> =
+        crate::diagnostics::snapshot(&state.diagnostics)
+            .into_iter()
+            .collect();
+
+    if let Ok(storage) = state.storage.read() {
+        merge_collision_lints(&storage, &mut grouped);
+    }
+
+    let mut total: usize = grouped.values().map(|v| v.len()).sum();
+    let mut by_candidate: Vec<serde_json::Value> = grouped
         .into_iter()
         .map(|(id, diags)| {
             serde_json::json!({
@@ -335,13 +364,47 @@ async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<se
             })
         })
         .collect();
+    // Stable order so the dashboard doesn't shuffle on every poll.
+    by_candidate.sort_by(|a, b| {
+        a["candidate_id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["candidate_id"].as_str().unwrap_or(""))
+    });
+
+    let global = global_lints(&state);
+    total += global.len();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "total": total,
+            "global": global,
             "items": by_candidate,
         })),
     )
+}
+
+/// Recompute lints that span the full entrypoint set (not attached to a
+/// single candidate). Today: only `W015 ACME enabled but no entrypoint
+/// declares tls=true`.
+fn global_lints(state: &AppState) -> Vec<crate::labels::diagnostic::Diagnostic> {
+    let storage = match state.storage.read() {
+        Ok(g) => g,
+        Err(e) => {
+            error!(
+                "internal state corrupted (configuration store), restart required: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    let eps: Vec<&Entrypoint> = storage.values().collect();
+    let mut out = Vec::new();
+    if let Some(d) = crate::labels::lint::lint_acme_without_tls(state.acme_enabled, &eps) {
+        out.push(d);
+    }
+    out
 }
 
 async fn get_entrypoint(
@@ -372,7 +435,8 @@ async fn get_entrypoint(
         }
     };
 
-    let diagnostics = read_diagnostics(&state);
+    let mut diagnostics = read_diagnostics(&state);
+    merge_collision_lints(&storage, &mut diagnostics);
 
     match storage.get(&id) {
         Some(entrypoint) => (
@@ -590,6 +654,7 @@ mod tests {
             users,
             unhealthy_backends: Arc::new(RwLock::new(HashSet::new())),
             diagnostics: crate::diagnostics::new_store(),
+            acme_enabled: false,
         }
     }
 
