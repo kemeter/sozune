@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+dashboard/node_modules/
+dashboard/build/
+dashboard/.svelte-kit/
+node_modules/
+
+# VCS / tooling
+.git/
+.gitignore
+.github/
+
+# Project-local junk that doesn't belong in the image
+bin/
+certs/
+issues/
+.claude/
+.prd/
+config_dev.yaml
+entrypoints.yaml
+middleware.md
+ROADMAP.md
+
+# E2E test infrastructure (not needed for the binary)
+tests/e2e/
+
+# Logs / editor / OS
+*.log
+*.swp
+.DS_Store
