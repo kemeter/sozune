@@ -42,30 +42,63 @@ New diagnostic codes surfaced by `sozune validate`:
 
 ## [0.12.0] - 2026-05-03
 
-Cluster ops & reliability. Hardening of the Kubernetes provider and the e2e suites.
+Multi-orchestrator release. New providers (Podman, Swarm, Nomad, Kubernetes), TCP entrypoints, brotli/zstd compression, dashboard health surface.
 
-### Kubernetes
+### Providers
 
-- Run sozune as in-cluster Pod with `hostNetwork` for the k8s e2e suite (4/4 passing).
-- Kubernetes Ingress e2e suite scaffold (network plumbing pending).
-- Route Kubernetes Ingress resources to pod IP backends.
-- Track per-slice attribution to drop stale endpoints on shrink.
+- **Podman provider**: Docker-API-compatible socket (delegates to the Docker provider internals).
+- **Swarm provider**: config block, full implementation with VIP discovery and event stream, wired into the provider factory, manager verification at startup, e2e suite, documentation.
+- **Nomad provider**: blocking-query discovery, services API polling, tag→label mapping, port synthesis.
+- **Kubernetes provider**: scaffold, cluster connect on startup, Service discovery via annotations and watch stream, EndpointSlice ready-pod IP resolution, Ingress routing with class filtering, per-slice attribution to drop stale endpoints on shrink, run as in-cluster Pod with `hostNetwork` for e2e (4/4 passing), Ingress e2e suite scaffold.
+- Provider factory spawns the Docker provider so other providers can start in parallel.
+
+### Routing & backends
+
+- TCP entrypoints: listener config block, label parsing, Sōzu TCP worker wiring, e2e suite, documentation.
+- Per-backend port and weight on `Backend` (replaces `config.port` and `backend_weights`); dashboard adapted accordingly.
+- Skip unchanged entrypoints when applying Sōzu routing config (avoid noisy reloads).
+- Diff full `Entrypoint` on reload to flush stale middleware state.
+
+### Compression
+
+- Brotli response compression (opt-in via `compress` label).
+- Zstd response compression.
+
+### CLI
+
+- `--config` flag overrides `CONFIG_PATH` env var.
+
+### Dashboard
+
+- Surface unhealthy backends.
+- Hero subtitle and taglines updated to mention Swarm, Kubernetes and Nomad.
+- Dashboard entrypoints screenshot in README and docs index.
+- Dashboard deps upgraded: vite 8, plugin-svelte 7, typescript 6 (CVE-2026-39365).
 
 ### Reliability
 
 - Reload signals are debounced to coalesce container start bursts.
+- HTTP provider avoids write-lock contention on unchanged polls.
+- Filter config-file watcher events to the watched file only.
+- Signal reload after the initial config-file load.
 - E2E suites wait for all routes to be live simultaneously before running.
 - Tightened e2e suites: real backend timeout, SSE octal fix.
 - New SSE e2e suite + documented SSE pattern through Sozune.
 - New API tests for payload validation, backend serialization, source guards.
 
+### Defaults
+
+- Restored production defaults: HTTP `:80`, HTTPS `:443`, dashboard `:3038`.
+
 ### Vendor
 
 - Sōzu pinned to `282bb93` (TLS chain dedup, 302/308 redirects, 30 commits upstream).
+- Earlier in the cycle: bumped Sōzu to `41b69cc` and upgraded other Rust dependencies; clippy fixes across the codebase.
 
 ### Repo
 
 - `.dockerignore` skips `target/`, `node_modules`, dev junk (Docker build context: 8.8 GB → 439 MB).
+- Documentation regrouped under `/providers` with a pinned sidebar order.
 
 ## [0.11.0] - 2026-04-29
 
@@ -118,15 +151,8 @@ New `EntrypointConfig` fields, parsed from Docker labels and passed through to S
 
 ### Routing & providers
 
-- **Kubernetes provider**: discovery via Service annotations and watch stream, EndpointSlice ready-pod IP resolution, Ingress routing with class filtering.
-- **Nomad provider**: blocking-query discovery, services API polling, tag→label mapping, port synthesis.
-- **Swarm provider**: VIP discovery, event stream, manager verification at startup, e2e suite.
-- **Podman provider**: Docker-API-compatible socket.
-- **HTTP provider**: poll entrypoints from a remote URL (JSON only).
 - Regex-based path matching (`PathRuleKind` aligned with Sōzu proto).
-- Per-backend port and weight on `Backend` (replaces `config.port` and `backend_weights`).
-- TCP entrypoints: listener config block, label parsing, Sōzu TCP worker wiring, e2e suite.
-- Provider factory spawns Docker so other providers can start in parallel.
+- New HTTP provider: poll entrypoints from a remote URL (JSON only).
 
 ### Middleware
 
