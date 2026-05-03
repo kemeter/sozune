@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
-use crate::labels::fields::{auth, core, headers, host, path, ratelimit, redirect};
+use crate::labels::fields::{auth, core, headers, host, methods, path, ratelimit, redirect};
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
 
@@ -168,6 +168,7 @@ fn build_entrypoint(
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
+    let methods = methods::parse_methods(labels, &prefix, diagnostics);
 
     let protocol_enum = match protocol {
         "http" => Protocol::Http,
@@ -200,6 +201,7 @@ fn build_entrypoint(
             sticky_session,
             compress,
             entrypoint: None,
+            methods,
         },
         source: None,
     })
@@ -258,6 +260,7 @@ fn build_tcp_entrypoint(
             sticky_session: false,
             compress: false,
             entrypoint: Some(entrypoint_ref),
+            methods: Vec::new(),
         },
         source: None,
     })

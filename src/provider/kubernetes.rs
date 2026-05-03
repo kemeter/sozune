@@ -997,6 +997,7 @@ impl KubernetesProvider {
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,
+                methods: Vec::new(),
             },
             source: Some(self.name.to_string()),
         };

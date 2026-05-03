@@ -44,6 +44,18 @@ struct TcpListenerChannel {
 /// One worker = one listener.
 type TcpChannels = HashMap<String, TcpListenerChannel>;
 
+/// Sōzu's `RequestHttpFrontend.method` accepts a single method per frontend.
+/// To support multi-method routing (`methods: ["GET","POST"]`) we register one
+/// frontend per method. An empty list means "any method" → a single frontend
+/// with `method: None`.
+fn methods_for_frontend(methods: &[String]) -> Vec<Option<String>> {
+    if methods.is_empty() {
+        vec![None]
+    } else {
+        methods.iter().map(|m| Some(m.clone())).collect()
+    }
+}
+
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
     storage
         .iter()
@@ -761,42 +773,14 @@ fn configure_http_entrypoint(
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();
 
-        let http_front = RequestHttpFrontend {
-            cluster_id: Some(cluster_id.to_string()),
-            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
-            hostname: hostname.clone(),
-            path: path_rule.clone(),
-            method: None,
-            position: RulePosition::Pre as i32,
-            tags: BTreeMap::new(),
-            headers: frontend_headers.clone(),
-            required_auth: frontend_required_auth,
-            rewrite_path: frontend_rewrite_path.clone(),
-            redirect: frontend_redirect,
-            redirect_scheme: frontend_redirect_scheme,
-            redirect_template: frontend_redirect_template.clone(),
-            ..Default::default()
-        };
-
-        if let Err(e) = send_to_worker(
-            command_channel,
-            format!("add-frontend-http-{}-{}", cluster_id, hostname),
-            RequestType::AddHttpFrontend(http_front),
-        ) {
-            debug!(
-                "Failed to add HTTP frontend for {} (may already exist): {}",
-                hostname, e
-            );
-        }
-
-        // HTTPS frontend if TLS is enabled
-        if entrypoint.config.tls {
-            let https_front = RequestHttpFrontend {
+        for method in methods_for_frontend(&entrypoint.config.methods) {
+            let method_tag = method.as_deref().unwrap_or("any");
+            let http_front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
-                address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
                 hostname: hostname.clone(),
                 path: path_rule.clone(),
-                method: None,
+                method: method.clone(),
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
                 headers: frontend_headers.clone(),
@@ -808,17 +792,57 @@ fn configure_http_entrypoint(
                 ..Default::default()
             };
 
-            info!(
-                "Configuring HTTPS frontend for {} on cluster {}",
-                hostname, cluster_id
-            );
-            match send_to_worker(
-                command_channel_https,
-                format!("add-frontend-https-{}-{}", cluster_id, hostname),
-                RequestType::AddHttpsFrontend(https_front),
+            if let Err(e) = send_to_worker(
+                command_channel,
+                format!(
+                    "add-frontend-http-{}-{}-{}",
+                    cluster_id, hostname, method_tag
+                ),
+                RequestType::AddHttpFrontend(http_front),
             ) {
-                Ok(_) => info!("HTTPS frontend added for {}", hostname),
-                Err(e) => error!("Failed to add HTTPS frontend for {}: {}", hostname, e),
+                debug!(
+                    "Failed to add HTTP frontend for {} [{}] (may already exist): {}",
+                    hostname, method_tag, e
+                );
+            }
+
+            // HTTPS frontend if TLS is enabled
+            if entrypoint.config.tls {
+                let https_front = RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                    hostname: hostname.clone(),
+                    path: path_rule.clone(),
+                    method: method.clone(),
+                    position: RulePosition::Pre as i32,
+                    tags: BTreeMap::new(),
+                    headers: frontend_headers.clone(),
+                    required_auth: frontend_required_auth,
+                    rewrite_path: frontend_rewrite_path.clone(),
+                    redirect: frontend_redirect,
+                    redirect_scheme: frontend_redirect_scheme,
+                    redirect_template: frontend_redirect_template.clone(),
+                    ..Default::default()
+                };
+
+                info!(
+                    "Configuring HTTPS frontend for {} [{}] on cluster {}",
+                    hostname, method_tag, cluster_id
+                );
+                match send_to_worker(
+                    command_channel_https,
+                    format!(
+                        "add-frontend-https-{}-{}-{}",
+                        cluster_id, hostname, method_tag
+                    ),
+                    RequestType::AddHttpsFrontend(https_front),
+                ) {
+                    Ok(_) => info!("HTTPS frontend added for {} [{}]", hostname, method_tag),
+                    Err(e) => error!(
+                        "Failed to add HTTPS frontend for {} [{}]: {}",
+                        hostname, method_tag, e
+                    ),
+                }
             }
         }
     }
@@ -1193,43 +1217,58 @@ fn remove_http_frontends(
     );
 
     for hostname in &entrypoint.config.hostnames {
-        let http_front = RequestHttpFrontend {
-            cluster_id: Some(cluster_id.to_string()),
-            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
-            hostname: hostname.clone(),
-            path: path_rule.clone(),
-            method: None,
-            position: RulePosition::Pre as i32,
-            tags: BTreeMap::new(),
-            ..Default::default()
-        };
-
-        if let Err(e) = send_to_worker(
-            command_channel,
-            format!("rm-frontend-http-{}-{}", cluster_id, hostname),
-            RequestType::RemoveHttpFrontend(http_front),
-        ) {
-            debug!("Failed to remove HTTP frontend for {}: {}", hostname, e);
-        }
-
-        if entrypoint.config.tls {
-            let https_front = RequestHttpFrontend {
+        for method in methods_for_frontend(&entrypoint.config.methods) {
+            let method_tag = method.as_deref().unwrap_or("any");
+            let http_front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
-                address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
                 hostname: hostname.clone(),
                 path: path_rule.clone(),
-                method: None,
+                method: method.clone(),
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
                 ..Default::default()
             };
 
             if let Err(e) = send_to_worker(
-                command_channel_https,
-                format!("rm-frontend-https-{}-{}", cluster_id, hostname),
-                RequestType::RemoveHttpsFrontend(https_front),
+                command_channel,
+                format!(
+                    "rm-frontend-http-{}-{}-{}",
+                    cluster_id, hostname, method_tag
+                ),
+                RequestType::RemoveHttpFrontend(http_front),
             ) {
-                debug!("Failed to remove HTTPS frontend for {}: {}", hostname, e);
+                debug!(
+                    "Failed to remove HTTP frontend for {} [{}]: {}",
+                    hostname, method_tag, e
+                );
+            }
+
+            if entrypoint.config.tls {
+                let https_front = RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                    hostname: hostname.clone(),
+                    path: path_rule.clone(),
+                    method: method.clone(),
+                    position: RulePosition::Pre as i32,
+                    tags: BTreeMap::new(),
+                    ..Default::default()
+                };
+
+                if let Err(e) = send_to_worker(
+                    command_channel_https,
+                    format!(
+                        "rm-frontend-https-{}-{}-{}",
+                        cluster_id, hostname, method_tag
+                    ),
+                    RequestType::RemoveHttpsFrontend(https_front),
+                ) {
+                    debug!(
+                        "Failed to remove HTTPS frontend for {} [{}]: {}",
+                        hostname, method_tag, e
+                    );
+                }
             }
         }
     }

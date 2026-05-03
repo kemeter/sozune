@@ -226,6 +226,15 @@ const ENTRIES: &[Entry] = &[
         example: None,
     },
     Entry {
+        code: "W014",
+        title: "Invalid HTTP method",
+        severity: "warning",
+        cause: "A method listed in `methods=...` is not a recognized HTTP verb.",
+        effect: "The invalid verb is dropped. Other valid methods in the same label still apply.",
+        fix: "Use one of: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE. Methods are case-insensitive (uppercased internally).",
+        example: Some("sozune.http.api.methods=GET,POST,PATCH"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         severity: "info",
@@ -270,6 +279,7 @@ mod tests {
             DiagnosticCode::W011EmptyBasicAuth,
             DiagnosticCode::W012InvalidProtocol,
             DiagnosticCode::W013UnknownLabel,
+            DiagnosticCode::W014InvalidMethod,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ];

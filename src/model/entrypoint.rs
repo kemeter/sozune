@@ -85,6 +85,11 @@ pub struct EntrypointConfig {
     pub compress: bool,
     #[serde(default)]
     pub entrypoint: Option<String>,
+    /// HTTP methods this entrypoint matches. Empty means any method.
+    /// Methods are uppercased and validated against the standard verbs
+    /// (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE).
+    #[serde(default)]
+    pub methods: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

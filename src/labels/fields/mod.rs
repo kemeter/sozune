@@ -2,6 +2,7 @@ pub mod auth;
 pub mod core;
 pub mod headers;
 pub mod host;
+pub mod methods;
 pub mod path;
 pub mod ratelimit;
 pub mod redirect;

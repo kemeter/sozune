@@ -27,6 +27,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "ratelimit.burst",
     "auth.basic",
     "entrypoint",
+    "methods",
 ];
 
 /// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`).

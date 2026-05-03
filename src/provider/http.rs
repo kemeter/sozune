@@ -153,6 +153,7 @@ mod tests {
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,
+                methods: Vec::new(),
             },
             source: None,
         }])

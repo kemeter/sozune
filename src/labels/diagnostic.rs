@@ -30,6 +30,7 @@ pub enum DiagnosticCode {
     W011EmptyBasicAuth,
     W012InvalidProtocol,
     W013UnknownLabel,
+    W014InvalidMethod,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -56,6 +57,7 @@ impl DiagnosticCode {
             DiagnosticCode::W011EmptyBasicAuth => "W011",
             DiagnosticCode::W012InvalidProtocol => "W012",
             DiagnosticCode::W013UnknownLabel => "W013",
+            DiagnosticCode::W014InvalidMethod => "W014",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
