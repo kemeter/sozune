@@ -86,7 +86,7 @@ fn render(state: &AppState) -> String {
 
     write_gauge(
         &mut out,
-        "sozune_entrypoints_total",
+        "sozune_entrypoints",
         "Number of entrypoints currently loaded.",
         entrypoints_total,
     );
@@ -105,40 +105,37 @@ fn render(state: &AppState) -> String {
 
     write_gauge(
         &mut out,
-        "sozune_entrypoints_tls_total",
+        "sozune_entrypoints_tls",
         "Number of entrypoints with TLS enabled.",
         tls_total,
     );
     write_gauge(
         &mut out,
-        "sozune_backends_total",
+        "sozune_backends",
         "Total number of backends across all entrypoints.",
         backends_total,
     );
     write_gauge(
         &mut out,
-        "sozune_backends_unhealthy_total",
+        "sozune_backends_unhealthy",
         "Number of backends currently marked unhealthy by the active health check.",
         unhealthy_total,
     );
 
     let _ = writeln!(
         &mut out,
-        "# HELP sozune_diagnostics_total Active diagnostics by severity."
+        "# HELP sozune_diagnostics Active diagnostics by severity."
     );
-    let _ = writeln!(&mut out, "# TYPE sozune_diagnostics_total gauge");
+    let _ = writeln!(&mut out, "# TYPE sozune_diagnostics gauge");
     let _ = writeln!(
         &mut out,
-        "sozune_diagnostics_total{{severity=\"error\"}} {errors}"
-    );
-    let _ = writeln!(
-        &mut out,
-        "sozune_diagnostics_total{{severity=\"warn\"}} {warnings}"
+        "sozune_diagnostics{{severity=\"error\"}} {errors}"
     );
     let _ = writeln!(
         &mut out,
-        "sozune_diagnostics_total{{severity=\"info\"}} {infos}"
+        "sozune_diagnostics{{severity=\"warn\"}} {warnings}"
     );
+    let _ = writeln!(&mut out, "sozune_diagnostics{{severity=\"info\"}} {infos}");
 
     write_gauge(
         &mut out,
@@ -147,7 +144,60 @@ fn render(state: &AppState) -> String {
         if state.acme_enabled { 1 } else { 0 },
     );
 
+    render_proxy_metrics(&mut out, state);
+
     out
+}
+
+/// Append `sozune_proxy_*` series sourced from the latest Sōzu workers
+/// snapshot. Names are derived from the worker metric key — only `[A-Za-z0-9_]`
+/// characters are kept and dots become underscores. Unknown / unsupported
+/// kinds are skipped silently (already filtered at the snapshot level).
+fn render_proxy_metrics(out: &mut String, state: &AppState) {
+    use crate::proxy::metrics_snapshot::MetricValue;
+
+    let snap = match state.metrics.read() {
+        Ok(g) => g.clone(),
+        Err(e) => {
+            error!("metrics: snapshot lock poisoned: {}", e);
+            return;
+        }
+    };
+
+    write_gauge(
+        out,
+        "sozune_proxy_last_poll_seconds",
+        "Unix timestamp of the last successful Sōzu metrics poll. 0 means never.",
+        snap.last_poll_unix as usize,
+    );
+
+    if snap.proxy.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP sozune_proxy_metric Proxy metric forwarded from Sōzu workers (gauge or counter)."
+    );
+    let _ = writeln!(out, "# TYPE sozune_proxy_metric untyped");
+    for (key, value) in &snap.proxy {
+        let safe = sanitize_metric_name(key);
+        let v: i128 = match value {
+            MetricValue::Gauge(g) => *g as i128,
+            MetricValue::Count(c) => *c as i128,
+            MetricValue::Time(t) => *t as i128,
+        };
+        let _ = writeln!(out, "sozune_proxy_metric{{key=\"{safe}\"}} {v}");
+    }
+}
+
+fn sanitize_metric_name(key: &str) -> String {
+    key.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => c,
+            _ => '_',
+        })
+        .collect()
 }
 
 fn write_gauge(out: &mut String, name: &str, help: &str, value: usize) {
@@ -175,6 +225,8 @@ mod tests {
             unhealthy_backends: Arc::new(RwLock::new(HashMap::new())),
             diagnostics: crate::diagnostics::new_store(),
             acme_enabled: false,
+            providers: crate::config::ProvidersConfig::default(),
+            metrics: crate::proxy::metrics_snapshot::new_store(),
         }
     }
 
@@ -206,6 +258,14 @@ mod tests {
                 compress: false,
                 entrypoint: None,
                 methods: Vec::new(),
+                add_prefix: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                forward_auth: None,
+                acme: None,
+                error_pages: std::collections::BTreeMap::new(),
+                plugins: Vec::new(),
             },
             source: Some("api".to_string()),
         }
@@ -214,11 +274,11 @@ mod tests {
     #[test]
     fn renders_zeros_for_empty_state() {
         let body = render(&empty_state());
-        assert!(body.contains("sozune_entrypoints_total 0"));
-        assert!(body.contains("sozune_backends_total 0"));
-        assert!(body.contains("sozune_backends_unhealthy_total 0"));
+        assert!(body.contains("sozune_entrypoints 0"));
+        assert!(body.contains("sozune_backends 0"));
+        assert!(body.contains("sozune_backends_unhealthy 0"));
         assert!(body.contains("sozune_acme_enabled 0"));
-        assert!(body.contains("sozune_diagnostics_total{severity=\"error\"} 0"));
+        assert!(body.contains("sozune_diagnostics{severity=\"error\"} 0"));
     }
 
     #[test]
@@ -230,9 +290,9 @@ mod tests {
             s.insert("b".into(), make_ep("b", "b.example.com", true, 3));
         }
         let body = render(&state);
-        assert!(body.contains("sozune_entrypoints_total 2"));
-        assert!(body.contains("sozune_backends_total 5"));
-        assert!(body.contains("sozune_entrypoints_tls_total 1"));
+        assert!(body.contains("sozune_entrypoints 2"));
+        assert!(body.contains("sozune_backends 5"));
+        assert!(body.contains("sozune_entrypoints_tls 1"));
         assert!(body.contains("sozune_entrypoints_by_protocol{protocol=\"http\"} 2"));
     }
 
@@ -249,7 +309,7 @@ mod tests {
             },
         );
         let body = render(&state);
-        assert!(body.contains("sozune_backends_unhealthy_total 1"));
+        assert!(body.contains("sozune_backends_unhealthy 1"));
     }
 
     #[test]
@@ -270,7 +330,7 @@ mod tests {
             ],
         );
         let body = render(&state);
-        assert!(body.contains("sozune_diagnostics_total{severity=\"warn\"} 2"));
+        assert!(body.contains("sozune_diagnostics{severity=\"warn\"} 2"));
     }
 
     #[test]
@@ -282,11 +342,45 @@ mod tests {
     }
 
     #[test]
+    fn proxy_metrics_section_present_with_zero_poll() {
+        let body = render(&empty_state());
+        assert!(body.contains("sozune_proxy_last_poll_seconds 0"));
+        assert!(!body.contains("sozune_proxy_metric{"));
+    }
+
+    #[test]
+    fn proxy_metrics_section_renders_polled_values() {
+        use crate::proxy::metrics_snapshot::MetricValue;
+        let state = empty_state();
+        {
+            let mut snap = state.metrics.write().unwrap();
+            snap.last_poll_unix = 12345;
+            snap.proxy
+                .insert("http.requests".into(), MetricValue::Count(42));
+            snap.proxy
+                .insert("connections".into(), MetricValue::Gauge(7));
+        }
+        let body = render(&state);
+        assert!(body.contains("sozune_proxy_last_poll_seconds 12345"));
+        assert!(body.contains("sozune_proxy_metric{key=\"http_requests\"} 42"));
+        assert!(body.contains("sozune_proxy_metric{key=\"connections\"} 7"));
+    }
+
+    #[test]
+    fn sanitize_replaces_dots_and_dashes() {
+        assert_eq!(
+            sanitize_metric_name("http.requests-total"),
+            "http_requests_total"
+        );
+        assert_eq!(sanitize_metric_name("ok_name"), "ok_name");
+    }
+
+    #[test]
     fn output_is_prometheus_text_format() {
         let body = render(&empty_state());
         // Each metric must be preceded by HELP and TYPE lines.
-        assert!(body.contains("# HELP sozune_entrypoints_total"));
-        assert!(body.contains("# TYPE sozune_entrypoints_total gauge"));
+        assert!(body.contains("# HELP sozune_entrypoints"));
+        assert!(body.contains("# TYPE sozune_entrypoints gauge"));
     }
 
     /// Prometheus client libraries reject responses whose `Content-Type` does

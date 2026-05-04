@@ -111,6 +111,11 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     // Create bounded channels to prevent memory exhaustion
     let (reload_tx, reload_rx) = mpsc::channel(64);
     let (cert_tx, cert_rx) = mpsc::channel(64);
+    let (metrics_poll_tx, metrics_poll_rx) = mpsc::channel::<()>(8);
+
+    // Snapshot of the latest metrics polled from Sōzu workers, shared with
+    // the API metrics endpoint.
+    let metrics_store = proxy::metrics_snapshot::new_store();
 
     // Notify ACME manager when storage changes (new TLS entrypoints)
     let acme_notify = Arc::new(Notify::new());
@@ -132,6 +137,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let handle = tokio::runtime::Handle::current();
     let plugin_fetch_client = middleware::build_forward_auth_client();
     let plugins = middleware::build_plugin_registry(&config.plugins, &plugin_fetch_client, &handle);
+    let metrics_store_proxy = Arc::clone(&metrics_store);
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
             proxy::backend::ProxyInputs {
@@ -139,6 +145,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 shutdown_rx,
                 reload_rx,
                 cert_rx,
+                metrics_poll_rx,
+                metrics_store: metrics_store_proxy,
                 acme_challenge_port,
                 middleware_state: middleware_state_proxy,
                 middleware_port,
@@ -147,6 +155,20 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             },
             &proxy_config,
         )
+    });
+
+    // Poll Sōzu workers for metrics every 5 seconds. Drop on full channel —
+    // a backed-up poller means the proxy mainloop is busy and we should not
+    // pile on more work; the next tick will retry.
+    let metrics_poll_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if metrics_poll_tx.try_send(()).is_err() {
+                debug!("Metrics poll channel full or closed, skipping tick");
+            }
+        }
     });
 
     // Start provider services (Docker, etc.)
@@ -181,6 +203,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let diagnostics_api = Arc::clone(&diagnostics_store);
     let acme_enabled_api = acme_enabled;
     let providers_api = config.providers.clone();
+    let metrics_store_api = Arc::clone(&metrics_store);
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
@@ -192,6 +215,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 diagnostics_api,
                 acme_enabled_api,
                 providers_api,
+                metrics_store_api,
             )
             .await?;
         }
@@ -365,6 +389,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             }
         }
     }
+
+    metrics_poll_task.abort();
 
     debug!("All tasks completed");
     Ok(())

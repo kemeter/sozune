@@ -3,6 +3,7 @@ use crate::config::ProxyConfig;
 use crate::middleware::{MiddlewareState, PluginRegistry};
 use crate::model::Entrypoint;
 use crate::proxy;
+use crate::proxy::metrics_snapshot::MetricsSnapshotStore;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -16,6 +17,8 @@ pub struct ProxyInputs {
     pub shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     pub reload_rx: mpsc::Receiver<()>,
     pub cert_rx: mpsc::Receiver<CertCommand>,
+    pub metrics_poll_rx: mpsc::Receiver<()>,
+    pub metrics_store: MetricsSnapshotStore,
     pub acme_challenge_port: Option<u16>,
     pub middleware_state: MiddlewareState,
     pub middleware_port: u16,
