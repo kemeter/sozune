@@ -670,6 +670,7 @@ mod tests {
                     .put(update_entrypoint)
                     .delete(delete_entrypoint),
             )
+            .route("/diagnostics", get(list_diagnostics))
             .route_layer(axum_middleware::from_fn(require_admin));
 
         let me_route = Router::new().route("/me", get(me));
@@ -1497,5 +1498,423 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ---- diagnostics surfacing ------------------------------------------------
+
+    /// Build a minimal HTTP entrypoint with the given id, hostname and path.
+    /// Source is set so we exercise the `entrypoint.source` lookup path used
+    /// by `entrypoint_payload` to attach diagnostics keyed on candidate id.
+    fn make_ep(id: &str, host: &str, path: Option<&str>, source: Option<&str>) -> Entrypoint {
+        Entrypoint {
+            id: id.to_string(),
+            name: id.to_string(),
+            backends: vec![Backend::new("10.0.0.1", 80)],
+            protocol: Protocol::Http,
+            config: EntrypointConfig {
+                hostnames: vec![host.to_string()],
+                path: path.map(|p| crate::model::PathConfig {
+                    rule_type: crate::model::PathRuleType::Prefix,
+                    value: p.to_string(),
+                }),
+                tls: false,
+                strip_prefix: false,
+                https_redirect: false,
+                https_redirect_port: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                www_authenticate: None,
+                priority: 0,
+                auth: None,
+                headers: Vec::new(),
+                backend_timeout: None,
+                rate_limit: None,
+                sticky_session: false,
+                compress: false,
+                entrypoint: None,
+                methods: Vec::new(),
+            },
+            source: source.map(|s| s.to_string()),
+        }
+    }
+
+    fn diag_w001(label: &str, value: &str) -> crate::labels::diagnostic::Diagnostic {
+        crate::labels::diagnostic::Diagnostic::new(
+            crate::labels::diagnostic::DiagnosticCode::W001InvalidPort,
+            "port is not a valid u16, falling back to 80",
+        )
+        .with_label(label)
+        .with_value(value)
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_returns_empty_when_nothing_in_store() {
+        let app = test_app(test_state());
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["global"].as_array().unwrap().len(), 0);
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_groups_per_candidate() {
+        let state = test_state();
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "docker-aaaa",
+            vec![diag_w001("sozune.http.web.port", "abc")],
+        );
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "docker-bbbb",
+            vec![diag_w001("sozune.http.api.port", "xyz")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["total"], 2);
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // Items are sorted by candidate_id, see `list_diagnostics`.
+        assert_eq!(items[0]["candidate_id"], "docker-aaaa");
+        assert_eq!(items[1]["candidate_id"], "docker-bbbb");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_serializes_severity_derived_from_code() {
+        let state = test_state();
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "c1",
+            vec![diag_w001("sozune.http.x.port", "abc")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let diag = &json["items"][0]["diagnostics"][0];
+        assert_eq!(diag["code"], "W001");
+        assert_eq!(
+            diag["severity"], "warn",
+            "severity must be derived from the code prefix"
+        );
+        assert_eq!(diag["label"], "sozune.http.x.port");
+        assert_eq!(diag["value"], "abc");
+        assert!(diag["message"].as_str().unwrap().contains("port"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_includes_acme_global_when_acme_enabled_no_tls() {
+        let mut state = test_state();
+        state.acme_enabled = true;
+        // Add an entrypoint without TLS so the global lint fires.
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("ep-1".into(), make_ep("ep-1", "example.com", None, None));
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let global = json["global"].as_array().unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0]["code"], "W015");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_omits_acme_global_when_at_least_one_tls_endpoint() {
+        let mut state = test_state();
+        state.acme_enabled = true;
+        let mut tls_ep = make_ep("ep-tls", "secure.example.com", None, None);
+        tls_ep.config.tls = true;
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("ep-tls".into(), tls_ep);
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["global"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_surfaces_w018_collisions_on_runtime_storage() {
+        let state = test_state();
+        // Two entrypoints sharing the same (host, path).
+        state.storage.write().unwrap().insert(
+            "ep-a".into(),
+            make_ep("ep-a", "collision.example.com", Some("/api"), None),
+        );
+        state.storage.write().unwrap().insert(
+            "ep-b".into(),
+            make_ep("ep-b", "collision.example.com", Some("/api"), None),
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let items = json["items"].as_array().unwrap();
+        // Both entrypoints should carry a W018, attributed to their entrypoint id.
+        assert_eq!(items.len(), 2);
+        for item in items {
+            let codes: Vec<&str> = item["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["code"].as_str().unwrap())
+                .collect();
+            assert!(codes.contains(&"W018"), "expected W018 on {item:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_requires_auth() {
+        let app = test_app(test_state());
+        let response = app
+            .oneshot(Request::get("/diagnostics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_allows_read_only_user() {
+        let app = test_app(test_state_with_users(vec![user(
+            "viewer",
+            "viewer-pass",
+            Role::ReadOnly,
+        )]));
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", basic("viewer", "viewer-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /diagnostics is a read endpoint and must be open to read-only users"
+        );
+    }
+
+    // ---- diagnostics on /entrypoints payload ----------------------------------
+
+    #[tokio::test]
+    async fn list_entrypoints_attaches_diagnostics_keyed_by_entrypoint_id() {
+        let state = test_state();
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("ep-1".into(), make_ep("ep-1", "example.com", None, None));
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "ep-1",
+            vec![diag_w001("sozune.http.web.port", "abc")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let diags = arr[0]["diagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["code"], "W001");
+    }
+
+    #[tokio::test]
+    async fn list_entrypoints_falls_back_to_diagnostics_keyed_by_source() {
+        // Diagnostics are stored under the candidate id; for Docker etc. the
+        // entrypoint id (cluster_id) does not match the candidate id, but the
+        // candidate id ends up in `entrypoint.source` indirectly. Here we
+        // verify the source-based fallback.
+        let state = test_state();
+        state.storage.write().unwrap().insert(
+            "http_web".into(),
+            make_ep(
+                "http_web",
+                "example.com",
+                None,
+                Some("docker-container-aaaa"),
+            ),
+        );
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "docker-container-aaaa",
+            vec![diag_w001("sozune.http.web.port", "abc")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let diags = json[0]["diagnostics"].as_array().unwrap();
+        assert_eq!(
+            diags.len(),
+            1,
+            "diagnostic stored under source must be surfaced"
+        );
+        assert_eq!(diags[0]["code"], "W001");
+    }
+
+    #[tokio::test]
+    async fn list_entrypoints_diagnostics_field_is_empty_when_none() {
+        let state = test_state();
+        state.storage.write().unwrap().insert(
+            "ep-clean".into(),
+            make_ep("ep-clean", "ok.example.com", None, None),
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let diags = json[0]["diagnostics"].as_array().unwrap();
+        assert!(diags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_entrypoint_includes_diagnostics_field() {
+        let state = test_state();
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("ep-1".into(), make_ep("ep-1", "example.com", None, None));
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "ep-1",
+            vec![diag_w001("sozune.http.web.port", "abc")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints/ep-1")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        let diags = json["diagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["code"], "W001");
+    }
+
+    #[tokio::test]
+    async fn get_entrypoint_includes_runtime_w018_collision() {
+        let state = test_state();
+        state.storage.write().unwrap().insert(
+            "ep-a".into(),
+            make_ep("ep-a", "collision.example.com", Some("/api"), None),
+        );
+        state.storage.write().unwrap().insert(
+            "ep-b".into(),
+            make_ep("ep-b", "collision.example.com", Some("/api"), None),
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints/ep-a")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let codes: Vec<&str> = json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"W018"));
     }
 }
