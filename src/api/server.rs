@@ -226,6 +226,7 @@ pub async fn serve(
 
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(crate::api::metrics::metrics))
         .merge(authed)
         .with_state(state);
 
