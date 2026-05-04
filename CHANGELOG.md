@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-UX overhaul. Full audit of every user-facing message; new self-documenting CLI surface.
+## [0.13.0] - 2026-05-04
+
+UX overhaul. Diagnostics become a first-class surface — visible in the CLI, the API, and the dashboard — and the dashboard gains the filters and drill-down to make them actionable.
 
 ### CLI
 
@@ -25,6 +27,25 @@ New diagnostic codes surfaced by `sozune validate`:
 - `W017` `rate_limit.burst < average` (burst window disabled)
 - `W018` route collision: same `(host, path)` declared by multiple candidates
 
+### API
+
+- New `GET /diagnostics` endpoint returning a snapshot grouped per candidate, plus a top-level `global` array for cross-cutting lints (e.g. `W015`).
+- `GET /entrypoints` and `GET /entrypoints/{id}` payloads gain a `diagnostics` field, populated from a runtime store the providers write to as they parse labels.
+- `W018` collisions are computed on the fly against live storage; `W015` is recomputed from `acme.enabled` and the live TLS entrypoints.
+- Diagnostics serialize their severity (derived from the code prefix) so clients don't have to know the convention.
+- 15 new tests covering the endpoint, the per-entrypoint field, severity derivation, and the runtime collision/global lints.
+
+### Dashboard
+
+- Per-entrypoint diagnostic badges (`⚠ N` / `✗ N`) on the entrypoints list, with a styled popover (replaces the native tooltip) and click-outside dismiss.
+- New `/diagnostics` page in the sidebar with a warning icon and a live count badge that polls the API.
+- "Diagnostics" stat-card on the entrypoints page (errors + warnings).
+- Detail page (`/entrypoints/{id}`) shows a Diagnostics section when the entrypoint has any.
+- Banner above the entrypoints table for global diagnostics (`W015` etc.).
+- New filters on the entrypoints page: source / TLS / health / diagnostics, with a result counter and a one-click reset.
+- New filters on the diagnostics page: free-text search, code dropdown.
+- Drill-down: each candidate group on `/diagnostics` lists the affected entrypoints as clickable chips that link to the detail page.
+
 ### Runtime errors
 
 - HTTP error responses in the middleware reverse-proxy now carry an `X-Sozune-Diagnostic` header on every 4xx/5xx (no more empty 502/504 bodies). Helpers cover `backend-unreachable`, `backend-timeout`, `forwarding-failed`, `internal-error`, `bad-request`, `rate-limited`, in addition to the existing `no-route-for-host` / `no-healthy-backend`.
@@ -33,12 +54,18 @@ New diagnostic codes surfaced by `sozune validate`:
 
 - Default log filter silences `sozu_lib`, `sozu_command_lib`, `mio`, `h2`, `kube`, `tower`, `hyper_util`. Override via `RUST_LOG`.
 - 47 internal-jargon log messages reformulated into user-facing language (no more `Storage lock poisoned`, `Failed to send reload signal`, `Challenge state lock poisoned`, …).
+- Reformulated `E001` and `E004` parser messages from "candidate is …" jargon to user-facing wording (`workload`, actionable hints).
 
 ### Config errors
 
 - YAML parse failures report the file path and `line:column`.
 - Provider errors in `validate` include actionable hints (Docker socket perms, Podman API socket, Nomad endpoint).
 - ACME warning suggests setting `acme.email` instead of just stating it is missing.
+
+### Docker provider
+
+- Detect service-name collisions instead of merging silently. When two unrelated containers share a `sozune.<protocol>.<service-name>` segment but expose different hostnames or paths, the second one is now stored under a disambiguated key (`<key>_<short-container-id>`) instead of being absorbed into the first cluster. A loud warning explains how to silence it (rename the service-name segment).
+- New e2e suite covering the collision case end-to-end.
 
 ## [0.12.0] - 2026-05-03
 
