@@ -18,12 +18,44 @@
   let lastRefresh = $state<Date | null>(null);
   let search = $state('');
   let protocolFilter = $state<'all' | 'Http' | 'Tcp' | 'Udp'>('all');
+  let sourceFilter = $state<string>('all');
+  let tlsFilter = $state<'all' | 'on' | 'off'>('all');
+  let healthFilter = $state<'all' | 'healthy' | 'degraded'>('all');
+  let diagFilter = $state<'all' | 'with' | 'without'>('all');
 
   let poll: ReturnType<typeof setInterval> | null = null;
+
+  /** All distinct values found in `entrypoint.source` across the current set,
+   *  feeding the source-filter dropdown. `api` covers entrypoints created via
+   *  the REST API (their source is null/missing). */
+  const sources = $derived.by(() => {
+    const set = new Set<string>();
+    for (const ep of entrypoints) {
+      set.add(ep.source ?? 'api');
+    }
+    return ['all', ...Array.from(set).sort()];
+  });
+
+  function epHasDown(ep: Entrypoint): boolean {
+    return (ep.unhealthy_backends?.length ?? 0) > 0;
+  }
+
+  function epHasDiag(ep: Entrypoint): boolean {
+    return (ep.diagnostics ?? []).some(
+      (d) => d.severity === 'error' || d.severity === 'warn'
+    );
+  }
 
   const filtered = $derived(
     entrypoints.filter((ep) => {
       if (protocolFilter !== 'all' && ep.protocol !== protocolFilter) return false;
+      if (sourceFilter !== 'all' && (ep.source ?? 'api') !== sourceFilter) return false;
+      if (tlsFilter === 'on' && !ep.config.tls) return false;
+      if (tlsFilter === 'off' && ep.config.tls) return false;
+      if (healthFilter === 'healthy' && epHasDown(ep)) return false;
+      if (healthFilter === 'degraded' && !epHasDown(ep)) return false;
+      if (diagFilter === 'with' && !epHasDiag(ep)) return false;
+      if (diagFilter === 'without' && epHasDiag(ep)) return false;
       if (!search) return true;
       const q = search.toLowerCase();
       return (
@@ -34,6 +66,21 @@
       );
     })
   );
+
+  /** True when at least one secondary filter is active (so we can show a "reset" affordance). */
+  const hasActiveFilters = $derived(
+    sourceFilter !== 'all' ||
+      tlsFilter !== 'all' ||
+      healthFilter !== 'all' ||
+      diagFilter !== 'all'
+  );
+
+  function resetFilters() {
+    sourceFilter = 'all';
+    tlsFilter = 'all';
+    healthFilter = 'all';
+    diagFilter = 'all';
+  }
 
   const stats = $derived({
     total: entrypoints.length,
@@ -209,6 +256,58 @@
         {p}
       </button>
     {/each}
+  </div>
+</section>
+
+<section class="filter-row">
+  <label class="select-wrap">
+    <span class="select-label">Source</span>
+    <select bind:value={sourceFilter}>
+      {#each sources as src}
+        <option value={src}>{src}</option>
+      {/each}
+    </select>
+  </label>
+
+  <div class="seg">
+    <span class="seg-label">TLS</span>
+    {#each ['all', 'on', 'off'] as v}
+      <button
+        class="seg-btn"
+        class:active={tlsFilter === v}
+        onclick={() => (tlsFilter = v as typeof tlsFilter)}
+      >{v}</button>
+    {/each}
+  </div>
+
+  <div class="seg">
+    <span class="seg-label">Health</span>
+    {#each ['all', 'healthy', 'degraded'] as v}
+      <button
+        class="seg-btn"
+        class:active={healthFilter === v}
+        onclick={() => (healthFilter = v as typeof healthFilter)}
+      >{v}</button>
+    {/each}
+  </div>
+
+  <div class="seg">
+    <span class="seg-label">Diagnostics</span>
+    {#each ['all', 'with', 'without'] as v}
+      <button
+        class="seg-btn"
+        class:active={diagFilter === v}
+        onclick={() => (diagFilter = v as typeof diagFilter)}
+      >{v}</button>
+    {/each}
+  </div>
+
+  {#if hasActiveFilters}
+    <button class="reset-btn" onclick={resetFilters}>Reset filters</button>
+  {/if}
+
+  <div class="result-count mono">
+    {filtered.length} / {entrypoints.length}
   </div>
 </section>
 
@@ -811,6 +910,99 @@
 
   .muted {
     color: var(--fg-3);
+  }
+
+  .filter-row {
+    display: flex;
+    gap: 0.625rem;
+    margin-bottom: 1rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .select-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 8px 4px 10px;
+  }
+  .select-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-2);
+    font-weight: 500;
+  }
+  .select-wrap select {
+    background: transparent;
+    border: none;
+    color: var(--fg-0);
+    font-size: 0.78rem;
+    outline: none;
+    padding: 2px 4px;
+    cursor: pointer;
+  }
+  .select-wrap select option {
+    background: var(--bg-1);
+    color: var(--fg-0);
+  }
+
+  .seg {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 3px 4px 3px 10px;
+  }
+  .seg-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-2);
+    font-weight: 500;
+    margin-right: 4px;
+  }
+  .seg-btn {
+    padding: 0.3rem 0.65rem;
+    background: transparent;
+    border: none;
+    color: var(--fg-2);
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    text-transform: capitalize;
+    cursor: pointer;
+  }
+  .seg-btn:hover {
+    color: var(--fg-0);
+  }
+  .seg-btn.active {
+    background: var(--bg-3);
+    color: var(--fg-0);
+  }
+
+  .reset-btn {
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--fg-2);
+    border-radius: var(--radius);
+    padding: 0.4rem 0.75rem;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .reset-btn:hover {
+    color: var(--fg-0);
+    border-style: solid;
+  }
+  .result-count {
+    margin-left: auto;
+    color: var(--fg-3);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
   }
 
 </style>

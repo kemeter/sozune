@@ -1,20 +1,32 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
-  import { listDiagnostics, type Diagnostic, type DiagnosticsResponse } from '$lib/api';
+  import {
+    listDiagnostics,
+    listEntrypoints,
+    type Diagnostic,
+    type DiagnosticsResponse,
+    type Entrypoint
+  } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
   let data = $state<DiagnosticsResponse | null>(null);
+  /** Loaded alongside diagnostics so we can drill down from a candidate to the
+   *  entrypoint(s) it produced. Lookup uses both `entrypoint.id` and
+   *  `entrypoint.source` since providers attribute differently. */
+  let entrypoints = $state<Entrypoint[]>([]);
   let error = $state<string | null>(null);
   let loading = $state(true);
   let lastRefresh = $state<Date | null>(null);
   let severityFilter = $state<'all' | 'error' | 'warn' | 'info'>('all');
+  let codeFilter = $state<string>('all');
+  let search = $state('');
 
   let poll: ReturnType<typeof setInterval> | null = null;
 
   const stats = $derived.by(() => {
     if (!data) return { total: 0, error: 0, warn: 0, info: 0 };
-    const all = [...data.global, ...data.items.flatMap((i) => i.diagnostics)];
+    const all = [...(data.global ?? []), ...data.items.flatMap((i) => i.diagnostics)];
     return {
       total: all.length,
       error: all.filter((d) => d.severity === 'error').length,
@@ -23,22 +35,72 @@
     };
   });
 
-  function passes(d: Diagnostic): boolean {
-    return severityFilter === 'all' || d.severity === severityFilter;
+  /** All diagnostic codes seen in the current snapshot, sorted, for the dropdown. */
+  const codes = $derived.by(() => {
+    if (!data) return ['all'];
+    const set = new Set<string>();
+    for (const d of data.global ?? []) set.add(d.code);
+    for (const it of data.items) for (const d of it.diagnostics) set.add(d.code);
+    return ['all', ...Array.from(set).sort()];
+  });
+
+  function passes(d: Diagnostic, candidateId?: string): boolean {
+    if (severityFilter !== 'all' && d.severity !== severityFilter) return false;
+    if (codeFilter !== 'all' && d.code !== codeFilter) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      const haystack = [
+        d.code,
+        d.message,
+        d.label ?? '',
+        d.value ?? '',
+        d.hint ?? '',
+        candidateId ?? ''
+      ]
+        .join('|')
+        .toLowerCase();
+      if (!haystack.includes(q)) return false;
+    }
+    return true;
   }
 
   const filteredItems = $derived(
     (data?.items ?? [])
-      .map((i) => ({ ...i, diagnostics: i.diagnostics.filter(passes) }))
+      .map((i) => ({
+        ...i,
+        diagnostics: i.diagnostics.filter((d) => passes(d, i.candidate_id))
+      }))
       .filter((i) => i.diagnostics.length > 0)
   );
 
-  const filteredGlobal = $derived((data?.global ?? []).filter(passes));
+  const filteredGlobal = $derived((data?.global ?? []).filter((d) => passes(d)));
+
+  const hasActiveSecondaryFilters = $derived(
+    codeFilter !== 'all' || severityFilter !== 'all' || search !== ''
+  );
+
+  function resetFilters() {
+    severityFilter = 'all';
+    codeFilter = 'all';
+    search = '';
+  }
+
+  /** Resolve the entrypoints linked to a given candidate id. The diagnostics
+   *  store keys on candidate id, while runtime entrypoints carry that id
+   *  either in `entrypoint.id` (Sōzu cluster_id when the candidate is the
+   *  unique source) or in `entrypoint.source` (when providers post-process). */
+  function entrypointsFor(candidateId: string): Entrypoint[] {
+    return entrypoints.filter(
+      (ep) => ep.id === candidateId || ep.source === candidateId
+    );
+  }
 
   async function load(silent = false) {
     if (!silent) loading = true;
     try {
-      data = await listDiagnostics();
+      const [d, eps] = await Promise.all([listDiagnostics(), listEntrypoints()]);
+      data = d;
+      entrypoints = eps;
       error = null;
       lastRefresh = new Date();
     } catch (e) {
@@ -105,6 +167,10 @@
 </section>
 
 <section class="toolbar">
+  <div class="search">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3" stroke-linecap="round"/></svg>
+    <input type="text" placeholder="search by code, message, label, candidate…" bind:value={search} />
+  </div>
   <div class="filters">
     {#each ['all', 'error', 'warn', 'info'] as sev}
       <button
@@ -116,6 +182,17 @@
       </button>
     {/each}
   </div>
+  <label class="select-wrap">
+    <span class="select-label">Code</span>
+    <select bind:value={codeFilter}>
+      {#each codes as c}
+        <option value={c}>{c}</option>
+      {/each}
+    </select>
+  </label>
+  {#if hasActiveSecondaryFilters}
+    <button class="reset-btn" onclick={resetFilters}>Reset</button>
+  {/if}
 </section>
 
 {#if error}
@@ -146,6 +223,17 @@
         <span class="group-id mono">{item.candidate_id}</span>
         <span class="group-count">{item.diagnostics.length}</span>
       </h2>
+      {#if entrypointsFor(item.candidate_id).length > 0}
+        <div class="group-eps">
+          <span class="group-eps-label">Affected entrypoints:</span>
+          {#each entrypointsFor(item.candidate_id) as ep}
+            <a
+              class="ep-chip mono"
+              href={`/entrypoints/${encodeURIComponent(ep.id)}`}
+            >{ep.name || ep.id}</a>
+          {/each}
+        </div>
+      {/if}
       <div class="diag-list">
         {#each item.diagnostics as diag}
           {@render diagCard(diag)}
@@ -384,5 +472,116 @@
     font-size: 0.78rem;
     margin-top: 0.35rem;
     margin-left: 1.45rem;
+  }
+
+  .toolbar {
+    display: flex;
+    gap: 0.625rem;
+    margin-bottom: 1rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .search {
+    flex: 1;
+    min-width: 220px;
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .search :global(svg) {
+    position: absolute;
+    left: 0.75rem;
+    width: 14px;
+    height: 14px;
+    color: var(--fg-3);
+    pointer-events: none;
+  }
+  .search input {
+    width: 100%;
+    padding: 0.5rem 0.75rem 0.5rem 2.1rem;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--fg-0);
+    outline: none;
+  }
+  .search input:focus {
+    border-color: var(--accent);
+  }
+  .search input::placeholder {
+    color: var(--fg-3);
+  }
+  .select-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 8px 4px 10px;
+  }
+  .select-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-2);
+    font-weight: 500;
+  }
+  .select-wrap select {
+    background: transparent;
+    border: none;
+    color: var(--fg-0);
+    font-size: 0.78rem;
+    outline: none;
+    padding: 2px 4px;
+    cursor: pointer;
+  }
+  .select-wrap select option {
+    background: var(--bg-1);
+    color: var(--fg-0);
+  }
+  .reset-btn {
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--fg-2);
+    border-radius: var(--radius);
+    padding: 0.4rem 0.75rem;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .reset-btn:hover {
+    color: var(--fg-0);
+    border-style: solid;
+  }
+
+  .group-eps {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 0.5rem;
+    font-size: 0.75rem;
+  }
+  .group-eps-label {
+    color: var(--fg-3);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.65rem;
+    font-weight: 500;
+    margin-right: 4px;
+  }
+  .ep-chip {
+    background: var(--bg-3);
+    color: var(--fg-1);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    text-decoration: none;
+    border: 1px solid transparent;
+    transition: border-color 0.1s, color 0.1s;
+  }
+  .ep-chip:hover {
+    color: var(--fg-0);
+    border-color: var(--accent);
   }
 </style>
