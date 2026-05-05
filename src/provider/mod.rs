@@ -12,6 +12,7 @@ pub mod config;
 pub mod docker;
 pub mod factory;
 pub mod http;
+pub mod k8s_gateway;
 pub mod kubernetes;
 pub mod nomad;
 pub mod podman;
