@@ -16,7 +16,11 @@ impl HttpProvider {
     }
 
     async fn fetch_entrypoints(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
-        let response = reqwest::get(&self.config.url).await?;
+        let mut request = reqwest::Client::new().get(&self.config.url);
+        if !self.config.auth_header.is_empty() && !self.config.auth_value.is_empty() {
+            request = request.header(&self.config.auth_header, &self.config.auth_value);
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             anyhow::bail!("HTTP provider returned status {}", response.status());
@@ -180,6 +184,8 @@ mod tests {
             enabled: true,
             url: format!("http://{}/config", addr),
             poll_interval: 30,
+            auth_header: String::new(),
+            auth_value: String::new(),
         });
 
         let result = provider.fetch_entrypoints().await.unwrap();
@@ -207,6 +213,8 @@ mod tests {
             enabled: true,
             url: format!("http://{}/config", addr),
             poll_interval: 1,
+            auth_header: String::new(),
+            auth_value: String::new(),
         });
 
         let storage = Arc::new(RwLock::new(BTreeMap::new()));
@@ -246,9 +254,92 @@ mod tests {
             enabled: true,
             url: format!("http://{}/missing", addr),
             poll_interval: 30,
+            auth_header: String::new(),
+            auth_value: String::new(),
         });
 
         let result = provider.fetch_entrypoints().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_sends_auth_header_when_configured() {
+        use std::sync::Mutex;
+        use axum::extract::Request;
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let json = sample_entrypoints_json();
+        let app = Router::new().route(
+            "/config",
+            get(move |req: Request| {
+                let json = json.clone();
+                let captured = Arc::clone(&captured_clone);
+                async move {
+                    let value = req
+                        .headers()
+                        .get("X-Sozune-Token")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    *captured.lock().unwrap() = value;
+                    json
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = HttpProvider::new(HttpProviderConfig {
+            enabled: true,
+            url: format!("http://{}/config", addr),
+            poll_interval: 30,
+            auth_header: "X-Sozune-Token".to_string(),
+            auth_value: "secret-123".to_string(),
+        });
+
+        provider.fetch_entrypoints().await.unwrap();
+
+        let header = captured.lock().unwrap().clone();
+        assert_eq!(header.as_deref(), Some("secret-123"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_omits_auth_header_when_value_is_empty() {
+        use std::sync::Mutex;
+        use axum::extract::Request;
+
+        let saw_header: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let saw_header_clone = Arc::clone(&saw_header);
+        let json = sample_entrypoints_json();
+        let app = Router::new().route(
+            "/config",
+            get(move |req: Request| {
+                let json = json.clone();
+                let saw = Arc::clone(&saw_header_clone);
+                async move {
+                    if req.headers().contains_key("X-Sozune-Token") {
+                        *saw.lock().unwrap() = true;
+                    }
+                    json
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = HttpProvider::new(HttpProviderConfig {
+            enabled: true,
+            url: format!("http://{}/config", addr),
+            poll_interval: 30,
+            auth_header: "X-Sozune-Token".to_string(),
+            auth_value: String::new(),
+        });
+
+        provider.fetch_entrypoints().await.unwrap();
+        assert!(!*saw_header.lock().unwrap());
     }
 }

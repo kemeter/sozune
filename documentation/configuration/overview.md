@@ -163,6 +163,8 @@ Every field above can be overridden through an environment variable. The env var
 | `providers.http.enabled` | `SOZUNE_PROVIDER_HTTP_ENABLED` |
 | `providers.http.url` | `SOZUNE_PROVIDER_HTTP_URL` |
 | `providers.http.poll_interval` | `SOZUNE_PROVIDER_HTTP_POLL_INTERVAL` |
+| `providers.http.auth_header` | `SOZUNE_PROVIDER_HTTP_AUTH_HEADER` |
+| `providers.http.auth_value` | `SOZUNE_PROVIDER_HTTP_AUTH_VALUE` |
 | `providers.config_file.enabled` | `SOZUNE_PROVIDER_CONFIG_FILE_ENABLED` |
 | `providers.config_file.path` | `SOZUNE_PROVIDER_CONFIG_FILE_PATH` |
 | `providers.config_file.watch` | `SOZUNE_PROVIDER_CONFIG_FILE_WATCH` |

@@ -10,6 +10,8 @@ providers:
     enabled: true
     url: "https://config.example.com/entrypoints"
     poll_interval: 30
+    auth_header: "X-Sozune-Token"
+    auth_value: "shared-secret"
 ```
 
 | Field | Default | Description |
@@ -17,6 +19,65 @@ providers:
 | `enabled` | `false` | Enables the HTTP provider |
 | `url` | — | URL to poll |
 | `poll_interval` | `30` | Polling interval, in seconds |
+| `auth_header` | `""` | Header name to send on every poll request. See [Authentication](#authentication). |
+| `auth_value` | `""` | Header value to send. Both `auth_header` and `auth_value` must be non-empty for any header to be sent. |
+
+Env var overrides: `SOZUNE_PROVIDER_HTTP_ENABLED`, `SOZUNE_PROVIDER_HTTP_URL`, `SOZUNE_PROVIDER_HTTP_POLL_INTERVAL`, `SOZUNE_PROVIDER_HTTP_AUTH_HEADER`, `SOZUNE_PROVIDER_HTTP_AUTH_VALUE`.
+
+## Authentication
+
+When the upstream config endpoint is reachable from the public internet, you typically don't want anonymous callers to be able to enumerate your topology. Sōzune supports a simple shared-secret scheme: a single fixed HTTP header sent on every poll.
+
+### How it works
+
+- If both `auth_header` and `auth_value` are set, Sōzune adds `<auth_header>: <auth_value>` to every GET request to `url`.
+- If either is empty, no header is sent — the request is anonymous.
+- The pair is sent verbatim: Sōzune does not prepend `Bearer `, base64-encode, or otherwise transform the value. If you want `Authorization: Bearer abc123`, set `auth_header: "Authorization"` and `auth_value: "Bearer abc123"`.
+- The header is sent on every poll. There is no rotation, no refresh, no challenge/response. Treat the value as a long-lived shared secret.
+
+### Recommended patterns
+
+- **`Authorization: Bearer <token>`** — works with most off-the-shelf auth middleware.
+- **`X-Sozune-Token: <secret>`** — a custom header makes intent explicit and keeps the endpoint outside generic auth chains.
+
+### Example: protecting a Symfony control plane
+
+The control plane checks the header before serving the entrypoint list:
+
+```php
+#[Route('/.well-known/sozune', methods: ['GET'])]
+public function __invoke(Request $request): JsonResponse
+{
+    if ($request->headers->get('X-Sozune-Token') !== $this->expectedToken) {
+        return new JsonResponse(['error' => 'Unauthorized'], 401);
+    }
+    return new JsonResponse($this->buildEntrypoints());
+}
+```
+
+Sōzune side:
+
+```yaml
+providers:
+  http:
+    enabled: true
+    url: "https://control-plane.example.com/.well-known/sozune"
+    poll_interval: 30
+    auth_header: "X-Sozune-Token"
+    auth_value: "${SOZUNE_HTTP_PROVIDER_TOKEN}"  # or use the env var override
+```
+
+### Storing the secret
+
+Prefer the env var override (`SOZUNE_PROVIDER_HTTP_AUTH_VALUE`) over committing the value to YAML. The env var wins if both are set.
+
+### Defence in depth
+
+A single static header is a low bar. For sensitive control planes, layer it with one or more of:
+
+- **Network ACLs** restricting the endpoint to Sōzune's source IP.
+- **TLS** on the upstream URL (Sōzune verifies certificates by default via `rustls`).
+- **mTLS** terminated by an upstream reverse proxy in front of the control plane (Sōzune itself does not currently load client certificates).
 
 ## Expected response
 
@@ -74,6 +135,6 @@ A poll only deletes entrypoints with `source: "http"` — Docker and API ones ar
 
 ## Limitations
 
-- **No authentication.** The polling client doesn't send any header to the upstream URL. Protect your config endpoint via network ACLs or run it on localhost.
 - **No retry/backoff.** A failed fetch waits the full `poll_interval` before retrying.
 - **No diff granularity below entrypoint-level fields.** A change in middleware config (auth, headers, rate limit) is currently not detected by the diff and won't trigger a reload until one of `backends`/`hostnames`/`port` changes too.
+- **Auth is a single static header.** No token rotation, OAuth flow, or mTLS client certs — see [Authentication](#authentication) for the trade-offs and recommended layered patterns.

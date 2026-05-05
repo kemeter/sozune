@@ -196,6 +196,19 @@ pub struct HttpProviderConfig {
         deserialize_with = "deserialize_http_provider_poll_interval_with_env"
     )]
     pub poll_interval: u64,
+    /// Optional HTTP header sent on every poll request — e.g. for bearer
+    /// tokens or shared secrets. Empty means no header is sent.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_http_provider_auth_header_with_env"
+    )]
+    pub auth_header: String,
+    /// Value paired with `auth_header`. Empty means no header is sent.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_http_provider_auth_value_with_env"
+    )]
+    pub auth_value: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -820,6 +833,18 @@ deserialize_with_env!(
     u64,
     default_http_provider_poll_interval
 );
+deserialize_string_with_env!(
+    deserialize_http_provider_auth_header_with_env,
+    "SOZUNE_PROVIDER_HTTP_AUTH_HEADER",
+    "",
+    literal
+);
+deserialize_string_with_env!(
+    deserialize_http_provider_auth_value_with_env,
+    "SOZUNE_PROVIDER_HTTP_AUTH_VALUE",
+    "",
+    literal
+);
 
 deserialize_bool_with_env!(
     deserialize_dashboard_enabled_with_env,
@@ -937,12 +962,16 @@ impl ProvidersConfig {
 
         let http_env = std::env::var("SOZUNE_PROVIDER_HTTP_ENABLED").is_ok()
             || std::env::var("SOZUNE_PROVIDER_HTTP_URL").is_ok()
-            || std::env::var("SOZUNE_PROVIDER_HTTP_POLL_INTERVAL").is_ok();
+            || std::env::var("SOZUNE_PROVIDER_HTTP_POLL_INTERVAL").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_HTTP_AUTH_HEADER").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_HTTP_AUTH_VALUE").is_ok();
         if http_env || self.http.is_some() {
             self.http.get_or_insert_with(|| HttpProviderConfig {
                 enabled: false,
                 url: String::new(),
                 poll_interval: default_http_provider_poll_interval(),
+                auth_header: String::new(),
+                auth_value: String::new(),
             }).apply_env_overrides();
         }
     }
@@ -1008,6 +1037,8 @@ impl HttpProviderConfig {
         if let Some(v) = env_bool("SOZUNE_PROVIDER_HTTP_ENABLED") { self.enabled = v; }
         if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_URL") { self.url = v; }
         if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_HTTP_POLL_INTERVAL") { self.poll_interval = v; }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_AUTH_HEADER") { self.auth_header = v; }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_AUTH_VALUE") { self.auth_value = v; }
     }
 }
 
@@ -1254,6 +1285,23 @@ acme:
 
     #[test]
     fn test_proxy_config_deserialization() {
+        // Take ENV_LOCK to avoid seeing env vars set by sibling tests; the
+        // serde deserializers honour SOZUNE_* env vars even on a YAML-only path.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            for k in [
+                "SOZUNE_HTTP_PORT",
+                "SOZUNE_HTTPS_PORT",
+                "SOZUNE_PROXY_MAX_BUFFERS",
+                "SOZUNE_PROXY_BUFFER_SIZE",
+                "SOZUNE_PROXY_STARTUP_DELAY_MS",
+                "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS",
+                "SOZUNE_PROXY_RELOAD_DEBOUNCE_MS",
+            ] {
+                std::env::remove_var(k);
+            }
+        }
+
         let yaml = r#"
 http:
   listen_address: 9080
