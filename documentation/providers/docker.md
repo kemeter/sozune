@@ -36,6 +36,7 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | `sozune.http.<svc>.headers.response.<name>` | [Custom headers](/documentation/middleware/headers) — response-side |
 | `sozune.http.<svc>.headers.both.<name>` | [Custom headers](/documentation/middleware/headers) — both directions |
 | `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/middleware/strip-prefix) |
+| `sozune.http.<svc>.addPrefix` | [Add prefix](/documentation/middleware/add-prefix) |
 | `sozune.http.<svc>.httpsRedirect` | [Redirects](/documentation/middleware/redirects) |
 | `sozune.http.<svc>.httpsRedirectPort` | [Redirects](/documentation/middleware/redirects) |
 | `sozune.http.<svc>.redirect` | [Redirects](/documentation/middleware/redirects) |

@@ -12,6 +12,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "backendTimeout",
     "tls",
     "stripPrefix",
+    "addPrefix",
     "httpsRedirect",
     "httpsRedirectPort",
     "stickySession",

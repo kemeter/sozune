@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Snapshot of the storage at the moment of the last successful reload, keyed
 /// by `cluster_id`. Used to compute the diff between two reloads.
@@ -640,8 +640,20 @@ fn regex_escape(s: &str) -> String {
 fn build_path_and_rewrite(
     path_config: Option<&PathConfig>,
     strip_prefix: bool,
+    add_prefix: Option<&str>,
     cluster_id: &str,
 ) -> (PathRule, Option<String>) {
+    if strip_prefix && add_prefix.is_some() {
+        warn!(
+            "strip_prefix and add_prefix are mutually exclusive on {}; add_prefix takes precedence",
+            cluster_id
+        );
+    }
+
+    if let Some(prefix) = add_prefix {
+        return build_add_prefix_rewrite(path_config, prefix);
+    }
+
     let Some(path_config) = path_config else {
         return (
             PathRule {
@@ -707,6 +719,75 @@ fn build_path_and_rewrite(
     }
 }
 
+fn normalize_add_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn build_add_prefix_rewrite(
+    path_config: Option<&PathConfig>,
+    prefix: &str,
+) -> (PathRule, Option<String>) {
+    let normalized = normalize_add_prefix(prefix);
+    if normalized.is_empty() {
+        return (
+            PathRule {
+                value: "/".to_string(),
+                kind: 0,
+            },
+            None,
+        );
+    }
+
+    match path_config {
+        None => {
+            // Match every path and capture it so the rewrite template can
+            // prepend the configured prefix verbatim.
+            (
+                PathRule {
+                    value: "^(/.*)$".to_string(),
+                    kind: 1,
+                },
+                Some(format!("{normalized}$PATH[1]")),
+            )
+        }
+        Some(pc) => match pc.rule_type {
+            PathRuleType::Prefix => {
+                let escaped = regex_escape(pc.value.trim_end_matches('/'));
+                let pattern = format!("^({}(?:/.*)?)$", escaped);
+                (
+                    PathRule {
+                        value: pattern,
+                        kind: 1,
+                    },
+                    Some(format!("{normalized}$PATH[1]")),
+                )
+            }
+            PathRuleType::Exact => (
+                PathRule {
+                    value: pc.value.clone(),
+                    kind: 2,
+                },
+                Some(format!("{normalized}{}", pc.value)),
+            ),
+            PathRuleType::Regex => (
+                PathRule {
+                    value: pc.value.clone(),
+                    kind: 1,
+                },
+                Some(format!("{normalized}$PATH[1]")),
+            ),
+        },
+    }
+}
+
 fn configure_http_entrypoint(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -765,6 +846,7 @@ fn configure_http_entrypoint(
         let (path_rule, frontend_rewrite_path) = build_path_and_rewrite(
             entrypoint.config.path.as_ref(),
             entrypoint.config.strip_prefix,
+            entrypoint.config.add_prefix.as_deref(),
             cluster_id,
         );
 
@@ -1213,6 +1295,7 @@ fn remove_http_frontends(
     let (path_rule, _) = build_path_and_rewrite(
         entrypoint.config.path.as_ref(),
         entrypoint.config.strip_prefix,
+        entrypoint.config.add_prefix.as_deref(),
         cluster_id,
     );
 
@@ -1559,5 +1642,72 @@ mod tests {
     fn test_parse_backend_address_invalid_port() {
         let result = parse_backend_address(&Backend::new("127.0.0.1", 0));
         assert!(result.is_ok()); // Port 0 is technically valid
+    }
+
+    #[test]
+    fn add_prefix_without_path_matches_root_and_prepends() {
+        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/foo"), "test");
+        assert_eq!(path_rule.kind, 1, "expected regex kind for capture");
+        assert_eq!(path_rule.value, "^(/.*)$");
+        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
+    }
+
+    #[test]
+    fn add_prefix_normalizes_missing_leading_slash() {
+        let (_, rewrite) = build_path_and_rewrite(None, false, Some("foo"), "test");
+        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
+    }
+
+    #[test]
+    fn add_prefix_strips_trailing_slash() {
+        let (_, rewrite) = build_path_and_rewrite(None, false, Some("/foo/"), "test");
+        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
+    }
+
+    #[test]
+    fn add_prefix_empty_value_is_treated_as_no_op() {
+        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/"), "test");
+        assert_eq!(path_rule.value, "/");
+        assert_eq!(path_rule.kind, 0);
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn add_prefix_with_prefix_path_matcher_keeps_filter() {
+        let path = PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".to_string(),
+        };
+        let (path_rule, rewrite) = build_path_and_rewrite(Some(&path), false, Some("/foo"), "test");
+        assert_eq!(path_rule.kind, 1);
+        assert!(path_rule.value.contains("/api"));
+        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
+    }
+
+    #[test]
+    fn add_prefix_with_exact_path_matcher_uses_static_rewrite() {
+        let path = PathConfig {
+            rule_type: PathRuleType::Exact,
+            value: "/health".to_string(),
+        };
+        let (path_rule, rewrite) = build_path_and_rewrite(Some(&path), false, Some("/foo"), "test");
+        assert_eq!(path_rule.kind, 2);
+        assert_eq!(path_rule.value, "/health");
+        assert_eq!(rewrite.as_deref(), Some("/foo/health"));
+    }
+
+    #[test]
+    fn add_prefix_takes_precedence_over_strip_prefix() {
+        // Mutually exclusive: when both set, add_prefix wins.
+        let (_, rewrite) = build_path_and_rewrite(None, true, Some("/foo"), "test");
+        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
+    }
+
+    #[test]
+    fn no_add_prefix_keeps_default_behaviour() {
+        let (path_rule, rewrite) = build_path_and_rewrite(None, false, None, "test");
+        assert_eq!(path_rule.value, "/");
+        assert_eq!(path_rule.kind, 0);
+        assert!(rewrite.is_none());
     }
 }

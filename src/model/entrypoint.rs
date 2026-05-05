@@ -60,6 +60,8 @@ pub struct EntrypointConfig {
     pub tls: bool,
     pub strip_prefix: bool,
     #[serde(default)]
+    pub add_prefix: Option<String>,
+    #[serde(default)]
     pub https_redirect: bool,
     #[serde(default)]
     pub https_redirect_port: Option<u16>,

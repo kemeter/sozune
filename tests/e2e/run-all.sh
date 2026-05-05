@@ -134,6 +134,14 @@ services:
       - "sozune.http.svcstrip.stripPrefix=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-add-prefix:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcaddprefix.host=$HOST_ADD_PREFIX"
+      - "sozune.http.svcaddprefix.addPrefix=/foo"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-redirect:
     image: traefik/whoami
     labels:
@@ -274,6 +282,7 @@ declare -A WAIT_PATHS=(
     ["$HOST_HEADERS_BOTH"]="/"
     ["$HOST_HEADERS_DELETE"]="/"
     ["$HOST_STRIP"]="/api"
+    ["$HOST_ADD_PREFIX"]="/"
     ["$HOST_REDIRECT"]="/"
     ["$HOST_RATELIMIT"]="/"
     ["$HOST_COMPRESS"]="/"
