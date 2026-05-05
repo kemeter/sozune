@@ -98,7 +98,7 @@ impl KubernetesProvider {
         })
     }
 
-    async fn build_client(&self) -> anyhow::Result<Client> {
+    pub async fn build_client(&self) -> anyhow::Result<Client> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         if self.config.kubeconfig.is_empty() {

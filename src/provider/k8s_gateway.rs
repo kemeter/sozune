@@ -21,7 +21,16 @@ use gateway_api::apis::standard::httproutes::{
 };
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Map a `route_uid` (Kubernetes UID, stable across renames) to the list of
+/// entrypoint ids it has produced. We track this so deletes can remove
+/// every cluster a previous Apply created without scanning the whole
+/// storage.
+type RouteIndex = Arc<RwLock<HashMap<String, Vec<String>>>>;
 
 /// DNS suffix used when synthesising a backend address from a Service name.
 /// Matches the standard Kubernetes `<svc>.<ns>.svc.cluster.local` form.
@@ -29,30 +38,145 @@ const CLUSTER_DNS_SUFFIX: &str = "svc.cluster.local";
 
 const SOURCE_TAG: &str = "k8s-gateway";
 
-/// Kick off a HTTPRoute watch on the given client. Runs forever (until the
-/// kube watcher errors permanently). On transient errors the watcher
-/// internally backs off and resumes.
-pub async fn run_httproute_watcher(client: Client) -> anyhow::Result<()> {
+/// Kick off a HTTPRoute watch on the given client. On every Apply we
+/// upsert the produced entrypoints into shared storage; on Delete we
+/// remove them. Each meaningful change emits a single `reload_tx` signal
+/// — the proxy's debouncer collapses bursts.
+pub async fn run_httproute_watcher(
+    client: Client,
+    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    reload_tx: mpsc::Sender<()>,
+) -> anyhow::Result<()> {
     let api: Api<HTTPRoute> = Api::all(client);
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
 
     info!("Gateway API: HTTPRoute watcher started");
 
     while let Some(event) = stream.next().await {
-        match event {
-            Ok(Event::Apply(route)) => log_route("apply", &route),
-            Ok(Event::Delete(route)) => log_route("delete", &route),
-            Ok(Event::Init) => debug!("Gateway API: HTTPRoute init"),
-            Ok(Event::InitApply(route)) => log_route("init-apply", &route),
-            Ok(Event::InitDone) => debug!("Gateway API: HTTPRoute init done"),
+        let changed = match event {
+            Ok(Event::Apply(route)) | Ok(Event::InitApply(route)) => {
+                log_route("apply", &route);
+                apply_route(&route, &storage, &index)
+            }
+            Ok(Event::Delete(route)) => {
+                log_route("delete", &route);
+                delete_route(&route, &storage, &index)
+            }
+            Ok(Event::Init) => {
+                debug!("Gateway API: HTTPRoute init");
+                false
+            }
+            Ok(Event::InitDone) => {
+                debug!("Gateway API: HTTPRoute init done");
+                false
+            }
             Err(e) => {
                 error!("Gateway API: HTTPRoute watcher error: {}", e);
+                false
             }
+        };
+        if changed && let Err(e) = reload_tx.send(()).await {
+            error!("Gateway API: failed to send reload signal: {}", e);
         }
     }
 
     warn!("Gateway API: HTTPRoute watcher stream ended unexpectedly");
     Ok(())
+}
+
+/// Returns true if storage was modified. Replaces any previous state for
+/// this route UID atomically so a rename of a rule doesn't leave a stale
+/// entrypoint behind.
+fn apply_route(
+    route: &HTTPRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &RouteIndex,
+) -> bool {
+    let uid = match route.metadata.uid.as_deref() {
+        Some(u) => u.to_string(),
+        None => {
+            warn!("Gateway API: HTTPRoute without uid, skipping");
+            return false;
+        }
+    };
+
+    let new_entrypoints = route_to_entrypoints(route);
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    if let Some(previous_ids) = index_guard.get(&uid).cloned() {
+        for id in previous_ids {
+            if storage_guard.remove(&id).is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    let new_ids: Vec<String> = new_entrypoints.iter().map(|e| e.id.clone()).collect();
+    for ep in new_entrypoints {
+        storage_guard.insert(ep.id.clone(), ep);
+        changed = true;
+    }
+
+    if new_ids.is_empty() {
+        index_guard.remove(&uid);
+    } else {
+        index_guard.insert(uid, new_ids);
+    }
+
+    changed
+}
+
+fn delete_route(
+    route: &HTTPRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &RouteIndex,
+) -> bool {
+    let Some(uid) = route.metadata.uid.as_deref() else {
+        return false;
+    };
+
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let Some(ids) = index_guard.remove(uid) else {
+        return false;
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for id in ids {
+        if storage_guard.remove(&id).is_some() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Validate that the cluster knows about the Gateway API CRDs before we
@@ -420,6 +544,121 @@ mod tests {
         b.kind = Some("CustomResource".into());
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
         assert!(route_to_entrypoints(&r).is_empty());
+    }
+
+    fn route_with_uid(uid: &str, rules: Vec<HTTPRouteRules>, hostnames: Vec<String>) -> HTTPRoute {
+        let mut r = route_with(rules, hostnames);
+        r.metadata.uid = Some(uid.into());
+        r
+    }
+
+    #[test]
+    fn apply_inserts_entrypoints_and_indexes_them_by_uid() {
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let r = route_with_uid(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+
+        let changed = apply_route(&r, &storage, &index);
+        assert!(changed);
+        assert_eq!(storage.read().unwrap().len(), 1);
+        assert_eq!(index.read().unwrap().get("uid-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn second_apply_replaces_previous_entrypoints_for_same_uid() {
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+
+        let v1 = route_with_uid(
+            "uid-1",
+            vec![
+                rule(None, vec![backend("api", 80)]),
+                rule(None, vec![backend("admin", 8080)]),
+            ],
+            vec!["app.example.com".into()],
+        );
+        apply_route(&v1, &storage, &index);
+        assert_eq!(storage.read().unwrap().len(), 2);
+
+        let v2 = route_with_uid(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        let changed = apply_route(&v2, &storage, &index);
+        assert!(changed);
+        assert_eq!(
+            storage.read().unwrap().len(),
+            1,
+            "the second rule's entrypoint must be removed when v2 only has one rule"
+        );
+        assert_eq!(index.read().unwrap().get("uid-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_removes_all_entrypoints_for_uid() {
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let r = route_with_uid(
+            "uid-1",
+            vec![
+                rule(None, vec![backend("api", 80)]),
+                rule(None, vec![backend("admin", 8080)]),
+            ],
+            vec!["app.example.com".into()],
+        );
+        apply_route(&r, &storage, &index);
+        assert_eq!(storage.read().unwrap().len(), 2);
+
+        let changed = delete_route(&r, &storage, &index);
+        assert!(changed);
+        assert!(storage.read().unwrap().is_empty());
+        assert!(index.read().unwrap().get("uid-1").is_none());
+    }
+
+    #[test]
+    fn delete_for_unknown_uid_is_noop() {
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let r = route_with_uid(
+            "uid-unknown",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!delete_route(&r, &storage, &index));
+    }
+
+    #[test]
+    fn apply_with_no_resolvable_backends_clears_previous_state() {
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+
+        let v1 = route_with_uid(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        apply_route(&v1, &storage, &index);
+        assert_eq!(storage.read().unwrap().len(), 1);
+
+        // v2 has rules but no usable backends — the route should be wiped
+        // from storage and from the index.
+        let v2 = route_with_uid(
+            "uid-1",
+            vec![HTTPRouteRules {
+                backend_refs: None,
+                ..Default::default()
+            }],
+            vec!["app.example.com".into()],
+        );
+        let changed = apply_route(&v2, &storage, &index);
+        assert!(changed);
+        assert!(storage.read().unwrap().is_empty());
+        assert!(index.read().unwrap().get("uid-1").is_none());
     }
 
     #[test]

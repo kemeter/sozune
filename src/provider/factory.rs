@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::diagnostics::DiagnosticsStore;
 use crate::model::Entrypoint;
 use crate::provider::{
-    Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
+    Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider, k8s_gateway,
     kubernetes::KubernetesProvider, nomad::NomadProvider, podman::PodmanProvider,
     swarm::SwarmProvider,
 };
@@ -176,6 +176,10 @@ pub async fn start_services(
         let acme_notify_kubernetes = Arc::clone(&acme_notify);
         let diagnostics_kubernetes = Arc::clone(&diagnostics);
 
+        let kubernetes_provider_for_gateway = Arc::clone(&kubernetes_provider);
+        let storage_for_gateway = Arc::clone(&storage);
+        let reload_tx_for_gateway = reload_tx.clone();
+
         tokio::spawn(async move {
             if let Err(e) = kubernetes_provider
                 .start_service(
@@ -187,6 +191,38 @@ pub async fn start_services(
                 .await
             {
                 error!("Kubernetes service failed: {}", e);
+            }
+        });
+
+        // Try to bring up the Gateway API HTTPRoute watcher alongside the
+        // legacy Ingress provider. If the cluster does not have the CRD
+        // installed we log and move on — Ingress alone is enough.
+        tokio::spawn(async move {
+            let client = match kubernetes_provider_for_gateway.build_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Gateway API: failed to build kube client: {}", e);
+                    return;
+                }
+            };
+            match k8s_gateway::httproute_crd_installed(&client).await {
+                Ok(true) => {
+                    if let Err(e) = k8s_gateway::run_httproute_watcher(
+                        client,
+                        storage_for_gateway,
+                        reload_tx_for_gateway,
+                    )
+                    .await
+                    {
+                        error!("Gateway API: HTTPRoute watcher failed: {}", e);
+                    }
+                }
+                Ok(false) => {
+                    info!("Gateway API: HTTPRoute CRD not installed, skipping Gateway watcher");
+                }
+                Err(e) => {
+                    warn!("Gateway API: probe failed, skipping watcher: {}", e);
+                }
             }
         });
     }
