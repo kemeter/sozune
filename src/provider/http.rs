@@ -139,6 +139,7 @@ mod tests {
                 path: None,
                 tls: false,
                 strip_prefix: false,
+                add_prefix: None,
                 https_redirect: false,
                 https_redirect_port: None,
                 redirect: None,

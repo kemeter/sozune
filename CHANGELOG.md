@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Routing
+
+- `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.
+
 ## [0.13.0] - 2026-05-04
 
 UX overhaul. Diagnostics become a first-class surface — visible in the CLI, the API, and the dashboard — and the dashboard gains the filters and drill-down to make them actionable.

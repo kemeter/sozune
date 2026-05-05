@@ -46,6 +46,7 @@ Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu).
 - [Basic auth](/documentation/middleware/auth)
 - [Custom headers](/documentation/middleware/headers)
 - [Strip prefix](/documentation/middleware/strip-prefix)
+- [Add prefix](/documentation/middleware/add-prefix)
 - [Redirects](/documentation/middleware/redirects)
 - [Rate limit](/documentation/middleware/rate-limit)
 - [Response compression](/documentation/middleware/compress)

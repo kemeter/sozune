@@ -35,6 +35,7 @@ A JSON array of entrypoints with the same schema as the [REST API](/documentatio
       "path": null,
       "tls": true,
       "strip_prefix": false,
+      "add_prefix": null,
       "https_redirect": true,
       "https_redirect_port": null,
       "redirect": null,

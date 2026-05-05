@@ -156,6 +156,11 @@ fn build_entrypoint(
 
     let tls = core::parse_bool(labels, &format!("{prefix}tls"));
     let strip_prefix = core::parse_bool(labels, &format!("{prefix}stripPrefix"));
+    let add_prefix = labels
+        .get(&format!("{prefix}addPrefix"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let https_redirect = core::parse_bool(labels, &format!("{prefix}httpsRedirect"));
     let https_redirect_port = redirect::parse_https_redirect_port(labels, &prefix, diagnostics);
     let redirect = redirect::parse_redirect_policy(labels, &prefix, diagnostics);
@@ -188,6 +193,7 @@ fn build_entrypoint(
             path,
             tls,
             strip_prefix,
+            add_prefix,
             https_redirect,
             https_redirect_port,
             redirect,
@@ -247,6 +253,7 @@ fn build_tcp_entrypoint(
             path: None,
             tls: false,
             strip_prefix: false,
+            add_prefix: None,
             https_redirect: false,
             https_redirect_port: None,
             redirect: None,
@@ -497,5 +504,35 @@ mod tests {
             r.entrypoints.get("http_web").unwrap().backends,
             vec![Backend::new("10.0.0.5", 80)]
         );
+    }
+
+    #[test]
+    fn add_prefix_label_is_parsed() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "expats.example.com"),
+                ("sozune.http.web.addPrefix", "/foo"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_web").expect("entrypoint");
+        assert_eq!(ep.config.add_prefix.as_deref(), Some("/foo"));
+    }
+
+    #[test]
+    fn empty_add_prefix_label_is_treated_as_unset() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "expats.example.com"),
+                ("sozune.http.web.addPrefix", "  "),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_web").expect("entrypoint");
+        assert!(ep.config.add_prefix.is_none());
     }
 }

@@ -98,6 +98,26 @@ else
     fail "strip prefix: backend did not receive /, got: $(echo "$strip_root_body" | grep -i 'GET ' | head -1)"
 fi
 
+log "[02] Middleware: add prefix"
+
+add_prefix_root_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_ADD_PREFIX" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
+if echo "$add_prefix_root_body" | grep -q "GET /foo"; then
+    pass "add prefix: / -> backend received /foo"
+else
+    fail "add prefix: backend did not receive /foo, got: $(echo "$add_prefix_root_body" | grep -i 'GET ' | head -1)"
+fi
+
+add_prefix_sub_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_ADD_PREFIX" \
+    "http://127.0.0.1:$HTTP_PORT/bar" 2>/dev/null || echo "")
+if echo "$add_prefix_sub_body" | grep -q "GET /foo/bar"; then
+    pass "add prefix: /bar -> backend received /foo/bar"
+else
+    fail "add prefix: backend did not receive /foo/bar, got: $(echo "$add_prefix_sub_body" | grep -i 'GET ' | head -1)"
+fi
+
 log "[02] Middleware: HTTPS redirect"
 
 redirect_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
