@@ -78,7 +78,7 @@ fn init_tracing() {
 async fn serve(config_path: &str) -> anyhow::Result<()> {
     info!("Starting Sozune proxy");
 
-    let config = if tokio::fs::try_exists(config_path).await.unwrap_or(false) {
+    let mut config = if tokio::fs::try_exists(config_path).await.unwrap_or(false) {
         info!("Loading configuration from: {}", config_path);
         let config_content = tokio::fs::read_to_string(config_path)
             .await
@@ -89,6 +89,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         info!("Configuration file not found, using the default configuration");
         AppConfig::default()
     };
+    config.apply_env_overrides();
 
     // Create empty storage - providers will populate it
     let storage = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
