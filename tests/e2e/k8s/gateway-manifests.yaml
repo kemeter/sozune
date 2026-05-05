@@ -1,0 +1,63 @@
+---
+# Two HTTPRoutes targeting the same Services (svca, svcb) already created
+# by manifests.yaml. Hostnames are prefixed `gw-` to keep the Gateway-API
+# routes disjoint from the Ingress routes the previous suite exercises.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: svca-gw
+  namespace: sozune-test
+spec:
+  hostnames:
+    - gw-svca.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: svca
+          port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: svcb-gw
+  namespace: sozune-test
+spec:
+  hostnames:
+    - gw-svcb.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: svcb
+          port: 80
+---
+# Path-based routing on a single hostname — exercises that the conversion
+# correctly emits one entrypoint per rule with the right path config.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: split-gw
+  namespace: sozune-test
+spec:
+  hostnames:
+    - gw-split.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /a
+      backendRefs:
+        - name: svca
+          port: 80
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /b
+      backendRefs:
+        - name: svcb
+          port: 80

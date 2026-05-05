@@ -8,6 +8,12 @@ All notable changes to this project will be documented in this file.
 
 - `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.
 
+### Kubernetes Gateway API
+
+- HTTPRoute support — Sōzune watches `gateway.networking.k8s.io/v1` `HTTPRoute` resources alongside Ingress when the Kubernetes provider is enabled and the CRDs are installed. Hostnames, `PathPrefix`/`Exact` path matches, multiple backendRefs (with weights), cross-namespace backends, and live apply/delete are wired in.
+- Service backendRefs are resolved to ready pod IPs through the existing EndpointSlice cache; Sōzu requires `IpAddr` backends, so routes targeting a Service with no ready endpoints retry every 2 seconds until pods come up.
+- Gateway / GatewayClass resources, status reporting, HTTPRoute filters, and GRPCRoute/TCPRoute are not yet implemented — see [Kubernetes provider docs](documentation/providers/kubernetes.md#gateway-api-httproute) for the support matrix.
+
 ## [0.13.0] - 2026-05-04
 
 UX overhaul. Diagnostics become a first-class surface — visible in the CLI, the API, and the dashboard — and the dashboard gains the filters and drill-down to make them actionable.

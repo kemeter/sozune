@@ -126,6 +126,10 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
+  # Optional: only needed if you want HTTPRoute support.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "gateways", "gatewayclasses"]
+    verbs: ["get", "list", "watch"]
 ```
 
 `namespaces` is only used for the start-up sanity check; if you want a strictly minimal role, drop it (Sōzune logs a warning instead of an info line).
@@ -139,6 +143,66 @@ Expose the Sōzune pod with a `Service` of type `LoadBalancer` (cloud) or `NodeP
 Useful for local development. Sōzune uses the current context from `$KUBECONFIG` or `~/.kube/config` automatically; set `kubeconfig:` only if you need a specific file.
 
 > **Heads up:** pod IPs (`10.244.x.x` on most clusters) are not routable from outside the cluster's CNI. Out-of-cluster Sōzune can therefore *discover* services correctly but cannot actually reach the backends. Use this mode for testing the discovery pipeline; deploy Sōzune in-cluster for real traffic.
+
+## Gateway API (HTTPRoute)
+
+Sōzune watches `gateway.networking.k8s.io/v1` `HTTPRoute` resources alongside Ingress. The watcher is started automatically when the Kubernetes provider is enabled and the CRD is installed; no extra configuration is required.
+
+### Prerequisites
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+```
+
+If the CRDs are missing, Sōzune logs `HTTPRoute CRD not installed` once and skips the Gateway watcher — Ingress alone keeps working.
+
+### What's supported
+
+- `spec.hostnames` — matched against the `Host` header of incoming requests.
+- `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
+- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
+- `backendRef.weight` — propagated to the load balancer.
+- Live reconciliation — apply/update/delete of an `HTTPRoute` is reflected in routing within seconds, including when the target Service's pods come up after the route was created.
+
+### Example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: default
+spec:
+  hostnames:
+    - app.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-svc
+          port: 8080
+          weight: 100
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web-svc
+          port: 80
+```
+
+### What's not supported (yet)
+
+- `Gateway` and `GatewayClass` resources — listeners are still declared statically via `proxy.http.listen_address` / `proxy.https.listen_address`. Sōzune ignores `spec.parentRefs`.
+- `status.parents[].conditions[]` reporting — `kubectl describe httproute` does not yet show "Accepted" / "ResolvedRefs" status from Sōzune.
+- HTTPRoute filters (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — use Service annotations or Ingress annotations until these land.
+- `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
+
+### How resolution works
+
+When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready pod IPs from the matching Service's `EndpointSlice`s. Sōzu requires `IpAddr` backends and refuses cluster-DNS hostnames, so a route that targets a Service with no ready endpoints registers no entrypoint and is retried every 2 seconds until the endpoints appear. Once at least one ready endpoint exists the route becomes live without any user intervention.
 
 ## ACME / Let's Encrypt
 
@@ -155,8 +219,8 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
-- **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec.
-- **Gateway API not yet supported.**
+- **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute does support cross-namespace `backendRefs`.)
+- **Gateway API: HTTPRoute only.** `Gateway`, `GatewayClass`, `GRPCRoute`, `TCPRoute`, `ReferenceGrant`, and HTTPRoute filters are not yet implemented. See the Gateway API section above for details.
 
 ## Environment variables
 

@@ -205,24 +205,23 @@ pub async fn start_services(
                     return;
                 }
             };
-            match k8s_gateway::httproute_crd_installed(&client).await {
-                Ok(true) => {
-                    if let Err(e) = k8s_gateway::run_httproute_watcher(
-                        client,
-                        storage_for_gateway,
-                        reload_tx_for_gateway,
-                    )
-                    .await
-                    {
-                        error!("Gateway API: HTTPRoute watcher failed: {}", e);
-                    }
+            if k8s_gateway::httproute_crd_installed(&client).await {
+                let resolver: Arc<dyn k8s_gateway::ServiceResolver> =
+                    kubernetes_provider_for_gateway.clone();
+                if let Err(e) = k8s_gateway::run_httproute_watcher(
+                    client,
+                    storage_for_gateway,
+                    reload_tx_for_gateway,
+                    resolver,
+                )
+                .await
+                {
+                    error!("Gateway API: HTTPRoute watcher failed: {}", e);
                 }
-                Ok(false) => {
-                    info!("Gateway API: HTTPRoute CRD not installed, skipping Gateway watcher");
-                }
-                Err(e) => {
-                    warn!("Gateway API: probe failed, skipping watcher: {}", e);
-                }
+            } else {
+                info!(
+                    "Gateway API: HTTPRoute CRD not installed (or unreachable), skipping Gateway watcher"
+                );
             }
         });
     }
