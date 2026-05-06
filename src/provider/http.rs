@@ -152,6 +152,7 @@ mod tests {
                 www_authenticate: None,
                 priority: 0,
                 auth: None,
+                forward_auth: None,
                 headers: Vec::new(),
                 backend_timeout: None,
                 rate_limit: None,
@@ -264,8 +265,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_sends_auth_header_when_configured() {
-        use std::sync::Mutex;
         use axum::extract::Request;
+        use std::sync::Mutex;
 
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_clone = Arc::clone(&captured);
@@ -307,8 +308,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_omits_auth_header_when_value_is_empty() {
-        use std::sync::Mutex;
         use axum::extract::Request;
+        use std::sync::Mutex;
 
         let saw_header: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let saw_header_clone = Arc::clone(&saw_header);

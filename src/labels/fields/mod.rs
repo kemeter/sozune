@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod core;
+pub mod forward_auth;
 pub mod headers;
 pub mod host;
 pub mod methods;

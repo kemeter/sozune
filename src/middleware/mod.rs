@@ -1,5 +1,6 @@
 mod compress;
 mod diag;
+mod forward_auth;
 mod proxy;
 pub mod rate_limit;
 
@@ -11,7 +12,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::info;
 
-use crate::model::{Backend, EntrypointConfig};
+use crate::model::{Backend, EntrypointConfig, ForwardAuthConfig};
 use rate_limit::RateLimiter;
 
 /// Shared state for the middleware server
@@ -19,6 +20,7 @@ use rate_limit::RateLimiter;
 pub struct MiddlewareAppState {
     pub route_table: Arc<RwLock<MiddlewareRouteTable>>,
     pub http_client: Client<hyper_util::client::legacy::connect::HttpConnector, axum::body::Body>,
+    pub forward_auth_client: reqwest::Client,
 }
 
 pub type MiddlewareState = Arc<RwLock<MiddlewareRouteTable>>;
@@ -37,6 +39,7 @@ pub struct MiddlewareRoute {
     pub backend_timeout: Option<u64>,
     pub rate_limiter: Option<RateLimiter>,
     pub compress: bool,
+    pub forward_auth: Option<ForwardAuthConfig>,
 }
 
 impl MiddlewareRouteTable {
@@ -80,7 +83,10 @@ impl MiddlewareRoute {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.backend_timeout.is_some() || config.rate_limit.is_some() || config.compress
+    config.backend_timeout.is_some()
+        || config.rate_limit.is_some()
+        || config.compress
+        || config.forward_auth.is_some()
 }
 
 /// Build middleware route from entrypoint config
@@ -102,6 +108,7 @@ pub fn build_middleware_route(
         backend_timeout: config.backend_timeout,
         rate_limiter,
         compress: config.compress,
+        forward_auth: config.forward_auth.clone(),
     })
 }
 
@@ -110,6 +117,11 @@ pub async fn serve(port: u16, route_table: MiddlewareState) -> anyhow::Result<()
     let app_state = MiddlewareAppState {
         route_table,
         http_client: Client::builder(TokioExecutor::new()).build_http(),
+        forward_auth_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(forward_auth::TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client builds with default config"),
     };
 
     let app = Router::new()
@@ -120,7 +132,11 @@ pub async fn serve(port: u16, route_table: MiddlewareState) -> anyhow::Result<()
     info!("Middleware server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

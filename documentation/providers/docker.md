@@ -32,6 +32,9 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | Label | Reference |
 |---|---|
 | `sozune.http.<svc>.auth.basic` | [Basic auth](/documentation/middleware/auth) |
+| `sozune.http.<svc>.forwardAuth.address` | [Forward auth](/documentation/middleware/forward-auth) — required to enable |
+| `sozune.http.<svc>.forwardAuth.responseHeaders` | [Forward auth](/documentation/middleware/forward-auth) — comma-separated headers to copy from auth response onto the request |
+| `sozune.http.<svc>.forwardAuth.trustForwardHeader` | [Forward auth](/documentation/middleware/forward-auth) — keep client `X-Forwarded-*` headers when calling the auth service |
 | `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/middleware/headers) — request-side by default |
 | `sozune.http.<svc>.headers.response.<name>` | [Custom headers](/documentation/middleware/headers) — response-side |
 | `sozune.http.<svc>.headers.both.<name>` | [Custom headers](/documentation/middleware/headers) — both directions |

@@ -1,8 +1,9 @@
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{Request, Response, StatusCode, Uri};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
+use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
@@ -10,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use super::MiddlewareAppState;
 use super::compress;
 use super::diag;
+use super::forward_auth::{self, AuthRequestSnapshot, ForwardAuthOutcome};
 use super::rate_limit::RateLimitResult;
 
 /// Main proxy handler: identifies the route by Host header,
@@ -19,6 +21,10 @@ pub async fn handle_proxy(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let start = Instant::now();
+    let client_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let source_ip = req
@@ -72,7 +78,47 @@ pub async fn handle_proxy(
         }
     };
 
-    // 1. Rate limit check
+    // 1. Forward auth (runs before rate limit, headers, compression)
+    let mut auth_injected_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+    if let Some(cfg) = route.forward_auth.as_ref() {
+        let snapshot = AuthRequestSnapshot {
+            method: req.method().clone(),
+            uri: req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| req.uri().path().to_string()),
+            host: host.clone(),
+            headers: req.headers().clone(),
+            is_tls: req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.eq_ignore_ascii_case("https"))
+                .unwrap_or(false),
+        };
+        match forward_auth::evaluate(&state.forward_auth_client, cfg, snapshot, client_addr).await {
+            ForwardAuthOutcome::Allow { headers } => {
+                auth_injected_headers = headers;
+            }
+            ForwardAuthOutcome::Deny(response) => {
+                let status = response.status().as_u16();
+                let duration = start.elapsed();
+                info!(
+                    "{} {} {} {} {} {}ms (forward-auth)",
+                    source_ip,
+                    method,
+                    host,
+                    path,
+                    status,
+                    duration.as_millis()
+                );
+                return response.into_response();
+            }
+        }
+    }
+
+    // 2. Rate limit check
     if let Some(ref limiter) = route.rate_limiter {
         let source_ip = req
             .headers()
@@ -88,7 +134,7 @@ pub async fn handle_proxy(
         }
     }
 
-    // 2. Pick a backend using round-robin
+    // 3. Pick a backend using round-robin
     let (backend_host, backend_port) = match route.next_backend() {
         Some(b) => b.clone(),
         None => {
@@ -97,7 +143,7 @@ pub async fn handle_proxy(
         }
     };
 
-    // 3. Build the forwarded URI
+    // 4. Build the forwarded URI
     let original_path = req.uri().path().to_string();
     let query = req
         .uri()
@@ -121,7 +167,7 @@ pub async fn handle_proxy(
         target_uri
     );
 
-    // 4. Check for WebSocket upgrade
+    // 5. Check for WebSocket upgrade
     let is_websocket = req
         .headers()
         .get("upgrade")
@@ -132,8 +178,13 @@ pub async fn handle_proxy(
         return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query).await;
     }
 
-    // 5. Build the forwarded request
+    // 6. Build the forwarded request
     let (mut parts, body) = req.into_parts();
+
+    // Stamp forward-auth response headers onto the request before forwarding.
+    for (name, value) in auth_injected_headers {
+        parts.headers.insert(name, value);
+    }
 
     // Update the URI
     parts.uri = match target_uri.parse::<Uri>() {
@@ -146,7 +197,7 @@ pub async fn handle_proxy(
 
     let forwarded_req = Request::from_parts(parts, body);
 
-    // 6. Send the request to the real backend
+    // 7. Send the request to the real backend
     let timeout_secs = route.backend_timeout.unwrap_or(30);
 
     let response_future = state.http_client.request(forwarded_req);

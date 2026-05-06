@@ -1043,6 +1043,7 @@ impl KubernetesProvider {
                 www_authenticate: None,
                 priority: 0,
                 auth: None,
+                forward_auth: None,
                 headers: Vec::new(),
                 backend_timeout: None,
                 rate_limit: None,

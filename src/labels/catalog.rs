@@ -27,6 +27,9 @@ const SERVICE_FIELDS: &[&str] = &[
     "ratelimit.average",
     "ratelimit.burst",
     "auth.basic",
+    "forwardAuth.address",
+    "forwardAuth.responseHeaders",
+    "forwardAuth.trustForwardHeader",
     "entrypoint",
     "methods",
 ];

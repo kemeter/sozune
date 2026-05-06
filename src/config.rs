@@ -911,14 +911,18 @@ impl ProvidersConfig {
             || std::env::var("SOZUNE_PROVIDER_DOCKER_ENDPOINT").is_ok()
             || std::env::var("SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT").is_ok();
         if docker_env || self.docker.is_some() {
-            self.docker.get_or_insert_with(DockerConfig::default).apply_env_overrides();
+            self.docker
+                .get_or_insert_with(DockerConfig::default)
+                .apply_env_overrides();
         }
 
         let podman_env = std::env::var("SOZUNE_PROVIDER_PODMAN_ENABLED").is_ok()
             || std::env::var("SOZUNE_PROVIDER_PODMAN_ENDPOINT").is_ok()
             || std::env::var("SOZUNE_PROVIDER_PODMAN_EXPOSE_BY_DEFAULT").is_ok();
         if podman_env || self.podman.is_some() {
-            self.podman.get_or_insert_with(PodmanConfig::default).apply_env_overrides();
+            self.podman
+                .get_or_insert_with(PodmanConfig::default)
+                .apply_env_overrides();
         }
 
         let swarm_env = std::env::var("SOZUNE_PROVIDER_SWARM_ENABLED").is_ok()
@@ -927,7 +931,9 @@ impl ProvidersConfig {
             || std::env::var("SOZUNE_PROVIDER_SWARM_NETWORK").is_ok()
             || std::env::var("SOZUNE_PROVIDER_SWARM_REFRESH_INTERVAL").is_ok();
         if swarm_env || self.swarm.is_some() {
-            self.swarm.get_or_insert_with(SwarmConfig::default).apply_env_overrides();
+            self.swarm
+                .get_or_insert_with(SwarmConfig::default)
+                .apply_env_overrides();
         }
 
         let kubernetes_env = std::env::var("SOZUNE_PROVIDER_KUBERNETES_ENABLED").is_ok()
@@ -936,7 +942,9 @@ impl ProvidersConfig {
             || std::env::var("SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS").is_ok()
             || std::env::var("SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT").is_ok();
         if kubernetes_env || self.kubernetes.is_some() {
-            self.kubernetes.get_or_insert_with(KubernetesConfig::default).apply_env_overrides();
+            self.kubernetes
+                .get_or_insert_with(KubernetesConfig::default)
+                .apply_env_overrides();
         }
 
         let nomad_env = std::env::var("SOZUNE_PROVIDER_NOMAD_ENABLED").is_ok()
@@ -946,18 +954,22 @@ impl ProvidersConfig {
             || std::env::var("SOZUNE_PROVIDER_NOMAD_POLL_INTERVAL").is_ok()
             || std::env::var("SOZUNE_PROVIDER_NOMAD_EXPOSE_BY_DEFAULT").is_ok();
         if nomad_env || self.nomad.is_some() {
-            self.nomad.get_or_insert_with(NomadConfig::default).apply_env_overrides();
+            self.nomad
+                .get_or_insert_with(NomadConfig::default)
+                .apply_env_overrides();
         }
 
         let config_file_env = std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_ENABLED").is_ok()
             || std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_PATH").is_ok()
             || std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_WATCH").is_ok();
         if config_file_env || self.config_file.is_some() {
-            self.config_file.get_or_insert_with(|| ConfigFileConfig {
-                enabled: false,
-                path: String::new(),
-                watch: true,
-            }).apply_env_overrides();
+            self.config_file
+                .get_or_insert_with(|| ConfigFileConfig {
+                    enabled: false,
+                    path: String::new(),
+                    watch: true,
+                })
+                .apply_env_overrides();
         }
 
         let http_env = std::env::var("SOZUNE_PROVIDER_HTTP_ENABLED").is_ok()
@@ -966,121 +978,217 @@ impl ProvidersConfig {
             || std::env::var("SOZUNE_PROVIDER_HTTP_AUTH_HEADER").is_ok()
             || std::env::var("SOZUNE_PROVIDER_HTTP_AUTH_VALUE").is_ok();
         if http_env || self.http.is_some() {
-            self.http.get_or_insert_with(|| HttpProviderConfig {
-                enabled: false,
-                url: String::new(),
-                poll_interval: default_http_provider_poll_interval(),
-                auth_header: String::new(),
-                auth_value: String::new(),
-            }).apply_env_overrides();
+            self.http
+                .get_or_insert_with(|| HttpProviderConfig {
+                    enabled: false,
+                    url: String::new(),
+                    poll_interval: default_http_provider_poll_interval(),
+                    auth_header: String::new(),
+                    auth_value: String::new(),
+                })
+                .apply_env_overrides();
         }
     }
 }
 
 impl DockerConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_DOCKER_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_DOCKER_ENDPOINT") { self.endpoint = v; }
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT") { self.expose_by_default = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_DOCKER_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_DOCKER_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
     }
 }
 
 impl PodmanConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_PODMAN_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_PODMAN_ENDPOINT") { self.endpoint = v; }
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_PODMAN_EXPOSE_BY_DEFAULT") { self.expose_by_default = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_PODMAN_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_PODMAN_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_PODMAN_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
     }
 }
 
 impl SwarmConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_SWARM_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_SWARM_ENDPOINT") { self.endpoint = v; }
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_SWARM_EXPOSE_BY_DEFAULT") { self.expose_by_default = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_SWARM_NETWORK") { self.network = v; }
-        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_SWARM_REFRESH_INTERVAL") { self.refresh_interval = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_SWARM_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_SWARM_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_SWARM_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_SWARM_NETWORK") {
+            self.network = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_SWARM_REFRESH_INTERVAL") {
+            self.refresh_interval = v;
+        }
     }
 }
 
 impl KubernetesConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_KUBERNETES_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_KUBECONFIG") { self.kubeconfig = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_NAMESPACE") { self.namespace = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS") { self.ingress_class = v; }
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT") { self.expose_by_default = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_KUBERNETES_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_KUBECONFIG") {
+            self.kubeconfig = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_NAMESPACE") {
+            self.namespace = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS") {
+            self.ingress_class = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
     }
 }
 
 impl NomadConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_NOMAD_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_NOMAD_ENDPOINT") { self.endpoint = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_NOMAD_TOKEN") { self.token = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_NOMAD_NAMESPACE") { self.namespace = v; }
-        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_NOMAD_POLL_INTERVAL") { self.poll_interval = v; }
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_NOMAD_EXPOSE_BY_DEFAULT") { self.expose_by_default = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_NOMAD_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_NOMAD_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_NOMAD_TOKEN") {
+            self.token = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_NOMAD_NAMESPACE") {
+            self.namespace = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_NOMAD_POLL_INTERVAL") {
+            self.poll_interval = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_NOMAD_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
     }
 }
 
 impl ConfigFileConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_CONFIG_FILE_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_CONFIG_FILE_PATH") { self.path = v; }
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_CONFIG_FILE_WATCH") { self.watch = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_CONFIG_FILE_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_CONFIG_FILE_PATH") {
+            self.path = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_CONFIG_FILE_WATCH") {
+            self.watch = v;
+        }
     }
 }
 
 impl HttpProviderConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_PROVIDER_HTTP_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_URL") { self.url = v; }
-        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_HTTP_POLL_INTERVAL") { self.poll_interval = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_AUTH_HEADER") { self.auth_header = v; }
-        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_AUTH_VALUE") { self.auth_value = v; }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_HTTP_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_URL") {
+            self.url = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_HTTP_POLL_INTERVAL") {
+            self.poll_interval = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_AUTH_HEADER") {
+            self.auth_header = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_HTTP_AUTH_VALUE") {
+            self.auth_value = v;
+        }
     }
 }
 
 impl ApiConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_API_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_API_LISTEN_ADDRESS") { self.listen_address = v; }
+        if let Some(v) = env_bool("SOZUNE_API_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_API_LISTEN_ADDRESS") {
+            self.listen_address = v;
+        }
     }
 }
 
 impl ProxyConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_parse::<u16>("SOZUNE_HTTP_PORT") { self.http.listen_address = v; }
-        if let Some(v) = env_parse::<u16>("SOZUNE_HTTPS_PORT") { self.https.listen_address = v; }
-        if let Some(v) = env_parse::<usize>("SOZUNE_PROXY_MAX_BUFFERS") { self.max_buffers = v; }
-        if let Some(v) = env_parse::<usize>("SOZUNE_PROXY_BUFFER_SIZE") { self.buffer_size = v; }
-        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_STARTUP_DELAY_MS") { self.startup_delay_ms = v; }
-        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS") { self.cluster_setup_delay_ms = v; }
-        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_RELOAD_DEBOUNCE_MS") { self.reload_debounce_ms = v; }
+        if let Some(v) = env_parse::<u16>("SOZUNE_HTTP_PORT") {
+            self.http.listen_address = v;
+        }
+        if let Some(v) = env_parse::<u16>("SOZUNE_HTTPS_PORT") {
+            self.https.listen_address = v;
+        }
+        if let Some(v) = env_parse::<usize>("SOZUNE_PROXY_MAX_BUFFERS") {
+            self.max_buffers = v;
+        }
+        if let Some(v) = env_parse::<usize>("SOZUNE_PROXY_BUFFER_SIZE") {
+            self.buffer_size = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_STARTUP_DELAY_MS") {
+            self.startup_delay_ms = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS") {
+            self.cluster_setup_delay_ms = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_RELOAD_DEBOUNCE_MS") {
+            self.reload_debounce_ms = v;
+        }
     }
 }
 
 impl MiddlewareConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_parse::<u16>("SOZUNE_MIDDLEWARE_PORT") { self.port = v; }
+        if let Some(v) = env_parse::<u16>("SOZUNE_MIDDLEWARE_PORT") {
+            self.port = v;
+        }
     }
 }
 
 impl DashboardConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_DASHBOARD_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_DASHBOARD_LISTEN_ADDRESS") { self.listen_address = v; }
+        if let Some(v) = env_bool("SOZUNE_DASHBOARD_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_DASHBOARD_LISTEN_ADDRESS") {
+            self.listen_address = v;
+        }
     }
 }
 
 impl AcmeConfig {
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = env_bool("SOZUNE_ACME_ENABLED") { self.enabled = v; }
-        if let Some(v) = env_string("SOZUNE_ACME_EMAIL") { self.email = v; }
-        if let Some(v) = env_string("SOZUNE_ACME_CERTS_DIR") { self.certs_dir = v; }
-        if let Some(v) = env_bool("SOZUNE_ACME_STAGING") { self.staging = v; }
-        if let Some(v) = env_parse::<u16>("SOZUNE_ACME_CHALLENGE_PORT") { self.challenge_port = v; }
+        if let Some(v) = env_bool("SOZUNE_ACME_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_ACME_EMAIL") {
+            self.email = v;
+        }
+        if let Some(v) = env_string("SOZUNE_ACME_CERTS_DIR") {
+            self.certs_dir = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_ACME_STAGING") {
+            self.staging = v;
+        }
+        if let Some(v) = env_parse::<u16>("SOZUNE_ACME_CHALLENGE_PORT") {
+            self.challenge_port = v;
+        }
     }
 }
 
@@ -1128,7 +1236,10 @@ mod tests {
             ("SOZUNE_PROVIDER_DOCKER_ENABLED", "true"),
             ("SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT", "false"),
             ("SOZUNE_PROVIDER_CONFIG_FILE_ENABLED", "true"),
-            ("SOZUNE_PROVIDER_CONFIG_FILE_PATH", "/etc/sozune/entrypoints.yaml"),
+            (
+                "SOZUNE_PROVIDER_CONFIG_FILE_PATH",
+                "/etc/sozune/entrypoints.yaml",
+            ),
             ("SOZUNE_PROVIDER_CONFIG_FILE_WATCH", "true"),
             ("SOZUNE_HTTP_PORT", "8080"),
             ("SOZUNE_HTTPS_PORT", "8443"),
@@ -1143,11 +1254,17 @@ mod tests {
         let mut config = AppConfig::default();
         config.apply_env_overrides();
 
-        let docker = config.providers.docker.expect("docker provider should be materialised");
+        let docker = config
+            .providers
+            .docker
+            .expect("docker provider should be materialised");
         assert!(docker.enabled);
         assert!(!docker.expose_by_default);
 
-        let cfg_file = config.providers.config_file.expect("config_file provider should be materialised");
+        let cfg_file = config
+            .providers
+            .config_file
+            .expect("config_file provider should be materialised");
         assert!(cfg_file.enabled);
         assert_eq!(cfg_file.path, "/etc/sozune/entrypoints.yaml");
         assert!(cfg_file.watch);
@@ -1155,7 +1272,9 @@ mod tests {
         assert_eq!(config.proxy.http.listen_address, 8080);
         assert_eq!(config.proxy.https.listen_address, 8443);
 
-        let acme = config.acme.expect("acme should be materialised when SOZUNE_ACME_* is set");
+        let acme = config
+            .acme
+            .expect("acme should be materialised when SOZUNE_ACME_* is set");
         assert!(acme.enabled);
         assert_eq!(acme.email, "ops@example.com");
         assert!(!acme.staging);
@@ -1236,10 +1355,19 @@ acme:
 
         let docker = config.providers.docker.expect("docker present in YAML");
         assert!(docker.enabled, "yaml value preserved when no env override");
-        assert!(docker.expose_by_default, "env should override yaml false → true");
+        assert!(
+            docker.expose_by_default,
+            "env should override yaml false → true"
+        );
 
-        assert_eq!(config.proxy.http.listen_address, 8080, "env overrides yaml port");
-        assert_eq!(config.proxy.https.listen_address, 443, "yaml preserved when no env");
+        assert_eq!(
+            config.proxy.http.listen_address, 8080,
+            "env overrides yaml port"
+        );
+        assert_eq!(
+            config.proxy.https.listen_address, 443,
+            "yaml preserved when no env"
+        );
 
         let acme = config.acme.expect("acme present in YAML");
         assert_eq!(acme.email, "override@example.com");
