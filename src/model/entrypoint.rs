@@ -76,6 +76,8 @@ pub struct EntrypointConfig {
     pub priority: i32,
     pub auth: Option<AuthConfig>,
     #[serde(default)]
+    pub forward_auth: Option<ForwardAuthConfig>,
+    #[serde(default)]
     pub headers: Vec<HeaderConfig>,
     #[serde(default)]
     pub backend_timeout: Option<u64>,
@@ -155,4 +157,13 @@ pub struct AuthConfig {
 pub struct BasicAuthUser {
     pub username: String,
     pub password_hash: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ForwardAuthConfig {
+    pub address: String,
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+    #[serde(default)]
+    pub trust_forward_header: bool,
 }

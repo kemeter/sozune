@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
-use crate::labels::fields::{auth, core, headers, host, methods, path, ratelimit, redirect};
+use crate::labels::fields::{
+    auth, core, forward_auth, headers, host, methods, path, ratelimit, redirect,
+};
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
 
@@ -173,6 +175,7 @@ fn build_entrypoint(
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
+    let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
     let methods = methods::parse_methods(labels, &prefix, diagnostics);
 
@@ -202,6 +205,7 @@ fn build_entrypoint(
             www_authenticate,
             priority,
             auth,
+            forward_auth,
             headers,
             backend_timeout,
             rate_limit,
@@ -262,6 +266,7 @@ fn build_tcp_entrypoint(
             www_authenticate: None,
             priority,
             auth: None,
+            forward_auth: None,
             headers: Vec::new(),
             backend_timeout: None,
             rate_limit: None,

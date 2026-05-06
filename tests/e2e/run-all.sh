@@ -11,6 +11,9 @@ set -euo pipefail
 E2E_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$E2E_DIR/lib.sh"
 
+AUTHELIA_CONFIG_DIR="$(mktemp -d -t sozune-authelia-XXXXXX)"
+export AUTHELIA_CONFIG_DIR
+
 cleanup() {
     log "Cleaning up..."
     if [[ -n "${SOZUNE_PID:-}" ]] && kill -0 "$SOZUNE_PID" 2>/dev/null; then
@@ -19,6 +22,12 @@ cleanup() {
     fi
     docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     rm -f "$COMPOSE_FILE" "$CONFIG_FILE"
+    # Authelia runs as root inside the container, so cleanup needs the same.
+    if [[ -d "$AUTHELIA_CONFIG_DIR" ]]; then
+        docker run --rm -v "$AUTHELIA_CONFIG_DIR:/c" alpine:latest \
+            sh -c 'rm -rf /c/* /c/.[!.]* 2>/dev/null || true' >/dev/null 2>&1 || true
+        rmdir "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -68,6 +77,55 @@ proxy:
 middleware:
   port: $MIDDLEWARE_PORT
 EOF
+
+# -- Authelia config (mounted as a volume so $-prefixed argon2 hashes survive
+#    docker-compose interpolation) --
+cat > "$AUTHELIA_CONFIG_DIR/configuration.yml" <<EOF
+server:
+  address: "tcp://0.0.0.0:9091/"
+log:
+  level: warn
+identity_validation:
+  reset_password:
+    jwt_secret: a_very_long_jwt_secret_at_least_64_characters_long_blah_blah_blah_blah
+authentication_backend:
+  file:
+    path: /config/users.yml
+access_control:
+  default_policy: deny
+  rules:
+    - domain: $HOST_FAUTH
+      policy: one_factor
+session:
+  cookies:
+    - domain: func-test.localhost
+      authelia_url: https://$HOST_AUTHELIA
+      default_redirection_url: https://$HOST_FAUTH
+  secret: a_very_long_session_secret_at_least_64_characters_long_blah_blah_blah_blah
+  expiration: 1h
+  inactivity: 5m
+storage:
+  encryption_key: another_very_long_encryption_key_at_least_64_characters_long_blah_blah
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notifications.txt
+EOF
+
+# argon2id hash of "alicepass". Generated once with:
+#   docker run --rm authelia/authelia:latest \
+#     authelia crypto hash generate argon2 --password 'alicepass'
+cat > "$AUTHELIA_CONFIG_DIR/users.yml" <<'USERS_EOF'
+users:
+  alice:
+    disabled: false
+    displayname: "Alice"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$1Jn+sBXzxE3Rm+uYmtWTVg$mvYLvk5lHWYCBKRh5eXjQ2QSOM5EoImMtzKD7U4ixmc"
+    email: alice@func-test.localhost
+    groups:
+      - admins
+USERS_EOF
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -219,6 +277,30 @@ services:
       - "sozune.http.svcsse.host=$HOST_SSE"
       - "sozune.http.svcsse.port=80"
       - "sozune.http.svcsse.backendTimeout=0"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  authelia:
+    image: authelia/authelia:latest
+    # Map 9091 onto the host so sozune (running on the host, not inside the
+    # compose network) can reach Authelia's verify endpoint directly.
+    ports:
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - "$AUTHELIA_CONFIG_DIR:/config"
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcauthelia.host=$HOST_AUTHELIA"
+      - "sozune.http.svcauthelia.port=9091"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-fauth:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcfauth.host=$HOST_FAUTH"
+      - "sozune.http.svcfauth.forwardAuth.address=http://127.0.0.1:9091/api/verify?rd=https://$HOST_AUTHELIA"
+      - "sozune.http.svcfauth.forwardAuth.responseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
+      - "sozune.http.svcfauth.forwardAuth.trustForwardHeader=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-tcpecho:
