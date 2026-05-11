@@ -32,7 +32,8 @@ use futures_util::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatchesPathType,
+    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
+    HTTPRouteRulesMatchesPathType,
 };
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client};
@@ -459,10 +460,25 @@ fn apply_route(
     // they activate the moment a matching Gateway appears (via
     // re_resolve_all from the Gateway watcher) and deactivate cleanly
     // when one disappears.
-    let new_entrypoints = if scope.accepts_route(route) {
-        route_to_entrypoints(route, resolver)
-    } else {
+    //
+    // Routes that declare unsupported filters (requestRedirect,
+    // urlRewrite, header modifiers, mirror, etc.) are also dropped:
+    // routing them as if the filter wasn't there would silently rewrite
+    // user intent. Worse than refusing the route — better to surface
+    // the problem so the user knows to fall back to Ingress annotations
+    // until filter support lands.
+    let new_entrypoints = if !scope.accepts_route(route) {
         Vec::new()
+    } else if route_has_unsupported_filters(route) {
+        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+        warn!(
+            "Gateway API: HTTPRoute {}/{} declares filters (requestRedirect / urlRewrite / header modifiers / mirror) which sōzune does not support yet — dropping the route",
+            ns, name
+        );
+        Vec::new()
+    } else {
+        route_to_entrypoints(route, resolver)
     };
 
     let mut storage_guard = match storage.write() {
@@ -613,8 +629,11 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
     }
 }
 
-/// Convert a HTTPRoute into one or more Sozune `Entrypoint`s — one per
-/// rule that has at least one resolvable backend.
+/// Convert a HTTPRoute into one or more Sozune `Entrypoint`s. Each rule
+/// expands to one entrypoint per `match` it declares (Gateway API
+/// semantics: matches inside a rule are OR'd together). A rule with no
+/// matches is treated as match-all, producing exactly one entrypoint
+/// with no path constraint.
 ///
 /// The `resolver` turns each Service reference into concrete pod IPs.
 /// Sōzu rejects DNS-style addresses (it expects `IpAddr`), so a route
@@ -623,8 +642,15 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
 /// frontend that 502s on every request. The watcher will retry once the
 /// EndpointSlice catches up.
 ///
-/// Skipped silently:
-/// - rules with no backends (logged once at watch time, not here)
+/// Rules are dropped (with a `warn!`) when they declare any
+/// `spec.rules[].filters` — silently honouring them would route as if
+/// the filter wasn't there, which is *worse* than dropping the route
+/// outright (the user would see traffic flowing but with the wrong
+/// shape, e.g. no `requestRedirect`). Once we implement filters this
+/// rejection lifts. See [`route_has_unsupported_filters`].
+///
+/// Other silent skips:
+/// - rules with no backends
 /// - rules with backends that resolve to zero pod IPs
 /// - matches that aren't `Path` (header/query/method-only matches)
 /// - `RegularExpression` path type — not yet supported by the routing layer
@@ -644,21 +670,52 @@ pub fn route_to_entrypoints(route: &HTTPRoute, resolver: &dyn ServiceResolver) -
     rules
         .iter()
         .enumerate()
-        .filter_map(|(idx, rule)| {
-            rule_to_entrypoint(ns, route_name, idx, &hostnames, rule, resolver)
+        .flat_map(|(idx, rule)| {
+            rule_to_entrypoints(ns, route_name, idx, &hostnames, rule, resolver)
         })
         .collect()
 }
 
-fn rule_to_entrypoint(
+/// True iff at least one rule in the route declares filters sōzune
+/// can't faithfully execute today. The HTTPRoute watcher uses this as
+/// an early reject so the user sees a clear log line and (later) a
+/// `ResolvedRefs=False` status condition rather than wrong behaviour.
+pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
+    route
+        .spec
+        .rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|rule| {
+            rule.filters
+                .as_deref()
+                .map(|f| !f.is_empty())
+                .unwrap_or(false)
+        })
+}
+
+fn rule_to_entrypoints(
     namespace: &str,
     route_name: &str,
     rule_index: usize,
     hostnames: &[String],
     rule: &HTTPRouteRules,
     resolver: &dyn ServiceResolver,
-) -> Option<Entrypoint> {
-    let backend_refs = rule.backend_refs.as_ref()?;
+) -> Vec<Entrypoint> {
+    // Gateway API: each entry in `filters` is meant to mutate the
+    // request before it reaches the backend. Routing without honouring
+    // them silently rewrites user intent — refuse the rule entirely
+    // until we implement filter support.
+    if let Some(filters) = rule.filters.as_deref()
+        && !filters.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let Some(backend_refs) = rule.backend_refs.as_ref() else {
+        return Vec::new();
+    };
     let backends: Vec<Backend> = backend_refs
         .iter()
         .flat_map(|b| {
@@ -691,56 +748,81 @@ fn rule_to_entrypoint(
         .collect();
 
     if backends.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let path = rule
-        .matches
-        .as_ref()
-        .and_then(|matches| matches.first())
-        .and_then(|m| m.path.as_ref())
-        .and_then(|p| {
-            let value = p.value.clone()?;
-            let rule_type = match p.r#type {
-                Some(HTTPRouteRulesMatchesPathType::Exact) => PathRuleType::Exact,
-                Some(HTTPRouteRulesMatchesPathType::PathPrefix) | None => PathRuleType::Prefix,
-                Some(HTTPRouteRulesMatchesPathType::RegularExpression) => return None,
+    // Gateway API: matches inside a rule are OR'd. Emit one entrypoint
+    // per match. A rule with no matches at all is "match anything" —
+    // emit a single entrypoint with no path constraint to preserve that
+    // semantic.
+    let matches: Vec<Option<&HTTPRouteRulesMatches>> = match rule.matches.as_deref() {
+        Some(ms) if !ms.is_empty() => ms.iter().map(Some).collect(),
+        _ => vec![None],
+    };
+    let single_match = matches.len() == 1;
+
+    matches
+        .into_iter()
+        .enumerate()
+        .map(|(match_index, m)| {
+            let path = m.and_then(|m| m.path.as_ref()).and_then(|p| {
+                let value = p.value.clone()?;
+                let rule_type = match p.r#type {
+                    Some(HTTPRouteRulesMatchesPathType::Exact) => PathRuleType::Exact,
+                    Some(HTTPRouteRulesMatchesPathType::PathPrefix) | None => PathRuleType::Prefix,
+                    Some(HTTPRouteRulesMatchesPathType::RegularExpression) => return None,
+                };
+                Some(PathConfig { rule_type, value })
+            });
+
+            // Stable IDs: keep the existing `…-{rule_index}` shape when a
+            // rule has exactly one match (the universal case until now,
+            // and what the storage / dashboard expects), and append
+            // `-m{match_index}` only when the rule fans out into
+            // multiple matches.
+            let id = if single_match {
+                format!("{SOURCE_TAG}-{namespace}-{route_name}-{rule_index}")
+            } else {
+                format!("{SOURCE_TAG}-{namespace}-{route_name}-{rule_index}-m{match_index}")
             };
-            Some(PathConfig { rule_type, value })
-        });
+            let name = if single_match {
+                format!("{route_name}-{rule_index}")
+            } else {
+                format!("{route_name}-{rule_index}-m{match_index}")
+            };
 
-    let id = format!("{SOURCE_TAG}-{namespace}-{route_name}-{rule_index}");
-
-    Some(Entrypoint {
-        id: id.clone(),
-        name: format!("{route_name}-{rule_index}"),
-        backends,
-        protocol: Protocol::Http,
-        config: EntrypointConfig {
-            hostnames: hostnames.to_vec(),
-            path,
-            tls: false,
-            strip_prefix: false,
-            add_prefix: None,
-            https_redirect: false,
-            https_redirect_port: None,
-            redirect: None,
-            redirect_scheme: None,
-            redirect_template: None,
-            www_authenticate: None,
-            priority: 0,
-            auth: None,
-            forward_auth: None,
-            headers: Vec::new(),
-            backend_timeout: None,
-            rate_limit: None,
-            sticky_session: false,
-            compress: false,
-            entrypoint: None,
-            methods: Vec::new(),
-        },
-        source: Some(id),
-    })
+            Entrypoint {
+                id: id.clone(),
+                name,
+                backends: backends.clone(),
+                protocol: Protocol::Http,
+                config: EntrypointConfig {
+                    hostnames: hostnames.to_vec(),
+                    path,
+                    tls: false,
+                    strip_prefix: false,
+                    add_prefix: None,
+                    https_redirect: false,
+                    https_redirect_port: None,
+                    redirect: None,
+                    redirect_scheme: None,
+                    redirect_template: None,
+                    www_authenticate: None,
+                    priority: 0,
+                    auth: None,
+                    forward_auth: None,
+                    headers: Vec::new(),
+                    backend_timeout: None,
+                    rate_limit: None,
+                    sticky_session: false,
+                    compress: false,
+                    entrypoint: None,
+                    methods: Vec::new(),
+                },
+                source: Some(id),
+            }
+        })
+        .collect()
 }
 
 fn log_route(action: &str, route: &HTTPRoute) {
@@ -1308,6 +1390,120 @@ mod tests {
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
         let eps = route_to_entrypoints(&r, &r1());
         assert_eq!(eps[0].backends[0].weight, 42);
+    }
+
+    // ---------- Filters & multi-match tests ----------
+
+    use gateway_api::apis::standard::httproutes::HTTPRouteRulesFilters;
+
+    fn rule_with_filter(
+        backends: Vec<HTTPRouteRulesBackendRefs>,
+        filters: Vec<HTTPRouteRulesFilters>,
+    ) -> HTTPRouteRules {
+        HTTPRouteRules {
+            backend_refs: Some(backends),
+            filters: if filters.is_empty() {
+                None
+            } else {
+                Some(filters)
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn route_with_any_filter_is_dropped_entirely() {
+        // Honouring a filter we don't understand is worse than refusing
+        // the route — silently routing as if the filter weren't there
+        // breaks user intent.
+        let r = route_with(
+            vec![rule_with_filter(
+                vec![backend("api", 80)],
+                vec![HTTPRouteRulesFilters::default()],
+            )],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_has_unsupported_filters(&r));
+    }
+
+    #[test]
+    fn route_with_empty_filter_list_still_routes() {
+        // A non-None but empty filters slice means "no filters declared"
+        // and must not trigger the rejection path.
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        assert_eq!(route_to_entrypoints(&r, &r1()).len(), 1);
+    }
+
+    #[test]
+    fn rule_with_multiple_matches_emits_one_entrypoint_per_match() {
+        // Gateway API treats matches inside one rule as OR. The old
+        // behaviour silently dropped everything past the first match.
+        let r = route_with(
+            vec![rule(
+                Some(vec![
+                    path_match("/api", HTTPRouteRulesMatchesPathType::PathPrefix),
+                    path_match("/v2", HTTPRouteRulesMatchesPathType::PathPrefix),
+                    path_match("/healthz", HTTPRouteRulesMatchesPathType::Exact),
+                ]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 3, "one entrypoint per match");
+        let paths: Vec<&str> = eps
+            .iter()
+            .map(|e| e.config.path.as_ref().unwrap().value.as_str())
+            .collect();
+        assert!(paths.contains(&"/api"));
+        assert!(paths.contains(&"/v2"));
+        assert!(paths.contains(&"/healthz"));
+        // Multi-match entrypoints share backends (cloned, not aliased).
+        for ep in &eps {
+            assert_eq!(ep.backends[0].address, "10.0.0.1");
+        }
+        // IDs disambiguated with `-m{idx}` suffix only when >1 match —
+        // single-match rules keep the legacy `-{rule_idx}` shape.
+        assert_eq!(eps[0].id, "k8s-gateway-default-web-0-m0");
+        assert_eq!(eps[1].id, "k8s-gateway-default-web-0-m1");
+        assert_eq!(eps[2].id, "k8s-gateway-default-web-0-m2");
+    }
+
+    #[test]
+    fn single_match_keeps_legacy_id_shape() {
+        // Existing storage / dashboards expect `…-{rule_idx}` for
+        // single-match rules. Don't break that.
+        let r = route_with(
+            vec![rule(
+                Some(vec![path_match(
+                    "/api",
+                    HTTPRouteRulesMatchesPathType::PathPrefix,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].id, "k8s-gateway-default-web-0");
+    }
+
+    #[test]
+    fn rule_with_no_matches_is_match_all() {
+        // Gateway API: a rule with no matches matches every request.
+        // Emit exactly one entrypoint with no path constraint.
+        let r = route_with(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].config.path.is_none());
     }
 
     // ---------- Scope tests ----------

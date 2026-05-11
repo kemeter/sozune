@@ -228,6 +228,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
 - `spec.hostnames` — matched against the `Host` header of incoming requests.
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
+- Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
 - `backendRef.weight` — propagated to the load balancer.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
@@ -237,7 +238,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
 - `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
 - `status.parents[].conditions[]` reporting — `kubectl describe httproute` does not yet show "Accepted" / "ResolvedRefs" status from Sōzune.
-- HTTPRoute filters (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — use Service annotations or Ingress annotations until these land.
+- HTTPRoute `filters` (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — declaring **any** filter on a rule causes Sōzune to drop the entire route with a `WARN` log line. Routing it as if the filter weren't there would silently rewrite user intent. Use Service annotations or Ingress annotations until filter support lands.
 - `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
 
 ### How resolution works
