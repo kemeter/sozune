@@ -178,6 +178,7 @@ impl KubernetesProvider {
             labels: annotations,
             networks,
             enabled_default: self.config.expose_by_default,
+            health: None,
         })
     }
 

@@ -15,6 +15,19 @@ Where `<service>` is your own identifier — it groups labels for the same logic
 | `sozune.enable=true` | Enables discovery for the container. Required unless `expose_by_default` is set on the Docker provider |
 | `sozune.network=<name>` | Docker network used for routing (when the container is on multiple networks) |
 
+## Readiness — Docker HEALTHCHECK
+
+When a container declares a Docker `HEALTHCHECK` (via `HEALTHCHECK` in the Dockerfile or `healthcheck:` in compose), Sōzune treats it as the container's readiness probe and gates routing on its status:
+
+| `State.Health.Status` | Routed? |
+|---|---|
+| (no HEALTHCHECK declared) | Yes — as soon as the container is `running` |
+| `starting` | No |
+| `healthy` | Yes |
+| `unhealthy` | No (backend removed; re-added when status returns to `healthy`) |
+
+There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the opt-in to the readiness contract. If you want traffic during warmup, drop the `HEALTHCHECK` or use `--health-start-period` to delay the first probe.
+
 ## Routing — HTTP
 
 | Label | Example | Reference |

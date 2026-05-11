@@ -114,6 +114,7 @@ impl SwarmProvider {
                 labels,
                 networks,
                 enabled_default: self.config.expose_by_default,
+                health: None,
             });
         }
         Ok(candidates)

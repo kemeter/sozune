@@ -368,6 +368,7 @@ impl ServiceInstance {
             labels: self.labels,
             networks,
             enabled_default: expose_by_default,
+            health: None,
         }
     }
 

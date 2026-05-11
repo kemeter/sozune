@@ -1,12 +1,13 @@
 use crate::config::DockerConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
-use crate::labels::candidate::{Candidate, NetworkInfo};
+use crate::labels::candidate::{Candidate, HealthStatus, NetworkInfo};
 use crate::labels::diagnostic::{Diagnostic, Severity};
 use crate::labels::source::LabelSource;
 use crate::labels::{self};
 use crate::model::Entrypoint;
 use crate::provider::Provider;
 use async_trait::async_trait;
+use bollard::models::HealthStatusEnum;
 use bollard::{
     Docker,
     query_parameters::{EventsOptions, InspectContainerOptions, ListContainersOptions},
@@ -71,7 +72,7 @@ impl LabelSource for DockerProvider {
                 .and_then(|names| names.first().cloned())
                 .map(|n| n.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| id.clone());
-            let networks = self.extract_networks(&id).await;
+            let (networks, health) = self.inspect_for_routing(&id).await;
             candidates.push(Candidate {
                 provider: self.name,
                 id,
@@ -79,6 +80,7 @@ impl LabelSource for DockerProvider {
                 labels,
                 networks,
                 enabled_default: self.config.expose_by_default,
+                health,
             });
         }
         Ok(candidates)
@@ -208,6 +210,11 @@ impl DockerProvider {
                 "die".to_string(),
                 "destroy".to_string(),
                 "update".to_string(),
+                // HEALTHCHECK transitions — Docker emits these as
+                // `health_status: healthy` / `health_status: unhealthy` (the
+                // space after the colon is part of the action string).
+                "health_status: healthy".to_string(),
+                "health_status: unhealthy".to_string(),
             ],
         );
 
@@ -228,8 +235,9 @@ impl DockerProvider {
 
                         let mut storage_changed = false;
 
-                        match action.as_str() {
-                            "start" => {
+                        let action_str = action.as_str();
+                        match action_str {
+                            "start" | "health_status: healthy" => {
                                 // Track the container IP for later cleanup
                                 if let Some(ip) = self.get_container_ip(container_id).await
                                     && let Ok(mut ips) = self.container_ips.lock()
@@ -253,7 +261,15 @@ impl DockerProvider {
                                         }
                                     };
                                     for (key, entrypoint) in entrypoints {
-                                        info!("Adding entrypoint from started container: {}", key);
+                                        info!(
+                                            "Adding entrypoint from {} container: {}",
+                                            if action_str == "start" {
+                                                "started"
+                                            } else {
+                                                "healthy"
+                                            },
+                                            key
+                                        );
                                         merge_or_insert_entrypoint_btree(
                                             &mut storage_write,
                                             key,
@@ -264,6 +280,49 @@ impl DockerProvider {
                                     }
                                     storage_changed = true;
                                 }
+                            }
+                            "health_status: unhealthy" => {
+                                // Container went unhealthy: remove from the
+                                // backend pool but keep the IP tracking so a
+                                // later recovery to healthy can re-add it
+                                // without a fresh container start/inspect race.
+                                let container_ip = self
+                                    .container_ips
+                                    .lock()
+                                    .ok()
+                                    .and_then(|ips| ips.get(container_id.as_str()).cloned());
+                                let Some(container_ip) = container_ip else {
+                                    debug!(
+                                        "Container {} went unhealthy but had no tracked IP; nothing to remove",
+                                        container_id
+                                    );
+                                    continue;
+                                };
+                                let mut storage_write = match storage.write() {
+                                    Ok(guard) => guard,
+                                    Err(e) => {
+                                        error!(
+                                            "internal state corrupted (configuration store), restart required: {}",
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let mut keys_to_remove = Vec::new();
+                                for (key, entrypoint) in storage_write.iter_mut() {
+                                    entrypoint.backends.retain(|b| b.address != container_ip);
+                                    if entrypoint.backends.is_empty() {
+                                        keys_to_remove.push(key.clone());
+                                    }
+                                }
+                                for key in &keys_to_remove {
+                                    info!(
+                                        "Removing entrypoint with no backends after unhealthy: {}",
+                                        key
+                                    );
+                                    storage_write.remove(key);
+                                }
+                                storage_changed = true;
                             }
                             "stop" | "die" | "destroy" => {
                                 // Drop any cached diagnostics for this container — it's gone.
@@ -384,6 +443,12 @@ impl DockerProvider {
     }
 
     /// Get entrypoints for a specific container.
+    ///
+    /// When the container declares a Docker `HEALTHCHECK` and the current
+    /// status is `starting` or `unhealthy`, returns an empty map: Sōzune treats
+    /// the healthcheck as a readiness probe and refuses to route traffic until
+    /// the probe reports `healthy`. Containers without a healthcheck are not
+    /// gated.
     async fn get_container_entrypoints(
         &self,
         container_id: &str,
@@ -396,6 +461,15 @@ impl DockerProvider {
 
         let result = diagnostics::parse_and_store(diagnostics, &candidate);
         log_diagnostics(&candidate, &result.diagnostics);
+
+        if is_gated(candidate.health) {
+            debug!(
+                "Gating container {}: HEALTHCHECK status is {:?}",
+                container_id, candidate.health
+            );
+            return Ok(HashMap::new());
+        }
+
         Ok(result.entrypoints)
     }
 
@@ -419,9 +493,11 @@ impl DockerProvider {
             };
             let container_id = container.id.unwrap_or_default();
 
-            // Network info is only available via inspect, not list — fetch it.
-            let networks = self.extract_networks(&container_id).await;
-            let candidate = self.build_candidate(container_id.clone(), container_labels, networks);
+            // Network info and health status are only available via inspect,
+            // not list (before API v1.52) — fetch both in one call.
+            let (networks, health) = self.inspect_for_routing(&container_id).await;
+            let candidate =
+                self.build_candidate(container_id.clone(), container_labels, networks, health);
 
             let result = diagnostics::parse_and_store(diagnostics, &candidate);
             log_diagnostics(&candidate, &result.diagnostics);
@@ -430,14 +506,23 @@ impl DockerProvider {
                 continue;
             }
 
-            // Track the resolved backend IP for cleanup on stop. Every
-            // entrypoint produced by a single candidate carries the same
-            // backend list, so peek at the first.
+            // Track the resolved backend IP for cleanup on stop, even when the
+            // container is currently gated by its healthcheck — we need the
+            // mapping so a later health_status: unhealthy event can locate the
+            // backend, and a healthy → unhealthy → healthy cycle stays cheap.
             if let Some(first) = result.entrypoints.values().next()
                 && let Some(backend) = first.backends.first()
                 && let Ok(mut ips) = self.container_ips.lock()
             {
                 ips.insert(container_id.clone(), backend.address.clone());
+            }
+
+            if is_gated(candidate.health) {
+                debug!(
+                    "Skipping container {} on initial scan: HEALTHCHECK status is {:?}",
+                    container_id, candidate.health
+                );
+                continue;
             }
 
             for (key, entrypoint) in result.entrypoints {
@@ -468,6 +553,13 @@ impl DockerProvider {
             .map(|n| n.trim_start_matches('/').to_string())
             .unwrap_or_else(|| container_id.to_string());
 
+        let health = container
+            .state
+            .as_ref()
+            .and_then(|s| s.health.as_ref())
+            .and_then(|h| h.status)
+            .and_then(map_health_status);
+
         let Some(config) = container.config else {
             return Ok(None);
         };
@@ -495,16 +587,19 @@ impl DockerProvider {
             labels,
             networks,
             enabled_default: self.config.expose_by_default,
+            health,
         }))
     }
 
     /// Build a `Candidate` from labels already obtained via list_containers
-    /// (which omits network_settings). Caller supplies `networks` separately.
+    /// (which omits network_settings and health). Caller supplies them via a
+    /// separate inspect.
     fn build_candidate(
         &self,
         container_id: String,
         labels: HashMap<String, String>,
         networks: Vec<NetworkInfo>,
+        health: Option<HealthStatus>,
     ) -> Candidate {
         Candidate {
             provider: self.name,
@@ -513,11 +608,17 @@ impl DockerProvider {
             labels,
             networks,
             enabled_default: self.config.expose_by_default,
+            health,
         }
     }
 
-    /// Fetch network information for a container via inspect.
-    async fn extract_networks(&self, container_id: &str) -> Vec<NetworkInfo> {
+    /// Fetch network information AND health status for a container via inspect.
+    /// One inspect call serves both needs — list_containers exposes neither
+    /// before API v1.52.
+    async fn inspect_for_routing(
+        &self,
+        container_id: &str,
+    ) -> (Vec<NetworkInfo>, Option<HealthStatus>) {
         let container = match self
             .docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
@@ -526,14 +627,21 @@ impl DockerProvider {
             Ok(c) => c,
             Err(e) => {
                 debug!(
-                    "Could not inspect container {} for networks: {}",
+                    "Could not inspect container {} for routing info: {}",
                     container_id, e
                 );
-                return Vec::new();
+                return (Vec::new(), None);
             }
         };
 
-        container
+        let health = container
+            .state
+            .as_ref()
+            .and_then(|s| s.health.as_ref())
+            .and_then(|h| h.status)
+            .and_then(map_health_status);
+
+        let networks = container
             .network_settings
             .and_then(|s| s.networks)
             .map(|nets| {
@@ -544,7 +652,9 @@ impl DockerProvider {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        (networks, health)
     }
 
     /// Resolve a container's backend IP using the shared label parser.
@@ -585,6 +695,26 @@ fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
             Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
         }
     }
+}
+
+/// Map bollard's `HealthStatusEnum` to our provider-agnostic `HealthStatus`.
+/// Returns `None` for `EMPTY` (no `State.Health` block) and `NONE` (Docker's
+/// "no healthcheck configured" sentinel) — both mean "container did not opt
+/// into a readiness contract, route as soon as running".
+fn map_health_status(status: HealthStatusEnum) -> Option<HealthStatus> {
+    match status {
+        HealthStatusEnum::EMPTY | HealthStatusEnum::NONE => None,
+        HealthStatusEnum::STARTING => Some(HealthStatus::Starting),
+        HealthStatusEnum::HEALTHY => Some(HealthStatus::Healthy),
+        HealthStatusEnum::UNHEALTHY => Some(HealthStatus::Unhealthy),
+    }
+}
+
+/// Gating rule: a container is gated (excluded from routing) when it declared
+/// a healthcheck and the current status is anything other than `healthy`.
+/// `None` (no healthcheck) and `Some(Healthy)` both pass.
+fn is_gated(health: Option<HealthStatus>) -> bool {
+    matches!(health, Some(s) if !s.is_routable())
 }
 
 /// Decide whether two entrypoints sharing the same key (`<protocol>_<service>`)
@@ -684,6 +814,53 @@ fn merge_or_insert_entrypoint_btree(
     let mut entrypoint = incoming;
     entrypoint.source = Some(source_label.to_string());
     dest.insert(alt_key, entrypoint);
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn no_healthcheck_is_not_gated() {
+        assert!(!is_gated(None));
+    }
+
+    #[test]
+    fn healthy_is_not_gated() {
+        assert!(!is_gated(Some(HealthStatus::Healthy)));
+    }
+
+    #[test]
+    fn starting_is_gated() {
+        assert!(is_gated(Some(HealthStatus::Starting)));
+    }
+
+    #[test]
+    fn unhealthy_is_gated() {
+        assert!(is_gated(Some(HealthStatus::Unhealthy)));
+    }
+
+    #[test]
+    fn maps_bollard_empty_and_none_to_no_healthcheck() {
+        assert_eq!(map_health_status(HealthStatusEnum::EMPTY), None);
+        assert_eq!(map_health_status(HealthStatusEnum::NONE), None);
+    }
+
+    #[test]
+    fn maps_bollard_states_to_our_enum() {
+        assert_eq!(
+            map_health_status(HealthStatusEnum::STARTING),
+            Some(HealthStatus::Starting)
+        );
+        assert_eq!(
+            map_health_status(HealthStatusEnum::HEALTHY),
+            Some(HealthStatus::Healthy)
+        );
+        assert_eq!(
+            map_health_status(HealthStatusEnum::UNHEALTHY),
+            Some(HealthStatus::Unhealthy)
+        );
+    }
 }
 
 #[cfg(test)]

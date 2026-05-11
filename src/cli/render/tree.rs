@@ -197,6 +197,7 @@ mod tests {
                 ip: Some("172.18.0.4".into()),
             }],
             enabled_default: false,
+            health: None,
         }
     }
 
