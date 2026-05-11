@@ -77,6 +77,7 @@ mod tests {
                 .collect::<HashMap<_, _>>(),
             networks,
             enabled_default: false,
+            health: None,
         }
     }
 

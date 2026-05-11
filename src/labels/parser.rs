@@ -295,6 +295,7 @@ mod tests {
                 .collect(),
             networks,
             enabled_default: false,
+            health: None,
         }
     }
 
