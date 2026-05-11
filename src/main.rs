@@ -122,15 +122,17 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let handle = tokio::runtime::Handle::current();
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
-            storage_proxy,
+            proxy::backend::ProxyInputs {
+                storage: storage_proxy,
+                shutdown_rx,
+                reload_rx,
+                cert_rx,
+                acme_challenge_port,
+                middleware_state: middleware_state_proxy,
+                middleware_port,
+                handle,
+            },
             &proxy_config,
-            shutdown_rx,
-            reload_rx,
-            cert_rx,
-            acme_challenge_port,
-            middleware_state_proxy,
-            middleware_port,
-            handle,
         )
     });
 

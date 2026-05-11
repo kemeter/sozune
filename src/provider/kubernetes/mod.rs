@@ -36,6 +36,17 @@ type EndpointsCache = Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>
 /// touching what other Ingresses or annotated Services produced.
 type IngressOwnership = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 
+/// References to the four shared values every watcher needs: the storage,
+/// the reload channel, the ACME notifier, and the diagnostics store. Borrowed
+/// so the same context can be threaded through nested helpers without forcing
+/// an `Arc::clone` at every call site.
+struct WatchCtx<'a> {
+    storage: &'a Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    reload_tx: &'a mpsc::Sender<()>,
+    acme_notify: &'a Arc<Notify>,
+    diagnostics: &'a DiagnosticsStore,
+}
+
 pub struct KubernetesProvider {
     config: KubernetesConfig,
     name: &'static str,
@@ -322,15 +333,20 @@ impl KubernetesProvider {
 
         info!("Kubernetes Service watcher started");
 
+        let ctx = WatchCtx {
+            storage: &storage,
+            reload_tx: &reload_tx,
+            acme_notify: &acme_notify,
+            diagnostics: &diagnostics,
+        };
+
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::Apply(svc)) | Ok(Event::InitApply(svc)) => {
-                    self.upsert_service(&svc, &storage, &reload_tx, &acme_notify, &diagnostics)
-                        .await;
+                    self.upsert_service(&svc, &ctx).await;
                 }
                 Ok(Event::Delete(svc)) => {
-                    self.remove_service(&svc, &storage, &reload_tx, &diagnostics)
-                        .await;
+                    self.remove_service(&svc, &ctx).await;
                 }
                 Ok(Event::Init) => {
                     debug!("Service watcher restart: reinitialising");
@@ -363,32 +379,23 @@ impl KubernetesProvider {
 
         info!("Kubernetes EndpointSlice watcher started");
 
+        let ctx = WatchCtx {
+            storage: &storage,
+            reload_tx: &reload_tx,
+            acme_notify: &acme_notify,
+            diagnostics: &diagnostics,
+        };
+
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::Apply(slice)) | Ok(Event::InitApply(slice)) => {
                     if let Some(svc_id) = self.apply_slice(&slice) {
-                        self.refresh_service(
-                            &client,
-                            &svc_id,
-                            &storage,
-                            &reload_tx,
-                            &acme_notify,
-                            &diagnostics,
-                        )
-                        .await;
+                        self.refresh_service(&client, &svc_id, &ctx).await;
                     }
                 }
                 Ok(Event::Delete(slice)) => {
                     if let Some(svc_id) = self.remove_slice(&slice) {
-                        self.refresh_service(
-                            &client,
-                            &svc_id,
-                            &storage,
-                            &reload_tx,
-                            &acme_notify,
-                            &diagnostics,
-                        )
-                        .await;
+                        self.refresh_service(&client, &svc_id, &ctx).await;
                     }
                 }
                 Ok(Event::Init) | Ok(Event::InitDone) => {}
@@ -494,23 +501,14 @@ impl KubernetesProvider {
 
     /// Re-fetch a Service and re-run the upsert path so its entrypoint picks
     /// up the freshest backend list from the endpoints cache.
-    async fn refresh_service(
-        &self,
-        client: &Client,
-        svc_id: &str,
-        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: &mpsc::Sender<()>,
-        acme_notify: &Arc<Notify>,
-        diagnostics: &DiagnosticsStore,
-    ) {
+    async fn refresh_service(&self, client: &Client, svc_id: &str, ctx: &WatchCtx<'_>) {
         let Some((namespace, name)) = svc_id.split_once('/') else {
             return;
         };
         let api: Api<Service> = Api::namespaced(client.clone(), namespace);
         match api.get(name).await {
             Ok(svc) => {
-                self.upsert_service(&svc, storage, reload_tx, acme_notify, diagnostics)
-                    .await;
+                self.upsert_service(&svc, ctx).await;
             }
             Err(kube::Error::Api(err)) if err.code == 404 => {
                 debug!(
@@ -526,16 +524,8 @@ impl KubernetesProvider {
             }
         }
 
-        self.refresh_ingresses_for_service(
-            client,
-            namespace,
-            name,
-            storage,
-            reload_tx,
-            acme_notify,
-            diagnostics,
-        )
-        .await;
+        self.refresh_ingresses_for_service(client, namespace, name, ctx)
+            .await;
     }
 
     /// Re-apply every Ingress in `namespace` whose backend references `svc_name`.
@@ -546,10 +536,7 @@ impl KubernetesProvider {
         client: &Client,
         namespace: &str,
         svc_name: &str,
-        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: &mpsc::Sender<()>,
-        acme_notify: &Arc<Notify>,
-        diagnostics: &DiagnosticsStore,
+        ctx: &WatchCtx<'_>,
     ) {
         let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
         let list = match api.list(&ListParams::default()).await {
@@ -567,24 +554,16 @@ impl KubernetesProvider {
             if !ingress_references_service(&ing, svc_name) {
                 continue;
             }
-            self.apply_ingress(&ing, storage, reload_tx, acme_notify, diagnostics)
-                .await;
+            self.apply_ingress(&ing, ctx).await;
         }
     }
 
-    async fn upsert_service(
-        &self,
-        svc: &Service,
-        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: &mpsc::Sender<()>,
-        acme_notify: &Arc<Notify>,
-        diagnostics: &DiagnosticsStore,
-    ) {
+    async fn upsert_service(&self, svc: &Service, ctx: &WatchCtx<'_>) {
         let Some(candidate) = self.service_to_candidate(svc) else {
             return;
         };
 
-        let result = diagnostics::parse_and_store(diagnostics, &candidate);
+        let result = diagnostics::parse_and_store(ctx.diagnostics, &candidate);
         log_diagnostics(&candidate, &result.diagnostics);
 
         if result.entrypoints.is_empty() {
@@ -598,7 +577,7 @@ impl KubernetesProvider {
 
         let mut storage_changed = false;
         {
-            let mut storage_write = match storage.write() {
+            let mut storage_write = match ctx.storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
                     error!(
@@ -642,23 +621,17 @@ impl KubernetesProvider {
         }
 
         if storage_changed {
-            if let Err(e) = reload_tx.send(()).await {
+            if let Err(e) = ctx.reload_tx.send(()).await {
                 error!(
                     "could not apply configuration update; will retry on next change: {}",
                     e
                 );
             }
-            acme_notify.notify_one();
+            ctx.acme_notify.notify_one();
         }
     }
 
-    async fn remove_service(
-        &self,
-        svc: &Service,
-        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: &mpsc::Sender<()>,
-        diagnostics: &DiagnosticsStore,
-    ) {
+    async fn remove_service(&self, svc: &Service, ctx: &WatchCtx<'_>) {
         let Some(candidate) = self.service_to_candidate(svc) else {
             return;
         };
@@ -666,14 +639,14 @@ impl KubernetesProvider {
         // Service is gone — drop its diagnostics. We still need to know which
         // entrypoint keys it produced, so re-parse without writing to the store.
         let result = crate::labels::parse(&candidate);
-        diagnostics::remove(diagnostics, &candidate.id);
+        diagnostics::remove(ctx.diagnostics, &candidate.id);
         if result.entrypoints.is_empty() {
             return;
         }
 
         let mut storage_changed = false;
         {
-            let mut storage_write = match storage.write() {
+            let mut storage_write = match ctx.storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
                     error!(
@@ -695,7 +668,7 @@ impl KubernetesProvider {
             }
         }
 
-        if storage_changed && let Err(e) = reload_tx.send(()).await {
+        if storage_changed && let Err(e) = ctx.reload_tx.send(()).await {
             error!(
                 "could not apply configuration update; will retry on next change: {}",
                 e
@@ -720,15 +693,20 @@ impl KubernetesProvider {
             self.config.ingress_class
         );
 
+        let ctx = WatchCtx {
+            storage: &storage,
+            reload_tx: &reload_tx,
+            acme_notify: &acme_notify,
+            diagnostics: &diagnostics,
+        };
+
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::Apply(ing)) | Ok(Event::InitApply(ing)) => {
-                    self.apply_ingress(&ing, &storage, &reload_tx, &acme_notify, &diagnostics)
-                        .await;
+                    self.apply_ingress(&ing, &ctx).await;
                 }
                 Ok(Event::Delete(ing)) => {
-                    self.remove_ingress(&ing, &storage, &reload_tx, &diagnostics)
-                        .await;
+                    self.remove_ingress(&ing, &ctx).await;
                 }
                 Ok(Event::Init) | Ok(Event::InitDone) => {}
                 Err(e) => {
@@ -742,14 +720,7 @@ impl KubernetesProvider {
         Ok(())
     }
 
-    async fn apply_ingress(
-        &self,
-        ing: &Ingress,
-        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: &mpsc::Sender<()>,
-        acme_notify: &Arc<Notify>,
-        diagnostics: &DiagnosticsStore,
-    ) {
+    async fn apply_ingress(&self, ing: &Ingress, ctx: &WatchCtx<'_>) {
         let Some(ing_id) = ingress_id(ing) else {
             return;
         };
@@ -763,8 +734,7 @@ impl KubernetesProvider {
             .map(|c| c == self.config.ingress_class)
             .unwrap_or(false);
         if !class_match {
-            self.remove_ingress(ing, storage, reload_tx, diagnostics)
-                .await;
+            self.remove_ingress(ing, ctx).await;
             return;
         }
 
@@ -781,7 +751,7 @@ impl KubernetesProvider {
         let mut storage_changed = false;
         let mut tls_added = false;
         {
-            let mut storage_write = match storage.write() {
+            let mut storage_write = match ctx.storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
                     error!(
@@ -828,27 +798,19 @@ impl KubernetesProvider {
         }
 
         if storage_changed {
-            if let Err(e) = reload_tx.send(()).await {
+            if let Err(e) = ctx.reload_tx.send(()).await {
                 error!(
                     "could not apply configuration update; will retry on next change: {}",
                     e
                 );
             }
             if tls_added {
-                acme_notify.notify_one();
+                ctx.acme_notify.notify_one();
             }
         }
     }
 
-    async fn remove_ingress(
-        &self,
-        ing: &Ingress,
-        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-        reload_tx: &mpsc::Sender<()>,
-        // Threaded for symmetry with apply_ingress; Ingress entries don't
-        // produce diagnostic entries (they don't go through `labels::parse`).
-        _diagnostics: &DiagnosticsStore,
-    ) {
+    async fn remove_ingress(&self, ing: &Ingress, ctx: &WatchCtx<'_>) {
         let Some(ing_id) = ingress_id(ing) else {
             return;
         };
@@ -870,7 +832,7 @@ impl KubernetesProvider {
 
         let mut storage_changed = false;
         {
-            let mut storage_write = match storage.write() {
+            let mut storage_write = match ctx.storage.write() {
                 Ok(guard) => guard,
                 Err(e) => {
                     error!(
@@ -888,7 +850,7 @@ impl KubernetesProvider {
             }
         }
 
-        if storage_changed && let Err(e) = reload_tx.send(()).await {
+        if storage_changed && let Err(e) = ctx.reload_tx.send(()).await {
             error!(
                 "could not apply configuration update; will retry on next change: {}",
                 e
@@ -922,6 +884,13 @@ impl KubernetesProvider {
             })
             .unwrap_or_default();
 
+        let ctx = IngressParseCtx {
+            provider: self,
+            ing_id: &ing_id,
+            namespace,
+            tls_hosts: &tls_hosts,
+        };
+
         let mut entries: Vec<(String, Entrypoint)> = Vec::new();
 
         if let Some(rules) = spec.rules.as_ref() {
@@ -931,15 +900,9 @@ impl KubernetesProvider {
                     continue;
                 };
                 for (path_idx, path) in http.paths.iter().enumerate() {
-                    if let Some(entry) = self.path_to_entrypoint(
-                        &ing_id,
-                        namespace,
-                        rule_idx,
-                        path_idx,
-                        host.as_deref(),
-                        path,
-                        &tls_hosts,
-                    ) {
+                    if let Some(entry) =
+                        ctx.path_to_entrypoint(rule_idx, path_idx, host.as_deref(), path)
+                    {
                         entries.push(entry);
                     }
                 }
@@ -947,27 +910,36 @@ impl KubernetesProvider {
         }
 
         if let Some(default) = spec.default_backend.as_ref()
-            && let Some(entry) = self
-                .backend_to_entrypoint(&ing_id, namespace, "default", None, None, default, false)
+            && let Some(entry) = ctx.backend_to_entrypoint("default", None, None, default, false)
         {
             entries.push(entry);
         }
 
         entries
     }
+}
 
+/// Identity + pre-computed state carried through every helper that parses one
+/// Ingress into entrypoints. Lifted out of `path_to_entrypoint` /
+/// `backend_to_entrypoint` so they're not dragging the same 4 contextual
+/// values through their signatures.
+struct IngressParseCtx<'a> {
+    provider: &'a KubernetesProvider,
+    ing_id: &'a str,
+    namespace: &'a str,
+    tls_hosts: &'a HashSet<String>,
+}
+
+impl IngressParseCtx<'_> {
     fn path_to_entrypoint(
         &self,
-        ing_id: &str,
-        namespace: &str,
         rule_idx: usize,
         path_idx: usize,
         host: Option<&str>,
         path: &HTTPIngressPath,
-        tls_hosts: &HashSet<String>,
     ) -> Option<(String, Entrypoint)> {
         let suffix = format!("r{rule_idx}p{path_idx}");
-        let tls = host.map(|h| tls_hosts.contains(h)).unwrap_or(false);
+        let tls = host.map(|h| self.tls_hosts.contains(h)).unwrap_or(false);
 
         let path_config = match path.path.as_deref() {
             Some(p) if !p.is_empty() => Some(PathConfig {
@@ -982,21 +954,11 @@ impl KubernetesProvider {
             _ => None,
         };
 
-        self.backend_to_entrypoint(
-            ing_id,
-            namespace,
-            &suffix,
-            host,
-            path_config,
-            &path.backend,
-            tls,
-        )
+        self.backend_to_entrypoint(&suffix, host, path_config, &path.backend, tls)
     }
 
     fn backend_to_entrypoint(
         &self,
-        ing_id: &str,
-        namespace: &str,
         suffix: &str,
         host: Option<&str>,
         path: Option<PathConfig>,
@@ -1008,13 +970,13 @@ impl KubernetesProvider {
             Some(p) => p.number.unwrap_or(80) as u16,
             None => 80,
         };
-        let svc_id = format!("{namespace}/{}", svc_ref.name);
+        let svc_id = format!("{}/{}", self.namespace, svc_ref.name);
 
-        let pod_ips = self.pod_ips_for(&svc_id);
+        let pod_ips = self.provider.pod_ips_for(&svc_id);
         let backends: Vec<Backend> = if pod_ips.is_empty() {
             warn!(
                 "Ingress {} references service {} but no ready endpoints are known yet",
-                ing_id, svc_id
+                self.ing_id, svc_id
             );
             Vec::new()
         } else {
@@ -1024,7 +986,7 @@ impl KubernetesProvider {
                 .collect()
         };
 
-        let key = format!("ingress_{}_{}", sanitise(ing_id), suffix);
+        let key = format!("ingress_{}_{}", sanitise(self.ing_id), suffix);
         let hostnames = host.map(|h| vec![h.to_string()]).unwrap_or_default();
 
         let entrypoint = Entrypoint {
@@ -1055,7 +1017,7 @@ impl KubernetesProvider {
                 entrypoint: None,
                 methods: Vec::new(),
             },
-            source: Some(self.name.to_string()),
+            source: Some(self.provider.name.to_string()),
         };
 
         Some((key, entrypoint))
