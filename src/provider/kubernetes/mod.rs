@@ -1,3 +1,5 @@
+pub mod gateway;
+
 use crate::config::KubernetesConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};

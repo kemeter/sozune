@@ -17,7 +17,7 @@
 //!     entrypoints, so they activate automatically once a matching
 //!     Gateway appears (and deactivate when it disappears).
 //!
-//! Pairing with [`KubernetesProvider`](super::kubernetes::KubernetesProvider):
+//! Pairing with [`KubernetesProvider`](super::KubernetesProvider):
 //! the existing provider keeps owning Service/Ingress/EndpointSlice. This
 //! module owns Gateway API CRDs. The two run side by side and feed the
 //! same shared storage through reload signals.
