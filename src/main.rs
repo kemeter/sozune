@@ -105,13 +105,11 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     // Notify ACME manager when storage changes (new TLS entrypoints)
     let acme_notify = Arc::new(Notify::new());
 
-    // Determine ACME challenge port
-    let acme_enabled = config.acme.as_ref().is_some_and(|a| a.enabled);
-    let acme_challenge_port = if acme_enabled {
-        Some(config.acme.as_ref().unwrap().challenge_port)
-    } else {
-        None
-    };
+    // Single lookup of the (optional) enabled ACME block — used both for the
+    // proxy challenge port and for the API's `acme_enabled` flag below.
+    let active_acme = config.acme.as_ref().filter(|a| a.enabled);
+    let acme_enabled = active_acme.is_some();
+    let acme_challenge_port = active_acme.map(|a| a.challenge_port);
 
     // Create middleware state shared between middleware server and proxy reload
     let middleware_state: middleware::MiddlewareState =

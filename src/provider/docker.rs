@@ -327,17 +327,23 @@ impl DockerProvider {
                             "stop" | "die" | "destroy" => {
                                 // Drop any cached diagnostics for this container — it's gone.
                                 diagnostics::remove(&diagnostics, container_id);
-                                // Use tracked IP (stopped containers lose their network IP)
-                                let container_ip = self.container_ips.lock().ok()
-                                            .and_then(|mut ips| ips.remove(container_id.as_str()))
-                                            .or({
-                                                // Fallback: try inspect (may work for "stop" before network teardown)
-                                                None
-                                            })
-                                            .unwrap_or_else(|| {
-                                                warn!("No tracked IP for stopped container {}, cleanup may be incomplete", container_id);
-                                                "127.0.0.1".to_string()
-                                            });
+                                // Stopped containers lose their network IP, so we read from
+                                // the per-container tracker populated at `start` time. If the
+                                // tracker has no entry (event arrived before we ever saw it),
+                                // fall back to 127.0.0.1 so the cleanup pass at least runs —
+                                // the warn! makes the partial cleanup visible in the logs.
+                                let container_ip = self
+                                    .container_ips
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut ips| ips.remove(container_id.as_str()))
+                                    .unwrap_or_else(|| {
+                                        warn!(
+                                            "No tracked IP for stopped container {}, cleanup may be incomplete",
+                                            container_id
+                                        );
+                                        "127.0.0.1".to_string()
+                                    });
                                 let mut storage_write = match storage.write() {
                                     Ok(guard) => guard,
                                     Err(e) => {

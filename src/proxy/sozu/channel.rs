@@ -51,12 +51,19 @@ pub(super) fn send_to_worker(
         },
     })?;
 
-    // Read responses until we find the one matching our request ID
+    // Read responses until we find the one matching our request ID. Bailing
+    // out with `Ok(())` on timeout or channel error would leave the caller
+    // believing the worker accepted the command while it may have rejected,
+    // queued, or never received it — that silent drift caused entrypoint
+    // desync against the live worker in the past. Return the actual failure.
     let deadline = std::time::Instant::now() + Duration::from_millis(2000);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            break;
+            return Err(anyhow::anyhow!(
+                "Worker did not ack {} within 2s; configuration may be desynced",
+                id
+            ));
         }
         match channel.read_message_blocking_timeout(Some(remaining)) {
             Ok(response) => {
@@ -77,11 +84,13 @@ pub(super) fn send_to_worker(
                     response.id, id
                 );
             }
-            Err(_) => {
-                break;
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Channel error while waiting for ack of {}: {}",
+                    id,
+                    e
+                ));
             }
         }
     }
-
-    Ok(())
 }
