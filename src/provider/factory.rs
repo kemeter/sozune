@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::diagnostics::DiagnosticsStore;
 use crate::model::Entrypoint;
 use crate::provider::{
-    Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider,
+    Provider, config::ConfigProvider, docker::DockerProvider, http::HttpProvider, k8s_gateway,
     kubernetes::KubernetesProvider, nomad::NomadProvider, podman::PodmanProvider,
     swarm::SwarmProvider,
 };
@@ -176,6 +176,10 @@ pub async fn start_services(
         let acme_notify_kubernetes = Arc::clone(&acme_notify);
         let diagnostics_kubernetes = Arc::clone(&diagnostics);
 
+        let kubernetes_provider_for_gateway = Arc::clone(&kubernetes_provider);
+        let storage_for_gateway = Arc::clone(&storage);
+        let reload_tx_for_gateway = reload_tx.clone();
+
         tokio::spawn(async move {
             if let Err(e) = kubernetes_provider
                 .start_service(
@@ -187,6 +191,68 @@ pub async fn start_services(
                 .await
             {
                 error!("Kubernetes service failed: {}", e);
+            }
+        });
+
+        // Try to bring up the Gateway API watchers alongside the legacy
+        // Ingress provider. If the cluster does not have the CRDs
+        // installed we log and move on — Ingress alone is enough.
+        //
+        // Three watchers run side by side, sharing a single
+        // `GatewayScope`:
+        //   - GatewayClass watcher — accepts classes whose
+        //     controllerName matches sōzune's identity
+        //   - Gateway watcher     — accepts Gateways whose class is owned
+        //   - HTTPRoute watcher   — accepts routes whose parentRefs
+        //                            point to an accepted Gateway
+        // Mutations to the scope notify the HTTPRoute watcher, which
+        // re-resolves every tracked route so changes propagate without
+        // waiting for the periodic tick.
+        tokio::spawn(async move {
+            let client = match kubernetes_provider_for_gateway.build_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Gateway API: failed to build kube client: {}", e);
+                    return;
+                }
+            };
+            if !k8s_gateway::httproute_crd_installed(&client).await {
+                info!(
+                    "Gateway API: HTTPRoute CRD not installed (or unreachable), skipping Gateway watchers"
+                );
+                return;
+            }
+
+            let scope = k8s_gateway::GatewayScope::new();
+            let resolver: Arc<dyn k8s_gateway::ServiceResolver> =
+                kubernetes_provider_for_gateway.clone();
+
+            let gc_client = client.clone();
+            let gc_scope = scope.clone();
+            tokio::spawn(async move {
+                if let Err(e) = k8s_gateway::run_gatewayclass_watcher(gc_client, gc_scope).await {
+                    error!("Gateway API: GatewayClass watcher failed: {}", e);
+                }
+            });
+
+            let gw_client = client.clone();
+            let gw_scope = scope.clone();
+            tokio::spawn(async move {
+                if let Err(e) = k8s_gateway::run_gateway_watcher(gw_client, gw_scope).await {
+                    error!("Gateway API: Gateway watcher failed: {}", e);
+                }
+            });
+
+            if let Err(e) = k8s_gateway::run_httproute_watcher(
+                client,
+                storage_for_gateway,
+                reload_tx_for_gateway,
+                resolver,
+                scope,
+            )
+            .await
+            {
+                error!("Gateway API: HTTPRoute watcher failed: {}", e);
             }
         });
     }

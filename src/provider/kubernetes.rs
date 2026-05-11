@@ -98,7 +98,7 @@ impl KubernetesProvider {
         })
     }
 
-    async fn build_client(&self) -> anyhow::Result<Client> {
+    pub async fn build_client(&self) -> anyhow::Result<Client> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         if self.config.kubeconfig.is_empty() {
@@ -186,7 +186,7 @@ impl KubernetesProvider {
     /// across every EndpointSlice attached to that service. IPs are
     /// deduplicated to avoid double-listing if two slices overlap (rare but
     /// permitted by the API).
-    fn pod_ips_for(&self, svc_id: &str) -> Vec<String> {
+    pub fn pod_ips_for(&self, svc_id: &str) -> Vec<String> {
         let Ok(cache) = self.endpoints.read() else {
             return Vec::new();
         };

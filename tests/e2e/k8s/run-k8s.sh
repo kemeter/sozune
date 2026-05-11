@@ -37,10 +37,20 @@ log "Pre-loading sozune image into kind..."
 # access for non-kind images by default on some setups.
 kind load docker-image "$SOZUNE_IMAGE_REF" --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
 
+# -- Gateway API CRDs (standard channel, v1.2 — must exist before sozune
+# starts so the HTTPRoute watcher's CRD probe succeeds on first try).
+# CRDs are vendored under tests/e2e/k8s/ so the suite stays runnable
+# without internet from the kind node.
+log "Installing Gateway API CRDs (standard v1.2.0)..."
+kubectl apply -f "$K8S_DIR/gateway-api-crds-v1.2.0.yaml" >/dev/null
+
 # -- Workload manifests (must come before the sozune Pod so the namespace
 # and ingresses already exist when sozune starts watching).
 log "Applying workload manifests..."
 kubectl apply -f "$MANIFESTS_FILE"
+
+log "Applying Gateway API workloads..."
+kubectl apply -f "$K8S_DIR/gateway-manifests.yaml"
 
 log "Applying sozune deployment..."
 # Sed-substitute the image ref in case the user overrode it.

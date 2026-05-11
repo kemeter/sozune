@@ -126,6 +126,15 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
+  # Optional: only needed if you want HTTPRoute support.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "gateways", "gatewayclasses"]
+    verbs: ["get", "list", "watch"]
+  # Optional: only needed for HTTPRoute status reporting (kubectl
+  # describe httproute will show Accepted/ResolvedRefs from sōzune).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes/status"]
+    verbs: ["update", "patch"]
 ```
 
 `namespaces` is only used for the start-up sanity check; if you want a strictly minimal role, drop it (Sōzune logs a warning instead of an info line).
@@ -139,6 +148,119 @@ Expose the Sōzune pod with a `Service` of type `LoadBalancer` (cloud) or `NodeP
 Useful for local development. Sōzune uses the current context from `$KUBECONFIG` or `~/.kube/config` automatically; set `kubeconfig:` only if you need a specific file.
 
 > **Heads up:** pod IPs (`10.244.x.x` on most clusters) are not routable from outside the cluster's CNI. Out-of-cluster Sōzune can therefore *discover* services correctly but cannot actually reach the backends. Use this mode for testing the discovery pipeline; deploy Sōzune in-cluster for real traffic.
+
+## Gateway API (HTTPRoute)
+
+Sōzune watches `gateway.networking.k8s.io/v1` resources alongside Ingress. Three watchers run side by side: `GatewayClass`, `Gateway`, and `HTTPRoute`. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required.
+
+### Prerequisites
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+```
+
+If the CRDs are missing, Sōzune logs `HTTPRoute CRD not installed` once and skips the Gateway watchers — Ingress alone keeps working.
+
+### Opting in: declare a GatewayClass
+
+Sōzune only serves `HTTPRoute`s whose chain of `parentRefs → Gateway → GatewayClass` ends at a `GatewayClass` it owns. Multi-controller clusters depend on this — without it, Sōzune would hijack routes meant for Traefik, Envoy Gateway, NGINX Gateway, and friends.
+
+Declare a `GatewayClass` whose `spec.controllerName` is **`kemeter.io/sozune`**:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: sozune
+spec:
+  controllerName: kemeter.io/sozune
+```
+
+Then a `Gateway` that references it:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw
+  namespace: default
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+```
+
+> The listener block is required by the Gateway API schema, but Sōzune currently ignores it: real listening ports stay declared via `proxy.http.listen_address` / `proxy.https.listen_address` in `config.yaml`. Wiring listeners to live ports is a planned post-MVP enhancement.
+
+Finally, the `HTTPRoute` references the `Gateway` via `parentRefs`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: default
+spec:
+  parentRefs:
+    - name: gw  # same namespace; add `namespace:` for cross-ns parents
+  hostnames:
+    - app.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-svc
+          port: 8080
+          weight: 100
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web-svc
+          port: 80
+```
+
+Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
+
+### What's supported
+
+- Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
+- Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
+- `spec.hostnames` — matched against the `Host` header of incoming requests.
+- `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
+- Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
+- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
+- `backendRef.weight` — propagated to the load balancer.
+- Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
+- Status reporting — for every `parentRef` Sōzune owns, the route's `status.parents[]` is updated with the standard `Accepted` and `ResolvedRefs` conditions (`controllerName: kemeter.io/sozune`). Visible via `kubectl describe httproute <name>`. Other controllers' entries are preserved untouched.
+
+### Status conditions
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `True` (`Accepted`) | Route is in scope (parent owned), filters are OK |
+| `Accepted` | `False` (`UnsupportedValue`) | Route declares unsupported filters |
+| `ResolvedRefs` | `True` (`ResolvedRefs`) | All backendRefs resolved to ready endpoints |
+| `ResolvedRefs` | `False` (`BackendNotFound`) | One or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
+| `ResolvedRefs` | `False` (`UnsupportedValue`) | Route was rejected because of unsupported filters |
+
+Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
+
+### What's not supported (yet)
+
+- Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
+- `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
+- HTTPRoute `filters` (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — declaring **any** filter on a rule causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service annotations or Ingress annotations until filter support lands.
+- `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
+
+### How resolution works
+
+When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready pod IPs from the matching Service's `EndpointSlice`s. Sōzu requires `IpAddr` backends and refuses cluster-DNS hostnames, so a route that targets a Service with no ready endpoints registers no entrypoint and is retried every 2 seconds until the endpoints appear. Once at least one ready endpoint exists the route becomes live without any user intervention.
 
 ## ACME / Let's Encrypt
 
@@ -155,8 +277,8 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
-- **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec.
-- **Gateway API not yet supported.**
+- **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute does support cross-namespace `backendRefs`.)
+- **Gateway API: HTTPRoute only.** `Gateway`, `GatewayClass`, `GRPCRoute`, `TCPRoute`, `ReferenceGrant`, and HTTPRoute filters are not yet implemented. See the Gateway API section above for details.
 
 ## Environment variables
 
