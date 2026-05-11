@@ -1,16 +1,26 @@
+mod acme;
+mod addr;
+mod builders;
+mod channel;
+
 use crate::acme::CertCommand;
 use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
-use crate::model::{Backend, Entrypoint, PathConfig, PathRuleType, Protocol};
+use crate::model::{Entrypoint, Protocol};
+use acme::{add_certificate, register_acme_challenge_cluster};
+use addr::parse_backend_address;
+use builders::{
+    build_authorized_hashes, build_frontend_headers, build_path_and_rewrite, map_redirect_policy,
+    map_redirect_scheme, methods_for_frontend,
+};
+use channel::{send_to_worker, wait_for_worker_ready};
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, Header, HeaderPosition,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
-        RedirectPolicy as SozuRedirectPolicy, RedirectScheme as SozuRedirectScheme, RemoveBackend,
-        Request, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition,
-        SocketAddress, Status, TlsVersion, WorkerRequest, WorkerResponse, request::RequestType,
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RemoveBackend,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, SocketAddress, WorkerRequest,
+        WorkerResponse, request::RequestType,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -18,7 +28,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Snapshot of the storage at the moment of the last successful reload, keyed
 /// by `cluster_id`. Used to compute the diff between two reloads.
@@ -43,18 +53,6 @@ struct TcpListenerChannel {
 /// TCP workers keyed by listener name (matches `proxy.tcp[].name`).
 /// One worker = one listener.
 type TcpChannels = HashMap<String, TcpListenerChannel>;
-
-/// Sōzu's `RequestHttpFrontend.method` accepts a single method per frontend.
-/// To support multi-method routing (`methods: ["GET","POST"]`) we register one
-/// frontend per method. An empty list means "any method" → a single frontend
-/// with `method: None`.
-fn methods_for_frontend(methods: &[String]) -> Vec<Option<String>> {
-    if methods.is_empty() {
-        vec![None]
-    } else {
-        methods.iter().map(|m| Some(m.clone())).collect()
-    }
-}
 
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
     storage
@@ -579,215 +577,6 @@ fn configure_sozu_routing(
     Ok(())
 }
 
-fn build_frontend_headers(edits: &[crate::model::HeaderConfig]) -> Vec<Header> {
-    edits
-        .iter()
-        .map(|edit| Header {
-            position: match edit.direction {
-                crate::model::HeaderDirection::Request => HeaderPosition::Request as i32,
-                crate::model::HeaderDirection::Response => HeaderPosition::Response as i32,
-                crate::model::HeaderDirection::Both => HeaderPosition::Both as i32,
-            },
-            key: edit.name.clone(),
-            val: edit.value.clone(),
-        })
-        .collect()
-}
-
-fn build_authorized_hashes(auth: &Option<crate::model::AuthConfig>) -> Vec<String> {
-    let Some(cfg) = auth else {
-        return Vec::new();
-    };
-    let Some(ref users) = cfg.basic else {
-        return Vec::new();
-    };
-    users
-        .iter()
-        .map(|u| format!("{}:{}", u.username, u.password_hash))
-        .collect()
-}
-
-fn map_redirect_policy(policy: crate::model::RedirectPolicy) -> i32 {
-    match policy {
-        crate::model::RedirectPolicy::Forward => SozuRedirectPolicy::Forward as i32,
-        crate::model::RedirectPolicy::Permanent => SozuRedirectPolicy::Permanent as i32,
-        crate::model::RedirectPolicy::Unauthorized => SozuRedirectPolicy::Unauthorized as i32,
-    }
-}
-
-fn map_redirect_scheme(scheme: crate::model::RedirectScheme) -> i32 {
-    match scheme {
-        crate::model::RedirectScheme::UseSame => SozuRedirectScheme::UseSame as i32,
-        crate::model::RedirectScheme::UseHttp => SozuRedirectScheme::UseHttp as i32,
-        crate::model::RedirectScheme::UseHttps => SozuRedirectScheme::UseHttps as i32,
-    }
-}
-
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for c in s.chars() {
-        match c {
-            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | '^' | '$' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn build_path_and_rewrite(
-    path_config: Option<&PathConfig>,
-    strip_prefix: bool,
-    add_prefix: Option<&str>,
-    cluster_id: &str,
-) -> (PathRule, Option<String>) {
-    if strip_prefix && add_prefix.is_some() {
-        warn!(
-            "strip_prefix and add_prefix are mutually exclusive on {}; add_prefix takes precedence",
-            cluster_id
-        );
-    }
-
-    if let Some(prefix) = add_prefix {
-        return build_add_prefix_rewrite(path_config, prefix);
-    }
-
-    let Some(path_config) = path_config else {
-        return (
-            PathRule {
-                value: "/".to_string(),
-                kind: 0,
-            },
-            None,
-        );
-    };
-
-    if !strip_prefix {
-        let kind = match path_config.rule_type {
-            PathRuleType::Prefix => 0,
-            PathRuleType::Regex => 1,
-            PathRuleType::Exact => 2,
-        };
-        return (
-            PathRule {
-                value: path_config.value.clone(),
-                kind,
-            },
-            None,
-        );
-    }
-
-    match path_config.rule_type {
-        PathRuleType::Prefix => {
-            // Convert to a regex that matches the prefix optionally followed
-            // by `/<tail>`. The non-capturing `/` before the capture lets
-            // the rewrite template prepend a literal `/` so backends always
-            // see a valid absolute path, regardless of whether the client
-            // requested `/api`, `/api/`, or `/api/users`.
-            let escaped = regex_escape(path_config.value.trim_end_matches('/'));
-            let pattern = format!("^{}(?:/(.*))?$", escaped);
-            (
-                PathRule {
-                    value: pattern,
-                    kind: 1,
-                },
-                Some("/$PATH[1]".to_string()),
-            )
-        }
-        PathRuleType::Exact => (
-            PathRule {
-                value: path_config.value.clone(),
-                kind: 2,
-            },
-            Some("/".to_string()),
-        ),
-        PathRuleType::Regex => {
-            debug!(
-                "strip_prefix on Regex path is not supported natively for {}; configure rewrite via Sozu directly if needed",
-                cluster_id
-            );
-            (
-                PathRule {
-                    value: path_config.value.clone(),
-                    kind: 1,
-                },
-                None,
-            )
-        }
-    }
-}
-
-fn normalize_add_prefix(prefix: &str) -> String {
-    let trimmed = prefix.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    }
-}
-
-fn build_add_prefix_rewrite(
-    path_config: Option<&PathConfig>,
-    prefix: &str,
-) -> (PathRule, Option<String>) {
-    let normalized = normalize_add_prefix(prefix);
-    if normalized.is_empty() {
-        return (
-            PathRule {
-                value: "/".to_string(),
-                kind: 0,
-            },
-            None,
-        );
-    }
-
-    match path_config {
-        None => {
-            // Match every path and capture it so the rewrite template can
-            // prepend the configured prefix verbatim.
-            (
-                PathRule {
-                    value: "^(/.*)$".to_string(),
-                    kind: 1,
-                },
-                Some(format!("{normalized}$PATH[1]")),
-            )
-        }
-        Some(pc) => match pc.rule_type {
-            PathRuleType::Prefix => {
-                let escaped = regex_escape(pc.value.trim_end_matches('/'));
-                let pattern = format!("^({}(?:/.*)?)$", escaped);
-                (
-                    PathRule {
-                        value: pattern,
-                        kind: 1,
-                    },
-                    Some(format!("{normalized}$PATH[1]")),
-                )
-            }
-            PathRuleType::Exact => (
-                PathRule {
-                    value: pc.value.clone(),
-                    kind: 2,
-                },
-                Some(format!("{normalized}{}", pc.value)),
-            ),
-            PathRuleType::Regex => (
-                PathRule {
-                    value: pc.value.clone(),
-                    kind: 1,
-                },
-                Some(format!("{normalized}$PATH[1]")),
-            ),
-        },
-    }
-}
-
 fn configure_http_entrypoint(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -1128,161 +917,7 @@ fn configure_tcp_entrypoint(
     }
 }
 
-fn wait_for_worker_ready(
-    channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    name: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    channel.write_message(&WorkerRequest {
-        id: format!("{}-readiness-probe", name),
-        content: Request {
-            request_type: Some(RequestType::Status(Status {})),
-        },
-    })?;
-
-    match channel.read_message_blocking_timeout(Some(timeout)) {
-        Ok(_) => {
-            info!("{} worker is ready", name);
-            Ok(())
-        }
-        Err(e) => {
-            anyhow::bail!(
-                "{} worker failed to become ready within {:?}: {}",
-                name,
-                timeout,
-                e
-            );
-        }
-    }
-}
-
-fn send_to_worker(
-    channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    id: String,
-    request: RequestType,
-) -> anyhow::Result<()> {
-    channel.write_message(&WorkerRequest {
-        id: id.clone(),
-        content: Request {
-            request_type: Some(request),
-        },
-    })?;
-
-    // Read responses until we find the one matching our request ID
-    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match channel.read_message_blocking_timeout(Some(remaining)) {
-            Ok(response) => {
-                if response.id == id {
-                    if response.status == ResponseStatus::Failure as i32 {
-                        error!("Worker rejected command {}: {}", id, response.message);
-                        return Err(anyhow::anyhow!(
-                            "Worker rejected {}: {}",
-                            id,
-                            response.message
-                        ));
-                    }
-                    return Ok(());
-                }
-                // Not our response, keep reading
-                debug!(
-                    "Received response for {} while waiting for {}",
-                    response.id, id
-                );
-            }
-            Err(_) => {
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Register the ACME challenge cluster and backend (frontends are added per-hostname during reload)
-fn register_acme_challenge_cluster(
-    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    challenge_port: u16,
-) -> anyhow::Result<()> {
-    let cluster_id = "acme-challenge".to_string();
-
-    let cluster = Cluster {
-        cluster_id: cluster_id.clone(),
-        sticky_session: false,
-        https_redirect: false,
-        proxy_protocol: None,
-        load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-        load_metric: None,
-        answer_503: None,
-        http2: None,
-        ..Default::default()
-    };
-
-    send_to_worker(
-        command_channel,
-        "add-cluster-acme-challenge".to_string(),
-        RequestType::AddCluster(cluster),
-    )?;
-
-    let backend = AddBackend {
-        cluster_id: cluster_id.clone(),
-        backend_id: "acme-challenge-backend-0".to_string(),
-        address: SocketAddress::new_v4(127, 0, 0, 1, challenge_port),
-        load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
-        sticky_id: None,
-        backup: None,
-    };
-
-    send_to_worker(
-        command_channel,
-        "add-backend-acme-challenge".to_string(),
-        RequestType::AddBackend(backend),
-    )?;
-
-    info!(
-        "ACME challenge cluster registered -> 127.0.0.1:{}",
-        challenge_port
-    );
-    Ok(())
-}
-
-/// Send an AddCertificate command to the HTTPS worker
-fn add_certificate(
-    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
-    https_port: u16,
-    cert_pem: &str,
-    chain: &[String],
-    key_pem: &str,
-    names: &[String],
-) -> anyhow::Result<()> {
-    let cert = AddCertificate {
-        address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
-        certificate: CertificateAndKey {
-            certificate: cert_pem.to_string(),
-            certificate_chain: chain.to_vec(),
-            key: key_pem.to_string(),
-            versions: vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
-            names: names.to_vec(),
-        },
-        expired_at: None,
-    };
-
-    send_to_worker(
-        command_channel_https,
-        format!(
-            "add-cert-{}",
-            names.first().map(|s| s.as_str()).unwrap_or("unknown")
-        ),
-        RequestType::AddCertificate(cert),
-    )?;
-
-    info!("Certificate added for {:?}", names);
-    Ok(())
-}
 
 fn remove_http_frontends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -1576,138 +1211,5 @@ fn remove_tcp_entrypoint(
         RequestType::RemoveCluster(cluster_id.to_string()),
     ) {
         debug!("Failed to remove TCP cluster {}: {}", cluster_id, e);
-    }
-}
-
-fn parse_backend_address(backend: &Backend) -> anyhow::Result<SocketAddress> {
-    let addr: std::net::SocketAddr = format!("{}:{}", backend.address, backend.port).parse()?;
-
-    match addr {
-        std::net::SocketAddr::V4(addr_v4) => {
-            let ip = addr_v4.ip().octets();
-            Ok(SocketAddress::new_v4(
-                ip[0],
-                ip[1],
-                ip[2],
-                ip[3],
-                addr_v4.port(),
-            ))
-        }
-        std::net::SocketAddr::V6(_) => {
-            anyhow::bail!("IPv6 addresses are not yet supported")
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_backend_address_ipv4() {
-        let result = parse_backend_address(&Backend::new("192.168.1.100", 8080));
-        assert!(result.is_ok(), "Failed to parse IPv4 address: {:?}", result);
-    }
-
-    #[test]
-    fn test_parse_backend_address_localhost() {
-        let result = parse_backend_address(&Backend::new("127.0.0.1", 3000));
-        assert!(result.is_ok(), "Failed to parse localhost: {:?}", result);
-    }
-
-    #[test]
-    fn test_parse_backend_address_hostname() {
-        let result = parse_backend_address(&Backend::new("localhost", 80));
-        // Localhost may not resolve in all test environments
-        // Just verify we get a consistent result
-        match result {
-            Ok(_) => (),
-            Err(e) => {
-                println!(
-                    "Hostname resolution failed (expected in some test environments): {}",
-                    e
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_backend_address_invalid() {
-        let result =
-            parse_backend_address(&Backend::new("invalid-host-name-that-does-not-exist", 80));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_backend_address_invalid_port() {
-        let result = parse_backend_address(&Backend::new("127.0.0.1", 0));
-        assert!(result.is_ok()); // Port 0 is technically valid
-    }
-
-    #[test]
-    fn add_prefix_without_path_matches_root_and_prepends() {
-        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/foo"), "test");
-        assert_eq!(path_rule.kind, 1, "expected regex kind for capture");
-        assert_eq!(path_rule.value, "^(/.*)$");
-        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
-    }
-
-    #[test]
-    fn add_prefix_normalizes_missing_leading_slash() {
-        let (_, rewrite) = build_path_and_rewrite(None, false, Some("foo"), "test");
-        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
-    }
-
-    #[test]
-    fn add_prefix_strips_trailing_slash() {
-        let (_, rewrite) = build_path_and_rewrite(None, false, Some("/foo/"), "test");
-        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
-    }
-
-    #[test]
-    fn add_prefix_empty_value_is_treated_as_no_op() {
-        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/"), "test");
-        assert_eq!(path_rule.value, "/");
-        assert_eq!(path_rule.kind, 0);
-        assert!(rewrite.is_none());
-    }
-
-    #[test]
-    fn add_prefix_with_prefix_path_matcher_keeps_filter() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Prefix,
-            value: "/api".to_string(),
-        };
-        let (path_rule, rewrite) = build_path_and_rewrite(Some(&path), false, Some("/foo"), "test");
-        assert_eq!(path_rule.kind, 1);
-        assert!(path_rule.value.contains("/api"));
-        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
-    }
-
-    #[test]
-    fn add_prefix_with_exact_path_matcher_uses_static_rewrite() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Exact,
-            value: "/health".to_string(),
-        };
-        let (path_rule, rewrite) = build_path_and_rewrite(Some(&path), false, Some("/foo"), "test");
-        assert_eq!(path_rule.kind, 2);
-        assert_eq!(path_rule.value, "/health");
-        assert_eq!(rewrite.as_deref(), Some("/foo/health"));
-    }
-
-    #[test]
-    fn add_prefix_takes_precedence_over_strip_prefix() {
-        // Mutually exclusive: when both set, add_prefix wins.
-        let (_, rewrite) = build_path_and_rewrite(None, true, Some("/foo"), "test");
-        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
-    }
-
-    #[test]
-    fn no_add_prefix_keeps_default_behaviour() {
-        let (path_rule, rewrite) = build_path_and_rewrite(None, false, None, "test");
-        assert_eq!(path_rule.value, "/");
-        assert_eq!(path_rule.kind, 0);
-        assert!(rewrite.is_none());
     }
 }
