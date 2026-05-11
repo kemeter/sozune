@@ -3,7 +3,7 @@ pub mod gateway;
 use crate::config::KubernetesConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
-use crate::labels::diagnostic::{Diagnostic, Severity};
+use crate::labels::diagnostic::log_diagnostics;
 use crate::labels::source::LabelSource;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol};
 use crate::provider::Provider;
@@ -1609,29 +1609,5 @@ mod tests {
     fn sanitise_replaces_path_separators() {
         assert_eq!(sanitise("default/web"), "default-web");
         assert_eq!(sanitise("ns.test/web.app"), "ns-test-web-app");
-    }
-}
-
-fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
-    for d in diagnostics {
-        let target = format!("{}/{}", candidate.provider, candidate.display_name);
-        match d.severity() {
-            Severity::Error => error!(
-                "[{}] {}: {} (label={})",
-                target,
-                d.code.as_str(),
-                d.message,
-                d.label.as_deref().unwrap_or("-")
-            ),
-            Severity::Warn => warn!(
-                "[{}] {}: {} (label={}, value={:?})",
-                target,
-                d.code.as_str(),
-                d.message,
-                d.label.as_deref().unwrap_or("-"),
-                d.value.as_deref().unwrap_or("")
-            ),
-            Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
-        }
     }
 }

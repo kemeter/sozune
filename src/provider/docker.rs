@@ -1,7 +1,7 @@
 use crate::config::DockerConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, HealthStatus, NetworkInfo};
-use crate::labels::diagnostic::{Diagnostic, Severity};
+use crate::labels::diagnostic::log_diagnostics;
 use crate::labels::source::LabelSource;
 use crate::labels::{self};
 use crate::model::Entrypoint;
@@ -668,32 +668,6 @@ impl DockerProvider {
         let mut throwaway = Vec::new();
         let ip = labels::network::resolve_ip(&candidate, &mut throwaway);
         if ip == "127.0.0.1" { None } else { Some(ip) }
-    }
-}
-
-/// Emit each diagnostic at the appropriate tracing level so the runtime logs
-/// match what `sozune validate` would report.
-fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
-    for d in diagnostics {
-        let target = format!("{}/{}", candidate.provider, candidate.display_name);
-        match d.severity() {
-            Severity::Error => error!(
-                "[{}] {}: {} (label={})",
-                target,
-                d.code.as_str(),
-                d.message,
-                d.label.as_deref().unwrap_or("-")
-            ),
-            Severity::Warn => warn!(
-                "[{}] {}: {} (label={}, value={:?})",
-                target,
-                d.code.as_str(),
-                d.message,
-                d.label.as_deref().unwrap_or("-"),
-                d.value.as_deref().unwrap_or("")
-            ),
-            Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
-        }
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::config::NomadConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
-use crate::labels::diagnostic::{Diagnostic, Severity};
+use crate::labels::diagnostic::log_diagnostics;
 use crate::labels::source::LabelSource;
 use crate::model::Entrypoint;
 use crate::provider::Provider;
@@ -411,30 +411,6 @@ fn parse_tags(tags: &[String]) -> HashMap<String, String> {
         }
     }
     out
-}
-
-fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
-    for d in diagnostics {
-        let target = format!("{}/{}", candidate.provider, candidate.display_name);
-        match d.severity() {
-            Severity::Error => error!(
-                "[{}] {}: {} (label={})",
-                target,
-                d.code.as_str(),
-                d.message,
-                d.label.as_deref().unwrap_or("-")
-            ),
-            Severity::Warn => warn!(
-                "[{}] {}: {} (label={}, value={:?})",
-                target,
-                d.code.as_str(),
-                d.message,
-                d.label.as_deref().unwrap_or("-"),
-                d.value.as_deref().unwrap_or("")
-            ),
-            Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
-        }
-    }
 }
 
 #[cfg(test)]

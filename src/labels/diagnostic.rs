@@ -1,6 +1,8 @@
+use crate::labels::Candidate;
 use crate::model::Entrypoint;
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
+use tracing::{debug, error, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -171,5 +173,32 @@ impl ParseResult {
         self.diagnostics
             .iter()
             .any(|d| d.severity() == Severity::Error)
+    }
+}
+
+/// Emit each diagnostic at the appropriate tracing level so the runtime logs
+/// match what `sozune validate` would report. Shared by every provider that
+/// turns a `Candidate` into entrypoints — see `provider::{docker,swarm,nomad,kubernetes}`.
+pub(crate) fn log_diagnostics(candidate: &Candidate, diagnostics: &[Diagnostic]) {
+    for d in diagnostics {
+        let target = format!("{}/{}", candidate.provider, candidate.display_name);
+        match d.severity() {
+            Severity::Error => error!(
+                "[{}] {}: {} (label={})",
+                target,
+                d.code.as_str(),
+                d.message,
+                d.label.as_deref().unwrap_or("-")
+            ),
+            Severity::Warn => warn!(
+                "[{}] {}: {} (label={}, value={:?})",
+                target,
+                d.code.as_str(),
+                d.message,
+                d.label.as_deref().unwrap_or("-"),
+                d.value.as_deref().unwrap_or("")
+            ),
+            Severity::Info => debug!("[{}] {}: {}", target, d.code.as_str(), d.message),
+        }
     }
 }
