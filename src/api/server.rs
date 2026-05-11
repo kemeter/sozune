@@ -25,6 +25,10 @@ pub struct AppState {
     pub unhealthy_backends: Arc<RwLock<HashSet<String>>>,
     pub diagnostics: crate::diagnostics::DiagnosticsStore,
     pub acme_enabled: bool,
+    /// Snapshot of the provider section from `config.yaml`. Read-only — used
+    /// by `GET /providers` to surface which providers are configured and
+    /// whether their `enabled` flag is set.
+    pub providers: crate::config::ProvidersConfig,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
@@ -162,6 +166,7 @@ pub async fn serve(
     unhealthy_backends: Arc<RwLock<HashSet<String>>>,
     diagnostics: crate::diagnostics::DiagnosticsStore,
     acme_enabled: bool,
+    providers: crate::config::ProvidersConfig,
 ) -> anyhow::Result<()> {
     if config.users.is_empty() {
         anyhow::bail!(
@@ -176,6 +181,7 @@ pub async fn serve(
         unhealthy_backends,
         diagnostics,
         acme_enabled,
+        providers,
     };
 
     let protected = Router::new()
@@ -190,6 +196,7 @@ pub async fn serve(
                 .delete(delete_entrypoint),
         )
         .route("/diagnostics", get(list_diagnostics))
+        .route("/providers", get(list_providers))
         .route_layer(axum_middleware::from_fn(require_admin));
 
     let me_route = Router::new().route("/me", get(me));
@@ -405,6 +412,95 @@ fn global_lints(state: &AppState) -> Vec<crate::labels::diagnostic::Diagnostic> 
         out.push(d);
     }
     out
+}
+
+/// `GET /providers` — snapshot of every provider sōzune knows about, its
+/// configured `enabled` flag, and how many entrypoints it currently owns in
+/// the storage. Lets the dashboard render a "what's wired up?" overview
+/// without inferring it from the entrypoint list.
+async fn list_providers(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let storage = match state.storage.read() {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!(
+                "internal state corrupted (configuration store), restart required: {}",
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal server error"})),
+            );
+        }
+    };
+
+    // Count entrypoints per source so the dashboard can show "Docker: 5
+    // entrypoints" next to each provider row. Sources sōzune emits today
+    // are listed under `documented_sources` below; an unknown source still
+    // gets counted but won't have a matching provider row.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for ep in storage.values() {
+        if let Some(src) = ep.source.as_deref() {
+            *counts.entry(src.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let providers = &state.providers;
+    let rows = [
+        (
+            "docker",
+            providers.docker.as_ref().is_some_and(|c| c.enabled),
+            providers.docker.is_some(),
+        ),
+        (
+            "podman",
+            providers.podman.as_ref().is_some_and(|c| c.enabled),
+            providers.podman.is_some(),
+        ),
+        (
+            "swarm",
+            providers.swarm.as_ref().is_some_and(|c| c.enabled),
+            providers.swarm.is_some(),
+        ),
+        (
+            "kubernetes",
+            providers.kubernetes.as_ref().is_some_and(|c| c.enabled),
+            providers.kubernetes.is_some(),
+        ),
+        (
+            "nomad",
+            providers.nomad.as_ref().is_some_and(|c| c.enabled),
+            providers.nomad.is_some(),
+        ),
+        (
+            "http",
+            providers.http.as_ref().is_some_and(|c| c.enabled),
+            providers.http.is_some(),
+        ),
+        (
+            "config",
+            providers.config_file.as_ref().is_some_and(|c| c.enabled),
+            providers.config_file.is_some(),
+        ),
+    ];
+
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(name, enabled, configured)| {
+            serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "configured": configured,
+                "entrypoint_count": counts.get(*name).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "providers": items,
+        })),
+    )
 }
 
 async fn get_entrypoint(
@@ -655,6 +751,7 @@ mod tests {
             unhealthy_backends: Arc::new(RwLock::new(HashSet::new())),
             diagnostics: crate::diagnostics::new_store(),
             acme_enabled: false,
+            providers: crate::config::ProvidersConfig::default(),
         }
     }
 
@@ -671,6 +768,7 @@ mod tests {
                     .delete(delete_entrypoint),
             )
             .route("/diagnostics", get(list_diagnostics))
+            .route("/providers", get(list_providers))
             .route_layer(axum_middleware::from_fn(require_admin));
 
         let me_route = Router::new().route("/me", get(me));
@@ -1761,6 +1859,118 @@ mod tests {
             response.status(),
             StatusCode::OK,
             "GET /diagnostics is a read endpoint and must be open to read-only users"
+        );
+    }
+
+    // ---- /providers -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn providers_endpoint_lists_every_known_provider() {
+        let app = test_app(test_state());
+        let response = app
+            .oneshot(
+                Request::get("/providers")
+                    .header("authorization", basic("admin", "admin-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = json["providers"].as_array().expect("providers is an array");
+
+        // Every provider known to sōzune must appear in the list, even when
+        // not configured — the dashboard relies on the full set to show
+        // "configure me" rows next to inactive providers.
+        let names: Vec<&str> = items.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        for expected in [
+            "docker",
+            "podman",
+            "swarm",
+            "kubernetes",
+            "nomad",
+            "http",
+            "config",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing provider `{}` in /providers response: got {:?}",
+                expected,
+                names
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn providers_endpoint_counts_entrypoints_per_source() {
+        let state = test_state();
+        {
+            let mut storage = state.storage.write().unwrap();
+            storage.insert(
+                "a".into(),
+                make_ep("a", "x.example.com", None, Some("docker")),
+            );
+            storage.insert(
+                "b".into(),
+                make_ep("b", "y.example.com", None, Some("docker")),
+            );
+            storage.insert(
+                "c".into(),
+                make_ep("c", "z.example.com", None, Some("nomad")),
+            );
+        }
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/providers")
+                    .header("authorization", basic("admin", "admin-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = json["providers"].as_array().unwrap();
+        let count_for = |name: &str| -> u64 {
+            items
+                .iter()
+                .find(|p| p["name"] == name)
+                .and_then(|p| p["entrypoint_count"].as_u64())
+                .unwrap()
+        };
+        assert_eq!(count_for("docker"), 2);
+        assert_eq!(count_for("nomad"), 1);
+        assert_eq!(count_for("swarm"), 0);
+    }
+
+    #[tokio::test]
+    async fn providers_endpoint_allows_read_only_user() {
+        let app = test_app(test_state_with_users(vec![user(
+            "viewer",
+            "viewer-pass",
+            Role::ReadOnly,
+        )]));
+        let response = app
+            .oneshot(
+                Request::get("/providers")
+                    .header("authorization", basic("viewer", "viewer-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /providers is a read endpoint and must be open to read-only users"
         );
     }
 
