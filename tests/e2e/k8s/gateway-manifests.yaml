@@ -1,4 +1,32 @@
 ---
+# Sōzune-owned GatewayClass — controllerName must match the constant in
+# src/provider/k8s_gateway.rs (SOZUNE_CONTROLLER_NAME). Every HTTPRoute
+# below joins sōzune through this class via the `gw` Gateway.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: sozune
+spec:
+  controllerName: kemeter.io/sozune
+---
+# Listener block is required by the Gateway API schema but ignored by
+# Sōzune today — actual ports come from proxy.http.listen_address in
+# config.yaml.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw
+  namespace: sozune-test
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
 # Two HTTPRoutes targeting the same Services (svca, svcb) already created
 # by manifests.yaml. Hostnames are prefixed `gw-` to keep the Gateway-API
 # routes disjoint from the Ingress routes the previous suite exercises.
@@ -8,6 +36,8 @@ metadata:
   name: svca-gw
   namespace: sozune-test
 spec:
+  parentRefs:
+    - name: gw
   hostnames:
     - gw-svca.k8s-test.localhost
   rules:
@@ -25,6 +55,8 @@ metadata:
   name: svcb-gw
   namespace: sozune-test
 spec:
+  parentRefs:
+    - name: gw
   hostnames:
     - gw-svcb.k8s-test.localhost
   rules:
@@ -44,6 +76,8 @@ metadata:
   name: split-gw
   namespace: sozune-test
 spec:
+  parentRefs:
+    - name: gw
   hostnames:
     - gw-split.k8s-test.localhost
   rules:

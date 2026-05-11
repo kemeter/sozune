@@ -146,7 +146,7 @@ Useful for local development. Sōzune uses the current context from `$KUBECONFIG
 
 ## Gateway API (HTTPRoute)
 
-Sōzune watches `gateway.networking.k8s.io/v1` `HTTPRoute` resources alongside Ingress. The watcher is started automatically when the Kubernetes provider is enabled and the CRD is installed; no extra configuration is required.
+Sōzune watches `gateway.networking.k8s.io/v1` resources alongside Ingress. Three watchers run side by side: `GatewayClass`, `Gateway`, and `HTTPRoute`. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required.
 
 ### Prerequisites
 
@@ -154,17 +154,42 @@ Sōzune watches `gateway.networking.k8s.io/v1` `HTTPRoute` resources alongside I
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
 ```
 
-If the CRDs are missing, Sōzune logs `HTTPRoute CRD not installed` once and skips the Gateway watcher — Ingress alone keeps working.
+If the CRDs are missing, Sōzune logs `HTTPRoute CRD not installed` once and skips the Gateway watchers — Ingress alone keeps working.
 
-### What's supported
+### Opting in: declare a GatewayClass
 
-- `spec.hostnames` — matched against the `Host` header of incoming requests.
-- `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
-- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
-- `backendRef.weight` — propagated to the load balancer.
-- Live reconciliation — apply/update/delete of an `HTTPRoute` is reflected in routing within seconds, including when the target Service's pods come up after the route was created.
+Sōzune only serves `HTTPRoute`s whose chain of `parentRefs → Gateway → GatewayClass` ends at a `GatewayClass` it owns. Multi-controller clusters depend on this — without it, Sōzune would hijack routes meant for Traefik, Envoy Gateway, NGINX Gateway, and friends.
 
-### Example
+Declare a `GatewayClass` whose `spec.controllerName` is **`kemeter.io/sozune`**:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: sozune
+spec:
+  controllerName: kemeter.io/sozune
+```
+
+Then a `Gateway` that references it:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw
+  namespace: default
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+```
+
+> The listener block is required by the Gateway API schema, but Sōzune currently ignores it: real listening ports stay declared via `proxy.http.listen_address` / `proxy.https.listen_address` in `config.yaml`. Wiring listeners to live ports is a planned post-MVP enhancement.
+
+Finally, the `HTTPRoute` references the `Gateway` via `parentRefs`:
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -173,6 +198,8 @@ metadata:
   name: web
   namespace: default
 spec:
+  parentRefs:
+    - name: gw  # same namespace; add `namespace:` for cross-ns parents
   hostnames:
     - app.example.com
   rules:
@@ -193,9 +220,22 @@ spec:
           port: 80
 ```
 
+Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
+
+### What's supported
+
+- Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
+- Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
+- `spec.hostnames` — matched against the `Host` header of incoming requests.
+- `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
+- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
+- `backendRef.weight` — propagated to the load balancer.
+- Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
+
 ### What's not supported (yet)
 
-- `Gateway` and `GatewayClass` resources — listeners are still declared statically via `proxy.http.listen_address` / `proxy.https.listen_address`. Sōzune ignores `spec.parentRefs`.
+- Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
+- `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
 - `status.parents[].conditions[]` reporting — `kubectl describe httproute` does not yet show "Accepted" / "ResolvedRefs" status from Sōzune.
 - HTTPRoute filters (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — use Service annotations or Ingress annotations until these land.
 - `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
