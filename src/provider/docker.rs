@@ -191,7 +191,7 @@ impl DockerProvider {
     }
 
     /// Start listening for Docker events and update storage directly
-    pub async fn start_event_listener(
+    async fn start_event_listener(
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         reload_tx: mpsc::Sender<()>,
@@ -479,7 +479,7 @@ impl DockerProvider {
         Ok(result.entrypoints)
     }
 
-    pub async fn get_entrypoints_from_containers(
+    async fn get_entrypoints_from_containers(
         &self,
         diagnostics: &DiagnosticsStore,
     ) -> Result<HashMap<String, Entrypoint>, bollard::errors::Error> {

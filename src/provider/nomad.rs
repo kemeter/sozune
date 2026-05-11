@@ -219,7 +219,6 @@ impl NomadProvider {
             return;
         }
 
-        let mut tls_added = false;
         {
             let mut storage_write = match storage.write() {
                 Ok(guard) => guard,
@@ -230,9 +229,6 @@ impl NomadProvider {
             };
             storage_write.retain(|_, ep| ep.source.as_deref() != Some(PROVIDER_NAME));
             for (id, entrypoint) in new_entrypoints {
-                if entrypoint.config.tls {
-                    tls_added = true;
-                }
                 debug!(
                     "Nomad entrypoint: {id} ({} backend(s))",
                     entrypoint.backends.len()
@@ -245,9 +241,11 @@ impl NomadProvider {
         if let Err(e) = reload_tx.send(()).await {
             warn!("could not apply configuration update; will retry on next change: {e}");
         }
-        if tls_added {
-            acme_notify.notify_one();
-        }
+        // Notify ACME unconditionally on any storage change: the manager
+        // checks for missing/expiring certs before re-issuing, so the extra
+        // notification is cheap and keeps the contract identical across
+        // providers (Docker, Swarm, Kubernetes do the same).
+        acme_notify.notify_one();
     }
 
     pub async fn start_polling(

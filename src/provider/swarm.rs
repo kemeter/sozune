@@ -357,74 +357,12 @@ impl SwarmProvider {
         loop {
             interval.tick().await;
 
-            let new_entrypoints = match self.provide_into(&diagnostics).await {
-                Ok(eps) => eps,
-                Err(e) => {
-                    warn!("Swarm provider poll failed: {}", e);
-                    continue;
-                }
-            };
-
-            let needs_update = {
-                let storage_read = match storage.read() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        error!(
-                            "internal state corrupted (configuration store), restart required: {}",
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                let old_ids: std::collections::HashSet<&String> = storage_read
-                    .iter()
-                    .filter(|(_, ep)| ep.source.as_deref() == Some(SOURCE))
-                    .map(|(id, _)| id)
-                    .collect();
-
-                let new_ids: std::collections::HashSet<&String> = new_entrypoints.keys().collect();
-
-                old_ids != new_ids
-                    || new_entrypoints.iter().any(|(id, ep)| {
-                        storage_read.get(id).is_none_or(|existing| {
-                            existing.backends != ep.backends
-                                || existing.config.hostnames != ep.config.hostnames
-                        })
-                    })
-            };
-
-            if !needs_update {
-                continue;
-            }
-
+            if let Err(e) = self
+                .sync_once(&storage, &reload_tx, &acme_notify, &diagnostics, false)
+                .await
             {
-                let mut storage_write = match storage.write() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        error!(
-                            "internal state corrupted (configuration store), restart required: {}",
-                            e
-                        );
-                        continue;
-                    }
-                };
-                storage_write.retain(|_, ep| ep.source.as_deref() != Some(SOURCE));
-                for (id, mut entrypoint) in new_entrypoints {
-                    entrypoint.source = Some(SOURCE.to_string());
-                    debug!("Swarm provider entrypoint: {}", id);
-                    storage_write.insert(id, entrypoint);
-                }
+                warn!("Swarm provider poll failed: {}", e);
             }
-
-            info!("Swarm provider config changed, triggering reload");
-            if let Err(e) = reload_tx.send(()).await {
-                warn!(
-                    "could not apply configuration update; will retry on next change: {}",
-                    e
-                );
-            }
-            acme_notify.notify_one();
         }
     }
 }
