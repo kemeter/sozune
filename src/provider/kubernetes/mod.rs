@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-const PROVIDER_NAME: &str = "kubernetes";
+const PROVIDER_NAME: &str = crate::provider::KUBERNETES;
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
 /// Maps `namespace/service` → (slice name → ready pod IPs from that slice).
@@ -71,18 +71,10 @@ impl Provider for KubernetesProvider {
         }
         Ok(entrypoints)
     }
-
-    fn name(&self) -> &'static str {
-        self.name
-    }
 }
 
 #[async_trait]
 impl LabelSource for KubernetesProvider {
-    fn provider_name(&self) -> &'static str {
-        self.name
-    }
-
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
         let client = self.build_client().await?;
         let services: Api<Service> = self.scoped_api(&client);

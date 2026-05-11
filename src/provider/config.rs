@@ -42,10 +42,6 @@ impl Provider for ConfigProvider {
             .map(|ep| (ep.id.clone(), ep))
             .collect())
     }
-
-    fn name(&self) -> &'static str {
-        "config"
-    }
 }
 
 impl ConfigProvider {
@@ -116,12 +112,15 @@ impl ConfigProvider {
 
                         // Remove existing config entrypoints
                         storage_write.retain(|_, entrypoint| {
-                            entrypoint.source.as_ref().is_none_or(|s| s != "config")
+                            entrypoint
+                                .source
+                                .as_ref()
+                                .is_none_or(|s| s != crate::provider::CONFIG)
                         });
 
                         // Add new config entrypoints
                         for (id, mut entrypoint) in new_entrypoints {
-                            entrypoint.source = Some("config".to_string());
+                            entrypoint.source = Some(crate::provider::CONFIG.to_string());
                             info!("Reloaded config entrypoint: {}", id);
                             storage_write.insert(id, entrypoint);
                         }

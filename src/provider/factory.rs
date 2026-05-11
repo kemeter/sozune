@@ -51,7 +51,7 @@ pub async fn start_services(
                         if storage_write.contains_key(&id) {
                             warn!("Duplicate entrypoint ID {} from config file provider", id);
                         }
-                        entrypoint.source = Some("config".to_string());
+                        entrypoint.source = Some(crate::provider::CONFIG.to_string());
                         info!("Loaded entrypoint from config: {}", id);
                         storage_write.insert(id, entrypoint);
                     }

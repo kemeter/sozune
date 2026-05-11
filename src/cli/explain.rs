@@ -1,7 +1,5 @@
 use clap::Args;
 
-use crate::labels::diagnostic::DiagnosticCode;
-
 #[derive(Args, Debug)]
 pub struct ExplainArgs {
     /// Diagnostic code to explain (e.g. E002, W009, I001).
@@ -293,6 +291,7 @@ const ENTRIES: &[Entry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels::diagnostic::DiagnosticCode;
 
     #[test]
     fn every_diagnostic_code_has_an_entry() {

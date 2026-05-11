@@ -27,7 +27,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 /// Snapshot of the storage at the moment of the last successful reload, keyed
@@ -215,7 +214,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     wait_for_worker_ready(&mut command_channel_https, "HTTPS", timeout)?;
 
     // Spawn one Sōzu TCP worker per declared listener.
-    let (mut tcp_channels, tcp_worker_handles) = spawn_tcp_workers(config)?;
+    let (tcp_channels, tcp_worker_handles) = spawn_tcp_workers(config)?;
 
     // Initial configuration will be handled by provider reload signals
     info!("Waiting for providers to populate configuration");
@@ -916,8 +915,6 @@ fn configure_tcp_entrypoint(
         }
     }
 }
-
-/// Register the ACME challenge cluster and backend (frontends are added per-hostname during reload)
 
 fn remove_http_frontends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,

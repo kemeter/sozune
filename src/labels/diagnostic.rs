@@ -17,6 +17,10 @@ pub enum DiagnosticCode {
     // Errors — block routing
     E001Disabled,
     E002MissingHost,
+    /// Reserved: documented in `sozune explain E003` but not yet emitted at
+    /// runtime. Belongs to the Docker provider when `inspect_container`
+    /// fails — surface that path before removing the variant.
+    #[allow(dead_code)]
     E003InspectFailed,
     E004NoServices,
     E005MissingTcpEntrypoint,
@@ -169,6 +173,11 @@ pub struct ParseResult {
 }
 
 impl ParseResult {
+    /// Whether any diagnostic in this result is `Severity::Error`.
+    /// Exercised by the parser tests; kept as part of the public API surface
+    /// so test fixtures and external consumers can gate on parse errors
+    /// without re-implementing the filter.
+    #[allow(dead_code)]
     pub fn has_errors(&self) -> bool {
         self.diagnostics
             .iter()

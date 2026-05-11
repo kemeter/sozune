@@ -22,7 +22,7 @@ impl PodmanProvider {
             expose_by_default: config.expose_by_default,
         };
         Ok(Self {
-            inner: DockerProvider::new_named(docker_config, "podman")?,
+            inner: DockerProvider::new_named(docker_config, crate::provider::PODMAN)?,
         })
     }
 
@@ -44,18 +44,10 @@ impl Provider for PodmanProvider {
     async fn provide(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
         self.inner.provide().await
     }
-
-    fn name(&self) -> &'static str {
-        "podman"
-    }
 }
 
 #[async_trait]
 impl LabelSource for PodmanProvider {
-    fn provider_name(&self) -> &'static str {
-        "podman"
-    }
-
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
         self.inner.collect().await
     }

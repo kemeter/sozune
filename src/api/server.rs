@@ -444,53 +444,49 @@ async fn list_providers(State(state): State<AppState>) -> (StatusCode, Json<serd
         }
     }
 
-    let providers = &state.providers;
-    let rows = [
-        (
-            "docker",
-            providers.docker.as_ref().is_some_and(|c| c.enabled),
-            providers.docker.is_some(),
-        ),
-        (
-            "podman",
-            providers.podman.as_ref().is_some_and(|c| c.enabled),
-            providers.podman.is_some(),
-        ),
-        (
-            "swarm",
-            providers.swarm.as_ref().is_some_and(|c| c.enabled),
-            providers.swarm.is_some(),
-        ),
-        (
-            "kubernetes",
-            providers.kubernetes.as_ref().is_some_and(|c| c.enabled),
-            providers.kubernetes.is_some(),
-        ),
-        (
-            "nomad",
-            providers.nomad.as_ref().is_some_and(|c| c.enabled),
-            providers.nomad.is_some(),
-        ),
-        (
-            "http",
-            providers.http.as_ref().is_some_and(|c| c.enabled),
-            providers.http.is_some(),
-        ),
-        (
-            "config",
-            providers.config_file.as_ref().is_some_and(|c| c.enabled),
-            providers.config_file.is_some(),
-        ),
-    ];
-
-    let items: Vec<serde_json::Value> = rows
+    let p = &state.providers;
+    // Iterate `provider::ALL` so the response order, and the set of names,
+    // come from the same source as `Provider::name()` and `Entrypoint::source`.
+    // Adding a new provider only requires registering its constant in
+    // `provider/mod.rs` and matching it below.
+    let items: Vec<serde_json::Value> = crate::provider::ALL
         .iter()
-        .map(|(name, enabled, configured)| {
+        .map(|&name| {
+            let (configured, enabled) = match name {
+                crate::provider::DOCKER => (
+                    p.docker.is_some(),
+                    p.docker.as_ref().is_some_and(|c| c.enabled),
+                ),
+                crate::provider::PODMAN => (
+                    p.podman.is_some(),
+                    p.podman.as_ref().is_some_and(|c| c.enabled),
+                ),
+                crate::provider::SWARM => (
+                    p.swarm.is_some(),
+                    p.swarm.as_ref().is_some_and(|c| c.enabled),
+                ),
+                crate::provider::KUBERNETES => (
+                    p.kubernetes.is_some(),
+                    p.kubernetes.as_ref().is_some_and(|c| c.enabled),
+                ),
+                crate::provider::NOMAD => (
+                    p.nomad.is_some(),
+                    p.nomad.as_ref().is_some_and(|c| c.enabled),
+                ),
+                crate::provider::HTTP => {
+                    (p.http.is_some(), p.http.as_ref().is_some_and(|c| c.enabled))
+                }
+                crate::provider::CONFIG => (
+                    p.config_file.is_some(),
+                    p.config_file.as_ref().is_some_and(|c| c.enabled),
+                ),
+                _ => (false, false),
+            };
             serde_json::json!({
                 "name": name,
                 "enabled": enabled,
                 "configured": configured,
-                "entrypoint_count": counts.get(*name).copied().unwrap_or(0),
+                "entrypoint_count": counts.get(name).copied().unwrap_or(0),
             })
         })
         .collect();

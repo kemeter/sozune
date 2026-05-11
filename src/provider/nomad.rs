@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-const PROVIDER_NAME: &str = "nomad";
+const PROVIDER_NAME: &str = crate::provider::NOMAD;
 const NETWORK_NAME: &str = "nomad";
 
 pub struct NomadProvider {
@@ -29,10 +29,6 @@ impl Provider for NomadProvider {
         // diagnostics are at least logged.
         let throwaway = diagnostics::new_store();
         self.provide_into(&throwaway).await
-    }
-
-    fn name(&self) -> &'static str {
-        PROVIDER_NAME
     }
 }
 
@@ -67,10 +63,6 @@ impl NomadProvider {
 
 #[async_trait]
 impl LabelSource for NomadProvider {
-    fn provider_name(&self) -> &'static str {
-        PROVIDER_NAME
-    }
-
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
         let (services, _) = self.list_services(None).await?;
         let mut candidates = Vec::new();
