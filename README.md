@@ -1,12 +1,12 @@
 # Sōzune
 
-Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Swarm, Kubernetes, Nomad, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
+Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Podman, Swarm, Kubernetes, Nomad, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
 
 ![Sōzune dashboard](documentation/assets/dashboard-entrypoints.png)
 
 ## Features
 
-- **Multi-platform service discovery** — Docker, Swarm, Kubernetes, Nomad, an HTTP endpoint, or a YAML file.
+- **Multi-platform service discovery** — Docker, Podman, Swarm, Kubernetes (Ingress + Gateway API), Nomad, an HTTP endpoint, or a YAML file.
 - **Automatic HTTPS** — ACME (Let's Encrypt) provisioning and renewal, no intervention.
 - **HTTP/2** — negotiated through ALPN on every TLS listener.
 - **Hot reload** — REST API applies changes on the fly, no downtime.
@@ -55,13 +55,12 @@ curl -H "Host: whoami.localhost" http://localhost
 ## Documentation
 
 - [Installation](documentation/getting-started/installation.md) · [Quick start](documentation/getting-started/quick-start.md)
-- [Docker labels reference](documentation/configuration/docker-labels.md)
-- [Swarm provider](documentation/configuration/swarm-provider.md) · [HTTP provider](documentation/configuration/http-provider.md)
+- Providers — [Docker](documentation/providers/docker.md) · [Swarm](documentation/providers/swarm.md) · [Kubernetes](documentation/providers/kubernetes.md) · [Nomad](documentation/providers/nomad.md) · [HTTP](documentation/providers/http.md)
 - [Configuration file & env vars](documentation/configuration/overview.md)
 - [REST API](documentation/configuration/api.md)
 - Routing — [Hostnames](documentation/routing/hostnames.md) · [Path matching](documentation/routing/path-matching.md) · [Load balancing](documentation/routing/load-balancing.md) · [TCP](documentation/routing/tcp.md)
 - TLS — [Overview](documentation/tls/overview.md) · [ACME / Let's Encrypt](documentation/tls/acme.md)
-- Middleware — [Basic auth](documentation/middleware/auth.md) · [Custom headers](documentation/middleware/headers.md) · [Strip prefix](documentation/middleware/strip-prefix.md) · [Redirects](documentation/middleware/redirects.md) · [Rate limit](documentation/middleware/rate-limit.md) · [Response compression](documentation/middleware/compress.md) · [Backend timeout](documentation/middleware/backend-timeout.md)
+- Middleware — [Basic auth](documentation/middleware/auth.md) · [Forward auth](documentation/middleware/forward-auth.md) · [Custom headers](documentation/middleware/headers.md) · [Strip prefix](documentation/middleware/strip-prefix.md) · [Add prefix](documentation/middleware/add-prefix.md) · [Redirects](documentation/middleware/redirects.md) · [Rate limit](documentation/middleware/rate-limit.md) · [Response compression](documentation/middleware/compress.md) · [Backend timeout](documentation/middleware/backend-timeout.md)
 - Advanced — [Health checks](documentation/advanced/health-checks.md) · [WebSocket](documentation/advanced/websocket.md) · [Access logs](documentation/advanced/access-logs.md) · [Debugging](documentation/advanced/debugging.md)
 
 ## Architecture

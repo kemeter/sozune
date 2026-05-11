@@ -8,6 +8,24 @@ All notable changes to this project will be documented in this file.
 
 - `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.
 
+### Middleware
+
+- `forwardAuth` — delegate authentication to an external service (e.g. Authelia, Authentik). The proxy issues a sub-request to the auth service before each protected request and forwards selected response headers (`Remote-User`, `Remote-Email`, `Remote-Groups`) to the backend. Supports `address`, `responseHeaders` (comma-separated), and `trustForwardHeader`. See [Forward auth docs](documentation/middleware/forward-auth.md).
+
+### Docker provider
+
+- HEALTHCHECK gating — when a container declares a Docker `HEALTHCHECK`, sōzune now treats it as a readiness probe and gates routing on `State.Health.Status`: `starting`/`unhealthy` containers are kept out of the backend pool, `healthy` ones routed, and transitions are tracked via `health_status: healthy`/`unhealthy` Docker events. No opt-out: containers without a HEALTHCHECK keep the old "route as soon as running" behaviour. See [Docker provider docs](documentation/providers/docker.md#readiness--docker-healthcheck).
+
+### HTTP provider
+
+- Optional auth header on outgoing fetches — `providers.http.auth.header` and `auth.value` send an arbitrary header (typically `Authorization: Bearer <token>`) with every poll. Useful when the upstream config service sits behind its own auth layer.
+
+### Fixes
+
+- Environment variable overrides (e.g. `SOZUNE_PROXY_HTTP_LISTEN_ADDRESS`) now apply when `config.yaml` is absent, instead of silently using defaults.
+- Docker provider: `send_to_worker` now returns an error on Sōzu worker ack timeout instead of `Ok(())`, so configuration desync becomes visible in the logs.
+- Proxy backend addresses: IPv6 (bracketed or bare literal) is now supported in addition to IPv4. Previously IPv6 backends were dropped with a `bail!`.
+
 ### Kubernetes Gateway API
 
 - HTTPRoute support — Sōzune watches `gateway.networking.k8s.io/v1` `GatewayClass`, `Gateway`, and `HTTPRoute` resources alongside Ingress when the Kubernetes provider is enabled and the CRDs are installed. Hostnames, `PathPrefix`/`Exact` path matches (multiple per rule, OR'd), multiple backendRefs (with weights), cross-namespace backends, and live apply/delete are wired in.
