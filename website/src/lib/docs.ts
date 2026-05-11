@@ -2,6 +2,7 @@ export interface DocEntry {
   slug: string;
   content: string;
   title: string;
+  description: string;
   segments: string[];
 }
 
@@ -13,6 +14,32 @@ function extractTitle(markdown: string): string {
     }
   }
   return '';
+}
+
+function extractDescription(markdown: string): string {
+  let pastTitle = false;
+  const buffer: string[] = [];
+  for (const rawLine of markdown.split('\n')) {
+    const line = rawLine.trim();
+    if (!pastTitle) {
+      if (line.startsWith('# ')) {
+        pastTitle = true;
+      }
+      continue;
+    }
+    if (!line) {
+      if (buffer.length > 0) break;
+      continue;
+    }
+    if (line.startsWith('#') || line.startsWith('```') || line.startsWith('|') || line.startsWith('- ') || line.startsWith('* ')) {
+      if (buffer.length > 0) break;
+      continue;
+    }
+    buffer.push(line);
+  }
+  const text = buffer.join(' ').replace(/`([^`]+)`/g, '$1').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+  if (text.length <= 200) return text;
+  return text.slice(0, 197).replace(/\s+\S*$/, '') + '…';
 }
 
 function humanize(segment: string): string {
@@ -80,7 +107,8 @@ const docs: DocEntry[] = ctx.keys()
     const segments = slug.split('/').filter(Boolean);
     const content = ctx<string>(key);
     const title = extractTitle(content) || humanize(segments[segments.length - 1] || 'Overview');
-    return { slug, content, title, segments };
+    const description = extractDescription(content);
+    return { slug, content, title, description, segments };
   })
   .sort((a, b) => {
     // Root pages first
