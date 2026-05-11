@@ -14,7 +14,8 @@ All notable changes to this project will be documented in this file.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` — sōzune only serves routes whose `parentRefs → Gateway → GatewayClass` chain ends at a class it owns, so it coexists with Traefik, Envoy Gateway, NGINX Gateway, and friends without hijacking their routes.
 - Service backendRefs are resolved to ready pod IPs through the existing EndpointSlice cache; Sōzu requires `IpAddr` backends, so routes targeting a Service with no ready endpoints retry every 2 seconds until pods come up. Routes also re-resolve the moment a matching Gateway appears or disappears.
 - Routes that declare any HTTPRoute `filters` (requestRedirect, urlRewrite, header modifiers, mirror) are dropped with a `WARN` log — silently routing them as if the filter weren't there would rewrite user intent.
-- Listener-driven port binding, `parentRef.sectionName`/`port`, status writes (Accepted/ResolvedRefs), HTTPRoute filters, and GRPCRoute/TCPRoute are not yet implemented — see [Kubernetes provider docs](documentation/providers/kubernetes.md#gateway-api-httproute) for the full support matrix.
+- Status conditions — sōzune writes the standard `Accepted` and `ResolvedRefs` conditions to `status.parents[]` for every parentRef it owns, so users see `Accepted=True` / `ResolvedRefs=BackendNotFound` / `Accepted=False reason=UnsupportedValue` directly in `kubectl describe httproute`. Other controllers' entries are preserved untouched. Requires the new `httproutes/status` `update;patch` RBAC.
+- Listener-driven port binding, `parentRef.sectionName`/`port`, HTTPRoute filters, and GRPCRoute/TCPRoute are not yet implemented — see [Kubernetes provider docs](documentation/providers/kubernetes.md#gateway-api-httproute) for the full support matrix.
 
 ## [0.13.0] - 2026-05-04
 

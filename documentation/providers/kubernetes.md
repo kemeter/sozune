@@ -130,6 +130,11 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes", "gateways", "gatewayclasses"]
     verbs: ["get", "list", "watch"]
+  # Optional: only needed for HTTPRoute status reporting (kubectl
+  # describe httproute will show Accepted/ResolvedRefs from sōzune).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes/status"]
+    verbs: ["update", "patch"]
 ```
 
 `namespaces` is only used for the start-up sanity check; if you want a strictly minimal role, drop it (Sōzune logs a warning instead of an info line).
@@ -232,13 +237,25 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
 - `backendRef.weight` — propagated to the load balancer.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
+- Status reporting — for every `parentRef` Sōzune owns, the route's `status.parents[]` is updated with the standard `Accepted` and `ResolvedRefs` conditions (`controllerName: kemeter.io/sozune`). Visible via `kubectl describe httproute <name>`. Other controllers' entries are preserved untouched.
+
+### Status conditions
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `True` (`Accepted`) | Route is in scope (parent owned), filters are OK |
+| `Accepted` | `False` (`UnsupportedValue`) | Route declares unsupported filters |
+| `ResolvedRefs` | `True` (`ResolvedRefs`) | All backendRefs resolved to ready endpoints |
+| `ResolvedRefs` | `False` (`BackendNotFound`) | One or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
+| `ResolvedRefs` | `False` (`UnsupportedValue`) | Route was rejected because of unsupported filters |
+
+Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
 
 ### What's not supported (yet)
 
 - Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
 - `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
-- `status.parents[].conditions[]` reporting — `kubectl describe httproute` does not yet show "Accepted" / "ResolvedRefs" status from Sōzune.
-- HTTPRoute `filters` (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — declaring **any** filter on a rule causes Sōzune to drop the entire route with a `WARN` log line. Routing it as if the filter weren't there would silently rewrite user intent. Use Service annotations or Ingress annotations until filter support lands.
+- HTTPRoute `filters` (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — declaring **any** filter on a rule causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service annotations or Ingress annotations until filter support lands.
 - `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
 
 ### How resolution works

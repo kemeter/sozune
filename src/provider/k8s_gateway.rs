@@ -33,8 +33,11 @@ use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
-    HTTPRouteRulesMatchesPathType,
+    HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
+    HTTPRouteStatusParentsParentRef,
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use kube::api::{Patch, PatchParams};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -294,6 +297,21 @@ pub async fn run_httproute_watcher(
     resolver: Arc<dyn ServiceResolver>,
     scope: GatewayScope,
 ) -> anyhow::Result<()> {
+    // Spawn the status writer in a dedicated task. Buffer chosen
+    // empirically: enough headroom for an apiserver burst (a relist on
+    // reconnect can replay hundreds of routes in a few hundred ms),
+    // small enough that we drop quietly under sustained load rather
+    // than holding everything in memory. Lost status writes are
+    // observability-only; routing keeps working.
+    let (status_tx, status_rx) = mpsc::channel::<(HTTPRoute, RouteOutcome)>(256);
+    {
+        let client = client.clone();
+        let scope = scope.clone();
+        tokio::spawn(async move {
+            run_status_writer(client, status_rx, scope).await;
+        });
+    }
+
     let api: Api<HTTPRoute> = Api::all(client);
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -312,7 +330,7 @@ pub async fn run_httproute_watcher(
             event = stream.next() => match event {
                 Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
                     log_route("apply", &route);
-                    apply_route(&route, &storage, &index, resolver.as_ref(), &scope)
+                    apply_route(&route, &storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_route("delete", &route);
@@ -333,7 +351,7 @@ pub async fn run_httproute_watcher(
                 None => break,
             },
             _ = resolve_ticker.tick() => {
-                re_resolve_all(&storage, &index, resolver.as_ref(), &scope)
+                re_resolve_all(&storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
             }
             // A new Gateway/GatewayClass was accepted (or one we owned
             // was removed). Routes pointing at it must flip in/out of
@@ -341,7 +359,7 @@ pub async fn run_httproute_watcher(
             // the next tick to propagate the change.
             _ = scope.changed() => {
                 debug!("Gateway API: scope changed, re-resolving routes");
-                re_resolve_all(&storage, &index, resolver.as_ref(), &scope)
+                re_resolve_all(&storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
             }
         };
         if changed && let Err(e) = reload_tx.send(()).await {
@@ -435,6 +453,60 @@ pub async fn run_gateway_watcher(client: Client, scope: GatewayScope) -> anyhow:
     Ok(())
 }
 
+/// Drains [`HTTPRoute`] outcomes from the watcher and patches the
+/// `parents[]` slice of `status` that sōzune owns, leaving every other
+/// controller's slice untouched. Conformance with Gateway API's status
+/// model: every implementation MUST report at minimum the `Accepted`
+/// condition for each parent it manages.
+///
+/// Failure modes are non-fatal — a 4xx (e.g. the route was deleted
+/// between dispatch and PATCH) or 5xx (transient apiserver hiccup) is
+/// logged at `warn` and dropped. The next re-resolve will retry. We
+/// intentionally do **not** retry-with-backoff in this loop: routing
+/// keeps working without status, and a tight retry loop here would mask
+/// genuine apiserver issues that deserve operator attention.
+async fn run_status_writer(
+    client: Client,
+    mut rx: mpsc::Receiver<(HTTPRoute, RouteOutcome)>,
+    scope: GatewayScope,
+) {
+    info!("Gateway API: HTTPRoute status writer started");
+    while let Some((route, outcome)) = rx.recv().await {
+        let Some(name) = route.metadata.name.as_deref() else {
+            continue;
+        };
+        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let our_status = build_route_status(&route, &scope, outcome);
+        let (merged, changed) = merge_route_status(route.status.as_ref(), our_status);
+        if !changed {
+            continue;
+        }
+
+        // Build the minimal status patch — only the `parents` field of
+        // `status`, as a strategic-merge JSON patch. This still
+        // overwrites the whole array (Kubernetes doesn't deep-merge
+        // arrays), but `merged` already contains every other
+        // controller's slice unchanged, so we can't clobber them.
+        let patch = serde_json::json!({
+            "status": { "parents": merged }
+        });
+        let api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
+        let pp = PatchParams::default();
+        if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
+            warn!(
+                "Gateway API: failed to patch status on HTTPRoute {}/{}: {}",
+                ns, name, e
+            );
+        } else {
+            debug!(
+                "Gateway API: status patched on HTTPRoute {}/{} (outcome={:?})",
+                ns, name, outcome
+            );
+        }
+    }
+    info!("Gateway API: HTTPRoute status writer stopped");
+}
+
 /// Returns true if storage was modified. Replaces any previous state for
 /// this route UID atomically so a rename of a rule doesn't leave a stale
 /// entrypoint behind. Always remembers the route in the index so a later
@@ -447,6 +519,7 @@ fn apply_route(
     index: &RouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
+    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome)>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -467,8 +540,8 @@ fn apply_route(
     // user intent. Worse than refusing the route — better to surface
     // the problem so the user knows to fall back to Ingress annotations
     // until filter support lands.
-    let new_entrypoints = if !scope.accepts_route(route) {
-        Vec::new()
+    let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
+        (RouteOutcome::NotMine, Vec::new())
     } else if route_has_unsupported_filters(route) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
@@ -476,10 +549,27 @@ fn apply_route(
             "Gateway API: HTTPRoute {}/{} declares filters (requestRedirect / urlRewrite / header modifiers / mirror) which sōzune does not support yet — dropping the route",
             ns, name
         );
-        Vec::new()
+        (RouteOutcome::UnsupportedFilters, Vec::new())
     } else {
-        route_to_entrypoints(route, resolver)
+        let eps = route_to_entrypoints(route, resolver);
+        let outcome = if eps.is_empty() {
+            RouteOutcome::NoResolvableBackends
+        } else {
+            RouteOutcome::Accepted
+        };
+        (outcome, eps)
     };
+
+    // Best-effort status notification. We send the route (cloned —
+    // tiny payload relative to the network round-trip) to the status
+    // writer; it computes the desired status, deduplicates against the
+    // current object, and PATCHes only when something changed. Send
+    // failures are non-fatal: status is observability, not routing.
+    if let Some(tx) = status_tx
+        && let Err(e) = tx.try_send((route.clone(), outcome))
+    {
+        debug!("Gateway API: status channel full or closed: {}", e);
+    }
 
     let mut storage_guard = match storage.write() {
         Ok(g) => g,
@@ -570,6 +660,7 @@ fn re_resolve_all(
     index: &RouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
+    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome)>>,
 ) -> bool {
     let routes: Vec<HTTPRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
@@ -581,7 +672,7 @@ fn re_resolve_all(
 
     let mut any_change = false;
     for r in routes {
-        if apply_route(&r, storage, index, resolver, scope) {
+        if apply_route(&r, storage, index, resolver, scope, status_tx) {
             any_change = true;
         }
     }
@@ -678,7 +769,7 @@ pub fn route_to_entrypoints(route: &HTTPRoute, resolver: &dyn ServiceResolver) -
 
 /// True iff at least one rule in the route declares filters sōzune
 /// can't faithfully execute today. The HTTPRoute watcher uses this as
-/// an early reject so the user sees a clear log line and (later) a
+/// an early reject so the user sees a clear log line and a
 /// `ResolvedRefs=False` status condition rather than wrong behaviour.
 pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
     route
@@ -693,6 +784,188 @@ pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
                 .map(|f| !f.is_empty())
                 .unwrap_or(false)
         })
+}
+
+// Gateway API standard condition types and reasons. Values are the
+// strings consumers (kubectl, gateway-api conformance suite) expect —
+// don't paraphrase them.
+const CONDITION_TYPE_ACCEPTED: &str = "Accepted";
+const CONDITION_TYPE_RESOLVED_REFS: &str = "ResolvedRefs";
+const REASON_ACCEPTED: &str = "Accepted";
+const REASON_RESOLVED_REFS: &str = "ResolvedRefs";
+const REASON_UNSUPPORTED_VALUE: &str = "UnsupportedValue";
+const REASON_BACKEND_NOT_FOUND: &str = "BackendNotFound";
+
+/// What the watcher decided about a route, computed once and used both
+/// for log output and for the status conditions written back to the
+/// apiserver. Centralising the decision in one enum keeps log/status
+/// consistent: the user sees the same explanation in `kubectl describe`
+/// as in sōzune's logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteOutcome {
+    /// Route is in scope and produced at least one entrypoint.
+    Accepted,
+    /// At least one parentRef points to a sōzune-owned Gateway, but
+    /// the route declares filters we don't support yet, so we dropped
+    /// the entire route. Reflected as `ResolvedRefs=False
+    /// reason=UnsupportedValue`.
+    UnsupportedFilters,
+    /// In scope, no filters, but every backendRef resolved to zero
+    /// ready endpoints. Surfaces as `ResolvedRefs=False
+    /// reason=BackendNotFound` so users can distinguish "I'm waiting
+    /// on pods" from "my route is wrong".
+    NoResolvableBackends,
+    /// None of the route's parentRefs matched a sōzune-owned Gateway
+    /// (or the route declares no parentRefs at all). We don't write a
+    /// status entry in this case — Gateway API says implementations
+    /// only populate `parents[]` for parents they own.
+    NotMine,
+}
+
+/// Build the slice of `parents[]` entries sōzune owns for a given
+/// route+outcome. Other controllers' entries must be preserved by the
+/// caller (see [`merge_route_status`]).
+///
+/// One entry per parentRef that resolves to a Gateway sōzune accepts.
+/// `Accepted=True` iff [`RouteOutcome::Accepted`]. `ResolvedRefs=True`
+/// only when the outcome is `Accepted` (filters and unresolved
+/// backends both flip it to False with distinct reasons).
+fn build_route_status(
+    route: &HTTPRoute,
+    scope: &GatewayScope,
+    outcome: RouteOutcome,
+) -> Vec<HTTPRouteStatusParents> {
+    if outcome == RouteOutcome::NotMine {
+        return Vec::new();
+    }
+    let now = Time(k8s_openapi::chrono::Utc::now());
+    let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    let generation = route.metadata.generation;
+
+    let (accepted_status, accepted_reason, accepted_msg) = match outcome {
+        RouteOutcome::Accepted | RouteOutcome::NoResolvableBackends => (
+            "True",
+            REASON_ACCEPTED,
+            "Route accepted by sōzune".to_string(),
+        ),
+        RouteOutcome::UnsupportedFilters => (
+            "False",
+            REASON_UNSUPPORTED_VALUE,
+            "Route declares HTTPRoute filters which sōzune does not support yet (requestRedirect, urlRewrite, header modifiers, mirror)".to_string(),
+        ),
+        RouteOutcome::NotMine => unreachable!("filtered out above"),
+    };
+    let (refs_status, refs_reason, refs_msg) = match outcome {
+        RouteOutcome::Accepted => (
+            "True",
+            REASON_RESOLVED_REFS,
+            "All backendRefs resolved to ready endpoints".to_string(),
+        ),
+        RouteOutcome::UnsupportedFilters => (
+            "False",
+            REASON_UNSUPPORTED_VALUE,
+            "Route filters are not supported".to_string(),
+        ),
+        RouteOutcome::NoResolvableBackends => (
+            "False",
+            REASON_BACKEND_NOT_FOUND,
+            "No ready endpoints found for one or more backendRefs".to_string(),
+        ),
+        RouteOutcome::NotMine => unreachable!("filtered out above"),
+    };
+
+    route
+        .spec
+        .parent_refs
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| scope.accepts_parent_ref(route_ns, p))
+        .map(|p| HTTPRouteStatusParents {
+            controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
+            parent_ref: HTTPRouteStatusParentsParentRef {
+                group: p.group.clone(),
+                kind: p.kind.clone(),
+                name: p.name.clone(),
+                namespace: p.namespace.clone(),
+                port: p.port,
+                section_name: p.section_name.clone(),
+            },
+            conditions: Some(vec![
+                Condition {
+                    type_: CONDITION_TYPE_ACCEPTED.to_string(),
+                    status: accepted_status.to_string(),
+                    reason: accepted_reason.to_string(),
+                    message: accepted_msg.clone(),
+                    last_transition_time: now.clone(),
+                    observed_generation: generation,
+                },
+                Condition {
+                    type_: CONDITION_TYPE_RESOLVED_REFS.to_string(),
+                    status: refs_status.to_string(),
+                    reason: refs_reason.to_string(),
+                    message: refs_msg.clone(),
+                    last_transition_time: now.clone(),
+                    observed_generation: generation,
+                },
+            ]),
+        })
+        .collect()
+}
+
+/// Merge sōzune's slice of `parents[]` into the route's existing
+/// status, preserving entries owned by other controllers (matched on
+/// `controllerName`). Returns the new full `parents[]` and a bool
+/// indicating whether anything changed compared to what was on the
+/// object — callers use that to skip no-op writes.
+fn merge_route_status(
+    existing: Option<&HTTPRouteStatus>,
+    ours: Vec<HTTPRouteStatusParents>,
+) -> (Vec<HTTPRouteStatusParents>, bool) {
+    let existing_parents: &[HTTPRouteStatusParents] =
+        existing.map(|s| s.parents.as_slice()).unwrap_or_default();
+    let foreign: Vec<HTTPRouteStatusParents> = existing_parents
+        .iter()
+        .filter(|p| p.controller_name != SOZUNE_CONTROLLER_NAME)
+        .cloned()
+        .collect();
+    let our_existing: Vec<&HTTPRouteStatusParents> = existing_parents
+        .iter()
+        .filter(|p| p.controller_name == SOZUNE_CONTROLLER_NAME)
+        .collect();
+
+    // Skip the write if our slice is byte-for-byte equivalent (modulo
+    // last_transition_time, which we recompute every call). Comparing
+    // conditions field-by-field with the timestamp ignored avoids
+    // hammering the apiserver on every periodic re-resolve.
+    let unchanged = our_existing.len() == ours.len()
+        && our_existing.iter().zip(ours.iter()).all(|(a, b)| {
+            a.parent_ref == b.parent_ref
+                && conditions_equivalent(a.conditions.as_deref(), b.conditions.as_deref())
+        });
+
+    let mut merged = foreign;
+    merged.extend(ours);
+    (merged, !unchanged)
+}
+
+/// Two condition lists are equivalent for change-detection purposes if
+/// they have the same (type, status, reason, message, observed_generation)
+/// for every type — `last_transition_time` is regenerated on every call
+/// and would otherwise force a write on every re-resolve.
+fn conditions_equivalent(a: Option<&[Condition]>, b: Option<&[Condition]>) -> bool {
+    let a = a.unwrap_or_default();
+    let b = b.unwrap_or_default();
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(c1, c2)| {
+        c1.type_ == c2.type_
+            && c1.status == c2.status
+            && c1.reason == c2.reason
+            && c1.message == c2.message
+            && c1.observed_generation == c2.observed_generation
+    })
 }
 
 fn rule_to_entrypoints(
@@ -1205,7 +1478,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
 
-        let changed = apply_route(&r, &storage, &index, &r1(), &scope);
+        let changed = apply_route(&r, &storage, &index, &r1(), &scope, None);
         assert!(changed);
         assert_eq!(storage.read().unwrap().len(), 1);
         assert_eq!(
@@ -1234,7 +1507,7 @@ mod tests {
             ],
             vec!["app.example.com".into()],
         );
-        apply_route(&v1, &storage, &index, &r1(), &scope);
+        apply_route(&v1, &storage, &index, &r1(), &scope, None);
         assert_eq!(storage.read().unwrap().len(), 2);
 
         let v2 = route_with_uid(
@@ -1242,7 +1515,7 @@ mod tests {
             vec![rule(None, vec![backend("api", 80)])],
             vec!["app.example.com".into()],
         );
-        let changed = apply_route(&v2, &storage, &index, &r1(), &scope);
+        let changed = apply_route(&v2, &storage, &index, &r1(), &scope, None);
         assert!(changed);
         assert_eq!(
             storage.read().unwrap().len(),
@@ -1274,7 +1547,7 @@ mod tests {
             ],
             vec!["app.example.com".into()],
         );
-        apply_route(&r, &storage, &index, &r1(), &scope);
+        apply_route(&r, &storage, &index, &r1(), &scope, None);
         assert_eq!(storage.read().unwrap().len(), 2);
 
         let changed = delete_route(&r, &storage, &index);
@@ -1306,7 +1579,7 @@ mod tests {
             vec![rule(None, vec![backend("api", 80)])],
             vec!["app.example.com".into()],
         );
-        apply_route(&v1, &storage, &index, &r1(), &scope);
+        apply_route(&v1, &storage, &index, &r1(), &scope, None);
         assert_eq!(storage.read().unwrap().len(), 1);
 
         // v2 has rules but no usable backends — the entrypoint must
@@ -1320,7 +1593,7 @@ mod tests {
             }],
             vec!["app.example.com".into()],
         );
-        let changed = apply_route(&v2, &storage, &index, &r1(), &scope);
+        let changed = apply_route(&v2, &storage, &index, &r1(), &scope, None);
         assert!(changed);
         assert!(storage.read().unwrap().is_empty());
         assert_eq!(
@@ -1367,7 +1640,7 @@ mod tests {
             vec![rule(None, vec![backend("api", 80)])],
             vec!["app.example.com".into()],
         );
-        apply_route(&r, &storage, &index, &resolver, &scope);
+        apply_route(&r, &storage, &index, &resolver, &scope, None);
         assert!(
             storage.read().unwrap().is_empty(),
             "no entrypoint while no endpoints"
@@ -1375,7 +1648,7 @@ mod tests {
         // EndpointSlice now has a ready pod IP.
         *resolver.ips.lock().unwrap() = vec!["10.0.0.42"];
 
-        let changed = re_resolve_all(&storage, &index, &resolver, &scope);
+        let changed = re_resolve_all(&storage, &index, &resolver, &scope, None);
         assert!(changed);
         let storage_g = storage.read().unwrap();
         assert_eq!(storage_g.len(), 1);
@@ -1504,6 +1777,244 @@ mod tests {
         let eps = route_to_entrypoints(&r, &r1());
         assert_eq!(eps.len(), 1);
         assert!(eps[0].config.path.is_none());
+    }
+
+    // ---------- Status tests ----------
+    //
+    // The status writer touches an apiserver, so we don't test it
+    // end-to-end here — the e2e suite does. We do test the two pure
+    // helpers `build_route_status` and `merge_route_status` because
+    // they encode the conformance contract: which conditions sōzune
+    // owns, with which reasons, and how to slot them into a
+    // multi-controller status without clobbering anyone.
+
+    fn route_with_uid_parents(
+        uid: &str,
+        rules: Vec<HTTPRouteRules>,
+        hostnames: Vec<String>,
+        parent_refs: Vec<HTTPRouteParentRefs>,
+    ) -> HTTPRoute {
+        let mut r = route_with_parents(rules, hostnames, parent_refs);
+        r.metadata.uid = Some(uid.into());
+        r
+    }
+
+    fn condition(parents: &[HTTPRouteStatusParents], idx: usize, ty: &str) -> Condition {
+        parents[idx]
+            .conditions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.type_ == ty)
+            .expect("expected condition not found")
+            .clone()
+    }
+
+    #[test]
+    fn build_status_for_accepted_route_emits_two_true_conditions() {
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent_default_gw()],
+        );
+        let parents = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].controller_name, SOZUNE_CONTROLLER_NAME);
+        assert_eq!(parents[0].parent_ref.name, "gw");
+
+        let accepted = condition(&parents, 0, CONDITION_TYPE_ACCEPTED);
+        assert_eq!(accepted.status, "True");
+        assert_eq!(accepted.reason, REASON_ACCEPTED);
+
+        let resolved = condition(&parents, 0, CONDITION_TYPE_RESOLVED_REFS);
+        assert_eq!(resolved.status, "True");
+        assert_eq!(resolved.reason, REASON_RESOLVED_REFS);
+    }
+
+    #[test]
+    fn build_status_for_unsupported_filters_flips_both_to_false() {
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent_default_gw()],
+        );
+        let parents = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters);
+        assert_eq!(
+            condition(&parents, 0, CONDITION_TYPE_ACCEPTED).status,
+            "False"
+        );
+        assert_eq!(
+            condition(&parents, 0, CONDITION_TYPE_ACCEPTED).reason,
+            REASON_UNSUPPORTED_VALUE
+        );
+        assert_eq!(
+            condition(&parents, 0, CONDITION_TYPE_RESOLVED_REFS).status,
+            "False"
+        );
+    }
+
+    #[test]
+    fn build_status_for_no_resolvable_backends_keeps_accepted_true() {
+        // The route is OK at the gateway level — pods just aren't ready
+        // yet. This is the most subtle case: `Accepted=True` so the
+        // user knows the route is wired up, but `ResolvedRefs=False
+        // reason=BackendNotFound` so they know why no traffic is
+        // flowing.
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent_default_gw()],
+        );
+        let parents = build_route_status(&r, &scope, RouteOutcome::NoResolvableBackends);
+        assert_eq!(
+            condition(&parents, 0, CONDITION_TYPE_ACCEPTED).status,
+            "True"
+        );
+        assert_eq!(
+            condition(&parents, 0, CONDITION_TYPE_RESOLVED_REFS).status,
+            "False"
+        );
+        assert_eq!(
+            condition(&parents, 0, CONDITION_TYPE_RESOLVED_REFS).reason,
+            REASON_BACKEND_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn build_status_for_not_mine_emits_no_entries() {
+        // Gateway API: we MUST NOT report status for parents we don't
+        // own. Otherwise we'd shadow the entries written by the actual
+        // owning controller.
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("foreign-gw")],
+        );
+        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+        assert!(parents.is_empty());
+    }
+
+    #[test]
+    fn build_status_skips_parent_refs_we_dont_own() {
+        // A route can have multiple parents, only some sōzune-owned.
+        // We must produce one entry per owned parent, and zero for the
+        // others.
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("foreign-gw"), parent_default_gw()],
+        );
+        let parents = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].parent_ref.name, "gw");
+    }
+
+    #[test]
+    fn merge_status_preserves_other_controllers_entries() {
+        let foreign = HTTPRouteStatusParents {
+            controller_name: "traefik.io/gateway-controller".into(),
+            parent_ref: HTTPRouteStatusParentsParentRef {
+                name: "their-gw".into(),
+                ..Default::default()
+            },
+            conditions: Some(vec![Condition {
+                type_: "Accepted".into(),
+                status: "True".into(),
+                reason: "Accepted".into(),
+                message: "their message".into(),
+                last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+                observed_generation: None,
+            }]),
+        };
+        let existing = HTTPRouteStatus {
+            parents: vec![foreign.clone()],
+        };
+
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent_default_gw()],
+        );
+        let ours = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let (merged, changed) = merge_route_status(Some(&existing), ours);
+        assert!(changed);
+        assert_eq!(merged.len(), 2);
+        assert!(
+            merged
+                .iter()
+                .any(|p| p.controller_name == "traefik.io/gateway-controller"),
+            "Traefik's slice must survive sōzune's status write"
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|p| p.controller_name == SOZUNE_CONTROLLER_NAME)
+        );
+    }
+
+    #[test]
+    fn merge_status_skips_when_only_timestamp_differs() {
+        // Re-resolve runs every 2 seconds; without dedup we'd PATCH the
+        // status on every tick (apiserver hammering, audit log noise).
+        // Equivalence ignores last_transition_time.
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent_default_gw()],
+        );
+        let first = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        // Simulate a status write having already happened: the
+        // existing object now contains our slice. A second computation
+        // of the same outcome should be detected as a no-op.
+        let existing = HTTPRouteStatus {
+            parents: first.clone(),
+        };
+        // Sleep a few ms so timestamps actually differ.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let (_merged, changed) = merge_route_status(Some(&existing), second);
+        assert!(
+            !changed,
+            "identical outcome must not trigger a status write — only the timestamp changed"
+        );
+    }
+
+    #[test]
+    fn merge_status_replaces_our_slice_when_outcome_flips() {
+        let scope = default_scope();
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent_default_gw()],
+        );
+        let accepted = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let existing = HTTPRouteStatus {
+            parents: accepted.clone(),
+        };
+        let unsupported = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters);
+        let (merged, changed) = merge_route_status(Some(&existing), unsupported);
+        assert!(changed);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            condition(&merged, 0, CONDITION_TYPE_ACCEPTED).status,
+            "False",
+            "our slice should now reflect the new outcome"
+        );
     }
 
     // ---------- Scope tests ----------
@@ -1756,7 +2267,7 @@ mod tests {
         );
 
         // Out of scope (no GatewayClass accepted yet) — no entrypoint.
-        let changed = apply_route(&r, &storage, &index, &r1(), &scope);
+        let changed = apply_route(&r, &storage, &index, &r1(), &scope, None);
         assert!(!changed, "no storage write the first time around");
         assert!(storage.read().unwrap().is_empty());
         assert_eq!(
@@ -1783,14 +2294,14 @@ mod tests {
             vec!["a.example.com".into()],
         );
 
-        apply_route(&r, &storage, &index, &r1(), &scope);
+        apply_route(&r, &storage, &index, &r1(), &scope, None);
         assert!(storage.read().unwrap().is_empty());
 
         // GatewayClass and Gateway show up.
         scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
         scope.upsert_gateway(&gateway("default", "gw", "sozune"));
         // Re-resolve — the orphan flips into scope.
-        let changed = re_resolve_all(&storage, &index, &r1(), &scope);
+        let changed = re_resolve_all(&storage, &index, &r1(), &scope, None);
         assert!(changed);
         assert_eq!(storage.read().unwrap().len(), 1);
     }
@@ -1805,11 +2316,11 @@ mod tests {
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
         );
-        apply_route(&r, &storage, &index, &r1(), &scope);
+        apply_route(&r, &storage, &index, &r1(), &scope, None);
         assert_eq!(storage.read().unwrap().len(), 1);
 
         scope.remove_gateway("default", "gw");
-        let changed = re_resolve_all(&storage, &index, &r1(), &scope);
+        let changed = re_resolve_all(&storage, &index, &r1(), &scope, None);
         assert!(changed);
         assert!(storage.read().unwrap().is_empty());
         // Index keeps the route so a later Gateway recreation revives
