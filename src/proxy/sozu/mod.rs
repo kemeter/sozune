@@ -3,10 +3,10 @@ mod addr;
 mod builders;
 mod channel;
 
-use crate::acme::CertCommand;
 use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
 use crate::model::{Entrypoint, Protocol};
+use crate::proxy::backend::ProxyInputs;
 use acme::{add_certificate, register_acme_challenge_cluster};
 use addr::parse_backend_address;
 use builders::{
@@ -53,6 +53,21 @@ struct TcpListenerChannel {
 /// TCP workers keyed by listener name (matches `proxy.tcp[].name`).
 /// One worker = one listener.
 type TcpChannels = HashMap<String, TcpListenerChannel>;
+
+/// Bundle of every Sōzu worker channel a reload needs to talk to, plus the
+/// ports they're bound on. Grouped together because every function in the
+/// reload path already has to pass all of them — this turns a 6-parameter
+/// drag into one `&mut Channels`.
+struct Channels {
+    http: Channel<WorkerRequest, WorkerResponse>,
+    https: Channel<WorkerRequest, WorkerResponse>,
+    tcp: TcpChannels,
+    http_port: u16,
+    https_port: u16,
+    /// Loopback port serving the ACME HTTP-01 challenge responder, when
+    /// ACME is enabled. `None` disables every ACME-specific code path.
+    acme_challenge_port: Option<u16>,
+}
 
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
     storage
@@ -127,17 +142,18 @@ fn spawn_tcp_workers(
     Ok((channels, handles))
 }
 
-pub fn start_sozu_proxy(
-    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-    config: &ProxyConfig,
-    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    mut reload_rx: mpsc::Receiver<()>,
-    mut cert_rx: mpsc::Receiver<CertCommand>,
-    acme_challenge_port: Option<u16>,
-    middleware_state: MiddlewareState,
-    middleware_port: u16,
-    handle: tokio::runtime::Handle,
-) -> anyhow::Result<()> {
+pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Result<()> {
+    let ProxyInputs {
+        storage,
+        shutdown_rx,
+        mut reload_rx,
+        mut cert_rx,
+        acme_challenge_port,
+        middleware_state,
+        middleware_port,
+        handle,
+    } = inputs;
+
     info!("Starting Sōzu HTTP and HTTPS workers");
 
     // Copy values needed for threads
@@ -227,6 +243,19 @@ pub fn start_sozu_proxy(
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
     let reload_debounce = Duration::from_millis(config.reload_debounce_ms);
 
+    // Now that every worker is up and the static ACME cluster has been
+    // registered, fold the three command channels into a single `Channels`
+    // and hand it to the reload thread by value. Splitting them again here
+    // would just push the 6-parameter mess further down.
+    let mut channels = Channels {
+        http: command_channel,
+        https: command_channel_https,
+        tcp: tcp_channels,
+        http_port,
+        https_port,
+        acme_challenge_port,
+    };
+
     let reload_handle = thread::spawn(move || {
         handle.block_on(async {
             let mut shutdown_rx = shutdown_rx;
@@ -263,7 +292,7 @@ pub fn start_sozu_proxy(
                         Some(cmd) => {
                             info!("Adding certificate for {}", cmd.hostname);
                             if let Err(e) = add_certificate(
-                                &mut command_channel_https,
+                                &mut channels.https,
                                 https_port,
                                 &cmd.cert_pem,
                                 &cmd.chain,
@@ -315,7 +344,7 @@ pub fn start_sozu_proxy(
                                 Some(cmd) => {
                                     info!("Adding certificate for {}", cmd.hostname);
                                     if let Err(e) = add_certificate(
-                                        &mut command_channel_https,
+                                        &mut channels.https,
                                         https_port,
                                         &cmd.cert_pem,
                                         &cmd.chain,
@@ -344,13 +373,8 @@ pub fn start_sozu_proxy(
 
                 previous_snapshot = handle_reload(
                     &storage_reload,
-                    &mut command_channel,
-                    &mut command_channel_https,
-                    &mut tcp_channels,
-                    http_port,
-                    https_port,
+                    &mut channels,
                     cluster_setup_delay_ms,
-                    acme_challenge_port,
                     &previous_snapshot,
                     &middleware_state,
                     middleware_port,
@@ -386,13 +410,8 @@ pub fn start_sozu_proxy(
 
 fn handle_reload(
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
-    tcp_channels: &mut TcpChannels,
-    http_port: u16,
-    https_port: u16,
+    channels: &mut Channels,
     cluster_setup_delay_ms: u64,
-    acme_challenge_port: Option<u16>,
     previous_snapshot: &RoutingSnapshot,
     middleware_state: &MiddlewareState,
     middleware_port: u16,
@@ -411,30 +430,16 @@ fn handle_reload(
 
     let current_snapshot = snapshot_from_storage(&storage_read);
 
-    apply_routing_diff(
-        previous_snapshot,
-        &current_snapshot,
-        command_channel,
-        command_channel_https,
-        tcp_channels,
-        http_port,
-        https_port,
-        acme_challenge_port,
-    );
+    apply_routing_diff(previous_snapshot, &current_snapshot, channels);
 
     // Update middleware route table
     update_middleware_routes(&storage_read, middleware_state);
 
     match configure_sozu_routing(
-        command_channel,
-        command_channel_https,
-        tcp_channels,
+        channels,
         &storage_read,
         previous_snapshot,
-        http_port,
-        https_port,
         cluster_setup_delay_ms,
-        acme_challenge_port,
         middleware_port,
     ) {
         Ok(()) => info!("Configuration reloaded successfully"),
@@ -482,15 +487,10 @@ fn update_middleware_routes(
 }
 
 fn configure_sozu_routing(
-    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
-    tcp_channels: &mut TcpChannels,
+    channels: &mut Channels,
     storage: &BTreeMap<String, Entrypoint>,
     previous: &RoutingSnapshot,
-    http_port: u16,
-    https_port: u16,
     cluster_setup_delay_ms: u64,
-    acme_challenge_port: Option<u16>,
     middleware_port: u16,
 ) -> anyhow::Result<()> {
     info!(
@@ -502,7 +502,7 @@ fn configure_sozu_routing(
     // Since Sozu Pre rules are matched in insertion order, registering
     // higher-priority routes first ensures they take precedence.
     let mut sorted_entrypoints: Vec<(&String, &Entrypoint)> = storage.iter().collect();
-    sorted_entrypoints.sort_by(|a, b| b.1.config.priority.cmp(&a.1.config.priority));
+    sorted_entrypoints.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
 
     for (cluster_id, entrypoint) in sorted_entrypoints {
         // Skip entrypoints that are byte-for-byte identical to the previous
@@ -521,11 +521,11 @@ fn configure_sozu_routing(
                 // Register ACME challenge frontend BEFORE normal frontend
                 // Pre rules are checked in insertion order, so the more specific
                 // ACME path must be registered first to take priority over "/"
-                if acme_challenge_port.is_some() {
+                if channels.acme_challenge_port.is_some() {
                     for hostname in &entrypoint.config.hostnames {
                         let acme_front = RequestHttpFrontend {
                             cluster_id: Some("acme-challenge".to_string()),
-                            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+                            address: SocketAddress::new_v4(0, 0, 0, 0, channels.http_port),
                             hostname: hostname.clone(),
                             path: PathRule {
                                 value: "/.well-known/acme-challenge/".to_string(),
@@ -537,7 +537,7 @@ fn configure_sozu_routing(
                             ..Default::default()
                         };
                         if let Err(e) = send_to_worker(
-                            command_channel,
+                            &mut channels.http,
                             format!("add-frontend-acme-{}", hostname),
                             RequestType::AddHttpFrontend(acme_front),
                         ) {
@@ -550,17 +550,17 @@ fn configure_sozu_routing(
                 }
 
                 configure_http_entrypoint(
-                    command_channel,
-                    command_channel_https,
+                    &mut channels.http,
+                    &mut channels.https,
                     cluster_id,
                     entrypoint,
-                    http_port,
-                    https_port,
+                    channels.http_port,
+                    channels.https_port,
                     middleware_port,
                 )?;
             }
             Protocol::Tcp => {
-                configure_tcp_entrypoint(tcp_channels, cluster_id, entrypoint);
+                configure_tcp_entrypoint(&mut channels.tcp, cluster_id, entrypoint);
             }
             Protocol::Udp => {
                 debug!(
@@ -1090,12 +1090,7 @@ fn remove_acme_frontends(
 fn apply_routing_diff(
     previous: &RoutingSnapshot,
     current: &RoutingSnapshot,
-    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
-    tcp_channels: &mut TcpChannels,
-    http_port: u16,
-    https_port: u16,
-    acme_challenge_port: Option<u16>,
+    channels: &mut Channels,
 ) {
     // Handle removed clusters
     for (cluster_id, old) in previous {
@@ -1104,22 +1099,26 @@ fn apply_routing_diff(
             match old.protocol {
                 Protocol::Http => {
                     remove_http_frontends(
-                        command_channel,
-                        command_channel_https,
+                        &mut channels.http,
+                        &mut channels.https,
                         cluster_id,
                         old,
-                        http_port,
-                        https_port,
+                        channels.http_port,
+                        channels.https_port,
                     );
-                    remove_backends(command_channel, command_channel_https, cluster_id, old);
-                    remove_cluster(command_channel, command_channel_https, cluster_id);
+                    remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
 
-                    if acme_challenge_port.is_some() {
-                        remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
+                    if channels.acme_challenge_port.is_some() {
+                        remove_acme_frontends(
+                            &mut channels.http,
+                            &old.config.hostnames,
+                            channels.http_port,
+                        );
                     }
                 }
                 Protocol::Tcp => {
-                    remove_tcp_entrypoint(tcp_channels, cluster_id, old);
+                    remove_tcp_entrypoint(&mut channels.tcp, cluster_id, old);
                 }
                 Protocol::Udp => {}
             }
@@ -1136,22 +1135,27 @@ fn apply_routing_diff(
             match old.protocol {
                 Protocol::Http => {
                     remove_http_frontends(
-                        command_channel,
-                        command_channel_https,
+                        &mut channels.http,
+                        &mut channels.https,
                         cluster_id,
                         old,
-                        http_port,
-                        https_port,
+                        channels.http_port,
+                        channels.https_port,
                     );
-                    remove_backends(command_channel, command_channel_https, cluster_id, old);
+                    remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
 
-                    if acme_challenge_port.is_some() && old.config.hostnames != new.config.hostnames
+                    if channels.acme_challenge_port.is_some()
+                        && old.config.hostnames != new.config.hostnames
                     {
-                        remove_acme_frontends(command_channel, &old.config.hostnames, http_port);
+                        remove_acme_frontends(
+                            &mut channels.http,
+                            &old.config.hostnames,
+                            channels.http_port,
+                        );
                     }
                 }
                 Protocol::Tcp => {
-                    remove_tcp_entrypoint(tcp_channels, cluster_id, old);
+                    remove_tcp_entrypoint(&mut channels.tcp, cluster_id, old);
                 }
                 Protocol::Udp => {}
             }

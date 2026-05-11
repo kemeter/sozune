@@ -7,26 +7,21 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
-pub fn init_proxy(
-    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-    config: &ProxyConfig,
-    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    reload_rx: mpsc::Receiver<()>,
-    cert_rx: mpsc::Receiver<CertCommand>,
-    acme_challenge_port: Option<u16>,
-    middleware_state: MiddlewareState,
-    middleware_port: u16,
-    handle: tokio::runtime::Handle,
-) -> anyhow::Result<()> {
-    proxy::sozu::start_sozu_proxy(
-        storage,
-        config,
-        shutdown_rx,
-        reload_rx,
-        cert_rx,
-        acme_challenge_port,
-        middleware_state,
-        middleware_port,
-        handle,
-    )
+/// Bundle of channels and state the proxy needs to wire up. Grouped here so
+/// every caller and forward (main.rs → init_proxy → start_sozu_proxy) only
+/// has to pass one value instead of nine — the inner fields are deliberately
+/// public so the sozu reload thread can take direct ownership of each.
+pub struct ProxyInputs {
+    pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    pub shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    pub reload_rx: mpsc::Receiver<()>,
+    pub cert_rx: mpsc::Receiver<CertCommand>,
+    pub acme_challenge_port: Option<u16>,
+    pub middleware_state: MiddlewareState,
+    pub middleware_port: u16,
+    pub handle: tokio::runtime::Handle,
+}
+
+pub fn init_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Result<()> {
+    proxy::sozu::start_sozu_proxy(inputs, config)
 }
