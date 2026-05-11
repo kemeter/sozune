@@ -131,12 +131,31 @@ export interface DiagnosticsResponse {
   items: { candidate_id: string; diagnostics: Diagnostic[] }[];
 }
 
+export interface Provider {
+  /** Provider identifier — matches `entrypoint.source` for entries it emits. */
+  name: string;
+  /** The provider block exists in `config.yaml` (regardless of `enabled`). */
+  configured: boolean;
+  /** The provider is configured *and* its `enabled` flag is true. */
+  enabled: boolean;
+  /** Live count of entrypoints in storage whose `source` matches this provider. */
+  entrypoint_count: number;
+}
+
+export interface ProvidersResponse {
+  providers: Provider[];
+}
+
 export function listEntrypoints(): Promise<Entrypoint[]> {
   return request<Entrypoint[]>('/entrypoints');
 }
 
 export function listDiagnostics(): Promise<DiagnosticsResponse> {
   return request<DiagnosticsResponse>('/diagnostics');
+}
+
+export function listProviders(): Promise<ProvidersResponse> {
+  return request<ProvidersResponse>('/providers');
 }
 
 export function getEntrypoint(id: string): Promise<Entrypoint> {
