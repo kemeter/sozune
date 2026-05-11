@@ -71,7 +71,7 @@ impl HttpProvider {
 
                         let old_ids: std::collections::HashSet<&String> = storage_read
                             .iter()
-                            .filter(|(_, ep)| ep.source.as_deref() == Some("http"))
+                            .filter(|(_, ep)| ep.source.as_deref() == Some(crate::provider::HTTP))
                             .map(|(id, _)| id)
                             .collect();
 
@@ -102,9 +102,10 @@ impl HttpProvider {
                                 continue;
                             }
                         };
-                        storage_write.retain(|_, ep| ep.source.as_deref() != Some("http"));
+                        storage_write
+                            .retain(|_, ep| ep.source.as_deref() != Some(crate::provider::HTTP));
                         for (id, mut entrypoint) in new_entrypoints {
-                            entrypoint.source = Some("http".to_string());
+                            entrypoint.source = Some(crate::provider::HTTP.to_string());
                             debug!("HTTP provider entrypoint: {}", id);
                             storage_write.insert(id, entrypoint);
                         }
@@ -240,7 +241,7 @@ mod tests {
         let storage_read = storage.read().unwrap();
         assert_eq!(storage_read.len(), 1);
         let ep = storage_read.get("web").unwrap();
-        assert_eq!(ep.source.as_deref(), Some("http"));
+        assert_eq!(ep.source.as_deref(), Some(crate::provider::HTTP));
         assert_eq!(ep.config.hostnames, vec!["example.com"]);
     }
 

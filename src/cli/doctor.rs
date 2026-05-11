@@ -280,21 +280,21 @@ fn check_acme(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
     }
 
     let dir = Path::new(&acme.certs_dir);
-    if !dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            results.push(
-                CheckResult::fail(
-                    "acme",
-                    format!("ACME directory `{}`", acme.certs_dir),
-                    format!("does not exist and cannot be created: {e}"),
-                )
-                .with_fix(format!(
-                    "create the directory and ensure sozune can write to it: `mkdir -p {} && chown $(id -un) {}`",
-                    acme.certs_dir, acme.certs_dir
-                )),
-            );
-            return;
-        }
+    if !dir.exists()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        results.push(
+            CheckResult::fail(
+                "acme",
+                format!("ACME directory `{}`", acme.certs_dir),
+                format!("does not exist and cannot be created: {e}"),
+            )
+            .with_fix(format!(
+                "create the directory and ensure sozune can write to it: `mkdir -p {} && chown $(id -un) {}`",
+                acme.certs_dir, acme.certs_dir
+            )),
+        );
+        return;
     }
 
     let probe = dir.join(".sozune-doctor-write-probe");

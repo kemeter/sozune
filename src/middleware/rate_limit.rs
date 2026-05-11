@@ -61,7 +61,11 @@ impl RateLimiter {
         }
     }
 
-    /// Remove stale buckets that haven't been used recently
+    /// Remove stale buckets that haven't been used recently. Exercised by
+    /// the rate_limit tests; not yet wired into the runtime — should be
+    /// called periodically (every minute or so) to prevent unbounded growth
+    /// when many ephemeral clients hit the limiter.
+    #[allow(dead_code)]
     pub fn cleanup(&self) {
         let mut buckets = match self.buckets.lock() {
             Ok(guard) => guard,

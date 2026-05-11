@@ -713,7 +713,7 @@ fn parse_asn1_time(data: &[u8]) -> Option<i64> {
 
     // Convert to Unix timestamp (simplified, no leap seconds)
     let days = days_from_civil(year, month, day)?;
-    Some(days as i64 * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64)
+    Some(days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64)
 }
 
 /// Convert a civil date to days since Unix epoch (algorithm from Howard Hinnant)

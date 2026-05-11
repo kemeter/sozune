@@ -8,8 +8,6 @@ use async_trait::async_trait;
 /// trait — they bypass the label parser entirely.
 #[async_trait]
 pub trait LabelSource: Send + Sync {
-    fn provider_name(&self) -> &'static str;
-
     /// Produce one `Candidate` per discoverable unit (container, job, pod).
     async fn collect(&self) -> Result<Vec<Candidate>>;
 }

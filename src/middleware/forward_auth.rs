@@ -104,13 +104,13 @@ pub async fn evaluate(
     if status.is_success() {
         let mut allow = Vec::new();
         for header_name in &cfg.response_headers {
-            if let Some(v) = resp.headers().get(header_name) {
-                if let (Ok(name), Ok(value)) = (
+            if let Some(v) = resp.headers().get(header_name)
+                && let (Ok(name), Ok(value)) = (
                     HeaderName::try_from(header_name.as_str()),
                     HeaderValue::from_bytes(v.as_bytes()),
-                ) {
-                    allow.push((name, value));
-                }
+                )
+            {
+                allow.push((name, value));
             }
         }
         return ForwardAuthOutcome::Allow { headers: allow };
@@ -175,10 +175,10 @@ fn build_outgoing_headers(
         (_, _, Some(ip)) => ip,
         _ => String::new(),
     };
-    if !appended_xff.is_empty() {
-        if let Ok(v) = HeaderValue::from_str(&appended_xff) {
-            out.insert(HeaderName::from_static("x-forwarded-for"), v);
-        }
+    if !appended_xff.is_empty()
+        && let Ok(v) = HeaderValue::from_str(&appended_xff)
+    {
+        out.insert(HeaderName::from_static("x-forwarded-for"), v);
     }
     out
 }

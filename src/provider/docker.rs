@@ -39,18 +39,10 @@ impl Provider for DockerProvider {
             .map_err(anyhow::Error::new)?;
         Ok(hashmap.into_iter().collect())
     }
-
-    fn name(&self) -> &'static str {
-        self.name
-    }
 }
 
 #[async_trait]
 impl LabelSource for DockerProvider {
-    fn provider_name(&self) -> &'static str {
-        self.name
-    }
-
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
         let containers = self
             .docker
@@ -89,7 +81,7 @@ impl LabelSource for DockerProvider {
 
 impl DockerProvider {
     pub fn new(config: DockerConfig) -> Result<Self, bollard::errors::Error> {
-        Self::new_named(config, "docker")
+        Self::new_named(config, crate::provider::DOCKER)
     }
 
     pub fn new_named(
@@ -532,7 +524,7 @@ impl DockerProvider {
             }
 
             for (key, entrypoint) in result.entrypoints {
-                if entrypoint.backends.first().is_none() {
+                if entrypoint.backends.is_empty() {
                     continue;
                 }
                 merge_or_insert_entrypoint(&mut entrypoints, key, entrypoint, &container_id);

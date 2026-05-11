@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-const SOURCE: &str = "swarm";
+const SOURCE: &str = crate::provider::SWARM;
 
 pub struct SwarmProvider {
     docker: Docker,
@@ -375,10 +375,6 @@ impl Provider for SwarmProvider {
         let throwaway = diagnostics::new_store();
         self.provide_into(&throwaway).await
     }
-
-    fn name(&self) -> &'static str {
-        SOURCE
-    }
 }
 
 impl SwarmProvider {
@@ -414,10 +410,6 @@ impl SwarmProvider {
 
 #[async_trait]
 impl LabelSource for SwarmProvider {
-    fn provider_name(&self) -> &'static str {
-        SOURCE
-    }
-
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
         self.build_candidates().await.map_err(anyhow::Error::new)
     }
