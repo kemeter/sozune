@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Middleware
+
+- Custom error pages — serve a custom body when Sōzune returns `404`, `503` or any of the 12 statuses Sōzu can template (`301, 400, 401, 404, 408, 413, 421, 429, 502, 503, 504, 507`). Two scopes compose: listener-level defaults (`proxy.http.error_pages` / `proxy.https.error_pages`) and entrypoint-level overrides (`entrypoints[*].error_pages`). Three value shapes are accepted — inline body (wrapped into a valid HTTP/1.1 response on your behalf), full HTTP/1.1 response (passed through), or `file://path` (loaded from disk). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.errorPages.<code>=<body>`, inline only — `file://` is refused from provider labels for security), the HTTP provider, the YAML config file, and the REST API. See [Error pages docs](documentation/middleware/error-pages.md).
+
 ### Routing
 
 - `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.

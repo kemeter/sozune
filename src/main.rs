@@ -18,6 +18,7 @@ mod config;
 mod config_load;
 mod dashboard;
 mod diagnostics;
+mod error_pages;
 mod labels;
 mod middleware;
 mod model;

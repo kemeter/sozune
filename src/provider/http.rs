@@ -161,6 +161,7 @@ mod tests {
                 compress: false,
                 entrypoint: None,
                 methods: Vec::new(),
+                error_pages: std::collections::BTreeMap::new(),
             },
             source: None,
         }])

@@ -1008,6 +1008,7 @@ impl IngressParseCtx<'_> {
                 compress: false,
                 entrypoint: None,
                 methods: Vec::new(),
+                error_pages: std::collections::BTreeMap::new(),
             },
             source: Some(self.provider.name.to_string()),
         };

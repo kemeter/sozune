@@ -62,6 +62,8 @@ api:
 proxy:
   http:
     listen_address: $HTTP_PORT
+    error_pages:
+      "404": "<html><body><h1>sozune custom 404</h1></body></html>"
   https:
     listen_address: $HTTPS_PORT
   tcp:
@@ -293,6 +295,14 @@ services:
       - "sozune.http.svcauthelia.port=9091"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-errorpages:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcerrorpages.host=$HOST_ERRORPAGES"
+      - "sozune.http.svcerrorpages.errorPages.503=<html>cluster maintenance</html>"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-fauth:
     image: traefik/whoami
     labels:
@@ -370,6 +380,7 @@ declare -A WAIT_PATHS=(
     ["$HOST_COMPRESS"]="/"
     ["$HOST_TIMEOUT"]="/"
     ["$HOST_REGEX"]="/users/0"
+    ["$HOST_ERRORPAGES"]="/"
     ["$HOST_WS"]="/"
     ["$HOST_SSE"]="/.well-known/mercure?topic=ready"
 )

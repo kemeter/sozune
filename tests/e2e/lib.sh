@@ -45,6 +45,8 @@ HOST_WS="ws.func-test.localhost"
 HOST_SSE="sse.func-test.localhost"
 HOST_FAUTH="fauth.func-test.localhost"
 HOST_AUTHELIA="authelia.func-test.localhost"
+HOST_UNKNOWN_404="nope.func-test.localhost"
+HOST_ERRORPAGES="errorpages.func-test.localhost"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
