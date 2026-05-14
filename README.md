@@ -60,7 +60,7 @@ curl -H "Host: whoami.localhost" http://localhost
 - [REST API](documentation/configuration/api.md)
 - Routing — [Hostnames](documentation/routing/hostnames.md) · [Path matching](documentation/routing/path-matching.md) · [Load balancing](documentation/routing/load-balancing.md) · [TCP](documentation/routing/tcp.md)
 - TLS — [Overview](documentation/tls/overview.md) · [ACME / Let's Encrypt](documentation/tls/acme.md)
-- Middleware — [Basic auth](documentation/middleware/auth.md) · [Forward auth](documentation/middleware/forward-auth.md) · [Custom headers](documentation/middleware/headers.md) · [Strip prefix](documentation/middleware/strip-prefix.md) · [Add prefix](documentation/middleware/add-prefix.md) · [Redirects](documentation/middleware/redirects.md) · [Rate limit](documentation/middleware/rate-limit.md) · [Response compression](documentation/middleware/compress.md) · [Backend timeout](documentation/middleware/backend-timeout.md)
+- Middleware — [Basic auth](documentation/middleware/auth.md) · [Forward auth](documentation/middleware/forward-auth.md) · [Custom headers](documentation/middleware/headers.md) · [Strip prefix](documentation/middleware/strip-prefix.md) · [Add prefix](documentation/middleware/add-prefix.md) · [Redirects](documentation/middleware/redirects.md) · [Rate limit](documentation/middleware/rate-limit.md) · [Response compression](documentation/middleware/compress.md) · [Backend timeout](documentation/middleware/backend-timeout.md) · [Error pages](documentation/middleware/error-pages.md)
 - Advanced — [Health checks](documentation/advanced/health-checks.md) · [WebSocket](documentation/advanced/websocket.md) · [Access logs](documentation/advanced/access-logs.md) · [Debugging](documentation/advanced/debugging.md)
 
 ## Architecture

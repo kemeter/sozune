@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct AppConfig {
@@ -266,6 +267,15 @@ pub struct HttpConfig {
         deserialize_with = "deserialize_port_with_env"
     )]
     pub listen_address: u16,
+    /// Listener-wide custom HTTP answer templates, keyed by status code.
+    /// Values may be inline bodies or `file://<path>` references; both are
+    /// resolved by Sōzu at listener-build time. Overridden per cluster
+    /// via `EntrypointConfig.error_pages`.
+    #[serde(
+        default,
+        deserialize_with = "crate::error_pages::deserialize_error_pages"
+    )]
+    pub error_pages: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -275,6 +285,12 @@ pub struct HttpsConfig {
         deserialize_with = "deserialize_https_port_with_env"
     )]
     pub listen_address: u16,
+    /// See [`HttpConfig::error_pages`]. Applies to the HTTPS listener only.
+    #[serde(
+        default,
+        deserialize_with = "crate::error_pages::deserialize_error_pages"
+    )]
+    pub error_pages: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -424,6 +440,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             listen_address: default_http_port(),
+            error_pages: BTreeMap::new(),
         }
     }
 }
@@ -432,6 +449,7 @@ impl Default for HttpsConfig {
     fn default() -> Self {
         Self {
             listen_address: default_https_port(),
+            error_pages: BTreeMap::new(),
         }
     }
 }

@@ -4,7 +4,7 @@ use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
-    auth, core, forward_auth, headers, host, methods, path, ratelimit, redirect,
+    auth, core, error_pages, forward_auth, headers, host, methods, path, ratelimit, redirect,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
@@ -178,6 +178,7 @@ fn build_entrypoint(
     let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
     let methods = methods::parse_methods(labels, &prefix, diagnostics);
+    let parsed_error_pages = error_pages::parse_error_pages(labels, &prefix, diagnostics);
 
     let protocol_enum = match protocol {
         "http" => Protocol::Http,
@@ -213,6 +214,7 @@ fn build_entrypoint(
             compress,
             entrypoint: None,
             methods,
+            error_pages: parsed_error_pages,
         },
         source: None,
     })
@@ -274,6 +276,7 @@ fn build_tcp_entrypoint(
             compress: false,
             entrypoint: Some(entrypoint_ref),
             methods: Vec::new(),
+            error_pages: std::collections::BTreeMap::new(),
         },
         source: None,
     })

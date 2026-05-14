@@ -53,6 +53,7 @@ Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu).
 - [Rate limit](/documentation/middleware/rate-limit)
 - [Response compression](/documentation/middleware/compress)
 - [Backend timeout](/documentation/middleware/backend-timeout)
+- [Error pages](/documentation/middleware/error-pages)
 
 ## Advanced
 

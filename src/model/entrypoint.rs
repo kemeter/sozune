@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Entrypoint {
@@ -94,6 +95,13 @@ pub struct EntrypointConfig {
     /// (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE).
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Cluster-scoped custom HTTP answer templates, keyed by status code.
+    /// Values may be inline bodies or `file://<path>` references when set
+    /// from static YAML; when populated from provider labels, `file://` is
+    /// refused and dropped via `error_pages::sanitize_provider_error_pages`.
+    /// Overrides the listener-level defaults for this entrypoint only.
+    #[serde(default)]
+    pub error_pages: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

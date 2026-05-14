@@ -44,6 +44,7 @@ pub enum DiagnosticCode {
     W017RateLimitBurstBelowAverage,
     W018RouteCollision,
     W019InvalidForwardAuth,
+    W020InvalidErrorPage,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -76,6 +77,7 @@ impl DiagnosticCode {
             DiagnosticCode::W017RateLimitBurstBelowAverage => "W017",
             DiagnosticCode::W018RouteCollision => "W018",
             DiagnosticCode::W019InvalidForwardAuth => "W019",
+            DiagnosticCode::W020InvalidErrorPage => "W020",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
