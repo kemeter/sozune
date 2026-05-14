@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Middleware
 
+- Custom error pages — serve a custom body when Sōzune returns `404`, `503` or any of the 12 statuses Sōzu can template (`301, 400, 401, 404, 408, 413, 421, 429, 502, 503, 504, 507`). Two scopes compose: listener-level defaults (`proxy.http.error_pages` / `proxy.https.error_pages`) and entrypoint-level overrides (`entrypoints[*].error_pages`). Three value shapes are accepted — inline body (wrapped into a valid HTTP/1.1 response on your behalf), full HTTP/1.1 response (passed through), or `file://path` (loaded from disk). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.errorPages.<code>=<body>`, inline only — `file://` is refused from provider labels for security), the HTTP provider, the YAML config file, and the REST API. See [Error pages docs](documentation/middleware/error-pages.md).
 - `forwardAuth` — delegate authentication to an external service (e.g. Authelia, Authentik). The proxy issues a sub-request to the auth service before each protected request and forwards selected response headers (`Remote-User`, `Remote-Email`, `Remote-Groups`) to the backend. Supports `address`, `responseHeaders` (comma-separated), and `trustForwardHeader`. See [Forward auth docs](documentation/middleware/forward-auth.md).
 
 ### Docker provider

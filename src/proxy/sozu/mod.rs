@@ -161,25 +161,29 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     let buffer_size = config.buffer_size;
 
     // HTTP Listener
-    let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(
+    let mut http_builder = ListenerBuilder::new_http(SocketAddress::new_v4(
         0,
         0,
         0,
         0,
         config.http.listen_address,
-    ))
-    .to_http(None)
-    .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
+    ));
+    apply_listener_error_pages(&mut http_builder, &config.http.error_pages, "HTTP");
+    let http_listener = http_builder
+        .to_http(None)
+        .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
 
-    let https_listener = ListenerBuilder::new_https(SocketAddress::new_v4(
+    let mut https_builder = ListenerBuilder::new_https(SocketAddress::new_v4(
         0,
         0,
         0,
         0,
         config.https.listen_address,
-    ))
-    .to_tls(None)
-    .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
+    ));
+    apply_listener_error_pages(&mut https_builder, &config.https.error_pages, "HTTPS");
+    let https_listener = https_builder
+        .to_tls(None)
+        .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
 
     // Create communication channels
     let (mut command_channel, proxy_channel) = Channel::generate(1000, 10000)
@@ -602,6 +606,7 @@ fn configure_http_entrypoint(
     } else {
         Some(true)
     };
+    let cluster_answers = build_cluster_answers(&entrypoint.config.error_pages, cluster_id);
     let cluster = Cluster {
         cluster_id: cluster_id.to_string(),
         sticky_session: entrypoint.config.sticky_session,
@@ -614,6 +619,7 @@ fn configure_http_entrypoint(
         authorized_hashes,
         https_redirect_port: entrypoint.config.https_redirect_port.map(|p| p as u32),
         www_authenticate: entrypoint.config.www_authenticate.clone(),
+        answers: cluster_answers,
         ..Default::default()
     };
 
@@ -1222,5 +1228,63 @@ fn remove_tcp_entrypoint(
         RequestType::RemoveCluster(cluster_id.to_string()),
     ) {
         debug!("Failed to remove TCP cluster {}: {}", cluster_id, e);
+    }
+}
+
+/// Build the per-cluster `answers` map pushed to Sōzu. Unsupported status
+/// codes are dropped with a warning; plain-body entries are wrapped into a
+/// full HTTP/1.1 response so the worker can parse them. Values that already
+/// start with `HTTP/` or `file://` pass through unchanged.
+fn build_cluster_answers(
+    error_pages: &BTreeMap<String, String>,
+    cluster_id: &str,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (code, value) in error_pages {
+        if !crate::error_pages::is_supported_status(code) {
+            tracing::warn!(
+                "cluster {} error_pages: status '{}' is not supported by sozu, ignored",
+                cluster_id,
+                code
+            );
+            continue;
+        }
+        out.insert(
+            code.clone(),
+            crate::error_pages::wrap_body_into_http_response(code, value),
+        );
+    }
+    out
+}
+
+/// Push `error_pages` onto a `ListenerBuilder`. Unsupported status codes are
+/// dropped with a warning; plain-body entries are wrapped into a full
+/// HTTP/1.1 response so Sōzu can parse them. Values that already start with
+/// `HTTP/` or `file://` pass through unchanged.
+fn apply_listener_error_pages(
+    builder: &mut ListenerBuilder,
+    error_pages: &BTreeMap<String, String>,
+    listener_label: &str,
+) {
+    if error_pages.is_empty() {
+        return;
+    }
+    let mut filtered = BTreeMap::new();
+    for (code, value) in error_pages {
+        if !crate::error_pages::is_supported_status(code) {
+            tracing::warn!(
+                "{} listener error_pages: status '{}' is not supported by sozu, ignored",
+                listener_label,
+                code
+            );
+            continue;
+        }
+        filtered.insert(
+            code.clone(),
+            crate::error_pages::wrap_body_into_http_response(code, value),
+        );
+    }
+    if !filtered.is_empty() {
+        builder.with_answers(filtered);
     }
 }

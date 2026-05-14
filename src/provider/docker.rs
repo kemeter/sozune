@@ -873,6 +873,7 @@ mod merge_tests {
                 methods: Vec::new(),
                 acme: None,
                 plugins: Vec::new(),
+                error_pages: std::collections::BTreeMap::new(),
             },
             source: None,
         }
