@@ -10,6 +10,7 @@ export default function Header() {
         </Link>
         <nav className="header-nav">
           <Link to="/documentation">Documentation</Link>
+          <Link to="/help">Help</Link>
           <a
             href="https://github.com/kemeter/sozune"
             className="header-cta"

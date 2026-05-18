@@ -1,0 +1,246 @@
+/* ===== Top: Help & Support + 3 cards ===== */
+.help {
+  padding: 88px 0 72px;
+}
+
+.help-head {
+  text-align: center;
+  max-width: 620px;
+  margin: 0 auto 48px;
+}
+
+.help-eyebrow {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  margin-bottom: 14px;
+}
+
+.help-head h1 {
+  font-size: clamp(34px, 5vw, 48px);
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin-bottom: 16px;
+  color: var(--text-primary);
+}
+
+.help-head p {
+  font-size: 17px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+
+.help-card {
+  display: flex;
+  flex-direction: column;
+  padding: 28px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.help-card-ico {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.help-card h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.help-card p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  flex: 1;
+  margin-bottom: 20px;
+}
+
+.help-card-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.help-lnk {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.help-lnk:hover {
+  color: var(--accent-hover);
+}
+
+/* ===== Bottom: Alpacode commercial support ===== */
+.commercial {
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 80px;
+}
+
+.csupport-hero {
+  background: var(--accent-strong);
+  color: #fff;
+  padding: 88px 0 80px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.csupport-hero::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -200px;
+  transform: translateX(-50%);
+  width: 680px;
+  height: 400px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.csupport-hero-inner {
+  position: relative;
+  max-width: 700px;
+  margin: 0 auto;
+}
+
+.csupport-hero h2 {
+  font-size: clamp(32px, 5vw, 48px);
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.08;
+  margin-bottom: 18px;
+  color: #fff;
+}
+
+.csupport-hero p {
+  font-size: 17px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.8);
+  max-width: 540px;
+  margin: 0 auto 32px;
+}
+
+.csupport-inline-link {
+  color: #fff;
+  text-decoration: underline;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 28px;
+  border-radius: var(--radius-pill);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.btn-on-accent {
+  background: #fff;
+  color: var(--accent-strong);
+}
+
+.btn-on-accent:hover {
+  background: var(--bg-subtle);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.svcs {
+  padding: 80px 0;
+}
+
+.svcs-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+
+.svc {
+  padding: 30px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.svc-ico {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 18px;
+}
+
+.svc h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.svc p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.cta-band {
+  text-align: center;
+  padding: 0 0 96px;
+}
+
+.cta-band h2 {
+  font-size: 26px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  color: var(--text-primary);
+}
+
+.cta-band p {
+  font-size: 16px;
+  color: var(--text-secondary);
+  margin-bottom: 26px;
+}
+
+@media (max-width: 900px) {
+  .help-grid,
+  .svcs-grid {
+    grid-template-columns: 1fr;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+}
