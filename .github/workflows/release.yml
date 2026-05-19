@@ -4,10 +4,19 @@ on:
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
+  # Manual re-run so a release can be rebuilt without re-tagging (useful
+  # when the workflow itself needed a fix). Pass the existing tag to build.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re-)build (e.g. 0.13.0)'
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
   IMAGE_NAME: ghcr.io/${{ github.repository }}
+  # The tag being released: the pushed tag, or the manual input on re-run.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   docker:
@@ -17,6 +26,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -35,7 +46,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -44,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -62,14 +75,20 @@ jobs:
 
       - name: Package
         run: |
+          set -euo pipefail
           mkdir -p dist
           cp target/release/sozune dist/sozune
-          cd dist && tar -czf sozune-${{ github.ref_name }}-linux-amd64.tar.gz sozune
+          cd dist
+          tar -czf "sozune-${RELEASE_TAG}-linux-amd64.tar.gz" sozune
+          sha256sum "sozune-${RELEASE_TAG}-linux-amd64.tar.gz" \
+            > "sozune-${RELEASE_TAG}-linux-amd64.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: sozune-linux-amd64
-          path: dist/sozune-${{ github.ref_name }}-linux-amd64.tar.gz
+          path: |
+            dist/sozune-${{ env.RELEASE_TAG }}-linux-amd64.tar.gz
+            dist/sozune-${{ env.RELEASE_TAG }}-linux-amd64.tar.gz.sha256
 
   release:
     runs-on: ubuntu-latest
@@ -78,6 +97,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -87,18 +108,28 @@ jobs:
       - name: Extract changelog section
         id: changelog
         run: |
-          version="${{ github.ref_name }}"
+          version="${RELEASE_TAG}"
           awk -v v="$version" '
             $0 ~ "^## \\[" v "\\]" { found = 1; next }
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes-file release-notes.md \
-            dist/sozune-${{ github.ref_name }}-linux-amd64.tar.gz
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          # `gh release create` is not idempotent: it exits 1 if the release
+          # already exists (e.g. tag pushed before this job, or a re-run).
+          # Create it only when missing, then attach assets with --clobber so
+          # the workflow stays safe to re-run.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" --clobber \
+            "dist/sozune-${TAG}-linux-amd64.tar.gz" \
+            "dist/sozune-${TAG}-linux-amd64.tar.gz.sha256"
