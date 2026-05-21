@@ -2039,9 +2039,9 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "nix"
-version = "0.31.2"
+version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d6d0705320c1e6ba1d912b5e37cf18071b6c2e9b7fa8215a1e8a7651966f5d3"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "sozu-command-lib"
 version = "1.1.1"
-source = "git+https://github.com/sozu-proxy/sozu?rev=7d10cd5#7d10cd53f3fce62d9950a735384e4c22ced3ca4c"
+source = "git+https://github.com/sozu-proxy/sozu?rev=ab4a6c9#ab4a6c92b1bad73e14af596ebea3970d62e5d969"
 dependencies = [
  "hex",
  "libc",
@@ -3266,7 +3266,7 @@ dependencies = [
 [[package]]
 name = "sozu-lib"
 version = "1.1.1"
-source = "git+https://github.com/sozu-proxy/sozu?rev=7d10cd5#7d10cd53f3fce62d9950a735384e4c22ced3ca4c"
+source = "git+https://github.com/sozu-proxy/sozu?rev=ab4a6c9#ab4a6c92b1bad73e14af596ebea3970d62e5d969"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3285,7 +3285,6 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "rustls",
- "rustls-pemfile",
  "rusty_ulid",
  "sha2 0.11.0",
  "slab",
