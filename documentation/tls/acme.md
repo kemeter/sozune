@@ -11,6 +11,14 @@ acme:
   certs_dir: "/etc/sozune/certs"
   staging: true
   challenge_port: 3036
+  resolvers:
+    legacy:
+      challenge: http-01
+    cloudflare-main:
+      challenge: dns-01
+      provider:
+        type: cloudflare
+        api_token_env: CF_API_TOKEN
 ```
 
 | Field | Default | Description |
@@ -20,8 +28,53 @@ acme:
 | `certs_dir` | `/etc/sozune/certs` | Where certificates and the ACME account credentials are stored. |
 | `staging` | `true` | Use Let's Encrypt's staging environment (no rate limit, untrusted certs). **Switch to `false` for production.** |
 | `challenge_port` | `3036` | Port where Sōzune answers HTTP-01 challenges (loopback only). |
+| `resolvers` | `{}` | Named challenge resolvers (HTTP-01 or DNS-01 with a provider). Entrypoints reference one by name. |
 
-Every field is overridable through `SOZUNE_ACME_*` environment variables.
+Top-level fields are overridable through `SOZUNE_ACME_*` environment variables. Provider credentials are always read from environment variables — never inlined in YAML.
+
+## DNS-01 and wildcards
+
+Wildcard certificates (`*.example.com`) cannot be issued through HTTP-01 — they require DNS-01. Declare a DNS-01 resolver and point your entrypoint at it:
+
+```yaml
+# config.yaml
+acme:
+  enabled: true
+  email: ops@example.com
+  resolvers:
+    cloudflare-main:
+      challenge: dns-01
+      provider:
+        type: cloudflare
+        api_token_env: CF_API_TOKEN
+```
+
+```yaml
+# entrypoint (from any provider — Docker label, k8s, file, etc.)
+- id: app
+  config:
+    hostnames: ["example.com", "*.example.com"]
+    tls: true
+    acme:
+      resolver: cloudflare-main
+```
+
+Set `CF_API_TOKEN=...` in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
+
+**Supported providers:**
+
+| Provider | `type` value | Required env vars | Optional fields |
+|---|---|---|---|
+| Cloudflare | `cloudflare` | `api_token_env` | — |
+| OVH | `ovh` | `application_key_env`, `application_secret_env`, `consumer_key_env` | `endpoint` (default `ovh-eu`) |
+| Gandi | `gandi` | `personal_access_token_env` | — |
+| Scaleway | `scaleway` | `secret_key_env` | — |
+
+**Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
+
+**Wildcard on an HTTP-01 resolver:** the order will fail loudly with `wildcard hostname requires a DNS-01 resolver`. Wildcards always need DNS-01.
+
+**Multiple entrypoints sharing a hostname with different resolvers:** Sōzune issues one certificate per hostname; the first resolver seen wins. A warning is logged for the others.
 
 ## How it works
 
@@ -76,7 +129,7 @@ A certificate that is already valid for more than 30 days is left untouched.
     └── key.pem
 ```
 
-- One subdirectory per hostname.
+- One subdirectory per hostname. Wildcard hostnames are stored under `_wildcard_.example.com/` (the `*` is not filesystem-portable).
 - Filenames are fixed: `cert.pem` (full chain) and `key.pem`.
 - Persisting `certs_dir` across restarts is what avoids re-issuing certs at every boot. **Always mount it on a volume in production** — Let's Encrypt enforces rate limits on new orders.
 
@@ -100,7 +153,7 @@ Every TLS hostname is validated before it's used as a directory name. Names cont
 
 ## Limitations
 
-- **HTTP-01 only.** No DNS-01. Wildcards (`*.example.com`) cannot be issued by Let's Encrypt with HTTP-01 — they require DNS-01. A wildcard hostname declared with `tls=true` will fail to provision.
+- **HTTP-01 and DNS-01.** DNS-01 is available through named resolvers (Cloudflare, OVH, Gandi, Scaleway), which also unlocks wildcard certificates. DNS-01 challenge solving is delegated to [cheti](https://github.com/kemeter/cheti).
 - **Let's Encrypt only.** The ACME directory URL is hardcoded. No support for custom ACME providers (ZeroSSL, Buypass, internal CA, Pebble for testing).
 - **No manual certificate path.** You cannot inject a cert managed externally (purchased, self-signed, internal PKI). ACME is the only source.
 - **No EAB.** No External Account Binding — incompatible with ACME providers that require it.

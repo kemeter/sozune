@@ -94,6 +94,17 @@ pub struct EntrypointConfig {
     /// (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE).
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Per-entrypoint ACME settings. When `tls: true` and this is `None`,
+    /// the legacy HTTP-01 fallback on `acme.challenge_port` is used.
+    #[serde(default)]
+    pub acme: Option<EntrypointAcmeConfig>,
+}
+
+/// Selects which ACME resolver (from `acme.resolvers`) issues certs for this
+/// entrypoint. Wildcard hostnames require a `dns-01` resolver.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct EntrypointAcmeConfig {
+    pub resolver: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

@@ -7,7 +7,7 @@ Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https:/
 ## Features
 
 - **Multi-platform service discovery** — Docker, Podman, Swarm, Kubernetes (Ingress + Gateway API), Nomad, an HTTP endpoint, or a YAML file.
-- **Automatic HTTPS** — ACME (Let's Encrypt) provisioning and renewal, no intervention.
+- **Automatic HTTPS** — ACME (Let's Encrypt) provisioning and renewal, no intervention. HTTP-01 and DNS-01 (Cloudflare, OVH, Gandi, Scaleway), including wildcard certificates.
 - **HTTP/2** — negotiated through ALPN on every TLS listener.
 - **Hot reload** — REST API applies changes on the fly, no downtime.
 - **Wildcard & regex hostnames** — `*.example.com`, `/cdn[0-9]+/.example.com`.

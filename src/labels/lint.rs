@@ -157,6 +157,7 @@ mod tests {
                 compress: false,
                 entrypoint: None,
                 methods: Vec::new(),
+                acme: None,
             },
             source: None,
         }

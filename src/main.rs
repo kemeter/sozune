@@ -25,6 +25,15 @@ mod provider;
 mod proxy;
 mod util;
 
+/// Shared lock serialising every test that mutates `std::env`. Tests across
+/// modules race on the global environment otherwise (and edition 2024 marks
+/// `set_var`/`remove_var` `unsafe` for exactly this reason).
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::Mutex;
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+}
+
 pub use model::*;
 
 #[tokio::main]

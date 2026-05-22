@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### TLS / ACME
+
+- DNS-01 challenge support via named resolvers — declare `acme.resolvers` with `challenge: dns-01` and a provider (Cloudflare, OVH, Gandi, Scaleway), then point an entrypoint at it with `acme.resolver: <name>`. Provider credentials are read from environment variables, never inlined in YAML. DNS-01 solving is delegated to [cheti](https://github.com/kemeter/cheti).
+- Wildcard certificates — `*.example.com` can now be issued through a DNS-01 resolver. Attempting a wildcard on an HTTP-01 resolver fails loudly. Wildcard certs are stored under `_wildcard_.example.com/` on disk.
+- Entrypoints with `tls: true` but no `acme.resolver` keep the existing HTTP-01 behaviour on `challenge_port` — no migration needed.
+- ACME account persistence and certificate renewal checks now use cheti (`FileAccountStore`, `needs_renewal`), replacing the in-tree X.509 parser. Storage layout is unchanged (`certs_dir/account_credentials.json`).
+
 ### Routing
 
 - `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.

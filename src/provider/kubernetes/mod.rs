@@ -1008,6 +1008,7 @@ impl IngressParseCtx<'_> {
                 compress: false,
                 entrypoint: None,
                 methods: Vec::new(),
+                acme: None,
             },
             source: Some(self.provider.name.to_string()),
         };

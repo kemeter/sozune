@@ -1091,6 +1091,7 @@ fn rule_to_entrypoints(
                     compress: false,
                     entrypoint: None,
                     methods: Vec::new(),
+                    acme: None,
                 },
                 source: Some(id),
             }

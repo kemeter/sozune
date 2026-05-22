@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -34,6 +36,45 @@ pub struct AcmeConfig {
         deserialize_with = "deserialize_acme_challenge_port_with_env"
     )]
     pub challenge_port: u16,
+    #[serde(default)]
+    pub resolvers: HashMap<String, ResolverConfig>,
+}
+
+/// One named ACME challenge resolver. Entrypoints reference these by name.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "challenge", rename_all = "kebab-case")]
+pub enum ResolverConfig {
+    #[serde(rename = "http-01")]
+    Http01,
+    #[serde(rename = "dns-01")]
+    Dns01 { provider: ProviderConfig },
+}
+
+/// DNS-01 provider configuration. Credentials are referenced by env var name,
+/// never inlined in YAML.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ProviderConfig {
+    Cloudflare {
+        api_token_env: String,
+    },
+    Ovh {
+        #[serde(default = "default_ovh_endpoint")]
+        endpoint: String,
+        application_key_env: String,
+        application_secret_env: String,
+        consumer_key_env: String,
+    },
+    Gandi {
+        personal_access_token_env: String,
+    },
+    Scaleway {
+        secret_key_env: String,
+    },
+}
+
+fn default_ovh_endpoint() -> String {
+    "ovh-eu".to_string()
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -899,6 +940,7 @@ impl AppConfig {
                 certs_dir: default_acme_certs_dir(),
                 staging: default_acme_staging(),
                 challenge_port: default_acme_challenge_port(),
+                resolvers: HashMap::new(),
             });
             acme.apply_env_overrides();
         }
@@ -1195,11 +1237,7 @@ impl AcmeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialise tests that mutate the process environment, otherwise
-    /// `cargo test` parallelism races on shared env vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env::ENV_LOCK;
 
     /// RAII helper: sets `SOZUNE_*` vars on construction, removes them on drop.
     /// Use together with `ENV_LOCK` to keep tests isolated.
@@ -1541,6 +1579,9 @@ enabled: true
 
     #[test]
     fn test_proxy_config_with_defaults() {
+        // ProxyConfig deserializers read SOZUNE_* env vars; hold the shared
+        // lock so a sibling test setting those vars can't bleed in here.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let yaml = r#"
 http:
   listen_address: 9080
