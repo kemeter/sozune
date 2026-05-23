@@ -1,13 +1,13 @@
 pub mod challenge_server;
+pub mod resolver;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use instant_acme::{
-    Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
-};
+use cheti::{AccountStore, Dns01Solver, FileAccountStore};
+use instant_acme::{Account, ChallengeType, Identifier, NewAccount, NewOrder, Order, OrderStatus};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
@@ -16,6 +16,7 @@ use crate::config::AcmeConfig;
 use crate::model::Entrypoint;
 
 use self::challenge_server::ChallengeState;
+use self::resolver::{Resolver, build_resolver};
 
 /// Command sent from ACME manager to the proxy reload handler
 pub struct CertCommand {
@@ -84,19 +85,22 @@ impl AcmeManager {
 
     /// Scan storage for entrypoints with tls: true and provision certificates
     async fn provision_all(&self) -> anyhow::Result<()> {
-        let hostnames = self.collect_tls_hostnames();
-        if hostnames.is_empty() {
+        let certs = self.collect_tls_certs();
+        if certs.is_empty() {
             debug!("No TLS-enabled hostnames found, skipping ACME provisioning");
             return Ok(());
         }
 
-        info!("Found {} TLS-enabled hostname(s) to check", hostnames.len());
+        info!("Found {} TLS-enabled hostname(s) to check", certs.len());
 
-        for hostname in &hostnames {
+        for (hostname, resolver_name) in &certs {
             match self.needs_certificate(hostname).await {
                 true => {
                     info!("Requesting certificate for {}", hostname);
-                    if let Err(e) = self.provision_certificate(hostname).await {
+                    if let Err(e) = self
+                        .provision_certificate(hostname, resolver_name.as_deref())
+                        .await
+                    {
                         error!("Failed to provision certificate for {}: {}", hostname, e);
                     }
                 }
@@ -109,8 +113,11 @@ impl AcmeManager {
         Ok(())
     }
 
-    /// Collect all unique hostnames with tls: true from storage
-    fn collect_tls_hostnames(&self) -> Vec<String> {
+    /// Collect all unique hostnames with tls: true, paired with the first
+    /// resolver name we see for each. If two entrypoints share a hostname
+    /// with different resolvers, the second one is dropped with a warning —
+    /// we want one cert per hostname, not duplicate ACME orders.
+    fn collect_tls_certs(&self) -> Vec<(String, Option<String>)> {
         let storage = match self.storage.read() {
             Ok(guard) => guard,
             Err(e) => {
@@ -122,28 +129,40 @@ impl AcmeManager {
             }
         };
 
-        let mut hostnames = Vec::new();
+        let mut certs: Vec<(String, Option<String>)> = Vec::new();
         for entrypoint in storage.values() {
-            if entrypoint.config.tls {
-                for hostname in &entrypoint.config.hostnames {
-                    if !hostnames.contains(hostname) {
-                        hostnames.push(hostname.clone());
+            if !entrypoint.config.tls {
+                continue;
+            }
+            let resolver_name = entrypoint.config.acme.as_ref().map(|a| a.resolver.clone());
+            for hostname in &entrypoint.config.hostnames {
+                if let Some((_, existing)) = certs.iter().find(|(h, _)| h == hostname) {
+                    if existing != &resolver_name {
+                        warn!(
+                            "Hostname {} is claimed by multiple entrypoints with different resolvers ({:?} vs {:?}); keeping the first",
+                            hostname, existing, resolver_name
+                        );
                     }
+                    continue;
                 }
+                certs.push((hostname.clone(), resolver_name.clone()));
             }
         }
-        hostnames
+        certs
     }
 
-    /// Validate that a hostname is safe to use as a directory name (no path traversal)
+    /// Validate that a hostname is safe to use as a directory name (no path traversal).
+    /// Wildcards (`*.foo.com`) are accepted; the wildcard label must be the leftmost one.
     fn validate_hostname(hostname: &str) -> anyhow::Result<()> {
-        if hostname.is_empty()
-            || hostname.contains('/')
-            || hostname.contains('\\')
-            || hostname.contains('\0')
-            || hostname == "."
-            || hostname == ".."
-            || hostname.contains("..")
+        let trailing = hostname.strip_prefix("*.").unwrap_or(hostname);
+        if trailing.is_empty()
+            || trailing.contains('*')
+            || trailing.contains('/')
+            || trailing.contains('\\')
+            || trailing.contains('\0')
+            || trailing == "."
+            || trailing == ".."
+            || trailing.contains("..")
         {
             anyhow::bail!("Invalid hostname for certificate storage: {}", hostname);
         }
@@ -156,21 +175,41 @@ impl AcmeManager {
             warn!("Skipping invalid hostname: {}", hostname);
             return false;
         }
-        let cert_path = self.certs_dir.join(hostname).join("cert.pem");
+        let cert_path = self.certs_dir.join(path_safe(hostname)).join("cert.pem");
         if !cert_path.exists() {
             return true;
         }
 
         // Read and parse existing cert to check expiration
         match tokio::fs::read_to_string(&cert_path).await {
-            Ok(pem_data) => is_cert_expiring_soon(&pem_data, 30),
+            Ok(pem_data) => cheti::needs_renewal_checked(&pem_data, 30).unwrap_or_else(|e| {
+                warn!(
+                    "Could not parse certificate expiry, assuming renewal needed: {}",
+                    e
+                );
+                true
+            }),
             Err(_) => true,
         }
     }
 
-    /// Full ACME HTTP-01 flow for a single hostname
-    async fn provision_certificate(&self, hostname: &str) -> anyhow::Result<()> {
+    /// Provision a certificate for `hostname` using the resolver named by
+    /// the entrypoint (or the legacy HTTP-01 fallback if none).
+    async fn provision_certificate(
+        &self,
+        hostname: &str,
+        resolver_name: Option<&str>,
+    ) -> anyhow::Result<()> {
         Self::validate_hostname(hostname)?;
+
+        let resolver = build_resolver(resolver_name, &self.config)?;
+
+        if is_wildcard(hostname) && !resolver.as_ref().is_some_and(Resolver::supports_wildcard) {
+            anyhow::bail!(
+                "wildcard hostname `{}` requires a DNS-01 resolver; assign one via `acme.resolver` on the entrypoint",
+                hostname
+            );
+        }
 
         // Ensure rustls has a crypto provider installed (needed by instant-acme/reqwest)
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -181,72 +220,18 @@ impl AcmeManager {
             "https://acme-v02.api.letsencrypt.org/directory"
         };
 
-        // Create or load ACME account
-        let (account, _credentials) = self.get_or_create_account(server_url).await?;
-
-        // Create order
+        let account = self.get_or_create_account(server_url).await?;
         let identifiers = vec![Identifier::Dns(hostname.to_string())];
-        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+        let order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
-        // Process authorizations and collect challenge tokens for cleanup
-        let mut challenge_tokens: Vec<String> = Vec::new();
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut auth_handle = result?;
-            let mut challenge = auth_handle
-                .challenge(ChallengeType::Http01)
-                .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found"))?;
+        let (cert_chain_pem, key_pem) = match resolver {
+            Some(Resolver::Dns01(provider)) => self.solve_dns01(order, provider).await?,
+            Some(Resolver::Http01) | None => self.solve_http01(order, hostname).await?,
+        };
 
-            let token = challenge.token.clone();
-            let key_auth = challenge.key_authorization();
-
-            // Store token → key_authorization in shared challenge state
-            {
-                let mut challenges = self.challenges.write().map_err(|e| {
-                    anyhow::anyhow!(
-                        "internal state corrupted (ACME challenges), restart required: {}",
-                        e
-                    )
-                })?;
-                challenges.insert(token.clone(), key_auth.as_str().to_string());
-            }
-
-            debug!("Challenge token stored: {} (type: HTTP-01)", token);
-            challenge_tokens.push(token);
-
-            // Tell ACME server we're ready
-            challenge.set_ready().await?;
-        }
-        // Authorizations holds a borrow on order; let NLL release it here.
-        let _ = authorizations;
-
-        // Wait for order to become ready
-        let ready_result = Self::poll_order_ready(&mut order).await;
-
-        // Clean up challenge tokens regardless of outcome
-        self.cleanup_challenge_tokens(&challenge_tokens);
-
-        ready_result?;
-        info!("Order for {} is ready", hostname);
-
-        // Generate key pair and CSR
-        let key_pair = KeyPair::generate()?;
-        let mut params = CertificateParams::new(vec![hostname.to_string()])?;
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        let csr = params.serialize_request(&key_pair)?;
-
-        // Finalize order with CSR
-        order.finalize_csr(csr.der()).await?;
-
-        // Poll for certificate
-        let cert_chain_pem = Self::poll_certificate(&mut order).await?;
-
-        // Save to disk
-        let key_pem = key_pair.serialize_pem();
         self.save_certificate(hostname, &cert_chain_pem, &key_pem)
             .await?;
 
-        // Parse chain and send to Sozu
         let (cert_pem, chain) = split_pem_chain(&cert_chain_pem);
         self.cert_tx
             .send(CertCommand {
@@ -261,49 +246,90 @@ impl AcmeManager {
         Ok(())
     }
 
-    /// Get or create an ACME account
-    async fn get_or_create_account(
+    /// HTTP-01 challenge flow: stash key auth in shared state, let
+    /// `challenge_server` answer the ACME validation request, then finalize.
+    async fn solve_http01(
         &self,
-        server_url: &str,
-    ) -> anyhow::Result<(Account, AccountCredentials)> {
-        let creds_path = self.certs_dir.join("account_credentials.json");
+        mut order: Order,
+        hostname: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let mut challenge_tokens: Vec<String> = Vec::new();
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut auth_handle = result?;
+            let mut challenge = auth_handle
+                .challenge(ChallengeType::Http01)
+                .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found"))?;
 
-        // Try to load existing credentials
-        if creds_path.exists() {
-            match tokio::fs::read_to_string(&creds_path).await {
-                Ok(data) => {
-                    match serde_json::from_str::<AccountCredentials>(&data) {
-                        Ok(credentials) => {
-                            match Account::builder()?.from_credentials(credentials).await {
-                                Ok(account) => {
-                                    // Re-parse from already loaded data (from_credentials consumed the first parse)
-                                    let creds: AccountCredentials = serde_json::from_str(&data)?;
-                                    info!("Loaded existing ACME account");
-                                    return Ok((account, creds));
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to restore ACME account, creating new one: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to parse account credentials, creating new one: {}",
-                                e
-                            );
-                        }
+            let token = challenge.token.clone();
+            let key_auth = challenge.key_authorization();
+
+            {
+                let mut challenges = self.challenges.write().map_err(|e| {
+                    anyhow::anyhow!(
+                        "internal state corrupted (ACME challenges), restart required: {}",
+                        e
+                    )
+                })?;
+                challenges.insert(token.clone(), key_auth.as_str().to_string());
+            }
+
+            debug!("Challenge token stored: {} (type: HTTP-01)", token);
+            challenge_tokens.push(token);
+            challenge.set_ready().await?;
+        }
+        let _ = authorizations;
+
+        let ready_result = Self::poll_order_ready(&mut order).await;
+        self.cleanup_challenge_tokens(&challenge_tokens);
+        ready_result?;
+        info!("Order for {} is ready", hostname);
+
+        let key_pair = KeyPair::generate()?;
+        let mut params = CertificateParams::new(vec![hostname.to_string()])?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let csr = params.serialize_request(&key_pair)?;
+
+        order.finalize_csr(csr.der()).await?;
+        let cert_chain_pem = Self::poll_certificate(&mut order).await?;
+        let key_pem = key_pair.serialize_pem();
+        Ok((cert_chain_pem, key_pem))
+    }
+
+    /// DNS-01 challenge flow: hand the order off to cheti, which drives
+    /// provider TXT records + propagation polling + finalize.
+    async fn solve_dns01(
+        &self,
+        order: Order,
+        provider: Box<dyn cheti::DnsProvider>,
+    ) -> anyhow::Result<(String, String)> {
+        Dns01Solver::new(provider)
+            .solve_and_finalize(order)
+            .await
+            .map_err(|e| anyhow::anyhow!("DNS-01 challenge failed: {e}"))
+    }
+
+    /// Get or create an ACME account, persisted via cheti's FileAccountStore.
+    async fn get_or_create_account(&self, server_url: &str) -> anyhow::Result<Account> {
+        let store = FileAccountStore::new(self.certs_dir.join("account_credentials.json"));
+
+        match store.load() {
+            Ok(Some(credentials)) => {
+                match Account::builder()?.from_credentials(credentials).await {
+                    Ok(account) => {
+                        info!("Loaded existing ACME account");
+                        return Ok(account);
                     }
-                }
-                Err(e) => {
-                    warn!("Failed to read account credentials: {}", e);
+                    Err(e) => warn!("Failed to restore ACME account, creating new one: {}", e),
                 }
             }
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Failed to load account credentials, creating new one: {}",
+                e
+            ),
         }
 
-        // Create new account
         let contact = if self.config.email.is_empty() {
             vec![]
         } else {
@@ -322,13 +348,12 @@ impl AcmeManager {
             )
             .await?;
 
-        // Save credentials with restrictive permissions
-        tokio::fs::create_dir_all(&self.certs_dir).await?;
-        let creds_json = serde_json::to_string_pretty(&credentials)?;
-        write_with_restricted_permissions(&creds_path, creds_json.as_bytes()).await?;
+        store
+            .save(&credentials)
+            .map_err(|e| anyhow::anyhow!("persist ACME account credentials: {e}"))?;
         info!("Created new ACME account");
 
-        Ok((account, credentials))
+        Ok(account)
     }
 
     /// Remove challenge tokens from shared state after order completion
@@ -409,7 +434,7 @@ impl AcmeManager {
         cert_chain_pem: &str,
         key_pem: &str,
     ) -> anyhow::Result<()> {
-        let cert_dir = self.certs_dir.join(hostname);
+        let cert_dir = self.certs_dir.join(path_safe(hostname));
         tokio::fs::create_dir_all(&cert_dir).await?;
 
         tokio::fs::write(cert_dir.join("cert.pem"), cert_chain_pem).await?;
@@ -441,15 +466,17 @@ impl AcmeManager {
                 continue;
             }
 
-            let hostname = match path.file_name().and_then(|n| n.to_str()) {
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(name) => name.to_string(),
                 None => continue,
             };
 
-            // Skip account credentials directory
-            if hostname == "account_credentials.json" {
+            // Skip account credentials file
+            if dir_name == "account_credentials.json" {
                 continue;
             }
+
+            let hostname = hostname_from_path(&dir_name);
 
             let cert_path = path.join("cert.pem");
             let key_path = path.join("key.pem");
@@ -475,7 +502,7 @@ impl AcmeManager {
             };
 
             // Check if cert is expired (not just expiring soon)
-            if is_cert_expiring_soon(&cert_pem, 0) {
+            if cheti::needs_renewal(&cert_pem, 0) {
                 warn!("Certificate for {} is expired, skipping load", hostname);
                 continue;
             }
@@ -514,6 +541,31 @@ async fn write_with_restricted_permissions(
     Ok(())
 }
 
+fn is_wildcard(hostname: &str) -> bool {
+    hostname.starts_with("*.")
+}
+
+/// Translate a hostname into a filesystem-safe directory name. `*` is not
+/// portable across tools, so wildcard hostnames are stored under
+/// `_wildcard_.{rest}`. Inverse of `hostname_from_path`.
+fn path_safe(hostname: &str) -> String {
+    if let Some(rest) = hostname.strip_prefix("*.") {
+        format!("_wildcard_.{rest}")
+    } else {
+        hostname.to_string()
+    }
+}
+
+/// Inverse of `path_safe`: recover the wildcard hostname stored under a
+/// `_wildcard_.{rest}` directory.
+fn hostname_from_path(dir_name: &str) -> String {
+    if let Some(rest) = dir_name.strip_prefix("_wildcard_.") {
+        format!("*.{rest}")
+    } else {
+        dir_name.to_string()
+    }
+}
+
 /// Split a PEM chain into the leaf certificate and the rest of the chain
 fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
     let pem_blocks: Vec<&str> = pem_chain
@@ -535,195 +587,58 @@ fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
     (leaf, chain)
 }
 
-/// Check if a PEM certificate is expiring within `days` days.
-/// Returns true if cert is invalid or expiring soon.
-fn is_cert_expiring_soon(pem_data: &str, days: i64) -> bool {
-    // Parse the PEM to extract the leaf cert and check its notAfter field.
-    // Falls back to assuming renewal is needed if parsing fails.
-    match parse_cert_expiry(pem_data) {
-        Some(expiry) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let threshold = now + (days * 86400);
-            expiry < threshold
-        }
-        None => {
-            warn!("Could not parse certificate expiry, assuming renewal needed");
-            true
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Parse the notAfter timestamp from a PEM certificate.
-/// Returns Unix timestamp or None if parsing fails.
-fn parse_cert_expiry(pem_data: &str) -> Option<i64> {
-    // Extract the first PEM block
-    let begin = pem_data.find("-----BEGIN CERTIFICATE-----")?;
-    let end = pem_data.find("-----END CERTIFICATE-----")?;
-    let b64_start = begin + "-----BEGIN CERTIFICATE-----".len();
-    let b64 = &pem_data[b64_start..end];
-
-    // Decode base64
-    let der = base64_decode(b64)?;
-
-    // Parse ASN.1 DER to find validity.notAfter
-    // TBSCertificate is the first element of the SEQUENCE
-    // validity is at a known position in TBSCertificate
-    parse_x509_not_after(&der)
-}
-
-/// Simple base64 decoder (no external dependency needed)
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let input: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-
-    for chunk in input.chunks(4) {
-        let mut buf = [0u8; 4];
-        let mut valid = 0;
-        for (i, &byte) in chunk.iter().enumerate() {
-            if byte == b'=' {
-                break;
-            }
-            buf[i] = TABLE.iter().position(|&c| c == byte)? as u8;
-            valid = i + 1;
-        }
-        if valid >= 2 {
-            output.push((buf[0] << 2) | (buf[1] >> 4));
-        }
-        if valid >= 3 {
-            output.push((buf[1] << 4) | (buf[2] >> 2));
-        }
-        if valid >= 4 {
-            output.push((buf[2] << 6) | buf[3]);
-        }
-    }
-    Some(output)
-}
-
-/// Parse X.509 DER to extract notAfter as a Unix timestamp
-fn parse_x509_not_after(der: &[u8]) -> Option<i64> {
-    // X.509 structure:
-    // SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
-    // tbsCertificate = SEQUENCE { version, serialNumber, signature, issuer, validity, ... }
-    // validity = SEQUENCE { notBefore, notAfter }
-
-    let (_, content) = parse_asn1_sequence(der)?;
-    let (_, tbs) = parse_asn1_sequence(content)?;
-
-    let mut pos = 0;
-
-    // version [0] EXPLICIT (optional, skip if present)
-    if tbs.get(pos)? & 0xe0 == 0xa0 {
-        let (len, next) = parse_asn1_element(&tbs[pos..])?;
-        pos += len + next;
+    #[test]
+    fn is_wildcard_detects_leading_star_dot() {
+        assert!(is_wildcard("*.example.com"));
+        assert!(!is_wildcard("example.com"));
+        assert!(!is_wildcard("api.*.example.com"));
+        assert!(!is_wildcard("*example.com"));
     }
 
-    // serialNumber (INTEGER, skip)
-    let (len, next) = parse_asn1_element(&tbs[pos..])?;
-    pos += len + next;
-
-    // signature (SEQUENCE, skip)
-    let (len, next) = parse_asn1_element(&tbs[pos..])?;
-    pos += len + next;
-
-    // issuer (SEQUENCE, skip)
-    let (len, next) = parse_asn1_element(&tbs[pos..])?;
-    pos += len + next;
-
-    // validity (SEQUENCE)
-    let (_, validity_content) = parse_asn1_sequence(&tbs[pos..])?;
-
-    // notBefore (skip)
-    let (len, next) = parse_asn1_element(validity_content)?;
-    let not_after_data = &validity_content[len + next..];
-
-    // notAfter
-    parse_asn1_time(not_after_data)
-}
-
-/// Parse an ASN.1 SEQUENCE and return (header_len, content)
-fn parse_asn1_sequence(data: &[u8]) -> Option<(usize, &[u8])> {
-    if data.first()? != &0x30 {
-        return None;
+    #[test]
+    fn path_safe_round_trips_wildcard() {
+        assert_eq!(path_safe("*.example.com"), "_wildcard_.example.com");
+        assert_eq!(
+            hostname_from_path("_wildcard_.example.com"),
+            "*.example.com"
+        );
+        assert_eq!(
+            hostname_from_path(&path_safe("*.deep.sub.example.com")),
+            "*.deep.sub.example.com"
+        );
     }
-    let (header_len, content_len) = parse_asn1_length(&data[1..])?;
-    let total_header = 1 + header_len;
-    Some((
-        total_header,
-        &data[total_header..total_header + content_len],
-    ))
-}
 
-/// Parse an ASN.1 element and return (header_size, content_size) — total = header + content
-fn parse_asn1_element(data: &[u8]) -> Option<(usize, usize)> {
-    let tag_len = 1;
-    let (len_bytes, content_len) = parse_asn1_length(&data[tag_len..])?;
-    Some((tag_len + len_bytes, content_len))
-}
-
-/// Parse ASN.1 length bytes. Returns (number_of_length_bytes, actual_length)
-fn parse_asn1_length(data: &[u8]) -> Option<(usize, usize)> {
-    let first = *data.first()?;
-    if first < 0x80 {
-        Some((1, first as usize))
-    } else {
-        let num_bytes = (first & 0x7f) as usize;
-        let mut length = 0usize;
-        for i in 0..num_bytes {
-            length = (length << 8) | (*data.get(1 + i)? as usize);
-        }
-        Some((1 + num_bytes, length))
+    #[test]
+    fn path_safe_passes_plain_hostnames_through() {
+        assert_eq!(path_safe("example.com"), "example.com");
+        assert_eq!(hostname_from_path("example.com"), "example.com");
     }
-}
 
-/// Parse an ASN.1 UTCTime or GeneralizedTime to Unix timestamp
-fn parse_asn1_time(data: &[u8]) -> Option<i64> {
-    let tag = *data.first()?;
-    let (header, content_len) = parse_asn1_element(data)?;
-    let time_str = std::str::from_utf8(&data[header..header + content_len]).ok()?;
+    #[test]
+    fn validate_hostname_accepts_wildcards_and_plain() {
+        AcmeManager::validate_hostname("example.com").unwrap();
+        AcmeManager::validate_hostname("*.example.com").unwrap();
+        AcmeManager::validate_hostname("*.deep.sub.example.com").unwrap();
+    }
 
-    let (year, month, day, hour, min, sec) = if tag == 0x17 {
-        // UTCTime: YYMMDDHHMMSSZ
-        let y: i32 = time_str.get(0..2)?.parse().ok()?;
-        let year = if y >= 50 { 1900 + y } else { 2000 + y };
-        (
-            year,
-            time_str.get(2..4)?.parse::<u32>().ok()?,
-            time_str.get(4..6)?.parse::<u32>().ok()?,
-            time_str.get(6..8)?.parse::<u32>().ok()?,
-            time_str.get(8..10)?.parse::<u32>().ok()?,
-            time_str.get(10..12)?.parse::<u32>().ok()?,
-        )
-    } else if tag == 0x18 {
-        // GeneralizedTime: YYYYMMDDHHMMSSZ
-        (
-            time_str.get(0..4)?.parse::<i32>().ok()?,
-            time_str.get(4..6)?.parse::<u32>().ok()?,
-            time_str.get(6..8)?.parse::<u32>().ok()?,
-            time_str.get(8..10)?.parse::<u32>().ok()?,
-            time_str.get(10..12)?.parse::<u32>().ok()?,
-            time_str.get(12..14)?.parse::<u32>().ok()?,
-        )
-    } else {
-        return None;
-    };
+    #[test]
+    fn validate_hostname_rejects_path_traversal() {
+        assert!(AcmeManager::validate_hostname("../etc/passwd").is_err());
+        assert!(AcmeManager::validate_hostname("a/b").is_err());
+        assert!(AcmeManager::validate_hostname("").is_err());
+        assert!(AcmeManager::validate_hostname(".").is_err());
+    }
 
-    // Convert to Unix timestamp (simplified, no leap seconds)
-    let days = days_from_civil(year, month, day)?;
-    Some(days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64)
-}
-
-/// Convert a civil date to days since Unix epoch (algorithm from Howard Hinnant)
-fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
-    let y = if m <= 2 { y - 1 } else { y } as i64;
-    let m = m as i64;
-    let d = d as i64;
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe as i64 * 365 + yoe as i64 / 4 - yoe as i64 / 100 + doy;
-    Some(era * 146097 + doe - 719468)
+    #[test]
+    fn validate_hostname_rejects_misplaced_wildcards() {
+        // Only the leftmost label may be a wildcard.
+        assert!(AcmeManager::validate_hostname("api.*.example.com").is_err());
+        assert!(AcmeManager::validate_hostname("*.*.example.com").is_err());
+        // Bare `*.` is also invalid (no apex).
+        assert!(AcmeManager::validate_hostname("*.").is_err());
+    }
 }

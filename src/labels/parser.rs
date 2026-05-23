@@ -213,6 +213,7 @@ fn build_entrypoint(
             compress,
             entrypoint: None,
             methods,
+            acme: None,
         },
         source: None,
     })
@@ -274,6 +275,7 @@ fn build_tcp_entrypoint(
             compress: false,
             entrypoint: Some(entrypoint_ref),
             methods: Vec::new(),
+            acme: None,
         },
         source: None,
     })
