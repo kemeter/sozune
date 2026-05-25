@@ -2,6 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use axum::body::Body;
+use axum::http::Request;
+use tracing::warn;
+
+use super::chain::{Flow, Middleware, RequestCtx};
+use super::diag;
+
 /// Token bucket rate limiter per source IP
 #[derive(Debug)]
 pub struct RateLimiter {
@@ -74,6 +81,44 @@ impl RateLimiter {
 
         let now = Instant::now();
         buckets.retain(|_, bucket| now.duration_since(bucket.last_refill).as_secs() < 3600);
+    }
+}
+
+/// Middleware wrapper: short-circuits with a 429-equivalent diagnostic when
+/// the source IP exceeds its bucket. Behavior matches the previous inline
+/// rate-limit step in `handle_proxy`.
+pub struct RateLimitMiddleware {
+    limiter: RateLimiter,
+}
+
+impl RateLimitMiddleware {
+    pub fn new(limiter: RateLimiter) -> Self {
+        Self { limiter }
+    }
+}
+
+#[async_trait::async_trait]
+impl Middleware for RateLimitMiddleware {
+    fn name(&self) -> &'static str {
+        "rate-limit"
+    }
+
+    async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
+        // Prefer the leftmost X-Forwarded-For entry; fall back to the host,
+        // matching the prior inline behavior.
+        let source_ip = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| ctx.host.clone());
+
+        if matches!(self.limiter.check(&source_ip), RateLimitResult::Limited) {
+            warn!("Rate limited request from {} to {}", source_ip, ctx.host);
+            return Flow::ShortCircuit(diag::rate_limited(&ctx.host));
+        }
+        Flow::Continue
     }
 }
 

@@ -1,8 +1,9 @@
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use std::net::SocketAddr;
 use tracing::{debug, error, warn};
 
+use super::chain::{Flow, Middleware, RequestCtx};
 use crate::model::ForwardAuthConfig;
 
 /// Snapshot of the incoming request needed to call the forward-auth endpoint.
@@ -143,6 +144,54 @@ pub async fn evaluate(
         .body(Body::from(body_bytes))
         .unwrap_or_else(|_| bad_gateway("forward-auth: cannot build response"));
     ForwardAuthOutcome::Deny(response)
+}
+
+/// Middleware wrapper: calls the forward-auth endpoint before the backend.
+/// On allow, stamps the configured response headers onto the request; on deny,
+/// short-circuits with the auth service's response. Matches the previous
+/// inline forward-auth step (which ran first in the chain).
+pub struct ForwardAuthMiddleware {
+    config: ForwardAuthConfig,
+    client: reqwest::Client,
+}
+
+impl ForwardAuthMiddleware {
+    pub fn new(config: ForwardAuthConfig, client: reqwest::Client) -> Self {
+        Self { config, client }
+    }
+}
+
+#[async_trait::async_trait]
+impl Middleware for ForwardAuthMiddleware {
+    fn name(&self) -> &'static str {
+        "forward-auth"
+    }
+
+    async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
+        // Snapshot the request before the async call so the future stays Send
+        // (axum Body is !Sync).
+        let snapshot = AuthRequestSnapshot {
+            method: req.method().clone(),
+            uri: req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| req.uri().path().to_string()),
+            host: ctx.host.clone(),
+            headers: req.headers().clone(),
+            is_tls: ctx.is_tls,
+        };
+
+        match evaluate(&self.client, &self.config, snapshot, ctx.client_addr).await {
+            ForwardAuthOutcome::Allow { headers } => {
+                for (name, value) in headers {
+                    req.headers_mut().insert(name, value);
+                }
+                Flow::Continue
+            }
+            ForwardAuthOutcome::Deny(response) => Flow::ShortCircuit(response),
+        }
+    }
 }
 
 fn build_outgoing_headers(

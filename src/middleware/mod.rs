@@ -1,3 +1,4 @@
+pub mod chain;
 mod compress;
 mod diag;
 mod forward_auth;
@@ -12,15 +13,27 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::info;
 
-use crate::model::{Backend, EntrypointConfig, ForwardAuthConfig};
-use rate_limit::RateLimiter;
+use crate::model::{Backend, EntrypointConfig};
+use chain::Middleware;
+use compress::CompressMiddleware;
+use forward_auth::ForwardAuthMiddleware;
+use rate_limit::{RateLimitMiddleware, RateLimiter};
+
+/// Build the shared HTTP client used by forward-auth middlewares. Same config
+/// as before: short timeout, no redirect following.
+pub fn build_forward_auth_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(forward_auth::TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client builds with default config")
+}
 
 /// Shared state for the middleware server
 #[derive(Clone)]
 pub struct MiddlewareAppState {
     pub route_table: Arc<RwLock<MiddlewareRouteTable>>,
     pub http_client: Client<hyper_util::client::legacy::connect::HttpConnector, axum::body::Body>,
-    pub forward_auth_client: reqwest::Client,
 }
 
 pub type MiddlewareState = Arc<RwLock<MiddlewareRouteTable>>;
@@ -31,15 +44,33 @@ pub struct MiddlewareRouteTable {
     pub(super) routes: std::collections::HashMap<String, Arc<MiddlewareRoute>>,
 }
 
-/// Middleware configuration for a single entrypoint
-#[derive(Debug)]
+/// Middleware configuration for a single entrypoint.
+///
+/// The middleware stack is an ordered list run before (and after) the backend.
+/// `backend_timeout` is not a middleware — it's a property of the backend
+/// forward itself — so it stays a plain field.
 pub struct MiddlewareRoute {
     pub backends: Vec<(String, u16)>,
     pub backend_counter: AtomicUsize,
     pub backend_timeout: Option<u64>,
-    pub rate_limiter: Option<RateLimiter>,
-    pub compress: bool,
-    pub forward_auth: Option<ForwardAuthConfig>,
+    pub middlewares: Vec<Arc<dyn Middleware>>,
+}
+
+impl std::fmt::Debug for MiddlewareRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MiddlewareRoute")
+            .field("backends", &self.backends)
+            .field("backend_timeout", &self.backend_timeout)
+            .field(
+                "middlewares",
+                &self
+                    .middlewares
+                    .iter()
+                    .map(|m| m.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl MiddlewareRouteTable {
@@ -89,15 +120,35 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.forward_auth.is_some()
 }
 
-/// Build middleware route from entrypoint config
+/// Build middleware route from entrypoint config.
+///
+/// The stack is assembled in the same order the proxy applied it inline:
+/// forward-auth, then rate-limit (both before the backend), then compression
+/// (on the response). `forward_auth_client` is the shared client from
+/// [`build_forward_auth_client`].
 pub fn build_middleware_route(
     config: &EntrypointConfig,
     backends: &[Backend],
+    forward_auth_client: &reqwest::Client,
 ) -> Arc<MiddlewareRoute> {
-    let rate_limiter = config
-        .rate_limit
-        .as_ref()
-        .map(|rl| RateLimiter::new(rl.average, rl.burst));
+    let mut middlewares: Vec<Arc<dyn Middleware>> = Vec::new();
+
+    if let Some(cfg) = config.forward_auth.as_ref() {
+        middlewares.push(Arc::new(ForwardAuthMiddleware::new(
+            cfg.clone(),
+            forward_auth_client.clone(),
+        )));
+    }
+
+    if let Some(rl) = config.rate_limit.as_ref() {
+        middlewares.push(Arc::new(RateLimitMiddleware::new(RateLimiter::new(
+            rl.average, rl.burst,
+        ))));
+    }
+
+    if config.compress {
+        middlewares.push(Arc::new(CompressMiddleware));
+    }
 
     Arc::new(MiddlewareRoute {
         backends: backends
@@ -106,9 +157,7 @@ pub fn build_middleware_route(
             .collect(),
         backend_counter: AtomicUsize::new(0),
         backend_timeout: config.backend_timeout,
-        rate_limiter,
-        compress: config.compress,
-        forward_auth: config.forward_auth.clone(),
+        middlewares,
     })
 }
 
@@ -117,11 +166,6 @@ pub async fn serve(port: u16, route_table: MiddlewareState) -> anyhow::Result<()
     let app_state = MiddlewareAppState {
         route_table,
         http_client: Client::builder(TokioExecutor::new()).build_http(),
-        forward_auth_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(forward_auth::TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client builds with default config"),
     };
 
     let app = Router::new()

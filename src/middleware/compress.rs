@@ -1,8 +1,15 @@
-use axum::http::HeaderMap;
+use axum::body::Body;
+use axum::http::{HeaderMap, Request, Response};
+use axum::response::IntoResponse;
 use brotli::enc::BrotliEncoderParams;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use http_body_util::BodyExt;
 use std::io::Write;
+use tracing::{debug, error};
+
+use super::chain::{Flow, Middleware, RequestCtx};
+use super::diag;
 
 const COMPRESSIBLE_TYPES: &[&str] = &[
     "text/",
@@ -95,6 +102,62 @@ fn brotli_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 
 fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     zstd::encode_all(std::io::Cursor::new(data), 3)
+}
+
+/// Middleware wrapper: compresses the response body when the client accepts a
+/// supported encoding and the content is compressible. The encoding is
+/// negotiated from the request (`ctx.client_encoding`) and applied here on the
+/// response. Behavior matches the previous inline compression step.
+pub struct CompressMiddleware;
+
+#[async_trait::async_trait]
+impl Middleware for CompressMiddleware {
+    fn name(&self) -> &'static str {
+        "compress"
+    }
+
+    async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
+        // Negotiate now, on the request, but apply on the response.
+        ctx.client_encoding = pick_encoding(req.headers());
+        Flow::Continue
+    }
+
+    async fn on_response(&self, ctx: &RequestCtx, resp: Response<Body>) -> Response<Body> {
+        let (mut parts, body) = resp.into_parts();
+
+        let encoding = ctx
+            .client_encoding
+            .filter(|_| is_compressible(&parts.headers) && !is_already_compressed(&parts.headers));
+
+        let Some(encoding) = encoding else {
+            return Response::from_parts(parts, body);
+        };
+
+        let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
+        match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+            Ok(bytes) => match compress(&bytes, encoding) {
+                Ok(compressed) => {
+                    parts
+                        .headers
+                        .insert("content-encoding", encoding.header_value().parse().unwrap());
+                    parts.headers.insert(
+                        "content-length",
+                        compressed.len().to_string().parse().unwrap(),
+                    );
+                    parts.headers.remove("transfer-encoding");
+                    Response::from_parts(parts, Body::from(compressed))
+                }
+                Err(e) => {
+                    debug!("Compression failed, sending uncompressed: {}", e);
+                    Response::from_parts(parts, Body::from(bytes))
+                }
+            },
+            Err(e) => {
+                error!("Failed to read response body for compression: {}", e);
+                diag::forwarding_failed("response-body-read-failed", &e.to_string()).into_response()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

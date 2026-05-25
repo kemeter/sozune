@@ -466,19 +466,23 @@ fn update_middleware_routes(
 
     table.clear();
 
+    let forward_auth_client = middleware::build_forward_auth_client();
+
     for (cluster_id, entrypoint) in storage {
         if !matches!(entrypoint.protocol, Protocol::Http) {
             continue;
         }
         if middleware::needs_middleware(&entrypoint.config) {
-            let route =
-                middleware::build_middleware_route(&entrypoint.config, &entrypoint.backends);
+            let route = middleware::build_middleware_route(
+                &entrypoint.config,
+                &entrypoint.backends,
+                &forward_auth_client,
+            );
             debug!(
-                "Middleware route for {} (hosts: {:?}): rate_limited={}, compress={}",
+                "Middleware route for {} (hosts: {:?}): {} middleware(s)",
                 cluster_id,
                 entrypoint.config.hostnames,
-                route.rate_limiter.is_some(),
-                route.compress,
+                route.middlewares.len(),
             );
             table.update_routes_for_entrypoint(&entrypoint.config.hostnames, route);
         }

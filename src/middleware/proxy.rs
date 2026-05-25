@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
+use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use std::net::SocketAddr;
@@ -9,16 +9,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
 use super::MiddlewareAppState;
-use super::compress;
+use super::chain::{self, RequestCtx};
 use super::diag;
-use super::forward_auth::{self, AuthRequestSnapshot, ForwardAuthOutcome};
-use super::rate_limit::RateLimitResult;
 
 /// Main proxy handler: identifies the route by Host header,
 /// applies middleware stack, and forwards to the real backend.
 pub async fn handle_proxy(
     State(state): State<MiddlewareAppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> impl IntoResponse {
     let start = Instant::now();
     let client_addr = req
@@ -78,63 +76,37 @@ pub async fn handle_proxy(
         }
     };
 
-    // 1. Forward auth (runs before rate limit, headers, compression)
-    let mut auth_injected_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
-    if let Some(cfg) = route.forward_auth.as_ref() {
-        let snapshot = AuthRequestSnapshot {
-            method: req.method().clone(),
-            uri: req
-                .uri()
-                .path_and_query()
-                .map(|pq| pq.as_str().to_string())
-                .unwrap_or_else(|| req.uri().path().to_string()),
-            host: host.clone(),
-            headers: req.headers().clone(),
-            is_tls: req
-                .headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.eq_ignore_ascii_case("https"))
-                .unwrap_or(false),
-        };
-        match forward_auth::evaluate(&state.forward_auth_client, cfg, snapshot, client_addr).await {
-            ForwardAuthOutcome::Allow { headers } => {
-                auth_injected_headers = headers;
-            }
-            ForwardAuthOutcome::Deny(response) => {
-                let status = response.status().as_u16();
-                let duration = start.elapsed();
-                info!(
-                    "{} {} {} {} {} {}ms (forward-auth)",
-                    source_ip,
-                    method,
-                    host,
-                    path,
-                    status,
-                    duration.as_millis()
-                );
-                return response.into_response();
-            }
-        }
-    }
-
-    // 2. Rate limit check
-    if let Some(ref limiter) = route.rate_limiter {
-        let source_ip = req
+    // Build the per-request context shared across middlewares.
+    let mut ctx = RequestCtx {
+        host: host.clone(),
+        client_addr,
+        is_tls: req
             .headers()
-            .get("x-forwarded-for")
+            .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| host.clone());
+            .map(|s| s.eq_ignore_ascii_case("https"))
+            .unwrap_or(false),
+        client_encoding: None,
+    };
 
-        if matches!(limiter.check(&source_ip), RateLimitResult::Limited) {
-            warn!("Rate limited request from {} to {}", source_ip, host);
-            return diag::rate_limited(&host).into_response();
-        }
+    // Request phase: run the middleware stack in order. A middleware may mutate
+    // the request (e.g. forward-auth stamping headers) or short-circuit (e.g.
+    // forward-auth deny, rate limit).
+    if let Err(response) = chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await {
+        let duration = start.elapsed();
+        info!(
+            "{} {} {} {} {} {}ms (middleware)",
+            source_ip,
+            method,
+            host,
+            path,
+            response.status().as_u16(),
+            duration.as_millis()
+        );
+        return response.into_response();
     }
 
-    // 3. Pick a backend using round-robin
+    // Pick a backend using round-robin.
     let (backend_host, backend_port) = match route.next_backend() {
         Some(b) => b.clone(),
         None => {
@@ -143,7 +115,7 @@ pub async fn handle_proxy(
         }
     };
 
-    // 4. Build the forwarded URI
+    // Build the forwarded URI.
     let original_path = req.uri().path().to_string();
     let query = req
         .uri()
@@ -158,8 +130,6 @@ pub async fn handle_proxy(
         backend_host, backend_port, forwarded_path, query
     );
 
-    let client_encoding = compress::pick_encoding(req.headers());
-
     debug!(
         "Proxying {} {} -> {}",
         req.method(),
@@ -167,7 +137,7 @@ pub async fn handle_proxy(
         target_uri
     );
 
-    // 5. Check for WebSocket upgrade
+    // Check for WebSocket upgrade.
     let is_websocket = req
         .headers()
         .get("upgrade")
@@ -178,15 +148,9 @@ pub async fn handle_proxy(
         return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query).await;
     }
 
-    // 6. Build the forwarded request
+    // Build the forwarded request.
     let (mut parts, body) = req.into_parts();
 
-    // Stamp forward-auth response headers onto the request before forwarding.
-    for (name, value) in auth_injected_headers {
-        parts.headers.insert(name, value);
-    }
-
-    // Update the URI
     parts.uri = match target_uri.parse::<Uri>() {
         Ok(uri) => uri,
         Err(e) => {
@@ -197,7 +161,7 @@ pub async fn handle_proxy(
 
     let forwarded_req = Request::from_parts(parts, body);
 
-    // 7. Send the request to the real backend
+    // Send the request to the real backend.
     let timeout_secs = route.backend_timeout.unwrap_or(30);
 
     let response_future = state.http_client.request(forwarded_req);
@@ -219,53 +183,22 @@ pub async fn handle_proxy(
         }
     };
 
-    let response = match result {
+    let backend_response = match result {
         Ok(resp) => {
-            let (mut parts, body) = resp.into_parts();
-
-            let encoding = client_encoding.filter(|_| {
-                route.compress
-                    && compress::is_compressible(&parts.headers)
-                    && !compress::is_already_compressed(&parts.headers)
-            });
-
-            if let Some(encoding) = encoding {
-                let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
-                match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                    Ok(bytes) => match compress::compress(&bytes, encoding) {
-                        Ok(compressed) => {
-                            parts.headers.insert(
-                                "content-encoding",
-                                encoding.header_value().parse().unwrap(),
-                            );
-                            parts.headers.insert(
-                                "content-length",
-                                compressed.len().to_string().parse().unwrap(),
-                            );
-                            parts.headers.remove("transfer-encoding");
-                            Response::from_parts(parts, Body::from(compressed)).into_response()
-                        }
-                        Err(e) => {
-                            debug!("Compression failed, sending uncompressed: {}", e);
-                            Response::from_parts(parts, Body::from(bytes)).into_response()
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to read response body for compression: {}", e);
-                        diag::forwarding_failed("response-body-read-failed", &e.to_string())
-                            .into_response()
-                    }
-                }
-            } else {
-                let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
-                Response::from_parts(parts, body).into_response()
-            }
+            let (parts, body) = resp.into_parts();
+            let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
+            Response::from_parts(parts, body)
         }
         Err(e) => {
             error!("Failed to forward request to {}: {}", target_uri, e);
-            diag::backend_unreachable(&format!("backend at {target_uri}: {e}")).into_response()
+            return diag::backend_unreachable(&format!("backend at {target_uri}: {e}"))
+                .into_response();
         }
     };
+
+    // Response phase: run the middleware stack in reverse (onion model). This is
+    // where compression applies.
+    let response = chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
 
     let duration = start.elapsed();
     info!(
@@ -278,7 +211,7 @@ pub async fn handle_proxy(
         duration.as_millis()
     );
 
-    response
+    response.into_response()
 }
 
 /// Handle WebSocket upgrade by establishing a TCP tunnel to the backend
