@@ -72,6 +72,19 @@ pub struct EntrypointConfig {
     pub redirect_scheme: Option<RedirectScheme>,
     #[serde(default)]
     pub redirect_template: Option<String>,
+    /// Host to write into a permanent redirect's `Location`, overriding the
+    /// request host. Maps to Sōzu's `rewrite_host`. A literal value (no
+    /// `$HOST[n]` / `$PATH[n]` capture) is a fixed authority.
+    #[serde(default)]
+    pub rewrite_host: Option<String>,
+    /// Path to write into a permanent redirect's `Location`, overriding the
+    /// request path. Maps to Sōzu's `rewrite_path`, same template grammar.
+    #[serde(default)]
+    pub rewrite_path: Option<String>,
+    /// Port to write into a permanent redirect's `Location`. Maps to Sōzu's
+    /// `rewrite_port`.
+    #[serde(default)]
+    pub rewrite_port: Option<u16>,
     #[serde(default)]
     pub www_authenticate: Option<String>,
     pub priority: i32,
