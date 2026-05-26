@@ -67,7 +67,7 @@ const FOLDER_ORDER = [
 const PAGE_ORDER: Record<string, string[]> = {
   'getting-started': ['installation', 'quick-start'],
   routing: ['hostnames', 'path-matching', 'load-balancing', 'tcp'],
-  providers: ['docker', 'swarm', 'http'],
+  providers: ['docker', 'podman', 'swarm', 'kubernetes', 'nomad', 'consul', 'http'],
   middleware: [
     'auth',
     'headers',

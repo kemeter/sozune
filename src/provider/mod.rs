@@ -12,11 +12,14 @@ pub const PODMAN: &str = "podman";
 pub const SWARM: &str = "swarm";
 pub const KUBERNETES: &str = "kubernetes";
 pub const NOMAD: &str = "nomad";
+pub const CONSUL: &str = "consul";
 pub const HTTP: &str = "http";
 pub const CONFIG: &str = "config";
 
 /// Every provider known to sōzune, in display order for `/providers`.
-pub const ALL: &[&str] = &[DOCKER, PODMAN, SWARM, KUBERNETES, NOMAD, HTTP, CONFIG];
+pub const ALL: &[&str] = &[
+    DOCKER, PODMAN, SWARM, KUBERNETES, NOMAD, CONSUL, HTTP, CONFIG,
+];
 
 #[async_trait]
 pub trait Provider {
@@ -24,6 +27,7 @@ pub trait Provider {
 }
 
 pub mod config;
+pub mod consul;
 pub mod docker;
 pub mod factory;
 pub mod http;
