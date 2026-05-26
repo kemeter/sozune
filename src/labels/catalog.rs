@@ -32,6 +32,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "forwardAuth.trustForwardHeader",
     "entrypoint",
     "methods",
+    "plugins",
 ];
 
 /// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`).

@@ -150,6 +150,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         acme_challenge_port,
         middleware_state,
         middleware_port,
+        plugins,
         handle,
     } = inputs;
 
@@ -377,6 +378,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     &previous_snapshot,
                     &middleware_state,
                     middleware_port,
+                    &plugins,
                 );
             }
         });
@@ -407,6 +409,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_reload(
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     channels: &mut Channels,
@@ -414,6 +417,7 @@ fn handle_reload(
     previous_snapshot: &RoutingSnapshot,
     middleware_state: &MiddlewareState,
     middleware_port: u16,
+    plugins: &middleware::PluginRegistry,
 ) -> RoutingSnapshot {
     info!("Received configuration reload request");
     let storage_read = match storage.read() {
@@ -432,7 +436,7 @@ fn handle_reload(
     apply_routing_diff(previous_snapshot, &current_snapshot, channels);
 
     // Update middleware route table
-    update_middleware_routes(&storage_read, middleware_state);
+    update_middleware_routes(&storage_read, middleware_state, plugins);
 
     match configure_sozu_routing(
         channels,
@@ -452,6 +456,7 @@ fn handle_reload(
 fn update_middleware_routes(
     storage: &BTreeMap<String, Entrypoint>,
     middleware_state: &MiddlewareState,
+    plugins: &middleware::PluginRegistry,
 ) {
     let mut table = match middleware_state.write() {
         Ok(guard) => guard,
@@ -477,6 +482,7 @@ fn update_middleware_routes(
                 &entrypoint.config,
                 &entrypoint.backends,
                 &forward_auth_client,
+                plugins,
             );
             debug!(
                 "Middleware route for {} (hosts: {:?}): {} middleware(s)",

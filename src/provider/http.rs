@@ -162,6 +162,7 @@ mod tests {
                 entrypoint: None,
                 methods: Vec::new(),
                 acme: None,
+                plugins: Vec::new(),
             },
             source: None,
         }])

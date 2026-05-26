@@ -98,6 +98,10 @@ pub struct EntrypointConfig {
     /// the legacy HTTP-01 fallback on `acme.challenge_port` is used.
     #[serde(default)]
     pub acme: Option<EntrypointAcmeConfig>,
+    /// Names of WASM plugins (declared in `AppConfig.plugins`) to run as
+    /// middleware on this entrypoint, in order.
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

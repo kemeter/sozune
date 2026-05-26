@@ -87,6 +87,7 @@ pub async fn handle_proxy(
             .map(|s| s.eq_ignore_ascii_case("https"))
             .unwrap_or(false),
         client_encoding: None,
+        pending_response_headers: Vec::new(),
     };
 
     // Request phase: run the middleware stack in order. A middleware may mutate

@@ -5,5 +5,6 @@ pub mod headers;
 pub mod host;
 pub mod methods;
 pub mod path;
+pub mod plugins;
 pub mod ratelimit;
 pub mod redirect;

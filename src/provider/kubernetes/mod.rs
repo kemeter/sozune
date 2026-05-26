@@ -1009,6 +1009,7 @@ impl IngressParseCtx<'_> {
                 entrypoint: None,
                 methods: Vec::new(),
                 acme: None,
+                plugins: Vec::new(),
             },
             source: Some(self.provider.name.to_string()),
         };
