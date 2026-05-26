@@ -16,7 +16,7 @@ use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use http_wasm_host::{
-    FetchRequest, FetchResponse, Fetcher, HeaderKind, Host, Limits, Next, Plugin,
+    FetchRequest, FetchResponse, Fetcher, HeaderKind, Host, Limits, Next, Plugin, SendOutcome, Sink,
 };
 use tracing::{error, warn};
 
@@ -244,6 +244,68 @@ impl Fetcher for HostFetcher {
     }
 }
 
+/// Serves the guest's fire-and-forget `http_send` calls. Enqueues each request
+/// onto a bounded channel without blocking; a background worker drains it and
+/// performs the POSTs. Requests to hosts outside `allowed_hosts` are dropped at
+/// enqueue time (anti-SSRF). When the queue is full, events are dropped rather
+/// than blocking the request path — analytics is best-effort.
+struct EventSink {
+    tx: tokio::sync::mpsc::Sender<FetchRequest>,
+    allowed_hosts: Vec<String>,
+}
+
+impl EventSink {
+    /// Build the sink and spawn its draining worker on `handle`. The worker
+    /// lives for the process; it stops when all senders are dropped.
+    fn new(
+        client: reqwest::Client,
+        handle: &tokio::runtime::Handle,
+        allowed_hosts: Vec<String>,
+        queue_size: usize,
+    ) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FetchRequest>(queue_size);
+        handle.spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let Ok(url) = reqwest::Url::parse(&req.url) else {
+                    continue;
+                };
+                let Ok(method) = reqwest::Method::from_bytes(req.method.as_bytes()) else {
+                    continue;
+                };
+                let mut builder = client.request(method, url);
+                for (name, value) in &req.headers {
+                    builder = builder.header(name, value);
+                }
+                if !req.body.is_empty() {
+                    builder = builder.body(req.body);
+                }
+                // Fire-and-forget: we don't surface the result, only log failures.
+                if let Err(e) = builder.send().await {
+                    warn!("wasm plugin event send failed: {e}");
+                }
+            }
+        });
+        Self { tx, allowed_hosts }
+    }
+}
+
+impl Sink for EventSink {
+    fn send(&self, request: FetchRequest) -> SendOutcome {
+        match reqwest::Url::parse(&request.url) {
+            Ok(url) if host_allowed(&url, &self.allowed_hosts) => {}
+            _ => return SendOutcome::Rejected,
+        }
+        match self.tx.try_send(request) {
+            Ok(()) => SendOutcome::Queued,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SendOutcome::QueueFull,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SendOutcome::Rejected,
+        }
+    }
+}
+
+/// Bounded queue size for a plugin's outbound events.
+const EVENT_QUEUE_SIZE: usize = 1024;
+
 /// A compiled http-wasm guest wired in as a middleware.
 pub struct WasmMiddleware {
     name: &'static str,
@@ -264,10 +326,10 @@ impl WasmMiddleware {
         })
     }
 
-    /// Like [`from_bytes`](Self::from_bytes) but enables the outbound-HTTP
-    /// extension: the guest's `http_fetch` calls go through `client`, restricted
-    /// to `allowed_hosts`.
-    pub fn from_bytes_with_fetch(
+    /// Like [`from_bytes`](Self::from_bytes) but enables the network extensions:
+    /// the guest's `http_fetch` (blocking) and `http_send` (fire-and-forget)
+    /// calls go through `client`, both restricted to `allowed_hosts`.
+    pub fn from_bytes_with_network(
         wasm: &[u8],
         config: Vec<u8>,
         limits: Limits,
@@ -276,13 +338,20 @@ impl WasmMiddleware {
         allowed_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
         let fetcher = Arc::new(HostFetcher {
-            client,
-            handle,
-            allowed_hosts,
+            client: client.clone(),
+            handle: handle.clone(),
+            allowed_hosts: allowed_hosts.clone(),
         });
+        let sink = Arc::new(EventSink::new(
+            client,
+            &handle,
+            allowed_hosts,
+            EVENT_QUEUE_SIZE,
+        ));
         let plugin = Plugin::from_bytes(wasm, limits)
             .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?
-            .with_fetcher(fetcher);
+            .with_fetcher(fetcher)
+            .with_sink(sink);
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
@@ -537,5 +606,57 @@ mod tests {
     #[test]
     fn empty_allow_list_rejects_everything() {
         assert!(!host_allowed(&url("http://crowdsec:8080/"), &[]));
+    }
+
+    fn beacon(url: &str) -> FetchRequest {
+        FetchRequest {
+            method: "POST".into(),
+            url: url.into(),
+            headers: vec![],
+            body: b"{}".to_vec(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_sink_queues_allowed_and_rejects_others() {
+        let client = reqwest::Client::new();
+        let handle = tokio::runtime::Handle::current();
+        let sink = EventSink::new(client, &handle, vec!["umami:3000".to_string()], 8);
+
+        // Allowed host → queued.
+        assert_eq!(
+            sink.send(beacon("http://umami:3000/api/send")),
+            SendOutcome::Queued
+        );
+        // Host not on the allow-list → rejected, never enqueued.
+        assert_eq!(
+            sink.send(beacon("http://evil.example/api/send")),
+            SendOutcome::Rejected
+        );
+        // Unparseable URL → rejected.
+        assert_eq!(sink.send(beacon("not a url")), SendOutcome::Rejected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_sink_reports_queue_full() {
+        // A tiny queue with no draining (worker can't keep up) fills quickly.
+        // We point at an unroutable host so the worker stays busy/blocked on the
+        // first item, letting subsequent try_sends hit the bound.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let sink = EventSink::new(client, &handle, vec!["10.255.255.1".to_string()], 1);
+
+        // Fire many; with a queue of 1 and a stalled worker, some must be QueueFull.
+        let mut full_seen = false;
+        for _ in 0..50 {
+            if sink.send(beacon("http://10.255.255.1/x")) == SendOutcome::QueueFull {
+                full_seen = true;
+                break;
+            }
+        }
+        assert!(full_seen, "expected the bounded queue to report QueueFull");
     }
 }

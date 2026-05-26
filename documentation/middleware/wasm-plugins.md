@@ -72,13 +72,20 @@ Each plugin invocation is bounded by a wall-clock timeout and a maximum linear m
 
 ## Outbound HTTP (`allowed_hosts`)
 
-The http-wasm spec has no way for a guest to make a network call. Sōzune adds a
-non-standard `http_fetch` extension for plugins that must reach an external
-service — for example a [CrowdSec](https://www.crowdsec.net/) bouncer querying
-its LAPI.
+The http-wasm spec has no way for a guest to make a network call. Sōzune adds
+two non-standard extensions for plugins that must reach an external service:
 
-A plugin opts into the extension by declaring `allowed_hosts`. The guest may
-build the request path and query, but the host only performs the call if the
+- **`http_fetch`** — blocking: the guest makes a request and waits for the
+  response. For decisions in the request path, e.g. a
+  [CrowdSec](https://www.crowdsec.net/) bouncer querying its LAPI before
+  allowing the request.
+- **`http_send`** — fire-and-forget: the guest hands off a request and
+  continues immediately; the host enqueues it and a background worker sends it.
+  For beacons that must not delay the request, e.g. an analytics feeder. Events
+  are dropped if the queue is full (best-effort).
+
+A plugin opts into both by declaring `allowed_hosts`. The guest may build the
+request path and query, but the host only performs (or enqueues) the call if the
 target host is on the list — this prevents a guest from reaching arbitrary
 internal addresses (SSRF). An empty or absent `allowed_hosts` means the plugin
 has no network access.
@@ -96,8 +103,8 @@ plugins:
 A list entry may be a bare host (`crowdsec`) or include a port
 (`crowdsec:8080`); both forms match.
 
-> A guest using `http_fetch` is no longer portable to a vanilla http-wasm host
-> (the extension is Sōzune-specific).
+> A guest using `http_fetch` or `http_send` is no longer portable to a vanilla
+> http-wasm host (the extensions are Sōzune-specific).
 
 ## Writing a plugin
 
