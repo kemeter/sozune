@@ -70,8 +70,35 @@ WASM plugins run after the native request-phase middlewares (forward-auth, rate-
 
 Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched.
 
+## Outbound HTTP (`allowed_hosts`)
+
+The http-wasm spec has no way for a guest to make a network call. Sōzune adds a
+non-standard `http_fetch` extension for plugins that must reach an external
+service — for example a [CrowdSec](https://www.crowdsec.net/) bouncer querying
+its LAPI.
+
+A plugin opts into the extension by declaring `allowed_hosts`. The guest may
+build the request path and query, but the host only performs the call if the
+target host is on the list — this prevents a guest from reaching arbitrary
+internal addresses (SSRF). An empty or absent `allowed_hosts` means the plugin
+has no network access.
+
+```yaml
+plugins:
+  crowdsec:
+    path: /plugins/sozune_crowdsec.wasm
+    allowed_hosts: ["crowdsec:8080"]
+    config:
+      lapi_host: "crowdsec:8080"
+      lapi_key: "<bouncer-api-key>"
+```
+
+A list entry may be a bare host (`crowdsec`) or include a port
+(`crowdsec:8080`); both forms match.
+
+> A guest using `http_fetch` is no longer portable to a vanilla http-wasm host
+> (the extension is Sōzune-specific).
+
 ## Writing a plugin
 
 A guest imports the host functions from the `http_handler` module and exports `handle_request`. You can target the ABI directly or use a guest SDK such as [`http-wasm-guest`](https://crates.io/crates/http-wasm-guest) for Rust. Sōzune's host side is the open-source [`http-wasm-host`](https://github.com/kemeter/http-wasm) crate.
-
-> **Note:** the http-wasm spec does not define outbound network calls from a guest. Plugins that need to reach an external service (e.g. a CrowdSec LAPI bouncer) are not yet supported and require a host extension — planned, not available today.

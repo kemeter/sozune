@@ -122,25 +122,42 @@ pub type PluginRegistry = std::collections::HashMap<String, Arc<dyn Middleware>>
 /// plugin doesn't take down routing.
 pub fn build_plugin_registry(
     declared: &std::collections::HashMap<String, crate::config::PluginConfig>,
+    fetch_client: &reqwest::Client,
+    handle: &tokio::runtime::Handle,
 ) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     for (name, cfg) in declared {
-        match std::fs::read(&cfg.path) {
-            Ok(wasm) => {
-                let config_bytes = serde_json::to_vec(&cfg.config).unwrap_or_default();
-                match wasm::WasmMiddleware::from_bytes(
-                    &wasm,
-                    config_bytes,
-                    http_wasm_host::Limits::default(),
-                ) {
-                    Ok(mw) => {
-                        info!("Loaded WASM plugin '{}' from {}", name, cfg.path);
-                        registry.insert(name.clone(), Arc::new(mw));
-                    }
-                    Err(e) => error!("Failed to load WASM plugin '{}': {}", name, e),
-                }
+        let wasm = match std::fs::read(&cfg.path) {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Cannot read WASM plugin '{}' at {}: {}", name, cfg.path, e);
+                continue;
             }
-            Err(e) => error!("Cannot read WASM plugin '{}' at {}: {}", name, cfg.path, e),
+        };
+        let config_bytes = serde_json::to_vec(&cfg.config).unwrap_or_default();
+        let limits = http_wasm_host::Limits::default();
+
+        // A plugin with declared allowed_hosts opts into the outbound-HTTP
+        // extension; otherwise it gets the standard sandbox with no network.
+        let built = if cfg.allowed_hosts.is_empty() {
+            wasm::WasmMiddleware::from_bytes(&wasm, config_bytes, limits)
+        } else {
+            wasm::WasmMiddleware::from_bytes_with_fetch(
+                &wasm,
+                config_bytes,
+                limits,
+                fetch_client.clone(),
+                handle.clone(),
+                cfg.allowed_hosts.clone(),
+            )
+        };
+
+        match built {
+            Ok(mw) => {
+                info!("Loaded WASM plugin '{}' from {}", name, cfg.path);
+                registry.insert(name.clone(), Arc::new(mw));
+            }
+            Err(e) => error!("Failed to load WASM plugin '{}': {}", name, e),
         }
     }
     registry

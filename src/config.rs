@@ -29,6 +29,11 @@ pub struct PluginConfig {
     /// JSON bytes before handing it to the guest.
     #[serde(default)]
     pub config: serde_json::Value,
+    /// Hosts the plugin is allowed to reach via the outbound-HTTP extension
+    /// (`http_fetch`). Empty disables network access for the plugin. Listing
+    /// hosts opts the plugin into the non-standard fetch extension.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
