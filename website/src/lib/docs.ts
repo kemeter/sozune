@@ -76,6 +76,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'strip-prefix',
     'compress',
     'backend-timeout',
+    'wasm-plugins',
   ],
   tls: ['overview', 'acme'],
   configuration: ['overview', 'api', 'dashboard'],

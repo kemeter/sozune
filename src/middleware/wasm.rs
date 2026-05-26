@@ -1,0 +1,402 @@
+//! WebAssembly middleware: runs an [http-wasm](https://http-wasm.io) guest as
+//! a Sōzune middleware.
+//!
+//! The bridge has two halves:
+//! - [`HttpState`] — an in-memory snapshot of the request/response that
+//!   implements the host crate's [`Host`] trait. We snapshot because the guest
+//!   ABI is synchronous and works on buffered bytes, whereas axum bodies are
+//!   async and streamed. This mirrors the snapshot pattern already used by
+//!   `forward_auth`.
+//! - [`WasmMiddleware`] — implements Sōzune's [`Middleware`] trait, driving the
+//!   guest's `handle_request`/`handle_response` phases around the backend call.
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use http_wasm_host::{HeaderKind, Host, Limits, Next, Plugin};
+use tracing::{error, warn};
+
+use super::chain::{Flow, Middleware, RequestCtx};
+
+/// Maximum request/response body we buffer for a guest. Bodies larger than this
+/// are passed through untouched (the guest sees an empty body). Keeps a hostile
+/// or huge upload from exhausting memory.
+const MAX_BUFFERED_BODY: usize = 1024 * 1024;
+
+/// In-memory view of one HTTP exchange handed to a guest. Field mutations made
+/// by the guest are read back by [`WasmMiddleware`] after each phase.
+struct HttpState {
+    method: String,
+    uri: String,
+    version: String,
+    source_addr: String,
+    status: u32,
+    config: Vec<u8>,
+    req_headers: Vec<(String, String)>,
+    resp_headers: Vec<(String, String)>,
+    req_body: Vec<u8>,
+    req_body_cursor: usize,
+    resp_body: Vec<u8>,
+    resp_body_cursor: usize,
+}
+
+impl HttpState {
+    fn headers_for(&self, kind: HeaderKind) -> &Vec<(String, String)> {
+        match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => &self.req_headers,
+            HeaderKind::Response | HeaderKind::ResponseTrailers => &self.resp_headers,
+        }
+    }
+
+    fn headers_mut(&mut self, kind: HeaderKind) -> &mut Vec<(String, String)> {
+        match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => &mut self.req_headers,
+            HeaderKind::Response | HeaderKind::ResponseTrailers => &mut self.resp_headers,
+        }
+    }
+}
+
+impl Host for HttpState {
+    fn method(&self) -> String {
+        self.method.clone()
+    }
+    fn set_method(&mut self, method: &str) {
+        self.method = method.to_string();
+    }
+    fn uri(&self) -> String {
+        self.uri.clone()
+    }
+    fn set_uri(&mut self, uri: &str) {
+        self.uri = uri.to_string();
+    }
+    fn protocol_version(&self) -> String {
+        self.version.clone()
+    }
+    fn source_addr(&self) -> String {
+        self.source_addr.clone()
+    }
+    fn status_code(&self) -> u32 {
+        self.status
+    }
+    fn set_status_code(&mut self, status: u32) {
+        self.status = status;
+    }
+
+    fn header_names(&self, kind: HeaderKind) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .headers_for(kind)
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+    fn header_values(&self, kind: HeaderKind, name: &str) -> Vec<String> {
+        let lower = name.to_ascii_lowercase();
+        self.headers_for(kind)
+            .iter()
+            .filter(|(n, _)| *n == lower)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+    fn set_header_value(&mut self, kind: HeaderKind, name: &str, value: &str) {
+        let lower = name.to_ascii_lowercase();
+        let headers = self.headers_mut(kind);
+        headers.retain(|(n, _)| *n != lower);
+        headers.push((lower, value.to_string()));
+    }
+    fn add_header_value(&mut self, kind: HeaderKind, name: &str, value: &str) {
+        self.headers_mut(kind)
+            .push((name.to_ascii_lowercase(), value.to_string()));
+    }
+    fn remove_header(&mut self, kind: HeaderKind, name: &str) {
+        let lower = name.to_ascii_lowercase();
+        self.headers_mut(kind).retain(|(n, _)| *n != lower);
+    }
+
+    fn read_body(&mut self, kind: HeaderKind, max: usize) -> Vec<u8> {
+        let (body, cursor) = match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => {
+                (&self.req_body, &mut self.req_body_cursor)
+            }
+            HeaderKind::Response | HeaderKind::ResponseTrailers => {
+                (&self.resp_body, &mut self.resp_body_cursor)
+            }
+        };
+        let start = (*cursor).min(body.len());
+        let end = (start + max).min(body.len());
+        *cursor = end;
+        body[start..end].to_vec()
+    }
+    fn write_body(&mut self, kind: HeaderKind, data: &[u8]) {
+        match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => self.req_body = data.to_vec(),
+            HeaderKind::Response | HeaderKind::ResponseTrailers => self.resp_body = data.to_vec(),
+        }
+    }
+
+    fn config(&self) -> Vec<u8> {
+        self.config.clone()
+    }
+}
+
+/// Snapshot the headers of an axum `HeaderMap` into the `(lowercase_name, value)`
+/// pairs `HttpState` keeps. Non-UTF-8 values are skipped (the guest ABI is
+/// UTF-8 / string based).
+fn snapshot_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(n, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (n.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Overwrite an axum `HeaderMap` from `(name, value)` pairs, dropping any that
+/// fail to parse back into valid header name/value.
+fn apply_headers(headers: &mut axum::http::HeaderMap, pairs: &[(String, String)]) {
+    headers.clear();
+    for (name, value) in pairs {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(n, v);
+        }
+    }
+}
+
+/// A compiled http-wasm guest wired in as a middleware.
+pub struct WasmMiddleware {
+    name: &'static str,
+    plugin: Arc<Plugin>,
+    config: Vec<u8>,
+}
+
+impl WasmMiddleware {
+    /// Compile a guest from `.wasm` bytes with the given per-invocation limits
+    /// and guest configuration.
+    pub fn from_bytes(wasm: &[u8], config: Vec<u8>, limits: Limits) -> anyhow::Result<Self> {
+        let plugin = Plugin::from_bytes(wasm, limits)
+            .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?;
+        Ok(Self {
+            name: "wasm",
+            plugin: Arc::new(plugin),
+            config,
+        })
+    }
+
+    /// Build an `HttpState` snapshot from the request, ready for the request
+    /// phase. The request body is consumed and buffered into the state.
+    async fn snapshot_request(&self, ctx: &RequestCtx, req: Request<Body>) -> (HttpState, Vec<u8>) {
+        let (parts, body) = req.into_parts();
+        let body_bytes = buffer_body(body).await;
+        let state = HttpState {
+            method: parts.method.to_string(),
+            uri: parts
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| parts.uri.path().to_string()),
+            version: format!("{:?}", parts.version),
+            source_addr: ctx.client_addr.map(|a| a.to_string()).unwrap_or_default(),
+            status: 0,
+            config: self.config.clone(),
+            req_headers: snapshot_headers(&parts.headers),
+            resp_headers: Vec::new(),
+            req_body: body_bytes.clone(),
+            req_body_cursor: 0,
+            resp_body: Vec::new(),
+            resp_body_cursor: 0,
+        };
+        (state, body_bytes)
+    }
+}
+
+/// Buffer an axum body up to [`MAX_BUFFERED_BODY`]. Returns empty on error or
+/// oversize (the guest then sees no body).
+async fn buffer_body(body: Body) -> Vec<u8> {
+    match body.collect().await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            if bytes.len() > MAX_BUFFERED_BODY {
+                warn!("wasm middleware: body exceeds {MAX_BUFFERED_BODY} bytes, not buffered");
+                Vec::new()
+            } else {
+                bytes.to_vec()
+            }
+        }
+        Err(e) => {
+            warn!("wasm middleware: failed to read body: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Build the short-circuit response the guest authored (status + headers + body).
+fn build_short_circuit(state: &HttpState) -> Response<Body> {
+    let status = StatusCode::from_u16(state.status as u16).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    if let Some(map) = builder.headers_mut() {
+        apply_headers(map, &state.resp_headers);
+    }
+    builder
+        .body(Body::from(state.resp_body.clone()))
+        .unwrap_or_else(|_| {
+            let mut r = Response::new(Body::empty());
+            *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            r
+        })
+}
+
+#[async_trait::async_trait]
+impl Middleware for WasmMiddleware {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
+        // Take ownership of the body to buffer it, leaving an empty body behind
+        // that we replace afterwards.
+        let taken = std::mem::replace(req, Request::new(Body::empty()));
+        let (mut state, _orig_body) = self.snapshot_request(ctx, taken).await;
+
+        let outcome = self.plugin.handle_request(&mut state);
+
+        match outcome {
+            Ok(Next::Stop) => Flow::ShortCircuit(build_short_circuit(&state)),
+            Ok(Next::Continue(_ctx)) => {
+                // Re-apply guest mutations onto the forwarded request.
+                apply_headers(req.headers_mut(), &state.req_headers);
+                if let Ok(uri) = state.uri.parse() {
+                    *req.uri_mut() = uri;
+                }
+                if let Ok(method) = state.method.parse() {
+                    *req.method_mut() = method;
+                }
+                *req.body_mut() = Body::from(state.req_body.clone());
+                // A guest may stage response headers from the request phase;
+                // carry them to the response side via the shared context.
+                ctx.pending_response_headers.extend(state.resp_headers);
+                Flow::Continue
+            }
+            Err(e) => {
+                error!("wasm middleware '{}' request phase failed: {e}", self.name);
+                Flow::ShortCircuit(
+                    Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from("wasm plugin error\n"))
+                        .unwrap_or_else(|_| Response::new(Body::empty())),
+                )
+            }
+        }
+    }
+
+    async fn on_response(&self, ctx: &RequestCtx, resp: Response<Body>) -> Response<Body> {
+        let (parts, body) = resp.into_parts();
+        let body_bytes = buffer_body(body).await;
+        // Start from the backend's response headers, then merge any headers the
+        // guest staged during the request phase. The guest can still read and
+        // mutate the full set in `handle_response`.
+        let mut resp_headers = snapshot_headers(&parts.headers);
+        resp_headers.extend(ctx.pending_response_headers.iter().cloned());
+        let mut state = HttpState {
+            method: String::new(),
+            uri: String::new(),
+            version: format!("{:?}", parts.version),
+            source_addr: String::new(),
+            status: parts.status.as_u16() as u32,
+            config: self.config.clone(),
+            req_headers: Vec::new(),
+            resp_headers,
+            req_body: Vec::new(),
+            req_body_cursor: 0,
+            resp_body: body_bytes,
+            resp_body_cursor: 0,
+        };
+
+        if let Err(e) = self.plugin.handle_response(&mut state, 0, false) {
+            error!("wasm middleware '{}' response phase failed: {e}", self.name);
+            // On failure, pass the original response through unchanged.
+            let mut rebuilt = Response::new(Body::from(state.resp_body));
+            *rebuilt.status_mut() = parts.status;
+            *rebuilt.headers_mut() = parts.headers;
+            return rebuilt;
+        }
+
+        let status = StatusCode::from_u16(state.status as u16).unwrap_or(parts.status);
+        let mut builder = Response::builder().status(status).version(parts.version);
+        if let Some(map) = builder.headers_mut() {
+            apply_headers(map, &state.resp_headers);
+        }
+        builder
+            .body(Body::from(state.resp_body))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> HttpState {
+        HttpState {
+            method: "GET".into(),
+            uri: "/".into(),
+            version: "HTTP/1.1".into(),
+            source_addr: String::new(),
+            status: 200,
+            config: Vec::new(),
+            req_headers: vec![("x-a".into(), "1".into())],
+            resp_headers: Vec::new(),
+            req_body: b"hello".to_vec(),
+            req_body_cursor: 0,
+            resp_body: Vec::new(),
+            resp_body_cursor: 0,
+        }
+    }
+
+    #[test]
+    fn header_get_set_add_remove_roundtrip() {
+        let mut s = state();
+        assert_eq!(s.header_values(HeaderKind::Request, "x-a"), vec!["1"]);
+
+        s.add_header_value(HeaderKind::Request, "X-A", "2");
+        assert_eq!(s.header_values(HeaderKind::Request, "x-a"), vec!["1", "2"]);
+
+        s.set_header_value(HeaderKind::Request, "x-a", "only");
+        assert_eq!(s.header_values(HeaderKind::Request, "x-a"), vec!["only"]);
+
+        s.remove_header(HeaderKind::Request, "x-a");
+        assert!(s.header_values(HeaderKind::Request, "x-a").is_empty());
+    }
+
+    #[test]
+    fn read_body_advances_cursor_and_signals_eof() {
+        let mut s = state();
+        assert_eq!(s.read_body(HeaderKind::Request, 3), b"hel".to_vec());
+        assert_eq!(s.read_body(HeaderKind::Request, 10), b"lo".to_vec());
+        // further reads are empty (EOF)
+        assert!(s.read_body(HeaderKind::Request, 10).is_empty());
+    }
+
+    #[test]
+    fn write_body_replaces_response_body() {
+        let mut s = state();
+        s.write_body(HeaderKind::Response, b"new body");
+        assert_eq!(s.resp_body, b"new body");
+    }
+
+    #[test]
+    fn request_and_response_headers_are_separate() {
+        let mut s = state();
+        s.add_header_value(HeaderKind::Response, "x-resp", "v");
+        assert!(s.header_values(HeaderKind::Request, "x-resp").is_empty());
+        assert_eq!(s.header_values(HeaderKind::Response, "x-resp"), vec!["v"]);
+    }
+}

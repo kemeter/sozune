@@ -40,6 +40,17 @@ if [[ ! -x "$SOZUNE_BIN" ]]; then
     exit 1
 fi
 
+# Build the e2e WASM plugin guest (skipped gracefully if the wasm target or
+# rustup is unavailable; the wasm suite then reports the dependency as missing).
+WASM_GUEST_DIR="$E2E_DIR/plugins/header-guest"
+WASM_PLUGIN_FILE="$WASM_GUEST_DIR/target/wasm32-unknown-unknown/release/header_guest.wasm"
+export WASM_PLUGIN_FILE
+if rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
+    log "Building e2e WASM plugin guest..."
+    cargo build --quiet --release --target wasm32-unknown-unknown \
+        --manifest-path "$WASM_GUEST_DIR/Cargo.toml" 2>&1 || true
+fi
+
 # -- Config files --
 log "Generating test config files..."
 
@@ -77,6 +88,17 @@ proxy:
 middleware:
   port: $MIDDLEWARE_PORT
 EOF
+
+# Declare the WASM plugin only if its guest was built, so the rest of the suite
+# still runs on systems without the wasm target.
+if [[ -f "$WASM_PLUGIN_FILE" ]]; then
+    cat >> "$CONFIG_FILE" <<EOF
+
+plugins:
+  headerguest:
+    path: $WASM_PLUGIN_FILE
+EOF
+fi
 
 # -- Authelia config (mounted as a volume so $-prefixed argon2 hashes survive
 #    docker-compose interpolation) --
@@ -157,6 +179,14 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcheaders.host=$HOST_HEADERS"
       - "sozune.http.svcheaders.headers.X-Custom-Test=hello-sozune"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-wasm:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcwasm.host=$HOST_WASM"
+      - "sozune.http.svcwasm.plugins=headerguest"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-headers-response:

@@ -13,6 +13,22 @@ pub struct AppConfig {
     pub middleware: MiddlewareConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// WASM plugins declared by name. Each entry points at an http-wasm guest
+    /// `.wasm`; entrypoints reference these by name to run them as middleware.
+    #[serde(default)]
+    pub plugins: HashMap<String, PluginConfig>,
+}
+
+/// Declaration of one WASM plugin artifact. The `config` blob is opaque to
+/// Sōzune and handed to the guest verbatim via the http-wasm `get_config` ABI.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct PluginConfig {
+    /// Filesystem path to the http-wasm guest `.wasm`.
+    pub path: String,
+    /// Guest-specific configuration, passed through unchanged. Serialized to
+    /// JSON bytes before handing it to the guest.
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 #[derive(Deserialize, Debug, Clone)]

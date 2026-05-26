@@ -1,0 +1,3 @@
+# Build artifacts of the e2e plugin guests; rebuilt on demand by run-all.sh.
+*/target/
+*/Cargo.lock

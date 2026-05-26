@@ -1,6 +1,6 @@
 use crate::acme::CertCommand;
 use crate::config::ProxyConfig;
-use crate::middleware::MiddlewareState;
+use crate::middleware::{MiddlewareState, PluginRegistry};
 use crate::model::Entrypoint;
 use crate::proxy;
 use std::collections::BTreeMap;
@@ -19,6 +19,8 @@ pub struct ProxyInputs {
     pub acme_challenge_port: Option<u16>,
     pub middleware_state: MiddlewareState,
     pub middleware_port: u16,
+    /// Compiled WASM plugins, keyed by declared name. Built once at startup.
+    pub plugins: PluginRegistry,
     pub handle: tokio::runtime::Handle,
 }
 

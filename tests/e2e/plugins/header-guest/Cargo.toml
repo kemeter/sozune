@@ -1,0 +1,14 @@
+# e2e test plugin: a minimal http-wasm guest exercised by the e2e suite.
+# Built to wasm32-unknown-unknown by run-all.sh before sozune starts.
+[package]
+name = "header-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true

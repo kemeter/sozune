@@ -128,6 +128,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let proxy_config = config.proxy.clone();
+    let plugins = middleware::build_plugin_registry(&config.plugins);
     let handle = tokio::runtime::Handle::current();
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
@@ -139,6 +140,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 acme_challenge_port,
                 middleware_state: middleware_state_proxy,
                 middleware_port,
+                plugins,
                 handle,
             },
             &proxy_config,

@@ -44,6 +44,7 @@ HOST_TLS="tls.func-test.localhost"
 HOST_WS="ws.func-test.localhost"
 HOST_SSE="sse.func-test.localhost"
 HOST_FAUTH="fauth.func-test.localhost"
+HOST_WASM="wasm.func-test.localhost"
 HOST_AUTHELIA="authelia.func-test.localhost"
 
 RED='\033[0;31m'

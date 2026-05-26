@@ -1092,6 +1092,7 @@ fn rule_to_entrypoints(
                     entrypoint: None,
                     methods: Vec::new(),
                     acme: None,
+                    plugins: Vec::new(),
                 },
                 source: Some(id),
             }

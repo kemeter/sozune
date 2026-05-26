@@ -4,6 +4,7 @@ mod diag;
 mod forward_auth;
 mod proxy;
 pub mod rate_limit;
+mod wasm;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -11,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use axum::{Router, routing::any};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::model::{Backend, EntrypointConfig};
 use chain::Middleware;
@@ -112,12 +113,46 @@ impl MiddlewareRoute {
     }
 }
 
+/// Compiled WASM plugins keyed by their declared name. Each plugin is compiled
+/// once at startup and shared across every route that references it.
+pub type PluginRegistry = std::collections::HashMap<String, Arc<dyn Middleware>>;
+
+/// Compile every declared plugin into a shareable middleware. A plugin that
+/// fails to load (missing file, bad wasm) is logged and skipped, so one broken
+/// plugin doesn't take down routing.
+pub fn build_plugin_registry(
+    declared: &std::collections::HashMap<String, crate::config::PluginConfig>,
+) -> PluginRegistry {
+    let mut registry = PluginRegistry::new();
+    for (name, cfg) in declared {
+        match std::fs::read(&cfg.path) {
+            Ok(wasm) => {
+                let config_bytes = serde_json::to_vec(&cfg.config).unwrap_or_default();
+                match wasm::WasmMiddleware::from_bytes(
+                    &wasm,
+                    config_bytes,
+                    http_wasm_host::Limits::default(),
+                ) {
+                    Ok(mw) => {
+                        info!("Loaded WASM plugin '{}' from {}", name, cfg.path);
+                        registry.insert(name.clone(), Arc::new(mw));
+                    }
+                    Err(e) => error!("Failed to load WASM plugin '{}': {}", name, e),
+                }
+            }
+            Err(e) => error!("Cannot read WASM plugin '{}' at {}: {}", name, cfg.path, e),
+        }
+    }
+    registry
+}
+
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.backend_timeout.is_some()
         || config.rate_limit.is_some()
         || config.compress
         || config.forward_auth.is_some()
+        || !config.plugins.is_empty()
 }
 
 /// Build middleware route from entrypoint config.
@@ -130,6 +165,7 @@ pub fn build_middleware_route(
     config: &EntrypointConfig,
     backends: &[Backend],
     forward_auth_client: &reqwest::Client,
+    plugins: &PluginRegistry,
 ) -> Arc<MiddlewareRoute> {
     let mut middlewares: Vec<Arc<dyn Middleware>> = Vec::new();
 
@@ -144,6 +180,15 @@ pub fn build_middleware_route(
         middlewares.push(Arc::new(RateLimitMiddleware::new(RateLimiter::new(
             rl.average, rl.burst,
         ))));
+    }
+
+    // WASM plugins run after the native request-phase middlewares, in the order
+    // the entrypoint lists them. An unknown name is logged and skipped.
+    for name in &config.plugins {
+        match plugins.get(name) {
+            Some(mw) => middlewares.push(Arc::clone(mw)),
+            None => warn!("entrypoint references unknown plugin '{}', skipping", name),
+        }
     }
 
     if config.compress {

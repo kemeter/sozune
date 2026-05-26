@@ -17,6 +17,10 @@ pub struct RequestCtx {
     /// middleware on the response side. `None` if the client accepts nothing
     /// we support.
     pub client_encoding: Option<Encoding>,
+    /// Response headers staged during the request phase (a WASM guest can set
+    /// response headers from `handle_request`). Applied to the final response
+    /// on the way out. `(lowercase_name, value)` pairs.
+    pub pending_response_headers: Vec<(String, String)>,
 }
 
 /// Outcome of a middleware's request phase.
