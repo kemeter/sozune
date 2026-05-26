@@ -109,3 +109,7 @@ A list entry may be a bare host (`crowdsec`) or include a port
 ## Writing a plugin
 
 A guest imports the host functions from the `http_handler` module and exports `handle_request`. You can target the ABI directly or use a guest SDK such as [`http-wasm-guest`](https://crates.io/crates/http-wasm-guest) for Rust. Sōzune's host side is the open-source [`http-wasm-host`](https://github.com/kemeter/http-wasm) crate.
+
+## Getting your plugin listed
+
+Published a plugin? Add it to the [plugins gallery](https://sozune.kemeter.io/plugins) by opening a pull request against [`sozune`](https://github.com/kemeter/sozune) that adds an entry to the plugin manifest (`website/src/data/plugins.json`) with your plugin's name, summary, tags, repository and `.wasm` release URL.

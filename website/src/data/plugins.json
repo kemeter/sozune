@@ -1,0 +1,49 @@
+{
+  "plugins": [
+    {
+      "name": "geoblock",
+      "version": "1.0.0",
+      "summary": "Allow or deny incoming requests based on the client's country.",
+      "author": "kemeter",
+      "tags": ["security", "access-control"],
+      "abi": "http-wasm",
+      "repo": "https://github.com/kemeter/sozune-plugin-geoblock",
+      "wasm": "https://github.com/kemeter/sozune-plugin-geoblock/releases/latest/download/geoblock.wasm",
+      "example": {
+        "allow_countries": ["FR", "BE"]
+      }
+    },
+    {
+      "name": "crowdsec",
+      "version": "0.1.0",
+      "summary": "CrowdSec bouncer: block IPs that have an active LAPI decision.",
+      "author": "kemeter",
+      "tags": ["security", "waf"],
+      "abi": "http-wasm",
+      "repo": "https://github.com/kemeter/sozune-crowdsec",
+      "wasm": "https://github.com/kemeter/sozune-crowdsec/releases/latest/download/sozune_crowdsec.wasm",
+      "example": {
+        "allowed_hosts": ["crowdsec:8080"],
+        "lapi_host": "crowdsec:8080",
+        "lapi_key": "<bouncer-api-key>"
+      }
+    },
+    {
+      "name": "umami",
+      "version": "0.1.0",
+      "summary": "Server-side Umami analytics feeder: reports pageviews with no client-side JavaScript or cookies.",
+      "author": "kemeter",
+      "tags": ["analytics", "privacy"],
+      "abi": "http-wasm",
+      "repo": "https://github.com/kemeter/sozune-umami",
+      "wasm": "https://github.com/kemeter/sozune-umami/releases/latest/download/sozune_umami.wasm",
+      "example": {
+        "allowed_hosts": ["umami:3000"],
+        "umami_host": "http://umami:3000",
+        "websites": {
+          "app.example.com": "<website-id>"
+        }
+      }
+    }
+  ]
+}
