@@ -333,7 +333,7 @@ EOF
 
 # -- Start backends --
 log "Starting test containers..."
-docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --wait
+docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --wait --wait-timeout 90
 
 # -- Start sozune --
 log "Starting sozune (HTTP on :$HTTP_PORT, HTTPS on :$HTTPS_PORT)..."
