@@ -142,7 +142,7 @@ pub fn build_plugin_registry(
         let built = if cfg.allowed_hosts.is_empty() {
             wasm::WasmMiddleware::from_bytes(&wasm, config_bytes, limits)
         } else {
-            wasm::WasmMiddleware::from_bytes_with_fetch(
+            wasm::WasmMiddleware::from_bytes_with_network(
                 &wasm,
                 config_bytes,
                 limits,
