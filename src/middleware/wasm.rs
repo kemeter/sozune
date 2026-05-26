@@ -15,7 +15,9 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::BodyExt;
-use http_wasm_host::{HeaderKind, Host, Limits, Next, Plugin};
+use http_wasm_host::{
+    FetchRequest, FetchResponse, Fetcher, HeaderKind, Host, Limits, Next, Plugin,
+};
 use tracing::{error, warn};
 
 use super::chain::{Flow, Middleware, RequestCtx};
@@ -171,6 +173,77 @@ fn apply_headers(headers: &mut axum::http::HeaderMap, pairs: &[(String, String)]
     }
 }
 
+/// Serves the guest's `http_fetch` calls over the network. Bridges the
+/// synchronous guest ABI to the async reqwest client by blocking on the shared
+/// runtime. Outbound requests are restricted to `allowed_hosts` (anti-SSRF):
+/// the guest may pick the path/query, but only against pre-declared hosts.
+struct HostFetcher {
+    client: reqwest::Client,
+    handle: tokio::runtime::Handle,
+    allowed_hosts: Vec<String>,
+}
+
+/// Whether `url`'s host is permitted by `allowed_hosts`. An allow-list entry
+/// may be a bare host (`crowdsec`) or include a port (`crowdsec:8080`); a URL is
+/// accepted if its host alone, or its `host:port` authority, matches an entry.
+/// This dual match is why a config entry like `127.0.0.1:8080` works even though
+/// `Url::host_str` returns just `127.0.0.1`.
+fn host_allowed(url: &reqwest::Url, allowed_hosts: &[String]) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    let authority = match url.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    allowed_hosts.iter().any(|h| h == host || h == &authority)
+}
+
+impl Fetcher for HostFetcher {
+    fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, String> {
+        // Validate the target against the allow-list before doing anything.
+        let url = reqwest::Url::parse(&request.url).map_err(|e| format!("invalid url: {e}"))?;
+        if !host_allowed(&url, &self.allowed_hosts) {
+            return Err(format!(
+                "host '{}' not in plugin allow-list",
+                url.host_str().unwrap_or_default()
+            ));
+        }
+
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|e| format!("invalid method: {e}"))?;
+
+        // The guest ABI is synchronous; block on the async client. `block_in_place`
+        // is safe on the multi-thread runtime sōzune runs on.
+        tokio::task::block_in_place(|| {
+            self.handle.block_on(async {
+                let mut builder = self.client.request(method, url);
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                if !request.body.is_empty() {
+                    builder = builder.body(request.body);
+                }
+                let resp = builder.send().await.map_err(|e| e.to_string())?;
+                let status = resp.status().as_u16();
+                let headers = resp
+                    .headers()
+                    .iter()
+                    .filter_map(|(n, v)| {
+                        v.to_str()
+                            .ok()
+                            .map(|v| (n.as_str().to_string(), v.to_string()))
+                    })
+                    .collect();
+                let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+                Ok(FetchResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            })
+        })
+    }
+}
+
 /// A compiled http-wasm guest wired in as a middleware.
 pub struct WasmMiddleware {
     name: &'static str,
@@ -184,6 +257,32 @@ impl WasmMiddleware {
     pub fn from_bytes(wasm: &[u8], config: Vec<u8>, limits: Limits) -> anyhow::Result<Self> {
         let plugin = Plugin::from_bytes(wasm, limits)
             .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?;
+        Ok(Self {
+            name: "wasm",
+            plugin: Arc::new(plugin),
+            config,
+        })
+    }
+
+    /// Like [`from_bytes`](Self::from_bytes) but enables the outbound-HTTP
+    /// extension: the guest's `http_fetch` calls go through `client`, restricted
+    /// to `allowed_hosts`.
+    pub fn from_bytes_with_fetch(
+        wasm: &[u8],
+        config: Vec<u8>,
+        limits: Limits,
+        client: reqwest::Client,
+        handle: tokio::runtime::Handle,
+        allowed_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let fetcher = Arc::new(HostFetcher {
+            client,
+            handle,
+            allowed_hosts,
+        });
+        let plugin = Plugin::from_bytes(wasm, limits)
+            .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?
+            .with_fetcher(fetcher);
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
@@ -398,5 +497,45 @@ mod tests {
         s.add_header_value(HeaderKind::Response, "x-resp", "v");
         assert!(s.header_values(HeaderKind::Request, "x-resp").is_empty());
         assert_eq!(s.header_values(HeaderKind::Response, "x-resp"), vec!["v"]);
+    }
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn allow_list_matches_host_and_port_against_bare_host_entry() {
+        // Entry without port matches a URL on any port (host_str has no port).
+        let allowed = vec!["crowdsec".to_string()];
+        assert!(host_allowed(
+            &url("http://crowdsec:8080/v1/decisions"),
+            &allowed
+        ));
+        assert!(host_allowed(&url("http://crowdsec/x"), &allowed));
+    }
+
+    #[test]
+    fn allow_list_matches_host_port_entry() {
+        // Regression: a `host:port` entry must match even though Url::host_str
+        // returns only the host. This is the bug found testing CrowdSec for real
+        // (config had 127.0.0.1:8080, host_str returns 127.0.0.1).
+        let allowed = vec!["127.0.0.1:8080".to_string()];
+        assert!(host_allowed(
+            &url("http://127.0.0.1:8080/v1/decisions?ip=9.9.9.9"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn allow_list_rejects_unlisted_host() {
+        let allowed = vec!["crowdsec:8080".to_string()];
+        assert!(!host_allowed(&url("http://evil.example/"), &allowed));
+        // wrong port when the entry pins a port
+        assert!(!host_allowed(&url("http://crowdsec:9999/"), &allowed));
+    }
+
+    #[test]
+    fn empty_allow_list_rejects_everything() {
+        assert!(!host_allowed(&url("http://crowdsec:8080/"), &[]));
     }
 }
