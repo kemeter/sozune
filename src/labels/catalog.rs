@@ -33,6 +33,8 @@ const SERVICE_FIELDS: &[&str] = &[
     "entrypoint",
     "methods",
     "plugins",
+    "matchHeaders",
+    "matchQuery",
 ];
 
 /// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`).

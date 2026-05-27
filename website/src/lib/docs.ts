@@ -66,7 +66,7 @@ const FOLDER_ORDER = [
 // Per-folder page order. Pages not listed here fall back to alphabetical.
 const PAGE_ORDER: Record<string, string[]> = {
   'getting-started': ['installation', 'quick-start'],
-  routing: ['hostnames', 'path-matching', 'load-balancing', 'tcp'],
+  routing: ['hostnames', 'path-matching', 'header-query-matching', 'load-balancing', 'tcp'],
   providers: ['docker', 'podman', 'swarm', 'kubernetes', 'nomad', 'consul', 'http'],
   middleware: [
     'auth',

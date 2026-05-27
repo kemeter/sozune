@@ -5,7 +5,7 @@ use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
     auth, core, error_pages, forward_auth, headers, host, methods, path, plugins, ratelimit,
-    redirect,
+    redirect, request_match,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
@@ -181,6 +181,8 @@ fn build_entrypoint(
     let methods = methods::parse_methods(labels, &prefix, diagnostics);
     let plugins = plugins::parse_plugins(labels, &prefix);
     let parsed_error_pages = error_pages::parse_error_pages(labels, &prefix, diagnostics);
+    let match_headers = request_match::parse_match_headers(labels, &prefix);
+    let match_query = request_match::parse_match_query(labels, &prefix);
 
     let protocol_enum = match protocol {
         "http" => Protocol::Http,
@@ -222,6 +224,8 @@ fn build_entrypoint(
             acme: None,
             plugins,
             error_pages: parsed_error_pages,
+            match_headers,
+            match_query,
         },
         source: None,
     })
@@ -289,6 +293,8 @@ fn build_tcp_entrypoint(
             acme: None,
             plugins: Vec::new(),
             error_pages: std::collections::BTreeMap::new(),
+            match_headers: Vec::new(),
+            match_query: Vec::new(),
         },
         source: None,
     })

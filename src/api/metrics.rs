@@ -376,6 +376,8 @@ mod tests {
                 acme: None,
                 error_pages: std::collections::BTreeMap::new(),
                 plugins: Vec::new(),
+                match_headers: Vec::new(),
+                match_query: Vec::new(),
             },
             source: Some("api".to_string()),
         }

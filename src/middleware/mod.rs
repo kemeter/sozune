@@ -4,6 +4,7 @@ mod diag;
 mod forward_auth;
 mod proxy;
 pub mod rate_limit;
+mod request_match;
 mod wasm;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +20,7 @@ use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
 use rate_limit::{RateLimitMiddleware, RateLimiter};
+use request_match::RequestMatchMiddleware;
 
 /// Build the shared HTTP client used by forward-auth middlewares. Same config
 /// as before: short timeout, no redirect following.
@@ -170,14 +172,16 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.compress
         || config.forward_auth.is_some()
         || !config.plugins.is_empty()
+        || !config.match_headers.is_empty()
+        || !config.match_query.is_empty()
 }
 
 /// Build middleware route from entrypoint config.
 ///
-/// The stack is assembled in the same order the proxy applied it inline:
-/// forward-auth, then rate-limit (both before the backend), then compression
-/// (on the response). `forward_auth_client` is the shared client from
-/// [`build_forward_auth_client`].
+/// The stack is assembled in order: request-match (reject requests that don't
+/// meet header/query conditions), forward-auth, then rate-limit (all before the
+/// backend), then compression (on the response). `forward_auth_client` is the
+/// shared client from [`build_forward_auth_client`].
 pub fn build_middleware_route(
     config: &EntrypointConfig,
     backends: &[Backend],
@@ -185,6 +189,15 @@ pub fn build_middleware_route(
     plugins: &PluginRegistry,
 ) -> Arc<MiddlewareRoute> {
     let mut middlewares: Vec<Arc<dyn Middleware>> = Vec::new();
+
+    // Header/query match conditions run first: a request that doesn't match the
+    // route's conditions is rejected (404) before auth, rate-limit, or backend.
+    if !config.match_headers.is_empty() || !config.match_query.is_empty() {
+        middlewares.push(Arc::new(RequestMatchMiddleware::new(
+            config.match_headers.clone(),
+            config.match_query.clone(),
+        )));
+    }
 
     if let Some(cfg) = config.forward_auth.as_ref() {
         middlewares.push(Arc::new(ForwardAuthMiddleware::new(

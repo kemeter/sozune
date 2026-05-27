@@ -48,6 +48,7 @@ HOST_WASM="wasm.func-test.localhost"
 HOST_AUTHELIA="authelia.func-test.localhost"
 HOST_UNKNOWN_404="nope.func-test.localhost"
 HOST_ERRORPAGES="errorpages.func-test.localhost"
+HOST_MATCH="match.func-test.localhost"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
