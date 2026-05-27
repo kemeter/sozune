@@ -87,12 +87,12 @@ If you declare `sozune.<proto>.<svc>.host` **without** an explicit `sozune.<prot
 
 ## Service provider: `nomad` vs `consul`
 
-Nomad services can register either against Nomad itself (`provider = "nomad"`) or Consul (`provider = "consul"`). Sōzune's Nomad provider only sees the **Nomad-native** registry. To route to Consul-registered services, run a separate Consul provider (not yet shipped — open an issue if you need it).
+Nomad services can register either against Nomad itself (`provider = "nomad"`) or Consul (`provider = "consul"`). Sōzune's Nomad provider only sees the **Nomad-native** registry. To route to Consul-registered services, enable the [Consul provider](/documentation/providers/consul) instead.
 
 ## Limitations
 
 - **One Nomad agent per Sōzune instance.** If you have several federated regions, run one Sōzune per region.
-- **No Consul integration.** As above.
+- **Nomad-native registry only.** For Consul-registered services, use the [Consul provider](/documentation/providers/consul).
 - **UDP services** are recognised at the tag level but not yet proxied (same caveat as the Docker provider).
 - **HCL stack changes** that don't change the services list (e.g. only env-var changes) won't wake up the blocking query — they'll be picked up on the next regular `poll_interval` tick.
 

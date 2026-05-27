@@ -105,6 +105,7 @@ pub struct ProvidersConfig {
     pub swarm: Option<SwarmConfig>,
     pub kubernetes: Option<KubernetesConfig>,
     pub nomad: Option<NomadConfig>,
+    pub consul: Option<ConsulConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -212,6 +213,42 @@ pub struct NomadConfig {
     #[serde(
         default,
         deserialize_with = "deserialize_nomad_expose_by_default_with_env"
+    )]
+    pub expose_by_default: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ConsulConfig {
+    #[serde(default, deserialize_with = "deserialize_consul_enabled_with_env")]
+    pub enabled: bool,
+    /// Consul HTTP API endpoint (e.g. `http://127.0.0.1:8500`).
+    #[serde(
+        default = "default_consul_endpoint",
+        deserialize_with = "deserialize_consul_endpoint_with_env"
+    )]
+    pub endpoint: String,
+    /// Optional ACL token sent as the `X-Consul-Token` header.
+    #[serde(default, deserialize_with = "deserialize_consul_token_with_env")]
+    pub token: String,
+    /// Restrict discovery to a single datacenter (`?dc=`). Empty means the
+    /// agent's default datacenter.
+    #[serde(default, deserialize_with = "deserialize_consul_datacenter_with_env")]
+    pub datacenter: String,
+    /// Polling interval, in seconds. Used as the `wait` bound for blocking
+    /// queries.
+    #[serde(
+        default = "default_consul_poll_interval",
+        deserialize_with = "deserialize_consul_poll_interval_with_env"
+    )]
+    pub poll_interval: u64,
+    /// Which Consul health-check states are allowed to receive traffic.
+    /// Defaults to `["passing", "warning"]` — only `critical` instances are
+    /// excluded. Mirrors Traefik's `strictChecks`.
+    #[serde(default = "default_consul_strict_checks")]
+    pub strict_checks: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_consul_expose_by_default_with_env"
     )]
     pub expose_by_default: bool,
 }
@@ -457,6 +494,32 @@ fn default_nomad_endpoint() -> String {
 
 fn default_nomad_poll_interval() -> u64 {
     15
+}
+
+impl Default for ConsulConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_consul_endpoint(),
+            token: String::new(),
+            datacenter: String::new(),
+            poll_interval: default_consul_poll_interval(),
+            strict_checks: default_consul_strict_checks(),
+            expose_by_default: false,
+        }
+    }
+}
+
+fn default_consul_endpoint() -> String {
+    "http://127.0.0.1:8500".to_string()
+}
+
+fn default_consul_poll_interval() -> u64 {
+    15
+}
+
+fn default_consul_strict_checks() -> Vec<String> {
+    vec!["passing".to_string(), "warning".to_string()]
 }
 
 fn default_swarm_endpoint() -> String {
@@ -782,6 +845,40 @@ deserialize_with_env!(
 deserialize_bool_with_env!(
     deserialize_nomad_expose_by_default_with_env,
     "SOZUNE_PROVIDER_NOMAD_EXPOSE_BY_DEFAULT",
+    false
+);
+
+deserialize_bool_with_env!(
+    deserialize_consul_enabled_with_env,
+    "SOZUNE_PROVIDER_CONSUL_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_consul_endpoint_with_env,
+    "SOZUNE_PROVIDER_CONSUL_ENDPOINT",
+    default_consul_endpoint
+);
+deserialize_string_with_env!(
+    deserialize_consul_token_with_env,
+    "SOZUNE_PROVIDER_CONSUL_TOKEN",
+    "",
+    literal
+);
+deserialize_string_with_env!(
+    deserialize_consul_datacenter_with_env,
+    "SOZUNE_PROVIDER_CONSUL_DATACENTER",
+    "",
+    literal
+);
+deserialize_with_env!(
+    deserialize_consul_poll_interval_with_env,
+    "SOZUNE_PROVIDER_CONSUL_POLL_INTERVAL",
+    u64,
+    default_consul_poll_interval
+);
+deserialize_bool_with_env!(
+    deserialize_consul_expose_by_default_with_env,
+    "SOZUNE_PROVIDER_CONSUL_EXPOSE_BY_DEFAULT",
     false
 );
 

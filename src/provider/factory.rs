@@ -4,6 +4,7 @@ use crate::model::Entrypoint;
 use crate::provider::{
     Provider,
     config::ConfigProvider,
+    consul::ConsulProvider,
     docker::DockerProvider,
     http::HttpProvider,
     kubernetes::{KubernetesProvider, gateway},
@@ -285,6 +286,33 @@ pub async fn start_services(
                 .await
             {
                 error!("Nomad provider failed: {}", e);
+            }
+        });
+    }
+
+    // Start Consul provider if enabled
+    if let Some(consul_config) = &config.providers.consul
+        && consul_config.enabled
+    {
+        info!("Starting Consul provider");
+        let consul_provider = ConsulProvider::new(consul_config.clone())
+            .context("Failed to create Consul provider")?;
+        let storage_consul = Arc::clone(&storage);
+        let reload_tx_consul = reload_tx.clone();
+        let acme_notify_consul = Arc::clone(&acme_notify);
+        let diagnostics_consul = Arc::clone(&diagnostics);
+
+        tokio::spawn(async move {
+            if let Err(e) = consul_provider
+                .start_polling(
+                    storage_consul,
+                    reload_tx_consul,
+                    acme_notify_consul,
+                    diagnostics_consul,
+                )
+                .await
+            {
+                error!("Consul provider failed: {}", e);
             }
         });
     }
