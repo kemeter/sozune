@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Entrypoint {
@@ -102,6 +103,13 @@ pub struct EntrypointConfig {
     /// middleware on this entrypoint, in order.
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// Cluster-scoped custom HTTP answer templates, keyed by status code.
+    /// Values may be inline bodies or `file://<path>` references when set
+    /// from static YAML; when populated from provider labels, `file://` is
+    /// refused and dropped via `error_pages::sanitize_provider_error_pages`.
+    /// Overrides the listener-level defaults for this entrypoint only.
+    #[serde(default)]
+    pub error_pages: BTreeMap<String, String>,
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

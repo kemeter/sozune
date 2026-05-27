@@ -37,7 +37,7 @@ const SERVICE_FIELDS: &[&str] = &[
 
 /// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`).
 /// Anything beginning with one of these is considered known.
-const SERVICE_FIELD_PREFIXES: &[&str] = &["headers."];
+const SERVICE_FIELD_PREFIXES: &[&str] = &["headers.", "errorPages."];
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
