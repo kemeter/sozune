@@ -1,22 +1,23 @@
 import Hero from '@/components/Hero';
+import PlatformShowcase from '@/components/PlatformShowcase';
 import FeatureSection from '@/components/FeatureSection';
 
 const description =
-  'The modern reverse proxy, without the painful config. Service discovery for Docker, Swarm, Kubernetes and Nomad, automatic HTTPS, HTTP/2 by default, hot reload through REST API.';
+  'The reverse proxy that configures itself. Sōzune discovers your services across Docker, Kubernetes, Nomad and Consul, secures them with automatic HTTPS, and keeps the routing table in sync.';
 
 export const meta = {
-  title: 'Sozune — The modern reverse proxy',
+  title: 'Sōzune — The reverse proxy that configures itself',
   description,
   canonical: 'https://sozune.kemeter.io/',
   og: {
-    title: 'Sozune — The modern reverse proxy',
+    title: 'Sōzune — The reverse proxy that configures itself',
     description,
     type: 'website',
     url: 'https://sozune.kemeter.io/',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Sozune — The modern reverse proxy',
+    title: 'Sōzune — The reverse proxy that configures itself',
     description,
   },
 };
@@ -25,6 +26,7 @@ export default function HomePage() {
   return (
     <>
       <Hero />
+      <PlatformShowcase />
       <FeatureSection />
     </>
   );

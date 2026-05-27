@@ -1,33 +1,39 @@
-interface Feature {
-  number: string;
+interface Capability {
+  tag: string;
   title: string;
   description: string;
+  demo?: { warn: string; label: string; hint: string };
 }
 
-const FEATURES: Feature[] = [
+const CAPABILITIES: Capability[] = [
   {
-    number: '01',
-    title: 'Multi-platform discovery',
+    tag: 'discover',
+    title: 'Real-time service discovery',
     description:
-      'Docker, Swarm, Kubernetes, Nomad, an HTTP endpoint, or a YAML file. Routes are picked up, added, and removed automatically.',
+      "Watches each platform's events and keeps the routing table in sync as services come and go. Nothing to reload by hand.",
   },
   {
-    number: '02',
+    tag: 'secure',
     title: 'Automatic HTTPS',
     description:
-      "Let's Encrypt provisioning and renewal, no intervention. Multi-domain SNI supported out of the box.",
+      "Let's Encrypt over HTTP-01 and DNS-01, wildcards included. Certificates provisioned and renewed without you touching a file.",
   },
   {
-    number: '03',
-    title: 'HTTP/2 by default',
+    tag: 'diagnose',
+    title: 'It tells you why',
     description:
-      'ALPN negotiates h2 on every TLS listener. No flag, no config — it just works.',
+      'A typo’d label or a shadowed route never fails silently. Validate before deploy, or read the reason straight off the failing request.',
+    demo: {
+      warn: '⚠ W013',
+      label: 'unknown label "sozune.http.web.hsot"',
+      hint: '→ did you mean `sozune.http.web.host`?',
+    },
   },
   {
-    number: '04',
-    title: 'Hot reload',
+    tag: 'operate',
+    title: 'Labels, API & dashboard',
     description:
-      'REST API to create, update, delete entrypoints on the fly. Zero downtime, zero restart.',
+      'Configure routes where your services live, drive them over a REST API, and watch the live state from the built-in dashboard.',
   },
 ];
 
@@ -36,18 +42,22 @@ export default function FeatureSection() {
     <section className="features">
       <div className="container">
         <div className="features-header">
-          <span className="features-eyebrow">Features</span>
-          <h2 className="features-title">Built for ops who are tired of YAML.</h2>
-          <p className="features-subtitle">
-            Four things you should expect from a modern reverse proxy. None of them optional.
-          </p>
+          <span className="features-eyebrow">What Sōzune does for you</span>
+          <h2 className="features-title">Four things, handled.</h2>
         </div>
         <div className="features-grid">
-          {FEATURES.map((f) => (
-            <article key={f.title} className="feature-card">
-              <div className="feature-card-label">{f.number}</div>
-              <h3 className="feature-card-title">{f.title}</h3>
-              <p className="feature-card-description">{f.description}</p>
+          {CAPABILITIES.map((c) => (
+            <article key={c.tag} className="feature-card">
+              <div className="feature-card-label">{c.tag}</div>
+              <h3 className="feature-card-title">{c.title}</h3>
+              <p className="feature-card-description">{c.description}</p>
+              {c.demo && (
+                <div className="feature-card-demo">
+                  <span className="demo-warn">{c.demo.warn}</span> {c.demo.label}
+                  {'\n'}
+                  <span className="demo-hint">{`   ${c.demo.hint}`}</span>
+                </div>
+              )}
             </article>
           ))}
         </div>

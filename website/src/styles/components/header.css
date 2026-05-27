@@ -78,3 +78,8 @@
   border-color: var(--text-primary);
   background: var(--bg-subtle);
 }
+
+.header-cta-icon {
+  flex-shrink: 0;
+  display: block;
+}

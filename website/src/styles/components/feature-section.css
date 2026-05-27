@@ -74,3 +74,23 @@
   color: var(--text-secondary);
   line-height: 1.6;
 }
+
+.feature-card-demo {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-code);
+  color: var(--text-on-code);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.feature-card-demo .demo-warn {
+  color: #e8b84b;
+}
+
+.feature-card-demo .demo-hint {
+  color: #8fb3e0;
+}
