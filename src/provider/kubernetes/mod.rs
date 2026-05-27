@@ -1,4 +1,5 @@
 pub mod gateway;
+pub mod gateway_filters;
 
 use crate::config::KubernetesConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
@@ -997,6 +998,9 @@ impl IngressParseCtx<'_> {
                 redirect: None,
                 redirect_scheme: None,
                 redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
                 www_authenticate: None,
                 priority: 0,
                 auth: None,

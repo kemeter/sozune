@@ -236,6 +236,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
 - `backendRef.weight` — propagated to the load balancer.
+- `spec.rules[].filters[]` — `requestRedirect` (see [HTTPRoute filters](#httproute-filters) below). Other filter types are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — for every `parentRef` Sōzune owns, the route's `status.parents[]` is updated with the standard `Accepted` and `ResolvedRefs` conditions (`controllerName: kemeter.io/sozune`). Visible via `kubectl describe httproute <name>`. Other controllers' entries are preserved untouched.
 
@@ -255,8 +256,40 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 
 - Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
 - `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
-- HTTPRoute `filters` (`requestRedirect`, `urlRewrite`, header modifiers, mirror) — declaring **any** filter on a rule causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service annotations or Ingress annotations until filter support lands.
+- HTTPRoute `filters` other than `requestRedirect` — `urlRewrite`, `requestHeaderModifier` / `responseHeaderModifier`, `requestMirror`. Declaring one of these (or a `requestRedirect` we can't represent, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands.
 - `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
+
+### HTTPRoute filters
+
+Sōzune maps the `requestRedirect` filter onto Sōzu's native frontend redirect — no extra middleware hop. A rule may declare a redirect alongside its `backendRefs`:
+
+```yaml
+rules:
+  - matches:
+      - path:
+          type: PathPrefix
+          value: /
+    filters:
+      - type: RequestRedirect
+        requestRedirect:
+          scheme: https      # http→https is the common case
+          hostname: new.example.com   # optional
+          port: 8443                  # optional
+    backendRefs:
+      - name: web-svc
+        port: 80
+```
+
+| `requestRedirect` field | Mapped to | Notes |
+|---|---|---|
+| `scheme` (`http` / `https`) | redirect scheme | omitted → preserve the request scheme |
+| `statusCode` | redirect policy | `301` (default) → permanent redirect. `302` is **not** supported — the route is dropped rather than emit a 301 |
+| `hostname` | `rewrite_host` | rewrites the `Location` authority |
+| `port` | `rewrite_port` | rewrites the `Location` port |
+| `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
+| `path.replacePrefixMatch` | — | **not supported**: keeping the request's trailing segments needs a path capture Sōzune doesn't set up for redirect rules, so the route is dropped |
+
+A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch`, a `302` status, or combined with another filter is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
 
 ### How resolution works
 

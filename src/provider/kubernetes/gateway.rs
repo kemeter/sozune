@@ -27,6 +27,7 @@
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gatewayclass/>
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gateway/>
 
+use super::gateway_filters;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol};
 use futures_util::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
@@ -546,7 +547,7 @@ fn apply_route(
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters (requestRedirect / urlRewrite / header modifiers / mirror) which sōzune does not support yet — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (only requestRedirect is supported, and not its path-rewrite or 302 forms) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -778,11 +779,11 @@ pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|rule| {
-            rule.filters
-                .as_deref()
-                .map(|f| !f.is_empty())
-                .unwrap_or(false)
+        .any(|rule| match rule.filters.as_deref() {
+            Some(filters) if !filters.is_empty() => {
+                !gateway_filters::rule_filters_supported(filters)
+            }
+            _ => false,
         })
 }
 
@@ -851,7 +852,7 @@ fn build_route_status(
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters which sōzune does not support yet (requestRedirect, urlRewrite, header modifiers, mirror)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (only requestRedirect is supported, excluding its path-rewrite and 302 forms)".to_string(),
         ),
         RouteOutcome::NotMine => unreachable!("filtered out above"),
     };
@@ -977,14 +978,23 @@ fn rule_to_entrypoints(
     resolver: &dyn ServiceResolver,
 ) -> Vec<Entrypoint> {
     // Gateway API: each entry in `filters` is meant to mutate the
-    // request before it reaches the backend. Routing without honouring
-    // them silently rewrites user intent — refuse the rule entirely
-    // until we implement filter support.
-    if let Some(filters) = rule.filters.as_deref()
-        && !filters.is_empty()
-    {
-        return Vec::new();
-    }
+    // request before it reaches the backend. We honour the ones we can
+    // map faithfully (`requestRedirect` → Sōzu's native frontend
+    // redirect). A rule carrying any filter we can't represent is
+    // refused outright: routing it as if the filter weren't there would
+    // silently rewrite user intent. The watcher also gates on
+    // `route_has_unsupported_filters` to set the route status, but we
+    // re-check here so a direct call can't slip an unsupported filter
+    // through.
+    let redirect = match rule.filters.as_deref() {
+        Some(filters) if !filters.is_empty() => {
+            if !gateway_filters::rule_filters_supported(filters) {
+                return Vec::new();
+            }
+            gateway_filters::redirect_from_filter(filters)
+        }
+        _ => None,
+    };
 
     let Some(backend_refs) = rule.backend_refs.as_ref() else {
         return Vec::new();
@@ -1077,9 +1087,12 @@ fn rule_to_entrypoints(
                     add_prefix: None,
                     https_redirect: false,
                     https_redirect_port: None,
-                    redirect: None,
-                    redirect_scheme: None,
+                    redirect: redirect.as_ref().map(|r| r.policy),
+                    redirect_scheme: redirect.as_ref().and_then(|r| r.scheme),
                     redirect_template: None,
+                    rewrite_host: redirect.as_ref().and_then(|r| r.host.clone()),
+                    rewrite_path: redirect.as_ref().and_then(|r| r.path.clone()),
+                    rewrite_port: redirect.as_ref().and_then(|r| r.port),
                     www_authenticate: None,
                     priority: 0,
                     auth: None,
@@ -1124,10 +1137,13 @@ fn log_route(action: &str, route: &HTTPRoute) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::entrypoint::{RedirectPolicy, RedirectScheme};
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
     use gateway_api::apis::standard::gateways::GatewaySpec;
     use gateway_api::apis::standard::httproutes::{
-        HTTPRouteRulesBackendRefs, HTTPRouteRulesMatches, HTTPRouteRulesMatchesPath, HTTPRouteSpec,
+        HTTPRouteRulesBackendRefs, HTTPRouteRulesFiltersRequestRedirect,
+        HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesMatches,
+        HTTPRouteRulesMatchesPath, HTTPRouteSpec,
     };
     use kube::api::ObjectMeta;
 
@@ -1688,10 +1704,11 @@ mod tests {
     }
 
     #[test]
-    fn route_with_any_filter_is_dropped_entirely() {
+    fn route_with_unsupported_filter_is_dropped_entirely() {
         // Honouring a filter we don't understand is worse than refusing
         // the route — silently routing as if the filter weren't there
-        // breaks user intent.
+        // breaks user intent. An empty filter struct carries no variant
+        // we recognise, so it counts as unsupported.
         let r = route_with(
             vec![rule_with_filter(
                 vec![backend("api", 80)],
@@ -1701,6 +1718,31 @@ mod tests {
         );
         assert!(route_to_entrypoints(&r, &r1()).is_empty());
         assert!(route_has_unsupported_filters(&r));
+    }
+
+    #[test]
+    fn route_with_request_redirect_maps_to_native_redirect() {
+        // A scheme-only requestRedirect (the HTTP→HTTPS case) is mapped
+        // onto Sōzu's native frontend redirect instead of being dropped.
+        let redirect = HTTPRouteRulesFilters {
+            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![redirect])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(
+            eps[0].config.redirect_scheme,
+            Some(RedirectScheme::UseHttps)
+        );
     }
 
     #[test]

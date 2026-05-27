@@ -658,6 +658,16 @@ fn configure_http_entrypoint(
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();
+        // A redirect target's path rewrite wins over the prefix rewrite:
+        // strip/add_prefix only make sense when the request reaches the
+        // backend, which a permanent redirect never does.
+        let frontend_rewrite_path = entrypoint
+            .config
+            .rewrite_path
+            .clone()
+            .or(frontend_rewrite_path);
+        let frontend_rewrite_host = entrypoint.config.rewrite_host.clone();
+        let frontend_rewrite_port = entrypoint.config.rewrite_port.map(|p| p as u32);
 
         for method in methods_for_frontend(&entrypoint.config.methods) {
             let method_tag = method.as_deref().unwrap_or("any");
@@ -672,6 +682,8 @@ fn configure_http_entrypoint(
                 headers: frontend_headers.clone(),
                 required_auth: frontend_required_auth,
                 rewrite_path: frontend_rewrite_path.clone(),
+                rewrite_host: frontend_rewrite_host.clone(),
+                rewrite_port: frontend_rewrite_port,
                 redirect: frontend_redirect,
                 redirect_scheme: frontend_redirect_scheme,
                 redirect_template: frontend_redirect_template.clone(),
@@ -705,6 +717,8 @@ fn configure_http_entrypoint(
                     headers: frontend_headers.clone(),
                     required_auth: frontend_required_auth,
                     rewrite_path: frontend_rewrite_path.clone(),
+                    rewrite_host: frontend_rewrite_host.clone(),
+                    rewrite_port: frontend_rewrite_port,
                     redirect: frontend_redirect,
                     redirect_scheme: frontend_redirect_scheme,
                     redirect_template: frontend_redirect_template.clone(),
