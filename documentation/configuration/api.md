@@ -130,7 +130,12 @@ curl -u admin:your-password http://localhost:3035/entrypoints
 
 Response: a JSON array of entrypoint objects (see [Entrypoint schema](#entrypoint-schema) below). Each item also carries:
 
-- `unhealthy_backends`: list of `"<address>:<port>"` backend strings the health checker has marked unhealthy for this entrypoint
+- `unhealthy_backends`: array of objects describing the backends the health checker has marked unhealthy for this entrypoint. Each object has:
+    - `address` — `"<host>:<port>"` of the failing backend
+    - `kind` — failure classification: `connection_refused`, `no_route_to_host`, `network_unreachable`, `host_unreachable`, `timeout`, `dns_failure`, or `other`
+    - `message` — raw error message from the last probe attempt
+    - `since` — Unix epoch (seconds) the backend was first marked down
+    - `last_checked` — Unix epoch (seconds) of the last probe attempt
 - `diagnostics`: list of [Diagnostic objects](#diagnostic-schema) associated with this entrypoint, including runtime collision lints (W018)
 
 ### `GET /entrypoints/{id}`
@@ -311,7 +316,7 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
     "entrypoint": null,                 // TCP listener name (required for protocol=Tcp)
     "methods": []                       // ["GET", "POST", ...]; empty = any method
   },
-  "unhealthy_backends": [],             // only on GET responses
+  "unhealthy_backends": [],             // only on GET responses (array of objects, see "GET /entrypoints")
   "diagnostics": []                     // only on GET responses
 }
 ```

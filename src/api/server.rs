@@ -1,6 +1,7 @@
 use crate::api::auth::{AuthOutcome, Identity, check};
 use crate::config::{ApiConfig, ApiUser, Role};
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
+use crate::proxy::health::UnhealthyMap;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Method, header};
@@ -9,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -22,7 +23,7 @@ pub struct AppState {
     pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     pub reload_tx: mpsc::Sender<()>,
     pub users: Vec<ApiUser>,
-    pub unhealthy_backends: Arc<RwLock<HashSet<String>>>,
+    pub unhealthy_backends: Arc<RwLock<UnhealthyMap>>,
     pub diagnostics: crate::diagnostics::DiagnosticsStore,
     pub acme_enabled: bool,
     /// Snapshot of the provider section from `config.yaml`. Read-only — used
@@ -32,23 +33,38 @@ pub struct AppState {
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
-/// `unhealthy_backends` list (subset of `backends` that the health checker
-/// has marked down) and the `diagnostics` produced for this entrypoint by the
-/// label parser (empty when none).
+/// `unhealthy_backends` list (subset of `backends` that the health checker has
+/// marked down, with the structured failure reason for each one) and the
+/// `diagnostics` produced for this entrypoint by the label parser (empty when
+/// none).
+///
+/// Each entry in `unhealthy_backends` is an object: `{ address, kind, message,
+/// since, last_checked }`. Breaking change vs. previous API where this field
+/// was a plain `string[]`.
 ///
 /// Diagnostics are looked up by `entrypoint.id` first (the cluster_id used at
 /// runtime), then by `entrypoint.source` which is set to the candidate id by
 /// most providers. The first non-empty match wins.
 fn entrypoint_payload(
     entrypoint: &Entrypoint,
-    unhealthy: &HashSet<String>,
+    unhealthy: &UnhealthyMap,
     diagnostics: &HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>>,
 ) -> serde_json::Value {
-    let unhealthy_for_ep: Vec<String> = entrypoint
+    let unhealthy_for_ep: Vec<serde_json::Value> = entrypoint
         .backends
         .iter()
-        .map(|b| b.to_string())
-        .filter(|key| unhealthy.contains(key))
+        .filter_map(|b| {
+            let key = b.to_string();
+            unhealthy.get(&key).map(|reason| {
+                serde_json::json!({
+                    "address": key,
+                    "kind": reason.kind,
+                    "message": reason.message,
+                    "since": reason.since,
+                    "last_checked": reason.last_checked,
+                })
+            })
+        })
         .collect();
 
     let diags_for_ep: Vec<crate::labels::diagnostic::Diagnostic> = diagnostics
@@ -163,7 +179,7 @@ pub async fn serve(
     config: ApiConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
-    unhealthy_backends: Arc<RwLock<HashSet<String>>>,
+    unhealthy_backends: Arc<RwLock<UnhealthyMap>>,
     diagnostics: crate::diagnostics::DiagnosticsStore,
     acme_enabled: bool,
     providers: crate::config::ProvidersConfig,
@@ -306,7 +322,7 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
                 "internal state corrupted (health tracking), restart required: {}",
                 e
             );
-            HashSet::new()
+            HashMap::new()
         }
     };
     let mut diagnostics = read_diagnostics(&state);
@@ -523,7 +539,7 @@ async fn get_entrypoint(
                 "internal state corrupted (health tracking), restart required: {}",
                 e
             );
-            HashSet::new()
+            HashMap::new()
         }
     };
 
@@ -744,7 +760,7 @@ mod tests {
             storage: Arc::new(RwLock::new(BTreeMap::new())),
             reload_tx,
             users,
-            unhealthy_backends: Arc::new(RwLock::new(HashSet::new())),
+            unhealthy_backends: Arc::new(RwLock::new(HashMap::new())),
             diagnostics: crate::diagnostics::new_store(),
             acme_enabled: false,
             providers: crate::config::ProvidersConfig::default(),
@@ -1392,11 +1408,15 @@ mod tests {
             .to_string();
 
         // Mark the backend down.
-        state
-            .unhealthy_backends
-            .write()
-            .unwrap()
-            .insert("127.0.0.1:3000".to_string());
+        state.unhealthy_backends.write().unwrap().insert(
+            "127.0.0.1:3000".to_string(),
+            crate::proxy::health::UnhealthyReason {
+                kind: crate::proxy::health::UnhealthyKind::ConnectionRefused,
+                message: "Connection refused (os error 111)".to_string(),
+                since: 1000,
+                last_checked: 1000,
+            },
+        );
 
         let response = app
             .oneshot(
@@ -1414,7 +1434,12 @@ mod tests {
             .as_array()
             .expect("unhealthy_backends array");
         assert_eq!(unhealthy.len(), 1);
-        assert_eq!(unhealthy[0], "127.0.0.1:3000");
+        let entry = &unhealthy[0];
+        assert_eq!(entry["address"], "127.0.0.1:3000");
+        assert_eq!(entry["kind"], "connection_refused");
+        assert_eq!(entry["message"], "Connection refused (os error 111)");
+        assert_eq!(entry["since"], 1000);
+        assert_eq!(entry["last_checked"], 1000);
     }
 
     #[tokio::test]

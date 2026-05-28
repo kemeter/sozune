@@ -95,7 +95,7 @@ export interface Backend {
   weight: number;
 }
 
-/** Backend identifier as serialized in `unhealthy_backends`: `address:port`. */
+/** Backend identifier as used in `UnhealthyBackend.address`: `host:port`. */
 export function backendKey(b: Backend): string {
   return `${b.address}:${b.port}`;
 }
@@ -111,6 +111,29 @@ export interface Diagnostic {
   hint?: string;
 }
 
+/** Classification of a failed health check. Matches `UnhealthyKind` server-side. */
+export type UnhealthyKind =
+  | 'connection_refused'
+  | 'no_route_to_host'
+  | 'network_unreachable'
+  | 'host_unreachable'
+  | 'timeout'
+  | 'dns_failure'
+  | 'other';
+
+export interface UnhealthyBackend {
+  /** `host:port` of the backend that's failing health checks. */
+  address: string;
+  /** Coarse classification of the failure. */
+  kind: UnhealthyKind;
+  /** Raw error message from the last probe attempt. */
+  message: string;
+  /** Unix epoch (seconds) the backend was first marked down. */
+  since: number;
+  /** Unix epoch (seconds) of the last probe attempt. */
+  last_checked: number;
+}
+
 export interface Entrypoint {
   id: string;
   name: string;
@@ -118,8 +141,8 @@ export interface Entrypoint {
   backends: Backend[];
   config: EntrypointConfig;
   source?: string | null;
-  /** Backend addresses (`host:port`) currently marked down by the health checker. */
-  unhealthy_backends?: string[];
+  /** Backends currently marked down by the health checker, with failure reason. */
+  unhealthy_backends?: UnhealthyBackend[];
   /** Diagnostics produced for this entrypoint by the label parser. */
   diagnostics?: Diagnostic[];
 }
