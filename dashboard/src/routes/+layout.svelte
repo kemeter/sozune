@@ -114,7 +114,7 @@
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h4a2 2 0 0 1 2 2v9a2 2 0 0 0-2-2H2zM14 3h-4a2 2 0 0 0-2 2v9a2 2 0 0 1 2-2h4z"/></svg>
           <span>Documentation</span>
         </a>
-        <div class="version mono">v0.11.0</div>
+        <div class="version mono">v0.13.0</div>
       </div>
     </aside>
 
