@@ -1,0 +1,267 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "text",
+      "title": "About",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 3},
+      "id": 100,
+      "options": {
+        "mode": "markdown",
+        "content": "## Sozune Overview\n\nReal-time proxy state: how many routes are loaded, how many backends are responding, how many configuration warnings are active.\n\n_Auto-refresh: 5 s. Hover panel titles for an explanation._"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Routes",
+      "description": "Total number of routes (entrypoints) currently loaded. A route is a (hostname, path) pair pointing at one or more backends. Discovered through providers (Docker, Kubernetes, etc.).",
+      "gridPos": {"x": 0, "y": 3, "w": 5, "h": 4},
+      "id": 1,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sozune_entrypoints", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Backends",
+      "description": "Total number of backend instances (container, pod, IP:port) reachable across all routes.",
+      "gridPos": {"x": 5, "y": 3, "w": 5, "h": 4},
+      "id": 2,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sozune_backends", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Backends down",
+      "description": "Backends marked DOWN by the active health check. Turns red as soon as >= 1. When > 0, requests will either fail or fall back to the remaining backends.",
+      "gridPos": {"x": 10, "y": 3, "w": 5, "h": 4},
+      "id": 3,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sozune_backends_unhealthy", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "unit": "short"
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "TLS routes",
+      "description": "Number of routes that terminate TLS (HTTPS). The remainder is plain HTTP. Useful to track HTTPS coverage across the fleet.",
+      "gridPos": {"x": 15, "y": 3, "w": 5, "h": 4},
+      "id": 4,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sozune_entrypoints_tls", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "purple", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "ACME",
+      "description": "ON = Sozune automatically obtains and renews Let's Encrypt certificates for its hostnames. OFF = no auto-issuance.",
+      "gridPos": {"x": 20, "y": 3, "w": 4, "h": 4},
+      "id": 5,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sozune_acme_enabled", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "OFF", "color": "red"}, "1": {"text": "ON", "color": "green"}}}
+          ],
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "piechart",
+      "title": "Routes by protocol",
+      "description": "How routes break down by protocol: HTTP (web traffic), TCP (raw proxying, e.g. Postgres), UDP (DNS, etc.).",
+      "gridPos": {"x": 0, "y": 7, "w": 12, "h": 8},
+      "id": 6,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sozune_entrypoints_by_protocol", "refId": "A", "legendFormat": "{{protocol}}"}],
+      "options": {
+        "legend": {"displayMode": "list", "placement": "right", "showLegend": true},
+        "pieType": "donut",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Diagnostics by severity",
+      "description": "Diagnostics emitted by Sozune: invalid ports, route collisions, misconfigured ACME, etc. Error (red) = blocking. Warn (yellow) = needs fixing. Info (blue) = informational.",
+      "gridPos": {"x": 12, "y": 7, "w": 12, "h": 8},
+      "id": 7,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sozune_diagnostics{severity=\"error\"}", "refId": "A", "legendFormat": "error"},
+        {"expr": "sozune_diagnostics{severity=\"warn\"}", "refId": "B", "legendFormat": "warn"},
+        {"expr": "sozune_diagnostics{severity=\"info\"}", "refId": "C", "legendFormat": "info"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "stacking": {"mode": "normal", "group": "A"},
+            "lineWidth": 0,
+            "fillOpacity": 100
+          },
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "error"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "warn"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]},
+          {"matcher": {"id": "byName", "options": "info"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Backends over time",
+      "description": "Green = total backends. Red = backends down. Track when backends come and go (container start/stop, pod crash).",
+      "gridPos": {"x": 0, "y": 15, "w": 24, "h": 8},
+      "id": 8,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sozune_backends", "refId": "A", "legendFormat": "total"},
+        {"expr": "sozune_backends_unhealthy", "refId": "B", "legendFormat": "down"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "down"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "total"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "text",
+      "title": "Sōzu worker metrics",
+      "gridPos": {"x": 0, "y": 23, "w": 24, "h": 2},
+      "id": 9,
+      "options": {
+        "mode": "markdown",
+        "content": "## Live Sōzu worker metrics\n\nValues polled every 5 s from the HTTP and HTTPS workers (connection, request, and error counters). If `last_poll` stops moving the proxy is no longer answering the poll — check the logs."
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Worker poll freshness",
+      "description": "Seconds since the last successful Sōzu worker poll. If this climbs past ~30 s, the observability pipeline is broken (worker blocked, command-channel dead).",
+      "gridPos": {"x": 0, "y": 25, "w": 6, "h": 4},
+      "id": 10,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "time() - sozune_proxy_last_poll_seconds", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 15},
+              {"color": "red", "value": 30}
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker counters (raw)",
+      "description": "Proxy-wide counters reported by Sōzu (connections, HTTP requests, 4xx/5xx errors, bytes in/out, etc.). Each line is one `key=` label. Wrap with `rate(...)` for per-second rates.",
+      "gridPos": {"x": 6, "y": 25, "w": 18, "h": 8},
+      "id": 11,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "rate(sozune_proxy_metric[1m])", "refId": "A", "legendFormat": "{{key}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 0}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["sozune"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Sozune Overview",
+  "uid": "sozune-overview",
+  "version": 2,
+  "weekStart": ""
+}

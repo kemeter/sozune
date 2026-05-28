@@ -7,6 +7,7 @@ use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
 use crate::model::{Entrypoint, Protocol};
 use crate::proxy::backend::ProxyInputs;
+use crate::proxy::metrics_snapshot;
 use acme::{add_certificate, register_acme_challenge_cluster};
 use addr::parse_backend_address;
 use builders::{
@@ -18,9 +19,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RemoveBackend,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, SocketAddress, WorkerRequest,
-        WorkerResponse, request::RequestType,
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
+        QueryMetricsOptions, RemoveBackend, Request, RequestHttpFrontend, RequestTcpFrontend,
+        ResponseStatus, RulePosition, SocketAddress, WorkerRequest, WorkerResponse,
+        request::RequestType, response_content::ContentType,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -147,6 +149,8 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         shutdown_rx,
         mut reload_rx,
         mut cert_rx,
+        mut metrics_poll_rx,
+        metrics_store,
         acme_challenge_port,
         middleware_state,
         middleware_port,
@@ -313,6 +317,40 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                         None => {
                             debug!("Cert channel closed, falling back to reload-only mode");
                             cert_rx_open = false;
+                            continue 'outer;
+                        }
+                    },
+                    poll = metrics_poll_rx.recv() => match poll {
+                        Some(()) => {
+                            // Drain coalesced pings so we only run one query
+                            // per wakeup even if the poller fires fast.
+                            while metrics_poll_rx.try_recv().is_ok() {}
+
+                            let mut merged = std::collections::BTreeMap::new();
+                            for (proxy_metrics, name) in [
+                                (poll_worker_metrics(&mut channels.http, "HTTP"), "HTTP"),
+                                (poll_worker_metrics(&mut channels.https, "HTTPS"), "HTTPS"),
+                            ] {
+                                debug!("metrics: {} worker returned {} keys", name, proxy_metrics.len());
+                                for (k, v) in proxy_metrics {
+                                    if let Some(value) = metrics_snapshot::convert(&v) {
+                                        metrics_snapshot::merge_into(&mut merged, k, value);
+                                    }
+                                }
+                            }
+
+                            match metrics_store.write() {
+                                Ok(mut snap) => {
+                                    snap.proxy = merged;
+                                    snap.last_poll_unix = metrics_snapshot::now_unix();
+                                }
+                                Err(e) => error!("metrics: snapshot lock poisoned: {}", e),
+                            }
+
+                            continue 'outer;
+                        }
+                        None => {
+                            debug!("Metrics poll channel closed");
                             continue 'outer;
                         }
                     },
@@ -942,6 +980,92 @@ fn configure_tcp_entrypoint(
             RequestType::AddBackend(backend),
         ) {
             debug!("Failed to add TCP backend {}-{}: {}", cluster_id, idx, e);
+        }
+    }
+}
+
+/// Send `QueryMetrics` to a single worker and return the proxy-wide metric
+/// map (worker counters/gauges, no per-cluster breakdown).
+///
+/// We request `no_clusters: true` to keep the response small — the API only
+/// exposes proxy-wide aggregates today. Returns an empty map on any error;
+/// callers log and move on (a transient worker hiccup must not poison the
+/// snapshot).
+fn poll_worker_metrics(
+    channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    name: &str,
+) -> std::collections::BTreeMap<String, sozu_command_lib::proto::command::FilteredMetrics> {
+    let id = format!("{}-metrics-{}", name, metrics_snapshot::now_unix());
+    let request = WorkerRequest {
+        id: id.clone(),
+        content: Request {
+            request_type: Some(RequestType::QueryMetrics(QueryMetricsOptions {
+                list: false,
+                cluster_ids: Vec::new(),
+                backend_ids: Vec::new(),
+                metric_names: Vec::new(),
+                no_clusters: true,
+                workers: false,
+            })),
+        },
+    };
+
+    if let Err(e) = channel.write_message(&request) {
+        error!(
+            "metrics: failed to write QueryMetrics to {} worker: {}",
+            name, e
+        );
+        return Default::default();
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            error!(
+                "metrics: timeout waiting for {} worker QueryMetrics response",
+                name
+            );
+            return Default::default();
+        }
+        match channel.read_message_blocking_timeout(Some(remaining)) {
+            Ok(response) => {
+                if response.id != id {
+                    debug!(
+                        "metrics: skipping unrelated response {} on {}",
+                        response.id, name
+                    );
+                    continue;
+                }
+                if response.status == ResponseStatus::Failure as i32 {
+                    error!(
+                        "metrics: {} worker rejected QueryMetrics: {}",
+                        name, response.message
+                    );
+                    return Default::default();
+                }
+                let Some(content) = response.content else {
+                    return Default::default();
+                };
+                match content.content_type {
+                    // Workers respond with WorkerMetrics (their own proxy +
+                    // cluster maps). The aggregated form Metrics(AggregatedMetrics)
+                    // only comes from the Sōzu main process, which we don't run.
+                    Some(ContentType::WorkerMetrics(wm)) => return wm.proxy,
+                    Some(ContentType::Metrics(agg)) => return agg.proxying,
+                    other => {
+                        debug!(
+                            "metrics: unexpected content from {} worker: {:?}",
+                            name, other
+                        );
+                        return Default::default();
+                    }
+                }
+            }
+            Err(e) => {
+                error!("metrics: error reading {} worker QueryMetrics: {}", name, e);
+                return Default::default();
+            }
         }
     }
 }

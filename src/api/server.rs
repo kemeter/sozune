@@ -30,6 +30,7 @@ pub struct AppState {
     /// by `GET /providers` to surface which providers are configured and
     /// whether their `enabled` flag is set.
     pub providers: crate::config::ProvidersConfig,
+    pub metrics: crate::proxy::metrics_snapshot::MetricsSnapshotStore,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
@@ -183,6 +184,7 @@ pub async fn serve(
     diagnostics: crate::diagnostics::DiagnosticsStore,
     acme_enabled: bool,
     providers: crate::config::ProvidersConfig,
+    metrics: crate::proxy::metrics_snapshot::MetricsSnapshotStore,
 ) -> anyhow::Result<()> {
     if config.users.is_empty() {
         anyhow::bail!(
@@ -198,6 +200,7 @@ pub async fn serve(
         diagnostics,
         acme_enabled,
         providers,
+        metrics,
     };
 
     let protected = Router::new()
@@ -226,6 +229,7 @@ pub async fn serve(
 
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(crate::api::metrics::metrics))
         .merge(authed)
         .with_state(state);
 
@@ -764,6 +768,7 @@ mod tests {
             diagnostics: crate::diagnostics::new_store(),
             acme_enabled: false,
             providers: crate::config::ProvidersConfig::default(),
+            metrics: crate::proxy::metrics_snapshot::new_store(),
         }
     }
 
