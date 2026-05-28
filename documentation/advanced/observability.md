@@ -7,8 +7,41 @@ Sōzune exposes a Prometheus-compatible `/metrics` endpoint so any Prometheus sc
 - Path: `/metrics` on the API listener (default `:3035`)
 - Method: `GET`
 - Auth: **none** (Prometheus scrapers don't authenticate by default; protect the listener with TLS / network ACLs at the perimeter)
-- Format: Prometheus text exposition `version=0.0.4`
 - Re-computed on every scrape from authoritative state — no background aggregator, no stale cache
+
+### Output formats
+
+The same endpoint serves two formats, picked by the request's `Accept` header:
+
+| `Accept` value | Response | Use case |
+|---|---|---|
+| missing, `*/*`, `text/plain`, … | Prometheus text exposition `version=0.0.4` | Prometheus scrapers, `curl`, anything that reads the standard format |
+| `application/json` | Structured JSON (same values, same names) | The Sōzune dashboard or any client that prefers to skip text parsing |
+
+JSON example:
+
+```json
+{
+  "static": {
+    "entrypoints": 14,
+    "entrypoints_by_protocol": {"http": 12, "tcp": 2},
+    "entrypoints_tls": 8,
+    "backends": 52,
+    "backends_unhealthy": 1,
+    "diagnostics": {"error": 0, "warn": 3, "info": 0},
+    "acme_enabled": true
+  },
+  "proxy": {
+    "last_poll_seconds": 1748547231,
+    "metrics": {
+      "connections": 14,
+      "http_requests": 1042
+    }
+  }
+}
+```
+
+Numeric values in both formats are produced from the same in-memory snapshot, so they can never drift.
 
 ## Static gauges
 

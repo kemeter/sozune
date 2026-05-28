@@ -1,94 +1,223 @@
-//! Prometheus text-format `/metrics` endpoint.
+//! `/metrics` endpoint with two output formats negotiated via `Accept`.
 //!
-//! Reads the live state (entrypoint store, unhealthy backends, diagnostics)
-//! and renders a snapshot in Prometheus exposition format. No moving parts,
-//! no background aggregator — every scrape recomputes from authoritative
-//! state, so the values are always consistent with what the API would
-//! return.
+//! Reads the live state (entrypoint store, unhealthy backends, diagnostics,
+//! Sōzu worker snapshot) and renders it in either:
 //!
-//! Endpoint is intentionally unauthenticated: Prometheus scrapers default
-//! to no auth and operators front the API with TLS / network ACLs anyway.
+//! - Prometheus text exposition `version=0.0.4` (default — what Prometheus
+//!   scrapers expect when no `Accept` is sent);
+//! - JSON, when the client sends `Accept: application/json`. Same data,
+//!   structured for direct consumption by the dashboard or any other client
+//!   that prefers to skip the text-parsing step.
+//!
+//! No moving parts, no background aggregator — every scrape recomputes from
+//! authoritative state, so values are always consistent with what the rest of
+//! the API would return.
+//!
+//! Endpoint is intentionally unauthenticated: Prometheus scrapers default to
+//! no auth and operators front the API with TLS / network ACLs anyway.
 
 use crate::api::server::AppState;
 use crate::labels::diagnostic::Severity;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
 use tracing::error;
 
-const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const PROM_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
-pub async fn metrics(State(state): State<AppState>) -> Response {
-    let body = render(&state);
+pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let snap = Snapshot::collect(&state);
+
+    let (body, content_type) = if wants_json(&headers) {
+        let body = serde_json::to_string(&snap).unwrap_or_else(|e| {
+            error!("metrics: JSON serialization failed: {}", e);
+            "{}".to_string()
+        });
+        (body, JSON_CONTENT_TYPE)
+    } else {
+        (render_prom(&snap), PROM_CONTENT_TYPE)
+    };
+
     let mut response = (StatusCode::OK, body).into_response();
     response
         .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
 }
 
-fn render(state: &AppState) -> String {
-    let mut out = String::with_capacity(1024);
+/// Returns true when the request's `Accept` header asks for JSON. Anything
+/// else — including no `Accept`, `*/*`, or the Prometheus content-type — falls
+/// back to Prometheus text so existing scrapers are never surprised by a JSON
+/// body.
+fn wants_json(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    accept
+        .split(',')
+        .map(|part| part.split(';').next().unwrap_or("").trim())
+        .any(|media| media.eq_ignore_ascii_case("application/json"))
+}
 
-    let (entrypoints_total, backends_total, tls_total, by_protocol) = match state.storage.read() {
-        Ok(guard) => {
-            let entrypoints = guard.len();
-            let backends: usize = guard.values().map(|e| e.backends.len()).sum();
-            let tls = guard.values().filter(|e| e.config.tls).count();
-            let mut by_proto: HashMap<&'static str, usize> = HashMap::new();
-            for ep in guard.values() {
-                let key = match ep.protocol {
-                    crate::model::Protocol::Http => "http",
-                    crate::model::Protocol::Tcp => "tcp",
-                    crate::model::Protocol::Udp => "udp",
-                };
-                *by_proto.entry(key).or_insert(0) += 1;
+/// Numeric snapshot of every metric we expose, computed once per scrape from
+/// the live `AppState`. Both renderers (Prometheus text and JSON) read from
+/// this struct so the two formats can never drift on values.
+#[derive(Debug, Serialize)]
+struct Snapshot {
+    #[serde(rename = "static")]
+    static_metrics: StaticMetrics,
+    proxy: ProxyMetrics,
+}
+
+#[derive(Debug, Serialize)]
+struct StaticMetrics {
+    entrypoints: usize,
+    entrypoints_by_protocol: HashMap<&'static str, usize>,
+    entrypoints_tls: usize,
+    backends: usize,
+    backends_unhealthy: usize,
+    diagnostics: DiagnosticsCounts,
+    acme_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticsCounts {
+    error: usize,
+    warn: usize,
+    info: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyMetrics {
+    /// Unix timestamp (seconds) of the last successful Sōzu worker poll.
+    /// `0` if no poll has ever succeeded.
+    last_poll_seconds: u64,
+    /// Per-key proxy counters/gauges as reported by Sōzu workers.
+    metrics: HashMap<String, i128>,
+}
+
+impl Snapshot {
+    fn collect(state: &AppState) -> Self {
+        let (entrypoints_total, backends_total, tls_total, by_protocol) = match state.storage.read()
+        {
+            Ok(guard) => {
+                let entrypoints = guard.len();
+                let backends: usize = guard.values().map(|e| e.backends.len()).sum();
+                let tls = guard.values().filter(|e| e.config.tls).count();
+                let mut by_proto: HashMap<&'static str, usize> = HashMap::new();
+                for ep in guard.values() {
+                    let key = match ep.protocol {
+                        crate::model::Protocol::Http => "http",
+                        crate::model::Protocol::Tcp => "tcp",
+                        crate::model::Protocol::Udp => "udp",
+                    };
+                    *by_proto.entry(key).or_insert(0) += 1;
+                }
+                (entrypoints, backends, tls, by_proto)
             }
-            (entrypoints, backends, tls, by_proto)
-        }
-        Err(e) => {
-            error!("metrics: storage lock poisoned: {}", e);
-            (0, 0, 0, HashMap::new())
-        }
-    };
+            Err(e) => {
+                error!("metrics: storage lock poisoned: {}", e);
+                (0, 0, 0, HashMap::new())
+            }
+        };
 
-    let unhealthy_total = match state.unhealthy_backends.read() {
-        Ok(guard) => guard.len(),
-        Err(e) => {
-            error!("metrics: unhealthy_backends lock poisoned: {}", e);
-            0
-        }
-    };
+        let unhealthy_total = match state.unhealthy_backends.read() {
+            Ok(guard) => guard.len(),
+            Err(e) => {
+                error!("metrics: unhealthy_backends lock poisoned: {}", e);
+                0
+            }
+        };
 
-    let (errors, warnings, infos) = match state.diagnostics.read() {
-        Ok(guard) => {
-            let mut e = 0usize;
-            let mut w = 0usize;
-            let mut i = 0usize;
-            for diags in guard.values() {
-                for d in diags {
-                    match d.severity() {
-                        Severity::Error => e += 1,
-                        Severity::Warn => w += 1,
-                        Severity::Info => i += 1,
+        let (errors, warnings, infos) = match state.diagnostics.read() {
+            Ok(guard) => {
+                let mut e = 0usize;
+                let mut w = 0usize;
+                let mut i = 0usize;
+                for diags in guard.values() {
+                    for d in diags {
+                        match d.severity() {
+                            Severity::Error => e += 1,
+                            Severity::Warn => w += 1,
+                            Severity::Info => i += 1,
+                        }
                     }
                 }
+                (e, w, i)
             }
-            (e, w, i)
+            Err(e) => {
+                error!("metrics: diagnostics lock poisoned: {}", e);
+                (0, 0, 0)
+            }
+        };
+
+        let proxy = ProxyMetrics::collect(state);
+
+        Snapshot {
+            static_metrics: StaticMetrics {
+                entrypoints: entrypoints_total,
+                entrypoints_by_protocol: by_protocol,
+                entrypoints_tls: tls_total,
+                backends: backends_total,
+                backends_unhealthy: unhealthy_total,
+                diagnostics: DiagnosticsCounts {
+                    error: errors,
+                    warn: warnings,
+                    info: infos,
+                },
+                acme_enabled: state.acme_enabled,
+            },
+            proxy,
         }
-        Err(e) => {
-            error!("metrics: diagnostics lock poisoned: {}", e);
-            (0, 0, 0)
+    }
+}
+
+impl ProxyMetrics {
+    fn collect(state: &AppState) -> Self {
+        use crate::proxy::metrics_snapshot::MetricValue;
+
+        let snap = match state.metrics.read() {
+            Ok(g) => g.clone(),
+            Err(e) => {
+                error!("metrics: snapshot lock poisoned: {}", e);
+                return ProxyMetrics {
+                    last_poll_seconds: 0,
+                    metrics: HashMap::new(),
+                };
+            }
+        };
+
+        let mut metrics: HashMap<String, i128> = HashMap::with_capacity(snap.proxy.len());
+        for (key, value) in &snap.proxy {
+            let safe = sanitize_metric_name(key);
+            let v: i128 = match value {
+                MetricValue::Gauge(g) => *g as i128,
+                MetricValue::Count(c) => *c as i128,
+                MetricValue::Time(t) => *t as i128,
+            };
+            metrics.insert(safe, v);
         }
-    };
+
+        ProxyMetrics {
+            last_poll_seconds: snap.last_poll_unix,
+            metrics,
+        }
+    }
+}
+
+fn render_prom(snap: &Snapshot) -> String {
+    let mut out = String::with_capacity(1024);
+    let s = &snap.static_metrics;
 
     write_gauge(
         &mut out,
         "sozune_entrypoints",
         "Number of entrypoints currently loaded.",
-        entrypoints_total,
+        s.entrypoints,
     );
 
     let _ = writeln!(
@@ -96,7 +225,7 @@ fn render(state: &AppState) -> String {
         "# HELP sozune_entrypoints_by_protocol Number of entrypoints per protocol."
     );
     let _ = writeln!(&mut out, "# TYPE sozune_entrypoints_by_protocol gauge");
-    for (proto, count) in &by_protocol {
+    for (proto, count) in &s.entrypoints_by_protocol {
         let _ = writeln!(
             &mut out,
             "sozune_entrypoints_by_protocol{{protocol=\"{proto}\"}} {count}"
@@ -107,19 +236,19 @@ fn render(state: &AppState) -> String {
         &mut out,
         "sozune_entrypoints_tls",
         "Number of entrypoints with TLS enabled.",
-        tls_total,
+        s.entrypoints_tls,
     );
     write_gauge(
         &mut out,
         "sozune_backends",
         "Total number of backends across all entrypoints.",
-        backends_total,
+        s.backends,
     );
     write_gauge(
         &mut out,
         "sozune_backends_unhealthy",
         "Number of backends currently marked unhealthy by the active health check.",
-        unhealthy_total,
+        s.backends_unhealthy,
     );
 
     let _ = writeln!(
@@ -129,66 +258,46 @@ fn render(state: &AppState) -> String {
     let _ = writeln!(&mut out, "# TYPE sozune_diagnostics gauge");
     let _ = writeln!(
         &mut out,
-        "sozune_diagnostics{{severity=\"error\"}} {errors}"
+        "sozune_diagnostics{{severity=\"error\"}} {}",
+        s.diagnostics.error
     );
     let _ = writeln!(
         &mut out,
-        "sozune_diagnostics{{severity=\"warn\"}} {warnings}"
+        "sozune_diagnostics{{severity=\"warn\"}} {}",
+        s.diagnostics.warn
     );
-    let _ = writeln!(&mut out, "sozune_diagnostics{{severity=\"info\"}} {infos}");
+    let _ = writeln!(
+        &mut out,
+        "sozune_diagnostics{{severity=\"info\"}} {}",
+        s.diagnostics.info
+    );
 
     write_gauge(
         &mut out,
         "sozune_acme_enabled",
         "1 if ACME is enabled, 0 otherwise.",
-        if state.acme_enabled { 1 } else { 0 },
+        if s.acme_enabled { 1 } else { 0 },
     );
-
-    render_proxy_metrics(&mut out, state);
-
-    out
-}
-
-/// Append `sozune_proxy_*` series sourced from the latest Sōzu workers
-/// snapshot. Names are derived from the worker metric key — only `[A-Za-z0-9_]`
-/// characters are kept and dots become underscores. Unknown / unsupported
-/// kinds are skipped silently (already filtered at the snapshot level).
-fn render_proxy_metrics(out: &mut String, state: &AppState) {
-    use crate::proxy::metrics_snapshot::MetricValue;
-
-    let snap = match state.metrics.read() {
-        Ok(g) => g.clone(),
-        Err(e) => {
-            error!("metrics: snapshot lock poisoned: {}", e);
-            return;
-        }
-    };
 
     write_gauge(
-        out,
+        &mut out,
         "sozune_proxy_last_poll_seconds",
         "Unix timestamp of the last successful Sōzu metrics poll. 0 means never.",
-        snap.last_poll_unix as usize,
+        snap.proxy.last_poll_seconds as usize,
     );
 
-    if snap.proxy.is_empty() {
-        return;
+    if !snap.proxy.metrics.is_empty() {
+        let _ = writeln!(
+            &mut out,
+            "# HELP sozune_proxy_metric Proxy metric forwarded from Sōzu workers (gauge or counter)."
+        );
+        let _ = writeln!(&mut out, "# TYPE sozune_proxy_metric untyped");
+        for (key, value) in &snap.proxy.metrics {
+            let _ = writeln!(&mut out, "sozune_proxy_metric{{key=\"{key}\"}} {value}");
+        }
     }
 
-    let _ = writeln!(
-        out,
-        "# HELP sozune_proxy_metric Proxy metric forwarded from Sōzu workers (gauge or counter)."
-    );
-    let _ = writeln!(out, "# TYPE sozune_proxy_metric untyped");
-    for (key, value) in &snap.proxy {
-        let safe = sanitize_metric_name(key);
-        let v: i128 = match value {
-            MetricValue::Gauge(g) => *g as i128,
-            MetricValue::Count(c) => *c as i128,
-            MetricValue::Time(t) => *t as i128,
-        };
-        let _ = writeln!(out, "sozune_proxy_metric{{key=\"{safe}\"}} {v}");
-    }
+    out
 }
 
 fn sanitize_metric_name(key: &str) -> String {
@@ -273,7 +382,7 @@ mod tests {
 
     #[test]
     fn renders_zeros_for_empty_state() {
-        let body = render(&empty_state());
+        let body = render_prom(&Snapshot::collect(&empty_state()));
         assert!(body.contains("sozune_entrypoints 0"));
         assert!(body.contains("sozune_backends 0"));
         assert!(body.contains("sozune_backends_unhealthy 0"));
@@ -289,7 +398,7 @@ mod tests {
             s.insert("a".into(), make_ep("a", "a.example.com", false, 2));
             s.insert("b".into(), make_ep("b", "b.example.com", true, 3));
         }
-        let body = render(&state);
+        let body = render_prom(&Snapshot::collect(&state));
         assert!(body.contains("sozune_entrypoints 2"));
         assert!(body.contains("sozune_backends 5"));
         assert!(body.contains("sozune_entrypoints_tls 1"));
@@ -308,7 +417,7 @@ mod tests {
                 last_checked: 0,
             },
         );
-        let body = render(&state);
+        let body = render_prom(&Snapshot::collect(&state));
         assert!(body.contains("sozune_backends_unhealthy 1"));
     }
 
@@ -329,7 +438,7 @@ mod tests {
                 ),
             ],
         );
-        let body = render(&state);
+        let body = render_prom(&Snapshot::collect(&state));
         assert!(body.contains("sozune_diagnostics{severity=\"warn\"} 2"));
     }
 
@@ -337,13 +446,13 @@ mod tests {
     fn acme_enabled_reflects_state() {
         let mut state = empty_state();
         state.acme_enabled = true;
-        let body = render(&state);
+        let body = render_prom(&Snapshot::collect(&state));
         assert!(body.contains("sozune_acme_enabled 1"));
     }
 
     #[test]
     fn proxy_metrics_section_present_with_zero_poll() {
-        let body = render(&empty_state());
+        let body = render_prom(&Snapshot::collect(&empty_state()));
         assert!(body.contains("sozune_proxy_last_poll_seconds 0"));
         assert!(!body.contains("sozune_proxy_metric{"));
     }
@@ -360,7 +469,7 @@ mod tests {
             snap.proxy
                 .insert("connections".into(), MetricValue::Gauge(7));
         }
-        let body = render(&state);
+        let body = render_prom(&Snapshot::collect(&state));
         assert!(body.contains("sozune_proxy_last_poll_seconds 12345"));
         assert!(body.contains("sozune_proxy_metric{key=\"http_requests\"} 42"));
         assert!(body.contains("sozune_proxy_metric{key=\"connections\"} 7"));
@@ -377,7 +486,7 @@ mod tests {
 
     #[test]
     fn output_is_prometheus_text_format() {
-        let body = render(&empty_state());
+        let body = render_prom(&Snapshot::collect(&empty_state()));
         // Each metric must be preceded by HELP and TYPE lines.
         assert!(body.contains("# HELP sozune_entrypoints"));
         assert!(body.contains("# TYPE sozune_entrypoints gauge"));
@@ -415,5 +524,154 @@ mod tests {
             .to_str()
             .expect("ASCII header");
         assert_eq!(header_value, "text/plain; version=0.0.4; charset=utf-8");
+    }
+
+    /// `Accept: application/json` must return a JSON body with the right
+    /// content-type. The dashboard relies on this so it can render metrics
+    /// without parsing the text format.
+    #[tokio::test]
+    async fn accept_json_returns_json_body() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        use axum::routing::get;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = empty_state();
+        let app = Router::new()
+            .route("/metrics", get(super::metrics))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json; charset=utf-8")
+        );
+
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response body is valid JSON");
+
+        // The top-level shape is stable contract for the dashboard.
+        assert!(json["static"]["entrypoints"].is_number());
+        assert!(json["static"]["backends"].is_number());
+        assert!(json["static"]["diagnostics"]["error"].is_number());
+        assert!(json["static"]["acme_enabled"].is_boolean());
+        assert!(json["proxy"]["last_poll_seconds"].is_number());
+        assert!(json["proxy"]["metrics"].is_object());
+    }
+
+    /// JSON and Prometheus must always agree on the numeric values — they read
+    /// from the same `Snapshot`. This guards against future refactors that
+    /// would let one format drift from the other.
+    #[tokio::test]
+    async fn prom_and_json_agree_on_values() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        use axum::routing::get;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let state = empty_state();
+        // Seed with one unhealthy backend so the comparison covers a non-zero
+        // value, not just defaults.
+        state.unhealthy_backends.write().unwrap().insert(
+            "10.0.0.99:80".into(),
+            UnhealthyReason {
+                kind: UnhealthyKind::Timeout,
+                message: "timeout".into(),
+                since: 0,
+                last_checked: 0,
+            },
+        );
+
+        let app = Router::new()
+            .route("/metrics", get(super::metrics))
+            .with_state(state);
+
+        let prom_bytes = app
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let prom = std::str::from_utf8(&prom_bytes).unwrap().to_string();
+
+        let json_bytes = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+
+        assert!(prom.contains("sozune_backends_unhealthy 1"));
+        assert_eq!(json["static"]["backends_unhealthy"], 1);
+    }
+
+    #[test]
+    fn wants_json_recognizes_application_json() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        assert!(wants_json(&h));
+    }
+
+    #[test]
+    fn wants_json_handles_multiple_media_types() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            "text/html, application/json;q=0.9, */*;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert!(wants_json(&h));
+    }
+
+    #[test]
+    fn wants_json_defaults_to_false_for_text() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::ACCEPT, "text/plain".parse().unwrap());
+        assert!(!wants_json(&h));
+    }
+
+    #[test]
+    fn wants_json_defaults_to_false_when_absent() {
+        let h = axum::http::HeaderMap::new();
+        assert!(!wants_json(&h));
     }
 }
