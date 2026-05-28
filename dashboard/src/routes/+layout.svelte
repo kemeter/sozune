@@ -9,7 +9,7 @@
   let { children } = $props();
 
   const nav = [
-    { href: './', label: 'Entrypoints', icon: 'grid' },
+    { href: './entrypoints', label: 'Entrypoints', icon: 'grid' },
     { href: './providers', label: 'Providers', icon: 'plug' },
     { href: './diagnostics', label: 'Diagnostics', icon: 'warning' },
     { href: './certificates', label: 'Certificates', icon: 'lock' },
