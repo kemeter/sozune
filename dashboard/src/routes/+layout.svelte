@@ -68,13 +68,26 @@
 {:else}
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand">
-        <div class="logo">s</div>
+      <a class="brand" href="./" aria-label="Sōzune dashboard home">
+        <svg
+          class="logo"
+          viewBox="0 0 256 256"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+        >
+          <g fill="none" stroke="currentColor" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="128" cy="128" r="100" />
+            <path d="M58 90 L140 110 L140 130 L58 110 Z" />
+            <path d="M134 132 L134 156" stroke-width="8" />
+            <path d="M90 144 L178 164 L178 184 L90 164 Z" />
+            <path d="M172 186 L172 206" stroke-width="8" />
+          </g>
+        </svg>
         <div class="brand-text">
           <div class="brand-name">sozune</div>
           <div class="brand-sub">dashboard</div>
         </div>
-      </div>
+      </a>
 
       <nav>
         {#each nav as item}
@@ -149,19 +162,22 @@
     padding: 0.25rem 0.5rem 1.25rem;
     margin-bottom: 0.5rem;
     border-bottom: 1px solid var(--border);
+    text-decoration: none;
+    color: inherit;
+  }
+  .brand:hover .brand-name {
+    color: var(--fg-0);
   }
 
   .logo {
     width: 32px;
     height: 32px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, var(--accent), #3a6fd9);
-    color: white;
-    display: grid;
-    place-items: center;
-    font-weight: 700;
-    font-size: 1.05rem;
-    box-shadow: 0 2px 8px rgba(91, 141, 255, 0.3);
+    color: #ffffff;
+    flex-shrink: 0;
+    transition: opacity 120ms ease;
+  }
+  .brand:hover .logo {
+    opacity: 0.85;
   }
 
   .brand-name {
