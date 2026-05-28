@@ -111,9 +111,16 @@
       <tbody>
         {#each providers as p (p.name)}
           {@const s = statusOf(p)}
-          <tr class:disabled={s !== 'active'}>
+          {@const canDrill = p.entrypoint_count > 0}
+          <tr class:disabled={s !== 'active'} class:clickable={canDrill}>
             <td>
-              <span class="provider-name">{p.name}</span>
+              {#if canDrill}
+                <a class="provider-link" href={`../entrypoints?source=${encodeURIComponent(p.name)}`}>
+                  <span class="provider-name">{p.name}</span>
+                </a>
+              {:else}
+                <span class="provider-name">{p.name}</span>
+              {/if}
             </td>
             <td>
               <span class="status-pill" class:active={s === 'active'} class:warn={s === 'disabled'}>
@@ -261,6 +268,20 @@
   .provider-name {
     font-weight: 500;
     color: var(--fg-0);
+  }
+  .provider-link {
+    display: inline-block;
+    text-decoration: none;
+    color: inherit;
+  }
+  .provider-link:hover .provider-name {
+    color: var(--accent);
+  }
+  tr.clickable {
+    cursor: pointer;
+  }
+  tr.clickable:hover {
+    background: var(--bg-2);
   }
 
   .status-pill {

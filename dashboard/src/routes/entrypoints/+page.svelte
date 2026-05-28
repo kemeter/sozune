@@ -11,19 +11,72 @@
   } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
+  type ProtocolFilter = 'all' | 'Http' | 'Tcp' | 'Udp';
+  type TlsFilter = 'all' | 'on' | 'off';
+  type HealthFilter = 'all' | 'healthy' | 'degraded';
+  type DiagFilter = 'all' | 'with' | 'without';
+
+  /** Read a query param with a default. Safe to call before mount (returns
+   *  the fallback during SSR). */
+  function getParam(key: string, fallback: string): string {
+    if (typeof window === 'undefined') return fallback;
+    const v = new URL(window.location.href).searchParams.get(key);
+    return v ?? fallback;
+  }
+
   let entrypoints = $state<Entrypoint[]>([]);
   let globalDiagnostics = $state<Diagnostic[]>([]);
   let error = $state<string | null>(null);
   let loading = $state(true);
   let lastRefresh = $state<Date | null>(null);
-  let search = $state('');
-  let protocolFilter = $state<'all' | 'Http' | 'Tcp' | 'Udp'>('all');
-  let sourceFilter = $state<string>('all');
-  let tlsFilter = $state<'all' | 'on' | 'off'>('all');
-  let healthFilter = $state<'all' | 'healthy' | 'degraded'>('all');
-  let diagFilter = $state<'all' | 'with' | 'without'>('all');
+
+  /** Filter state is driven by the URL so links can deep-link a pre-filtered
+   *  view (e.g. /entrypoints?source=docker) and reload/share keeps filters. */
+  let search = $state(getParam('q', ''));
+  let protocolFilter = $state<ProtocolFilter>(getParam('protocol', 'all') as ProtocolFilter);
+  let sourceFilter = $state<string>(getParam('source', 'all'));
+  let tlsFilter = $state<TlsFilter>(getParam('tls', 'all') as TlsFilter);
+  let healthFilter = $state<HealthFilter>(getParam('health', 'all') as HealthFilter);
+  let diagFilter = $state<DiagFilter>(getParam('diag', 'all') as DiagFilter);
 
   let poll: ReturnType<typeof setInterval> | null = null;
+
+  /** Push the current filter state back into the URL. `replaceState` keeps
+   *  the browser back button useful — it goes "to where I came from", not
+   *  "through every filter toggle". */
+  function syncUrl() {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    const params = url.searchParams;
+
+    const writeOrClear = (key: string, value: string, def: string) => {
+      if (value === def || value === '') params.delete(key);
+      else params.set(key, value);
+    };
+
+    writeOrClear('q', search, '');
+    writeOrClear('protocol', protocolFilter, 'all');
+    writeOrClear('source', sourceFilter, 'all');
+    writeOrClear('tls', tlsFilter, 'all');
+    writeOrClear('health', healthFilter, 'all');
+    writeOrClear('diag', diagFilter, 'all');
+
+    const next = url.pathname + (params.toString() ? `?${params}` : '');
+    if (next !== url.pathname + url.search) {
+      void goto(next, { replaceState: true, keepFocus: true, noScroll: true });
+    }
+  }
+
+  $effect(() => {
+    // Touch every filter so the effect re-runs when any changes.
+    search;
+    protocolFilter;
+    sourceFilter;
+    tlsFilter;
+    healthFilter;
+    diagFilter;
+    syncUrl();
+  });
 
   /** All distinct values found in `entrypoint.source` across the current set,
    *  feeding the source-filter dropdown. `api` covers entrypoints created via
