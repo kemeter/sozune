@@ -14,7 +14,17 @@
   const id = $derived($page.params.id ?? '');
 
   function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
-    return (ep.unhealthy_backends ?? []).includes(backendKey(backend));
+    const key = backendKey(backend);
+    return (ep.unhealthy_backends ?? []).some((u) => u.address === key);
+  }
+
+  function backendDownReason(
+    ep: Entrypoint,
+    backend: Backend
+  ): { kind: string; message: string } | null {
+    const key = backendKey(backend);
+    const u = (ep.unhealthy_backends ?? []).find((x) => x.address === key);
+    return u ? { kind: u.kind, message: u.message } : null;
   }
 
   async function load(silent = false) {
@@ -166,12 +176,18 @@
         </thead>
         <tbody>
           {#each entrypoint.backends as backend}
+            {@const reason = backendDownReason(entrypoint, backend)}
             <tr>
               <td class="mono">{backendKey(backend)}</td>
               <td class="mono">{backend.weight}</td>
               <td>
-                {#if isBackendDown(entrypoint, backend)}
-                  <span class="status-pill down">down</span>
+                {#if reason}
+                  <div class="status-stack">
+                    <span class="status-pill down">
+                      down · {reason.kind.replaceAll('_', ' ')}
+                    </span>
+                    <span class="status-reason mono">{reason.message}</span>
+                  </div>
                 {:else}
                   <span class="status-pill up">healthy</span>
                 {/if}
@@ -432,6 +448,18 @@
   .status-pill.down {
     background: var(--danger-bg);
     color: var(--danger);
+  }
+  .status-stack {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .status-reason {
+    font-size: 0.75rem;
+    color: var(--muted);
+    line-height: 1.3;
+    word-break: break-word;
   }
   .backends-table tbody tr:last-child td,
   .kv-table tbody tr:last-child td {

@@ -46,12 +46,26 @@ fi
 ep_id=$(echo "$create_body" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 
 if [[ -n "$ep_id" ]]; then
+    get_response=$(curl -s --max-time 2 \
+        -H "$AUTH_HEADER" "$API_URL/entrypoints/$ep_id" 2>/dev/null || echo "")
     get_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
         -H "$AUTH_HEADER" "$API_URL/entrypoints/$ep_id" 2>/dev/null || echo "000")
     if [[ "$get_status" == "200" ]]; then
         pass "API get entrypoint by ID returns 200"
     else
         fail "API get entrypoint returned $get_status instead of 200"
+    fi
+
+    # Confirm the GET payload exposes `unhealthy_backends` as an array — the
+    # field is now an array of objects (`{address, kind, message, since,
+    # last_checked}`), not the legacy `string[]`. Content/kind classification
+    # is exercised by Rust unit tests; this assertion only locks down the
+    # response shape so dashboards and clients can rely on it.
+    shape=$(echo "$get_response" | grep -o '"unhealthy_backends":\[[^]]*\]' || true)
+    if [[ -n "$shape" ]]; then
+        pass "API entrypoint payload exposes unhealthy_backends as an array"
+    else
+        fail "API entrypoint payload is missing the unhealthy_backends array (got: $get_response)"
     fi
 
     update_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \

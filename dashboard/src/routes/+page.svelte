@@ -123,7 +123,8 @@
   }
 
   function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
-    return (ep.unhealthy_backends ?? []).includes(backendKey(backend));
+    const key = backendKey(backend);
+    return (ep.unhealthy_backends ?? []).some((u) => u.address === key);
   }
 
   function downCount(ep: Entrypoint): number {
