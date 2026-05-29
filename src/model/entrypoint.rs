@@ -123,6 +123,25 @@ pub struct EntrypointConfig {
     /// Overrides the listener-level defaults for this entrypoint only.
     #[serde(default)]
     pub error_pages: BTreeMap<String, String>,
+    /// Request header match conditions. When non-empty, a request is served by
+    /// this entrypoint only if every listed header is present with the given
+    /// value. Sōzu routes on host/path/method only, so this is enforced by a
+    /// middleware that returns `404` when a condition fails.
+    #[serde(default)]
+    pub match_headers: Vec<MatchCondition>,
+    /// Query-parameter match conditions. Same semantics as `match_headers`,
+    /// against the request's query string.
+    #[serde(default)]
+    pub match_query: Vec<MatchCondition>,
+}
+
+/// One key/value match condition used by header and query matching. An empty
+/// `value` matches on key presence alone.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MatchCondition {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

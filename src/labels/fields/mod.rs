@@ -9,3 +9,4 @@ pub mod path;
 pub mod plugins;
 pub mod ratelimit;
 pub mod redirect;
+pub mod request_match;

@@ -333,6 +333,15 @@ services:
       - "sozune.http.svcerrorpages.errorPages.503=<html>cluster maintenance</html>"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-match:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcmatch.host=$HOST_MATCH"
+      - "sozune.http.svcmatch.matchHeaders=X-Env:prod"
+      - "sozune.http.svcmatch.matchQuery=version:2"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-fauth:
     image: traefik/whoami
     labels:

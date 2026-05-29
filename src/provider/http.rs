@@ -167,6 +167,8 @@ mod tests {
                 acme: None,
                 plugins: Vec::new(),
                 error_pages: std::collections::BTreeMap::new(),
+                match_headers: Vec::new(),
+                match_query: Vec::new(),
             },
             source: None,
         }])

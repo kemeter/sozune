@@ -75,6 +75,14 @@ pub fn rate_limited(host: &str) -> Response<Body> {
     )
 }
 
+pub fn no_match(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::NOT_FOUND,
+        "no-match",
+        format!("sozune: request did not meet the match conditions for host '{host}'.\n"),
+    )
+}
+
 fn diag_response(status: StatusCode, reason: &str, debug_body: String) -> Response<Body> {
     let body = if debug_enabled() {
         debug_body
