@@ -125,3 +125,41 @@
   border: none;
   border-top: 1px solid var(--border-subtle);
 }
+
+.doc-content .doc-cta {
+  display: block;
+  margin: 24px 0;
+  padding: 20px 24px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  text-decoration: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.doc-content .doc-cta:hover {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-elevated);
+  transform: translateY(-1px);
+  text-decoration: none;
+}
+
+.doc-content .doc-cta-title {
+  display: block;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--accent);
+}
+
+.doc-content .doc-cta-title::after {
+  content: ' →';
+  color: var(--accent);
+}
+
+.doc-content .doc-cta-desc {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+  color: var(--text-secondary);
+}

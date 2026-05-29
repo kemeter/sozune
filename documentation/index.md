@@ -1,6 +1,6 @@
 # Sōzune
 
-The modern reverse proxy, without the painful config.
+The modern reverse proxy. Routing you can read, configured the way you already describe your services.
 
 Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Podman, Swarm, Kubernetes, Nomad, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
 
@@ -12,53 +12,36 @@ Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu).
 - **Automatic HTTPS** — ACME provisioning and renewal, no intervention.
 - **HTTP/2 by default** — negotiated through ALPN on every TLS listener.
 - **Hot reload** — the REST API applies changes on the fly, no downtime.
+- **Built-in diagnostics** — an `X-Sozune-Diagnostic` header on every routing failure, plus explanatory `502` bodies and a did-you-mean for mistyped hosts under `SOZUNE_DEBUG`.
 
-## Get started
+## How it works
 
-- [Installation](/documentation/getting-started/installation)
-- [Quick start](/documentation/getting-started/quick-start)
+```
+   From the Internet              Sōzune                       To your infrastructure
 
-## Configuration
+  ┌──────────────────┐               ┌───────────┐                ┌──────────────────┐
+  │ api.domain.com   │── HTTPS ─┐    │ Security  │             ┌─▶│   Kubernetes     │
+  └──────────────────┘          │    ├───────────┤             │  └──────────────────┘
+  ┌──────────────────┐          │    │  Routing  │             │  ┌──────────────────┐
+  │ domain.com       │── HTTP ──┼───▶│  Engine   │─────────────┼─▶│ Docker · Podman  │
+  └──────────────────┘          │    ├───────────┤             │  │ Swarm · Nomad    │
+  ┌──────────────────┐          │    │ ACME/TLS  │             │  └──────────────────┘
+  │ shop.domain.com  │── TCP ───┘    │ Hot reload│             │  ┌──────────────────┐
+  └──────────────────┘               └───────────┘             └─▶│ Bare metal / VM  │
+                                                                   └──────────────────┘
+```
 
-- [Configuration overview](/documentation/configuration/overview)
-- [Docker labels](/documentation/providers/docker)
-- [Podman provider](/documentation/providers/podman)
-- [Swarm provider](/documentation/providers/swarm)
-- [Kubernetes provider](/documentation/providers/kubernetes)
-- [Nomad provider](/documentation/providers/nomad)
-- [HTTP provider](/documentation/providers/http)
-- [REST API](/documentation/configuration/api)
-- [Dashboard](/documentation/configuration/dashboard)
+Sōzune watches your platform for service definitions, builds routes from labels, tags,
+or files, terminates TLS, and hands traffic to the right backend — reconfiguring live
+as services come and go.
 
-## Routing
+## New here?
 
-- [Hostnames](/documentation/routing/hostnames)
-- [Path matching](/documentation/routing/path-matching)
-- [Load balancing](/documentation/routing/load-balancing)
-- [TCP](/documentation/routing/tcp)
+Point Sōzune at your services and have your first route live in a couple of minutes.
 
-## TLS
+<a class="doc-cta" href="/documentation/getting-started/quick-start">
+  <span class="doc-cta-title">Quick start</span>
+  <span class="doc-cta-desc">Install Sōzune and expose your first service.</span>
+</a>
 
-- [TLS overview](/documentation/tls/overview)
-- [ACME / Let's Encrypt](/documentation/tls/acme)
-
-## Middleware
-
-- [Basic auth](/documentation/middleware/auth)
-- [Forward auth](/documentation/middleware/forward-auth)
-- [Custom headers](/documentation/middleware/headers)
-- [Strip prefix](/documentation/middleware/strip-prefix)
-- [Add prefix](/documentation/middleware/add-prefix)
-- [Redirects](/documentation/middleware/redirects)
-- [Rate limit](/documentation/middleware/rate-limit)
-- [Response compression](/documentation/middleware/compress)
-- [Backend timeout](/documentation/middleware/backend-timeout)
-- [Error pages](/documentation/middleware/error-pages)
-
-## Advanced
-
-- [Health checks](/documentation/advanced/health-checks)
-- [WebSocket](/documentation/advanced/websocket)
-- [Server-Sent Events](/documentation/advanced/sse)
-- [Long-polling](/documentation/advanced/long-polling)
-- [Access logs](/documentation/advanced/access-logs)
+Already running? The full table of contents lives in the sidebar — pick a provider, dive into routing and TLS, or browse the middleware reference.
