@@ -357,6 +357,15 @@ pub struct ProxyConfig {
         deserialize_with = "deserialize_reload_debounce_ms_with_env"
     )]
     pub reload_debounce_ms: u64,
+    /// CIDRs of reverse-proxies that sit in front of Sōzune and are trusted
+    /// to set `X-Forwarded-For`. **Empty by default** — when no entry is
+    /// configured, Sōzune ignores `X-Forwarded-For` entirely and treats the
+    /// direct TCP peer as the client. This is the only safe default when the
+    /// proxy is exposed to the internet, since `X-Forwarded-For` is
+    /// attacker-controllable otherwise. Entries may be bare IPs (auto-promoted
+    /// to /32 or /128) or CIDR blocks.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -590,6 +599,7 @@ impl Default for ProxyConfig {
             startup_delay_ms: default_startup_delay_ms(),
             cluster_setup_delay_ms: default_cluster_setup_delay_ms(),
             reload_debounce_ms: default_reload_debounce_ms(),
+            trusted_proxies: Vec::new(),
         }
     }
 }

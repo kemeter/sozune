@@ -75,6 +75,15 @@ pub fn rate_limited(host: &str) -> Response<Body> {
     )
 }
 
+/// 403 Forbidden — the client IP is not in the route's allow-list.
+pub fn ip_forbidden(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::FORBIDDEN,
+        "ip-forbidden",
+        format!("sozune: client IP not allowed for host '{host}'.\n"),
+    )
+}
+
 pub fn no_match(host: &str) -> Response<Body> {
     diag_response(
         StatusCode::NOT_FOUND,

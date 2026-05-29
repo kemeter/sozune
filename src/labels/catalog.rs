@@ -35,6 +35,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "plugins",
     "matchHeaders",
     "matchQuery",
+    "ipAllowList",
 ];
 
 /// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`).

@@ -4,8 +4,8 @@ use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
-    auth, core, error_pages, forward_auth, headers, host, methods, path, plugins, ratelimit,
-    redirect, request_match,
+    auth, core, error_pages, forward_auth, headers, host, ip_allow_list, methods, path, plugins,
+    ratelimit, redirect, request_match,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
@@ -183,6 +183,7 @@ fn build_entrypoint(
     let parsed_error_pages = error_pages::parse_error_pages(labels, &prefix, diagnostics);
     let match_headers = request_match::parse_match_headers(labels, &prefix);
     let match_query = request_match::parse_match_query(labels, &prefix);
+    let ip_allow_list = ip_allow_list::parse_ip_allow_list(labels, &prefix);
 
     let protocol_enum = match protocol {
         "http" => Protocol::Http,
@@ -226,6 +227,7 @@ fn build_entrypoint(
             error_pages: parsed_error_pages,
             match_headers,
             match_query,
+            ip_allow_list,
         },
         source: None,
     })
@@ -295,6 +297,7 @@ fn build_tcp_entrypoint(
             error_pages: std::collections::BTreeMap::new(),
             match_headers: Vec::new(),
             match_query: Vec::new(),
+            ip_allow_list: Vec::new(),
         },
         source: None,
     })
@@ -495,6 +498,27 @@ mod tests {
         let r = parse(&c);
         assert!(r.entrypoints.is_empty());
         assert!(has_code(&r, DiagnosticCode::E005MissingTcpEntrypoint));
+    }
+
+    #[test]
+    fn ip_allow_list_label_is_threaded_into_config() {
+        // End-to-end: a `ipAllowList` label on the candidate must surface in
+        // the resulting EntrypointConfig.ip_allow_list. A regression here is
+        // what breaks the e2e suite without breaking any unit test below it.
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.api.host", "api.example.com"),
+                ("sozune.http.api.ipAllowList", "10.0.0.0/8, 192.168.1.5"),
+            ],
+            vec![net("bridge", "172.18.0.4")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_api").expect("http_api emitted");
+        assert_eq!(
+            ep.config.ip_allow_list,
+            vec!["10.0.0.0/8".to_string(), "192.168.1.5".to_string()]
+        );
     }
 
     #[test]
