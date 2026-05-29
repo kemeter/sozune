@@ -336,6 +336,7 @@ mod tests {
             acme_enabled: false,
             providers: crate::config::ProvidersConfig::default(),
             metrics: crate::proxy::metrics_snapshot::new_store(),
+            config: Arc::new(crate::config::AppConfig::default()),
         }
     }
 

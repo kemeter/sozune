@@ -234,6 +234,54 @@ curl -u admin:your-password http://localhost:3035/providers
 
 The list always contains every known provider, even when not configured, so the dashboard can render "configure me" rows next to inactive providers.
 
+### `GET /config`
+
+Read-only snapshot of the running configuration: listener ports, ACME settings, providers, the dashboard listener, and the API listener (without the user list). **Admin only.**
+
+```bash
+curl -u admin:your-password http://localhost:3035/config
+```
+
+Sample response:
+
+```jsonc
+{
+  "version": "0.13.0",
+  "listeners": {
+    "http":  { "port": 80 },
+    "https": { "port": 443 }
+  },
+  "acme": {
+    "enabled": true,
+    "email": "ops@example.com",
+    "staging": true,
+    "challenge_port": 8080,
+    "resolvers": {
+      "le-prod": { "challenge": "http-01" },
+      "le-cf":   { "challenge": "dns-01", "provider": "cloudflare", "required_env": ["CLOUDFLARE_API_TOKEN (configurable)"] }
+    }
+  },
+  "providers": {
+    "docker": { "enabled": true, "endpoint": "unix:///var/run/docker.sock", "expose_by_default": false },
+    "config_file": { "enabled": true, "path": "/etc/sozune/entrypoints.yaml", "watch": true }
+    // ... podman, swarm, kubernetes, nomad, consul, http: same shape, null when not configured
+  },
+  "dashboard": {
+    "enabled": true,
+    "listen_address": "0.0.0.0:3038"
+  },
+  "api": {
+    "enabled": true,
+    "listen_address": "0.0.0.0:3035",
+    "cors_origins": ["https://dashboard.example.com"]
+  }
+}
+```
+
+**Never exposed:**
+- `api.users` — neither the names nor the password hashes. Even hashed credentials enable offline brute-force attacks.
+- DNS-01 resolver secrets — only the *names* of the env vars referenced by ACME resolvers travel; their values stay on the process.
+
 ### `GET /diagnostics`
 
 Snapshot of every diagnostic sōzune has computed: per-candidate diagnostics from the parser, plus global lints (e.g. `W015` ACME enabled but no `tls=true`) and runtime collision lints (`W018`). Available to both roles.

@@ -31,6 +31,10 @@ pub struct AppState {
     /// whether their `enabled` flag is set.
     pub providers: crate::config::ProvidersConfig,
     pub metrics: crate::proxy::metrics_snapshot::MetricsSnapshotStore,
+    /// Full parsed config snapshot. Shared (Arc) so we never clone the whole
+    /// thing per request — `/config` reads it under no lock since the parsed
+    /// config is immutable once Sōzune is up.
+    pub config: Arc<crate::config::AppConfig>,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
@@ -178,6 +182,7 @@ fn forbidden(message: &str) -> Response {
 
 pub async fn serve(
     config: ApiConfig,
+    app_config: Arc<crate::config::AppConfig>,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     reload_tx: mpsc::Sender<()>,
     unhealthy_backends: Arc<RwLock<UnhealthyMap>>,
@@ -201,6 +206,7 @@ pub async fn serve(
         acme_enabled,
         providers,
         metrics,
+        config: app_config,
     };
 
     let protected = Router::new()
@@ -216,6 +222,7 @@ pub async fn serve(
         )
         .route("/diagnostics", get(list_diagnostics))
         .route("/providers", get(list_providers))
+        .route("/config", get(crate::api::config_view::config))
         .route_layer(axum_middleware::from_fn(require_admin));
 
     let me_route = Router::new().route("/me", get(me));
@@ -769,6 +776,7 @@ mod tests {
             acme_enabled: false,
             providers: crate::config::ProvidersConfig::default(),
             metrics: crate::proxy::metrics_snapshot::new_store(),
+            config: Arc::new(crate::config::AppConfig::default()),
         }
     }
 
