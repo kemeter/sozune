@@ -5,11 +5,20 @@
   import { goto } from '$app/navigation';
   import { clearAuth, identity, isAuthenticated } from '$lib/auth';
   import { listDiagnostics } from '$lib/api';
+  import { applyTheme, loadTheme, saveTheme, type Theme } from '$lib/theme';
 
   let { children } = $props();
 
+  let theme = $state<Theme>('dark');
+
+  function toggleTheme() {
+    theme = theme === 'dark' ? 'light' : 'dark';
+    applyTheme(theme);
+    saveTheme(theme);
+  }
+
   const nav = [
-    { href: './', label: 'Entrypoints', icon: 'grid' },
+    { href: './entrypoints', label: 'Entrypoints', icon: 'grid' },
     { href: './providers', label: 'Providers', icon: 'plug' },
     { href: './diagnostics', label: 'Diagnostics', icon: 'warning' },
     { href: './certificates', label: 'Certificates', icon: 'lock' },
@@ -43,6 +52,11 @@
   }
 
   onMount(() => {
+    // Apply the persisted (or system-preferred) theme as early as possible
+    // so the dashboard doesn't briefly flash the opposite palette.
+    theme = loadTheme();
+    applyTheme(theme);
+
     if (!onLoginPage && !isAuthenticated()) {
       goto('./login');
       return;
@@ -68,13 +82,26 @@
 {:else}
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand">
-        <div class="logo">s</div>
+      <a class="brand" href="./" aria-label="Sōzune dashboard home">
+        <svg
+          class="logo"
+          viewBox="0 0 256 256"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+        >
+          <g fill="none" stroke="currentColor" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="128" cy="128" r="100" />
+            <path d="M58 90 L140 110 L140 130 L58 110 Z" />
+            <path d="M134 132 L134 156" stroke-width="8" />
+            <path d="M90 144 L178 164 L178 184 L90 164 Z" />
+            <path d="M172 186 L172 206" stroke-width="8" />
+          </g>
+        </svg>
         <div class="brand-text">
           <div class="brand-name">sozune</div>
           <div class="brand-sub">dashboard</div>
         </div>
-      </div>
+      </a>
 
       <nav>
         {#each nav as item}
@@ -114,7 +141,28 @@
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h4a2 2 0 0 1 2 2v9a2 2 0 0 0-2-2H2zM14 3h-4a2 2 0 0 0-2 2v9a2 2 0 0 1 2-2h4z"/></svg>
           <span>Documentation</span>
         </a>
-        <div class="version mono">v0.11.0</div>
+        <button
+          class="theme-toggle"
+          onclick={toggleTheme}
+          aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {#if theme === 'dark'}
+            <!-- Sun: shown in dark mode → click to go light -->
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="3" />
+              <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.4 1.4M11.55 11.55l1.4 1.4M3.05 12.95l1.4-1.4M11.55 4.45l1.4-1.4" />
+            </svg>
+            <span>Light mode</span>
+          {:else}
+            <!-- Moon: shown in light mode → click to go dark -->
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5 6 6 0 1 0 13.5 9.2z" />
+            </svg>
+            <span>Dark mode</span>
+          {/if}
+        </button>
+        <div class="version mono">v0.13.0</div>
       </div>
     </aside>
 
@@ -149,19 +197,22 @@
     padding: 0.25rem 0.5rem 1.25rem;
     margin-bottom: 0.5rem;
     border-bottom: 1px solid var(--border);
+    text-decoration: none;
+    color: inherit;
+  }
+  .brand:hover .brand-name {
+    color: var(--fg-0);
   }
 
   .logo {
     width: 32px;
     height: 32px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, var(--accent), #3a6fd9);
-    color: white;
-    display: grid;
-    place-items: center;
-    font-weight: 700;
-    font-size: 1.05rem;
-    box-shadow: 0 2px 8px rgba(91, 141, 255, 0.3);
+    color: #ffffff;
+    flex-shrink: 0;
+    transition: opacity 120ms ease;
+  }
+  .brand:hover .logo {
+    opacity: 0.85;
   }
 
   .brand-name {
@@ -283,6 +334,31 @@
     color: var(--fg-0);
   }
   .doc-link :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+
+  .theme-toggle {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.625rem;
+    border-radius: var(--radius);
+    color: var(--fg-2);
+    font-size: 0.75rem;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .theme-toggle:hover {
+    background: var(--bg-hover);
+    color: var(--fg-0);
+  }
+  .theme-toggle svg {
     width: 14px;
     height: 14px;
   }

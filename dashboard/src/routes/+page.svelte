@@ -4,146 +4,85 @@
   import {
     listEntrypoints,
     listDiagnostics,
-    backendKey,
-    type Backend,
-    type Diagnostic,
-    type Entrypoint
+    listProviders,
+    getConfig,
+    getMetrics,
+    type ConfigView,
+    type Entrypoint,
+    type MetricsView,
+    type Provider,
+    type Diagnostic
   } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
   let entrypoints = $state<Entrypoint[]>([]);
+  let providers = $state<Provider[]>([]);
   let globalDiagnostics = $state<Diagnostic[]>([]);
+  let config = $state<ConfigView | null>(null);
+  let metrics = $state<MetricsView | null>(null);
+  /** `firstLoad` distinguishes "never loaded anything yet" from "polling on
+   *  top of cached data". The latter must keep the old payload visible so the
+   *  UI doesn't flicker back to zeros on every 5 s refresh. */
+  let firstLoad = $state(true);
+  let refreshing = $state(false);
   let error = $state<string | null>(null);
-  let loading = $state(true);
   let lastRefresh = $state<Date | null>(null);
-  let search = $state('');
-  let protocolFilter = $state<'all' | 'Http' | 'Tcp' | 'Udp'>('all');
-  let sourceFilter = $state<string>('all');
-  let tlsFilter = $state<'all' | 'on' | 'off'>('all');
-  let healthFilter = $state<'all' | 'healthy' | 'degraded'>('all');
-  let diagFilter = $state<'all' | 'with' | 'without'>('all');
-
   let poll: ReturnType<typeof setInterval> | null = null;
 
-  /** All distinct values found in `entrypoint.source` across the current set,
-   *  feeding the source-filter dropdown. `api` covers entrypoints created via
-   *  the REST API (their source is null/missing). */
-  const sources = $derived.by(() => {
-    const set = new Set<string>();
-    for (const ep of entrypoints) {
-      set.add(ep.source ?? 'api');
-    }
-    return ['all', ...Array.from(set).sort()];
-  });
-
-  function epHasDown(ep: Entrypoint): boolean {
-    return (ep.unhealthy_backends?.length ?? 0) > 0;
-  }
-
-  function epHasDiag(ep: Entrypoint): boolean {
-    return (ep.diagnostics ?? []).some(
-      (d) => d.severity === 'error' || d.severity === 'warn'
-    );
-  }
-
-  const filtered = $derived(
-    entrypoints.filter((ep) => {
-      if (protocolFilter !== 'all' && ep.protocol !== protocolFilter) return false;
-      if (sourceFilter !== 'all' && (ep.source ?? 'api') !== sourceFilter) return false;
-      if (tlsFilter === 'on' && !ep.config.tls) return false;
-      if (tlsFilter === 'off' && ep.config.tls) return false;
-      if (healthFilter === 'healthy' && epHasDown(ep)) return false;
-      if (healthFilter === 'degraded' && !epHasDown(ep)) return false;
-      if (diagFilter === 'with' && !epHasDiag(ep)) return false;
-      if (diagFilter === 'without' && epHasDiag(ep)) return false;
-      if (!search) return true;
-      const q = search.toLowerCase();
-      return (
-        ep.name.toLowerCase().includes(q) ||
-        ep.id.toLowerCase().includes(q) ||
-        ep.config.hostnames.some((h) => h.toLowerCase().includes(q)) ||
-        ep.backends.some((b) => backendKey(b).toLowerCase().includes(q))
-      );
-    })
-  );
-
-  /** True when at least one secondary filter is active (so we can show a "reset" affordance). */
-  const hasActiveFilters = $derived(
-    sourceFilter !== 'all' ||
-      tlsFilter !== 'all' ||
-      healthFilter !== 'all' ||
-      diagFilter !== 'all'
-  );
-
-  function resetFilters() {
-    sourceFilter = 'all';
-    tlsFilter = 'all';
-    healthFilter = 'all';
-    diagFilter = 'all';
-  }
-
-  const stats = $derived({
-    total: entrypoints.length,
-    http: entrypoints.filter((e) => e.protocol === 'Http').length,
-    tcp: entrypoints.filter((e) => e.protocol === 'Tcp').length,
-    backends: entrypoints.reduce((n, e) => n + e.backends.length, 0),
-    backendsDown: entrypoints.reduce((n, e) => n + (e.unhealthy_backends?.length ?? 0), 0),
-    tls: entrypoints.filter((e) => e.config.tls).length,
-    warnings: entrypoints.reduce(
-      (n, e) => n + (e.diagnostics?.filter((d) => d.severity === 'warn').length ?? 0),
-      0
-    ),
-    errors: entrypoints.reduce(
-      (n, e) => n + (e.diagnostics?.filter((d) => d.severity === 'error').length ?? 0),
-      0
-    )
-  });
-
-  function diagSummary(ep: Entrypoint): { warn: number; err: number } {
-    const diags = ep.diagnostics ?? [];
-    return {
-      warn: diags.filter((d) => d.severity === 'warn').length,
-      err: diags.filter((d) => d.severity === 'error').length
-    };
-  }
-
-  /** Entrypoint id whose diagnostic popover is currently open. Click on a
-   *  badge toggles; click anywhere else closes. */
-  let openDiagFor = $state<string | null>(null);
-
-  function toggleDiagPopover(epId: string, ev: Event) {
-    // Stop both the row's `goto` handler and the window-level closer.
-    ev.stopPropagation();
-    ev.preventDefault();
-    openDiagFor = openDiagFor === epId ? null : epId;
-  }
-
-  function closeDiagPopover() {
-    openDiagFor = null;
-  }
-
-  function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
-    const key = backendKey(backend);
-    return (ep.unhealthy_backends ?? []).some((u) => u.address === key);
-  }
-
-  function downCount(ep: Entrypoint): number {
-    return ep.backends.filter((b) => isBackendDown(ep, b)).length;
-  }
-
-  async function load(silent = false) {
-    if (!silent) loading = true;
+  async function load() {
+    refreshing = true;
     try {
-      const [eps, diags] = await Promise.all([listEntrypoints(), listDiagnostics()]);
+      const [eps, prov, diag, cfg, met] = await Promise.all([
+        listEntrypoints(),
+        listProviders(),
+        listDiagnostics(),
+        // `/config` is admin-only; read-only viewers will 403 here. Treat
+        // failure as "no config" rather than as a page-wide error.
+        getConfig().catch(() => null),
+        // `/metrics` is unauthenticated and may take a worker-poll cycle to
+        // populate the proxy section. Failure or empty proxy → we just hide
+        // the live counters rather than fail the page.
+        getMetrics().catch(() => null)
+      ]);
       entrypoints = eps;
-      globalDiagnostics = diags.global ?? [];
+      providers = prov.providers ?? [];
+      globalDiagnostics = diag.global ?? [];
+      config = cfg;
+      metrics = met;
       error = null;
       lastRefresh = new Date();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      refreshing = false;
+      firstLoad = false;
     }
+  }
+
+  /** Pick a metric value defensively. Sōzu's keys vary across versions; we
+   *  accept a handful of candidates and return the first one present. */
+  function metric(...keys: string[]): number | null {
+    if (!metrics?.proxy.metrics) return null;
+    for (const k of keys) {
+      const v = metrics.proxy.metrics[k];
+      if (typeof v === 'number') return v;
+    }
+    return null;
+  }
+
+  const liveConnections = $derived(metric('connections', 'connections_active'));
+  const liveRequests = $derived(
+    metric('http_requests', 'http_requests_total', 'requests')
+  );
+  const liveErrors5xx = $derived(metric('http_errors_5xx', 'http_5xx', 'errors_5xx'));
+  const workerPollFresh = $derived(
+    !!metrics && metrics.proxy.last_poll_seconds > 0
+  );
+
+  function fmtCompact(n: number): string {
+    if (n < 1000) return String(n);
+    if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
+    return `${(n / 1_000_000).toFixed(1)}M`;
   }
 
   onMount(() => {
@@ -152,858 +91,954 @@
       return;
     }
     void load();
-    poll = setInterval(() => void load(true), 5000);
-    window.addEventListener('click', closeDiagPopover);
+    poll = setInterval(() => void load(), 5000);
   });
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
-    window.removeEventListener('click', closeDiagPopover);
   });
+
+  /** Listener inventory, sourced from `/config` when available so we never
+   *  lie about ports. Falls back to the documented defaults only on the first
+   *  load (before `/config` answered) so the card isn't empty for 200 ms. */
+  const listeners = $derived.by(() => {
+    const httpPort = config?.listeners.http.port ?? 80;
+    const httpsPort = config?.listeners.https.port ?? 443;
+    const dashPort = parseListenPort(config?.dashboard.listen_address, 3038);
+    const apiPort = parseListenPort(config?.api.listen_address, 3035);
+    return [
+      { name: 'HTTP', port: `:${httpPort}` },
+      { name: 'HTTPS', port: `:${httpsPort}` },
+      { name: 'API', port: `:${apiPort}` },
+      { name: 'DASHBOARD', port: `:${dashPort}` }
+    ];
+  });
+
+  function parseListenPort(addr: string | undefined, fallback: number): number {
+    if (!addr) return fallback;
+    const m = addr.match(/:(\d+)$/);
+    return m ? Number(m[1]) : fallback;
+  }
+
+  const stats = $derived.by(() => {
+    let backendsTotal = 0;
+    let backendsDown = 0;
+    const kinds = new Map<string, number>();
+    let http = 0;
+    let tcp = 0;
+    let udp = 0;
+    let tls = 0;
+    for (const ep of entrypoints) {
+      backendsTotal += ep.backends.length;
+      const down = ep.unhealthy_backends ?? [];
+      backendsDown += down.length;
+      for (const u of down) {
+        kinds.set(u.kind, (kinds.get(u.kind) ?? 0) + 1);
+      }
+      if (ep.protocol === 'Http') http += 1;
+      else if (ep.protocol === 'Tcp') tcp += 1;
+      else if (ep.protocol === 'Udp') udp += 1;
+      if (ep.config.tls) tls += 1;
+    }
+    const totalEntrypoints = entrypoints.length;
+    const backendsHealthy = backendsTotal - backendsDown;
+    const healthyPct = backendsTotal === 0 ? 0 : Math.round((backendsHealthy / backendsTotal) * 100);
+
+    return {
+      total: totalEntrypoints,
+      http,
+      tcp,
+      udp,
+      tls,
+      backendsTotal,
+      backendsHealthy,
+      backendsDown,
+      healthyPct,
+      kinds
+    };
+  });
+
+  /** Compact "46 timeout · 1 connection_refused" summary of failure kinds. */
+  const kindsLabel = $derived.by(() => {
+    const parts: string[] = [];
+    for (const [kind, count] of stats.kinds.entries()) {
+      parts.push(`${count} ${kind.replaceAll('_', ' ')}`);
+    }
+    return parts.join(' · ') || '—';
+  });
+
+  const diagCounts = $derived.by(() => {
+    let err = 0;
+    let warn = 0;
+    let info = 0;
+    for (const d of globalDiagnostics) {
+      if (d.severity === 'error') err += 1;
+      else if (d.severity === 'warn') warn += 1;
+      else if (d.severity === 'info') info += 1;
+    }
+    for (const ep of entrypoints) {
+      for (const d of ep.diagnostics ?? []) {
+        if (d.severity === 'error') err += 1;
+        else if (d.severity === 'warn') warn += 1;
+        else if (d.severity === 'info') info += 1;
+      }
+    }
+    return { err, warn, info, total: err + warn + info };
+  });
+
+  /** Critical events table: backends currently down with their failure reason
+   *  and how long they've been failing. Drawn from `unhealthy_backends[].since`,
+   *  no historical store needed. Capped at 5 most recent. */
+  type CritRow = {
+    sev: 'CRITICAL' | 'WARN';
+    when: string;
+    sinceEpoch: number;
+    source: string;
+    detail: string;
+    kind: string;
+  };
+
+  const criticalRows = $derived.by<CritRow[]>(() => {
+    const rows: CritRow[] = [];
+    const now = Math.floor(Date.now() / 1000);
+    for (const ep of entrypoints) {
+      for (const u of ep.unhealthy_backends ?? []) {
+        const since = Number(u.since ?? 0);
+        rows.push({
+          sev: 'CRITICAL',
+          when: relativeShort(now - since),
+          sinceEpoch: since,
+          source: ep.config.hostnames[0] ?? ep.name,
+          detail: `${u.address} down · ${u.kind.replaceAll('_', ' ').toUpperCase()}`,
+          kind: u.kind
+        });
+      }
+    }
+    // Most recent failures first (largest `since` = most recent).
+    rows.sort((a, b) => b.sinceEpoch - a.sinceEpoch);
+    return rows.slice(0, 5);
+  });
+
+  function relativeShort(secs: number): string {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    if (secs < 86400) {
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    }
+    return `${Math.floor(secs / 86400)}d`;
+  }
 
   function timeAgo(d: Date | null): string {
     if (!d) return '';
     const s = Math.floor((Date.now() - d.getTime()) / 1000);
     if (s < 5) return 'just now';
     if (s < 60) return `${s}s ago`;
-    return `${Math.floor(s / 60)}m ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    return `${Math.floor(s / 3600)}h ago`;
   }
+
+  const enabledProviders = $derived(providers.filter((p) => p.configured));
+
+  /** Banner state: error if anything is down or critical diag, warn for warns,
+   *  otherwise ok. */
+  const systemStatus = $derived.by<{ label: string; tone: 'ok' | 'warn' | 'err' }>(() => {
+    if (stats.backendsDown > 0 || diagCounts.err > 0)
+      return { label: 'degraded', tone: 'err' };
+    if (diagCounts.warn > 0) return { label: 'warnings', tone: 'warn' };
+    return { label: 'running', tone: 'ok' };
+  });
 </script>
 
-<header class="page-header">
-  <div>
-    <h1>Entrypoints</h1>
-    <p class="subtitle">Routes served by the proxy</p>
-  </div>
-  <div class="header-actions">
-    {#if lastRefresh}
-      <span class="refresh-meta">updated {timeAgo(lastRefresh)}</span>
-    {/if}
-    <button class="btn-secondary" onclick={() => load()} disabled={loading}>
-      {loading ? 'loading…' : 'Refresh'}
-    </button>
-  </div>
-</header>
-
-<section class="stats">
-  <div class="stat-card">
-    <div class="stat-label">Entrypoints</div>
-    <div class="stat-value">{stats.total}</div>
-    <div class="stat-sub">{stats.http} HTTP · {stats.tcp} TCP</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Backends</div>
-    <div class="stat-value">{stats.backends}</div>
-    <div class="stat-sub">
-      {#if stats.backendsDown > 0}
-        <span class="stat-down">{stats.backendsDown} down</span> · {stats.backends - stats.backendsDown} healthy
-      {:else}
-        across all entrypoints
-      {/if}
-    </div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">TLS enabled</div>
-    <div class="stat-value">{stats.tls}</div>
-    <div class="stat-sub">{stats.total ? Math.round((stats.tls / stats.total) * 100) : 0}% of routes</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Diagnostics</div>
-    <div class="stat-value">
-      {stats.warnings + stats.errors}
-    </div>
-    <div class="stat-sub">
-      {#if stats.errors > 0}
-        <span class="stat-down">{stats.errors} error{stats.errors === 1 ? '' : 's'}</span>
-        {#if stats.warnings > 0}· {stats.warnings} warning{stats.warnings === 1 ? '' : 's'}{/if}
-      {:else if stats.warnings > 0}
-        {stats.warnings} warning{stats.warnings === 1 ? '' : 's'}
-      {:else}
-        no issues
-      {/if}
-    </div>
-  </div>
-</section>
-
-{#if globalDiagnostics.length > 0}
-  <section class="global-diags">
-    {#each globalDiagnostics as diag}
-      <div class="global-diag global-diag-{diag.severity}">
-        <span class="global-diag-glyph">
-          {#if diag.severity === 'error'}✗{:else if diag.severity === 'warn'}⚠{:else}ℹ{/if}
-        </span>
-        <span class="global-diag-code mono">{diag.code}</span>
-        <span class="global-diag-message">{diag.message}</span>
-        {#if diag.hint}
-          <span class="global-diag-hint">→ {diag.hint}</span>
-        {/if}
-      </div>
-    {/each}
-  </section>
-{/if}
-
-<section class="toolbar">
-  <div class="search">
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3" stroke-linecap="round"/></svg>
-    <input type="text" placeholder="search by name, hostname, backend…" bind:value={search} />
-  </div>
-  <div class="filters">
-    {#each ['all', 'Http', 'Tcp', 'Udp'] as p}
-      <button
-        class="filter-chip"
-        class:active={protocolFilter === p}
-        onclick={() => (protocolFilter = p as typeof protocolFilter)}
+{#snippet criticalSection()}
+  <section class="section">
+    <header class="section-head">
+      <h2 class="section-title">Critical · recent events</h2>
+      <span class="pill pill-err"
+        ><span class="dot"></span> {criticalRows.length} active</span
       >
-        {p}
-      </button>
-    {/each}
-  </div>
-</section>
-
-<section class="filter-row">
-  <label class="select-wrap">
-    <span class="select-label">Source</span>
-    <select bind:value={sourceFilter}>
-      {#each sources as src}
-        <option value={src}>{src}</option>
-      {/each}
-    </select>
-  </label>
-
-  <div class="seg">
-    <span class="seg-label">TLS</span>
-    {#each ['all', 'on', 'off'] as v}
-      <button
-        class="seg-btn"
-        class:active={tlsFilter === v}
-        onclick={() => (tlsFilter = v as typeof tlsFilter)}
-      >{v}</button>
-    {/each}
-  </div>
-
-  <div class="seg">
-    <span class="seg-label">Health</span>
-    {#each ['all', 'healthy', 'degraded'] as v}
-      <button
-        class="seg-btn"
-        class:active={healthFilter === v}
-        onclick={() => (healthFilter = v as typeof healthFilter)}
-      >{v}</button>
-    {/each}
-  </div>
-
-  <div class="seg">
-    <span class="seg-label">Diagnostics</span>
-    {#each ['all', 'with', 'without'] as v}
-      <button
-        class="seg-btn"
-        class:active={diagFilter === v}
-        onclick={() => (diagFilter = v as typeof diagFilter)}
-      >{v}</button>
-    {/each}
-  </div>
-
-  {#if hasActiveFilters}
-    <button class="reset-btn" onclick={resetFilters}>Reset filters</button>
-  {/if}
-
-  <div class="result-count mono">
-    {filtered.length} / {entrypoints.length}
-  </div>
-</section>
-
-{#if error}
-  <div class="alert">
-    <strong>error</strong> {error}
-  </div>
-{/if}
-
-<section class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Protocol</th>
-        <th>Hostnames</th>
-        <th>Backends</th>
-        <th>Features</th>
-        <th>Source</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#if loading && entrypoints.length === 0}
-        <tr><td colspan="6" class="empty">loading…</td></tr>
-      {:else if filtered.length === 0}
-        <tr><td colspan="6" class="empty">no entrypoints match</td></tr>
-      {:else}
-        {#each filtered as ep (ep.id)}
-          <tr class="clickable" onclick={() => goto(`/entrypoints/${encodeURIComponent(ep.id)}`)}>
-            <td>
-              <div class="cell-name">{ep.name}</div>
-              <div class="cell-id mono">{ep.id}</div>
-            </td>
-            <td>
-              <span class="badge badge-{ep.protocol.toLowerCase()}">{ep.protocol.toUpperCase()}</span>
-            </td>
-            <td>
-              {#if ep.config.hostnames.length === 0}
-                <span class="muted">—</span>
-              {:else}
-                <div class="hostnames">
-                  {#each ep.config.hostnames.slice(0, 2) as h}
-                    <span class="host mono">{h}</span>
-                  {/each}
-                  {#if ep.config.hostnames.length > 2}
-                    <span class="more">+{ep.config.hostnames.length - 2}</span>
-                  {/if}
-                </div>
-              {/if}
-            </td>
-            <td>
-              <div class="backends-cell">
-                <span class="backend-count mono">{ep.backends.length}</span>
-                <div
-                  class="health-bar"
-                  title={downCount(ep) > 0
-                    ? `${ep.backends.length - downCount(ep)}/${ep.backends.length} healthy`
-                    : `${ep.backends.length} backends, all healthy`}
-                >
-                  {#each ep.backends as b, i}
-                    <span
-                      class="health-seg"
-                      class:down={isBackendDown(ep, b)}
-                      style="animation-delay: {i * 40}ms"
-                    ></span>
-                  {/each}
-                </div>
-              </div>
-            </td>
-            <td>
-              <div class="features">
-                {#if ep.config.tls}<span class="chip">TLS</span>{/if}
-                {#if ep.config.https_redirect}<span class="chip">→HTTPS</span>{/if}
-                {#if ep.config.sticky_session}<span class="chip">sticky</span>{/if}
-                {#if ep.config.compress}<span class="chip">gzip</span>{/if}
-                {#if ep.config.strip_prefix}<span class="chip">strip</span>{/if}
-                {#if diagSummary(ep).err + diagSummary(ep).warn > 0}
-                  <span class="diag-anchor">
-                    {#if diagSummary(ep).err > 0}
-                      <button
-                        type="button"
-                        class="chip chip-err"
-                        onclick={(ev) => toggleDiagPopover(ep.id, ev)}
-                      >
-                        ✗ {diagSummary(ep).err}
-                      </button>
-                    {/if}
-                    {#if diagSummary(ep).warn > 0}
-                      <button
-                        type="button"
-                        class="chip chip-warn"
-                        onclick={(ev) => toggleDiagPopover(ep.id, ev)}
-                      >
-                        ⚠ {diagSummary(ep).warn}
-                      </button>
-                    {/if}
-                    {#if openDiagFor === ep.id}
-                      <div
-                        class="diag-popover"
-                        role="dialog"
-                        onclick={(ev) => ev.stopPropagation()}
-                      >
-                        {#each ep.diagnostics ?? [] as diag}
-                          <div class="pop-diag pop-diag-{diag.severity}">
-                            <div class="pop-head">
-                              <span class="pop-glyph">
-                                {#if diag.severity === 'error'}✗{:else if diag.severity === 'warn'}⚠{:else}ℹ{/if}
-                              </span>
-                              <span class="pop-code mono">{diag.code}</span>
-                              <span class="pop-message">{diag.message}</span>
-                            </div>
-                            {#if diag.hint}
-                              <div class="pop-hint">→ {diag.hint}</div>
-                            {/if}
-                          </div>
-                        {/each}
-                      </div>
-                    {/if}
-                  </span>
-                {/if}
-              </div>
-            </td>
-            <td>
-              <span class="source mono">{ep.source ?? 'api'}</span>
-            </td>
+    </header>
+    <table class="evt-table">
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Severity</th>
+          <th>Source</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each criticalRows as row}
+          <tr class="evt-row">
+            <td class="t-when">{row.when}</td>
+            <td><span class="sev-pill sev-pill-err">{row.sev}</span></td>
+            <td class="t-src mono">{row.source}</td>
+            <td class="t-det">{row.detail}</td>
           </tr>
         {/each}
+      </tbody>
+    </table>
+    <footer class="section-foot">
+      <a class="link" style="color: var(--danger)" href="./entrypoints?health=degraded"
+        >Inspect impacted routes <span class="arr">→</span></a
+      >
+    </footer>
+  </section>
+{/snippet}
+
+<main class="overview">
+  <header class="topbar">
+    <div>
+      <h1>Overview</h1>
+      <div class="sub">
+        All systems at a glance. {stats.total} routes serving traffic.
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="status-pill status-{systemStatus.tone}">
+        <span class="status-ind"></span> {systemStatus.label}
+      </span>
+      {#if refreshing}
+        <span class="spinner" aria-label="refreshing" title="refreshing…"></span>
       {/if}
-    </tbody>
-  </table>
-</section>
+      {#if lastRefresh}
+        <span class="updated">updated {timeAgo(lastRefresh)}</span>
+      {/if}
+    </div>
+  </header>
+
+  {#if error}
+    <div class="alert"><strong>error</strong> {error}</div>
+  {/if}
+
+  {#if firstLoad}
+    <!-- Skeleton: only shown until the first payload lands. After that, the
+         poll cycle re-runs `load()` but the previous values stay on screen. -->
+    <section class="grid">
+      {#each Array(8) as _}
+        <article class="card card-skeleton">
+          <div class="skeleton-line skeleton-title"></div>
+          <div class="skeleton-line skeleton-value"></div>
+          <div class="skeleton-line skeleton-sub"></div>
+        </article>
+      {/each}
+    </section>
+  {:else}
+    <!-- Promote the critical events table above the grid when something is
+         actually wrong — that's the first thing operators came to see. -->
+    {#if criticalRows.length > 0}
+      {@render criticalSection()}
+    {/if}
+
+    <section class="grid">
+      <!-- Routes -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Routes</span>
+          <span class="pill pill-ok"><span class="dot"></span> running</span>
+        </div>
+        <div class="value">{stats.total}<small>entrypoints</small></div>
+        <div class="sub">
+          {stats.http} HTTP &nbsp;·&nbsp; {stats.tcp} TCP &nbsp;·&nbsp; {stats.udp} UDP
+        </div>
+        <div class="foot">
+          {#if workerPollFresh && liveRequests !== null}
+            <span class="live mono" title="Total HTTP requests since startup">
+              <span class="live-dot"></span> {fmtCompact(liveRequests)} req
+            </span>
+          {:else}
+            <span></span>
+          {/if}
+          <a class="link" href="./entrypoints">View all <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Backends -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Backends</span>
+          <span class="pill pill-{stats.backendsDown > 0 ? 'err' : 'ok'}">
+            <span class="dot"></span>
+            {stats.backendsDown > 0 ? `${stats.backendsDown} down` : 'all up'}
+          </span>
+        </div>
+        <div class="value">
+          <span class="value-ok">{stats.backendsHealthy}</span><small
+            >/ {stats.backendsTotal} healthy</small
+          >
+        </div>
+        <div class="sub">{kindsLabel}</div>
+        <div class="foot">
+          {#if workerPollFresh && liveConnections !== null}
+            <span class="live mono" title="Open connections right now">
+              <span class="live-dot"></span> {fmtCompact(liveConnections)} conn
+            </span>
+          {:else}
+            <span class="healthy-pct mono">{stats.healthyPct}%</span>
+          {/if}
+          <a
+            class="link"
+            href={stats.backendsDown > 0
+              ? './entrypoints?health=degraded'
+              : './entrypoints'}
+          >
+            {stats.backendsDown > 0 ? 'Inspect down' : 'Inspect'}
+            <span class="arr">→</span>
+          </a>
+        </div>
+      </article>
+
+      <!-- Providers -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Providers</span>
+          <span class="pill pill-ok">
+            <span class="dot"></span>
+            {enabledProviders.filter((p) => p.enabled).length} active
+          </span>
+        </div>
+        <div class="value">
+          {enabledProviders.filter((p) => p.enabled).length}<small
+            >/ {providers.length} enabled</small
+          >
+        </div>
+        <div class="prov-row">
+          {#each providers as p}
+            <span class="prov" class:on={p.enabled} class:off={!p.enabled}>
+              {p.name}{p.enabled ? ` · ${p.entrypoint_count}` : ''}
+            </span>
+          {/each}
+        </div>
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./providers">Manage <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Diagnostics -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Diagnostics</span>
+          <span
+            class="pill pill-{diagCounts.err > 0
+              ? 'err'
+              : diagCounts.warn > 0
+                ? 'warn'
+                : 'ok'}"
+          >
+            <span class="dot"></span>
+            {diagCounts.total > 0 ? `${diagCounts.total} active` : 'clean'}
+          </span>
+        </div>
+        <div class="value">
+          {diagCounts.total}<small>
+            {#if diagCounts.err > 0}<span class="value-err">{diagCounts.err} err</span>{/if}
+            {#if diagCounts.err > 0 && diagCounts.warn > 0}&nbsp;·&nbsp;{/if}
+            {#if diagCounts.warn > 0}<span class="value-warn"
+                >{diagCounts.warn} warn</span
+              >{/if}
+            {#if diagCounts.total === 0}no issues detected{/if}
+          </small>
+        </div>
+        <div class="sub">
+          {#if diagCounts.total === 0}
+            Label parser, route collisions and runtime checks all pass.
+          {:else}
+            Configuration issues raised by the label parser and runtime lints.
+          {/if}
+        </div>
+        <div class="foot">
+          {#if workerPollFresh && liveErrors5xx !== null && liveErrors5xx > 0}
+            <span class="live mono" title="HTTP 5xx responses since startup">
+              <span class="live-dot live-dot-err"></span>
+              {fmtCompact(liveErrors5xx)} 5xx
+            </span>
+          {:else}
+            <span></span>
+          {/if}
+          <a
+            class="link"
+            href={diagCounts.err > 0
+              ? './diagnostics?severity=error'
+              : diagCounts.warn > 0
+                ? './diagnostics?severity=warn'
+                : './diagnostics'}
+          >
+            Review <span class="arr">→</span>
+          </a>
+        </div>
+      </article>
+
+      <!-- TLS -->
+      <article class="card">
+        <div class="head">
+          <span class="title">TLS</span>
+          <span class="pill pill-ok"><span class="dot"></span> {stats.tls} routes</span>
+        </div>
+        <div class="value">{stats.tls}<small>HTTPS entrypoints</small></div>
+        <div class="sub">
+          {stats.total - stats.tls} plain HTTP &nbsp;·&nbsp; certificate inventory coming
+        </div>
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./entrypoints?tls=on"
+            >TLS routes <span class="arr">→</span></a
+          >
+        </div>
+      </article>
+
+      <!-- ACME -->
+      <article class="card">
+        <div class="head">
+          <span class="title">ACME</span>
+          {#if config?.acme?.enabled}
+            <span class="pill pill-ok">
+              <span class="dot"></span>
+              {config.acme.staging ? 'staging' : 'production'}
+            </span>
+          {:else}
+            <span class="pill pill-muted"><span class="dot"></span> disabled</span>
+          {/if}
+        </div>
+        {#if config?.acme}
+          <div class="value">
+            {Object.keys(config.acme.resolvers).length}<small>
+              {Object.keys(config.acme.resolvers).length === 1
+                ? 'resolver'
+                : 'resolvers'}
+            </small>
+          </div>
+          <div class="sub">
+            Account email <b>{config.acme.email || '—'}</b><br />
+            Challenge port <span class="mono">:{config.acme.challenge_port}</span>
+          </div>
+        {:else}
+          <div class="value">—<small>not configured</small></div>
+          <div class="sub">
+            Configure under <code>acme.*</code> in <code>config.yaml</code> to enable
+            Let's Encrypt.
+          </div>
+        {/if}
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./certificates">Certificates <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Listeners -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Listeners</span>
+          <span class="pill pill-ok"
+            ><span class="dot"></span> {listeners.length} bound</span
+          >
+        </div>
+        <div class="value">{listeners.length}<small>ports</small></div>
+        <div class="lst">
+          {#each listeners as l}
+            <div class="lst-row"><b>{l.name}</b><span class="mono">{l.port}</span></div>
+          {/each}
+        </div>
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./health">Health <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Critical summary -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Critical</span>
+          <span class="pill pill-{criticalRows.length > 0 ? 'err' : 'ok'}">
+            <span class="dot"></span>
+            {criticalRows.length > 0 ? 'action req.' : 'all clear'}
+          </span>
+        </div>
+        <div class="value">
+          <span class={criticalRows.length > 0 ? 'value-err' : 'value-ok'}
+            >{criticalRows.length}</span
+          ><small>{criticalRows.length === 1 ? 'event' : 'events'}</small>
+        </div>
+        <div class="sub">
+          {#if criticalRows.length > 0}
+            See the events table above for details.
+          {:else}
+            No backends down, no critical diagnostics. Everything routing.
+          {/if}
+        </div>
+        <div class="foot">
+          <span></span>
+          <a
+            class="link"
+            href={criticalRows.length > 0
+              ? './entrypoints?health=degraded'
+              : './diagnostics'}
+          >
+            {criticalRows.length > 0 ? 'Inspect' : 'Diagnostics'}
+            <span class="arr">→</span>
+          </a>
+        </div>
+      </article>
+    </section>
+  {/if}
+</main>
 
 <style>
-  .page-header {
+  .overview {
+    padding: 24px 40px 32px;
+    max-width: 1440px;
     display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .topbar {
+    display: flex;
+    align-items: baseline;
     justify-content: space-between;
-    align-items: flex-end;
-    margin-bottom: 1.75rem;
+    margin-bottom: 4px;
   }
   h1 {
     margin: 0;
-    font-size: 1.5rem;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-  }
-  .subtitle {
-    margin: 0.25rem 0 0;
-    color: var(--fg-2);
-    font-size: 0.825rem;
-  }
-
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-  .refresh-meta {
-    color: var(--fg-3);
-    font-size: 0.75rem;
-    margin-right: 0.25rem;
-  }
-  .btn-secondary {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0.5rem 0.875rem;
-    font-size: 0.8rem;
+    font-size: 22px;
     font-weight: 500;
-    transition: background 0.1s, border-color 0.1s;
-    background: var(--bg-2);
-    color: var(--fg-1);
-  }
-  .btn-secondary:hover {
-    background: var(--bg-hover);
+    letter-spacing: -0.4px;
     color: var(--fg-0);
   }
-  .btn-secondary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-  }
-  .stat-card {
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 1rem 1.125rem;
-  }
-  .stat-label {
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+  .sub {
     color: var(--fg-2);
-    font-weight: 500;
+    font-size: 13px;
+    margin-top: 4px;
   }
-  .stat-value {
-    font-size: 1.75rem;
-    font-weight: 600;
-    margin-top: 0.25rem;
-    letter-spacing: -0.02em;
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 12px;
+    color: var(--fg-2);
+  }
+  .updated {
     font-variant-numeric: tabular-nums;
   }
-  .stat-value.healthy {
-    color: var(--success);
-    font-size: 1.05rem;
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-top: 0.6rem;
-    margin-bottom: 0.1rem;
-  }
-  .dot {
-    width: 8px;
-    height: 8px;
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 1.5px solid var(--fg-3);
+    border-top-color: var(--accent);
     border-radius: 50%;
-    background: var(--success);
-    box-shadow: 0 0 0 3px var(--success-bg);
-    animation: pulse 2s infinite;
+    display: inline-block;
+    animation: spin 700ms linear infinite;
+    opacity: 0.7;
   }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-  }
-  .stat-sub {
-    font-size: 0.75rem;
-    color: var(--fg-3);
-    margin-top: 0.25rem;
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
-  .toolbar {
-    display: flex;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
-    align-items: center;
-  }
-  .search {
-    flex: 1;
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-  .search :global(svg) {
-    position: absolute;
-    left: 0.75rem;
-    width: 14px;
-    height: 14px;
-    color: var(--fg-3);
+  /* First-load skeleton — only used while we have no data yet. */
+  .card-skeleton {
     pointer-events: none;
   }
-  .search input {
-    width: 100%;
-    padding: 0.55rem 0.75rem 0.55rem 2.1rem;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--fg-0);
-    outline: none;
-    transition: border-color 0.1s;
-  }
-  .search input:focus {
-    border-color: var(--accent);
-  }
-  .search input::placeholder {
-    color: var(--fg-3);
-  }
-
-  .filters {
-    display: flex;
-    gap: 4px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 3px;
-  }
-  .filter-chip {
-    padding: 0.35rem 0.75rem;
-    background: transparent;
-    border: none;
-    color: var(--fg-2);
+  .skeleton-line {
+    background: linear-gradient(
+      90deg,
+      var(--bg-2) 0%,
+      var(--bg-hover) 50%,
+      var(--bg-2) 100%
+    );
+    background-size: 200% 100%;
     border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    text-transform: capitalize;
+    animation: shimmer 1.4s ease-in-out infinite;
   }
-  .filter-chip:hover {
-    color: var(--fg-0);
+  .skeleton-title {
+    height: 10px;
+    width: 40%;
   }
-  .filter-chip.active {
-    background: var(--bg-3);
-    color: var(--fg-0);
+  .skeleton-value {
+    height: 28px;
+    width: 60%;
+  }
+  .skeleton-sub {
+    height: 12px;
+    width: 80%;
+  }
+  @keyframes shimmer {
+    0% {
+      background-position: 100% 0;
+    }
+    100% {
+      background-position: -100% 0;
+    }
   }
 
   .alert {
     background: var(--danger-bg);
-    border: 1px solid var(--danger);
-    color: var(--fg-0);
-    padding: 0.75rem 1rem;
+    color: var(--danger);
+    padding: 8px 14px;
     border-radius: var(--radius);
-    margin-bottom: 1rem;
-    font-size: 0.825rem;
+    font-size: 13px;
   }
   .alert strong {
-    color: var(--danger);
-    margin-right: 0.5rem;
     text-transform: uppercase;
-    font-size: 0.7rem;
+    margin-right: 6px;
+    font-size: 11px;
     letter-spacing: 0.08em;
   }
 
-  .table-wrap {
+  /* Grid — 4 columns compact */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+  }
+
+  .card {
     background: var(--bg-1);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    overflow: hidden;
+    border-radius: 10px;
+    padding: 18px 20px 16px;
+    min-height: 132px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    transition: background 160ms ease, border-color 160ms ease;
   }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-  thead {
+  .card:hover {
     background: var(--bg-2);
+    border-color: var(--border-strong);
   }
-  th {
-    text-align: left;
-    padding: 0.65rem 1rem;
-    font-size: 0.7rem;
+
+  .head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .title {
+    font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 1.6px;
     color: var(--fg-2);
     font-weight: 500;
-    border-bottom: 1px solid var(--border);
-  }
-  td {
-    padding: 0.85rem 1rem;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.825rem;
-    vertical-align: middle;
-  }
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-  tbody tr {
-    transition: background 0.08s;
-  }
-  tbody tr:hover {
-    background: var(--bg-2);
-  }
-  tbody tr.clickable {
-    cursor: pointer;
   }
 
-  .empty {
-    text-align: center;
-    color: var(--fg-3);
-    padding: 2rem !important;
-  }
-
-  .cell-name {
-    font-weight: 500;
-    color: var(--fg-0);
-  }
-  .cell-id {
-    color: var(--fg-3);
-    font-size: 0.7rem;
-    margin-top: 2px;
-  }
-
-  .badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.68rem;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    font-family: var(--font-mono);
-  }
-  .badge-http {
-    background: var(--accent-bg);
-    color: var(--accent);
-  }
-  .badge-tcp {
-    background: rgba(240, 180, 41, 0.12);
-    color: var(--warning);
-  }
-  .badge-udp {
-    background: rgba(187, 115, 255, 0.12);
-    color: #bb73ff;
-  }
-
-  .hostnames {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    align-items: center;
-  }
-  .host {
-    background: var(--bg-3);
-    padding: 2px 7px;
-    border-radius: 4px;
-    font-size: 0.72rem;
-    color: var(--fg-1);
-  }
-  .more {
-    color: var(--fg-3);
-    font-size: 0.72rem;
-  }
-
-  .backends-cell {
-    display: flex;
-    align-items: center;
-    gap: 0.625rem;
-  }
-  .backend-count {
-    font-weight: 600;
-    color: var(--fg-0);
-    min-width: 14px;
-  }
-  .health-bar {
-    display: flex;
-    gap: 2px;
-    flex: 1;
-    max-width: 80px;
-  }
-  .health-seg {
-    flex: 1;
-    height: 8px;
-    background: var(--success);
-    border-radius: 2px;
-    opacity: 0;
-    animation: fade-in 0.4s forwards;
-  }
-  .health-seg.down {
-    background: var(--danger);
-  }
-  .stat-down {
-    color: var(--danger);
-    font-weight: 600;
-  }
-  @keyframes fade-in {
-    to { opacity: 1; }
-  }
-
-  .features {
-    display: flex;
-    gap: 3px;
-    flex-wrap: wrap;
-  }
-  .chip {
-    background: var(--bg-3);
-    color: var(--fg-1);
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-size: 0.68rem;
-    font-family: var(--font-mono);
-    font-weight: 500;
-  }
-  .chip-warn {
-    background: rgba(240, 180, 41, 0.18);
-    color: var(--warning);
-    cursor: pointer;
-    border: none;
-    font-family: inherit;
-  }
-  .chip-err {
-    background: var(--danger-bg);
-    color: var(--danger);
-    cursor: pointer;
-    border: none;
-    font-family: inherit;
-  }
-
-  .diag-anchor {
-    position: relative;
-    display: inline-flex;
-    gap: 3px;
-  }
-  .diag-popover {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    z-index: 20;
-    min-width: 320px;
-    max-width: 480px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 0.5rem;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    cursor: default;
-    text-align: left;
-    white-space: normal;
-  }
-  .pop-diag {
-    border-left: 3px solid var(--border);
-    padding: 0.45rem 0.625rem;
-    background: var(--bg-2);
-    border-radius: 4px;
-  }
-  .pop-diag-error { border-left-color: var(--danger); }
-  .pop-diag-warn { border-left-color: var(--warning); }
-  .pop-diag-info { border-left-color: var(--accent); }
-  .pop-head {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.78rem;
-  }
-  .pop-glyph { line-height: 1; }
-  .pop-diag-error .pop-glyph { color: var(--danger); }
-  .pop-diag-warn .pop-glyph { color: var(--warning); }
-  .pop-diag-info .pop-glyph { color: var(--accent); }
-  .pop-code {
-    background: var(--bg-3);
-    color: var(--fg-1);
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-size: 0.65rem;
-    font-weight: 600;
-  }
-  .pop-message {
-    color: var(--fg-0);
-    flex: 1;
-  }
-  .pop-hint {
-    color: var(--fg-2);
-    font-size: 0.72rem;
-    margin-top: 0.25rem;
-    margin-left: 1.3rem;
-  }
-
-  .global-diags {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 1.25rem;
-  }
-  .global-diag {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.625rem 0.875rem;
-    border: 1px solid var(--border);
-    border-left-width: 3px;
-    border-radius: var(--radius);
-    background: var(--bg-1);
-    font-size: 0.825rem;
-    flex-wrap: wrap;
-  }
-  .global-diag-error {
-    border-left-color: var(--danger);
-  }
-  .global-diag-warn {
-    border-left-color: var(--warning);
-  }
-  .global-diag-info {
-    border-left-color: var(--accent);
-  }
-  .global-diag-glyph {
-    font-size: 0.95rem;
-    line-height: 1;
-  }
-  .global-diag-error .global-diag-glyph {
-    color: var(--danger);
-  }
-  .global-diag-warn .global-diag-glyph {
-    color: var(--warning);
-  }
-  .global-diag-info .global-diag-glyph {
-    color: var(--accent);
-  }
-  .global-diag-code {
-    background: var(--bg-3);
-    color: var(--fg-1);
-    padding: 1px 7px;
-    border-radius: 3px;
-    font-size: 0.7rem;
-    font-weight: 600;
-  }
-  .global-diag-message {
-    color: var(--fg-0);
-  }
-  .global-diag-hint {
-    color: var(--fg-2);
-    font-size: 0.78rem;
-    width: 100%;
-    margin-left: 1.55rem;
-  }
-
-  .source {
-    color: var(--fg-2);
-    font-size: 0.72rem;
-  }
-
-  .muted {
-    color: var(--fg-3);
-  }
-
-  .filter-row {
-    display: flex;
-    gap: 0.625rem;
-    margin-bottom: 1rem;
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .select-wrap {
+  .pill {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 4px 8px 4px 10px;
-  }
-  .select-label {
-    font-size: 0.7rem;
+    font-size: 10px;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 1.2px;
+    color: var(--fg-3);
+  }
+  .pill .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--fg-3);
+  }
+  .pill-ok {
+    color: var(--success);
+  }
+  .pill-ok .dot {
+    background: var(--success);
+    box-shadow: 0 0 6px rgba(63, 185, 80, 0.5);
+  }
+  .pill-warn {
+    color: var(--warning);
+  }
+  .pill-warn .dot {
+    background: var(--warning);
+    box-shadow: 0 0 6px rgba(240, 180, 41, 0.5);
+  }
+  .pill-err {
+    color: var(--danger);
+  }
+  .pill-err .dot {
+    background: var(--danger);
+    box-shadow: 0 0 6px rgba(248, 81, 73, 0.5);
+  }
+  .pill-muted {
     color: var(--fg-2);
-    font-weight: 500;
-  }
-  .select-wrap select {
-    background: transparent;
-    border: none;
-    color: var(--fg-0);
-    font-size: 0.78rem;
-    outline: none;
-    padding: 2px 4px;
-    cursor: pointer;
-  }
-  .select-wrap select option {
-    background: var(--bg-1);
-    color: var(--fg-0);
   }
 
-  .seg {
+  .value {
+    font-size: 34px;
+    font-weight: 500;
+    letter-spacing: -0.8px;
+    line-height: 1;
+    color: var(--fg-0);
+    font-variant-numeric: tabular-nums;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .value small {
+    font-size: 12px;
+    color: var(--fg-2);
+    font-weight: 400;
+    letter-spacing: 0;
+  }
+  .value-ok {
+    color: var(--success);
+  }
+  .value-warn {
+    color: var(--warning);
+  }
+  .value-err {
+    color: var(--danger);
+  }
+
+  .card .sub {
+    font-size: 11.5px;
+    color: var(--fg-2);
+    line-height: 1.5;
+    margin-top: 0;
+  }
+
+  .foot {
+    margin-top: auto;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    padding-top: 6px;
+  }
+  .healthy-pct {
+    color: var(--fg-2);
+    font-size: 13px;
+  }
+  /* Live counter coming from Sōzu's worker poll. The pulsing dot tells the
+   * viewer this number is fresh (≤5 s old) and not a cached gauge. */
+  .live {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    background: var(--bg-1);
+    gap: 6px;
+    color: var(--fg-1);
+    font-size: 12px;
+  }
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 6px rgba(63, 185, 80, 0.5);
+    animation: live-pulse 1.6s ease-in-out infinite;
+  }
+  .live-dot-err {
+    background: var(--danger);
+    box-shadow: 0 0 6px rgba(248, 81, 73, 0.5);
+  }
+  @keyframes live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
+  }
+  .link {
+    color: var(--fg-2);
+    text-decoration: none;
+    font-size: 12px;
+  }
+  .link:hover {
+    color: var(--fg-0);
+  }
+  .link .arr {
+    display: inline-block;
+    transition: transform 120ms ease;
+    margin-left: 4px;
+  }
+  .link:hover .arr {
+    transform: translateX(3px);
+    color: var(--accent);
+  }
+
+  /* Provider chips */
+  .prov-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .prov {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--fg-2);
     border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 3px 4px 3px 10px;
   }
-  .seg-label {
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--fg-2);
-    font-weight: 500;
-    margin-right: 4px;
+  .prov.on {
+    color: var(--success);
+    border-color: rgba(63, 185, 80, 0.25);
+    background: rgba(63, 185, 80, 0.05);
   }
-  .seg-btn {
-    padding: 0.3rem 0.65rem;
-    background: transparent;
-    border: none;
-    color: var(--fg-2);
-    border-radius: 4px;
-    font-size: 0.72rem;
-    font-weight: 500;
-    text-transform: capitalize;
-    cursor: pointer;
-  }
-  .seg-btn:hover {
-    color: var(--fg-0);
-  }
-  .seg-btn.active {
-    background: var(--bg-3);
-    color: var(--fg-0);
-  }
-
-  .reset-btn {
-    background: transparent;
-    border: 1px dashed var(--border);
-    color: var(--fg-2);
-    border-radius: var(--radius);
-    padding: 0.4rem 0.75rem;
-    font-size: 0.72rem;
-    cursor: pointer;
-  }
-  .reset-btn:hover {
-    color: var(--fg-0);
-    border-style: solid;
-  }
-  .result-count {
-    margin-left: auto;
+  .prov.off {
     color: var(--fg-3);
-    font-size: 0.75rem;
-    font-variant-numeric: tabular-nums;
   }
 
+  /* Listener list */
+  .lst {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--fg-2);
+  }
+  .lst-row {
+    display: flex;
+    justify-content: space-between;
+  }
+  .lst-row b {
+    color: var(--fg-0);
+    font-weight: 500;
+  }
+
+  /* Free-flowing events section */
+  .section {
+    margin-top: 24px;
+  }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .section-title {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--fg-2);
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+  }
+  .section-foot {
+    margin-top: 12px;
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .evt-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .evt-table thead th {
+    text-align: left;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--fg-3);
+    font-weight: 500;
+    padding: 0 14px 8px;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .evt-table thead th:first-child {
+    padding-left: 0;
+  }
+  .evt-table thead th:last-child {
+    padding-right: 0;
+  }
+  .evt-table tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+    line-height: 1.45;
+  }
+  .evt-table tbody td:first-child {
+    padding-left: 0;
+  }
+  .evt-table tbody td:last-child {
+    padding-right: 0;
+  }
+  .evt-table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .evt-table tbody tr.evt-row:hover {
+    background: rgba(255, 255, 255, 0.015);
+  }
+  .t-when {
+    color: var(--fg-3);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    width: 84px;
+  }
+  .t-src {
+    color: var(--fg-0);
+    font-size: 12.5px;
+    width: 240px;
+  }
+  .t-det {
+    color: var(--fg-2);
+  }
+  .sev-pill {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .sev-pill-err {
+    color: var(--danger);
+    background: var(--danger-bg);
+  }
+  .sev-pill-warn {
+    color: var(--warning);
+    background: var(--warning-bg);
+  }
+
+  /* Status pill in top bar */
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .status-pill .status-ind {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+  .status-ok {
+    color: var(--success);
+    background: var(--success-bg);
+  }
+  .status-ok .status-ind {
+    background: var(--success);
+  }
+  .status-warn {
+    color: var(--warning);
+    background: var(--warning-bg);
+  }
+  .status-warn .status-ind {
+    background: var(--warning);
+  }
+  .status-err {
+    color: var(--danger);
+    background: var(--danger-bg);
+  }
+  .status-err .status-ind {
+    background: var(--danger);
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.04);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--fg-0);
+  }
 </style>

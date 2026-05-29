@@ -199,6 +199,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let storage_server = storage.clone();
     let reload_tx_api = reload_tx.clone();
     let api_config = config.api.clone();
+    let app_config_api = Arc::new(config.clone());
     let unhealthy_api = Arc::clone(&unhealthy_backends);
     let diagnostics_api = Arc::clone(&diagnostics_store);
     let acme_enabled_api = acme_enabled;
@@ -209,6 +210,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             info!("Starting API server");
             api::server::serve(
                 api_config,
+                app_config_api,
                 storage_server,
                 reload_tx_api,
                 unhealthy_api,

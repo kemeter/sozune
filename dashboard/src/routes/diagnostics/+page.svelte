@@ -18,11 +18,54 @@
   let error = $state<string | null>(null);
   let loading = $state(true);
   let lastRefresh = $state<Date | null>(null);
-  let severityFilter = $state<'all' | 'error' | 'warn' | 'info'>('all');
-  let codeFilter = $state<string>('all');
-  let search = $state('');
+
+  type SeverityFilter = 'all' | 'error' | 'warn' | 'info';
+
+  /** Read a query param with a default. Safe before mount (SSR returns the
+   *  fallback). */
+  function getParam(key: string, fallback: string): string {
+    if (typeof window === 'undefined') return fallback;
+    const v = new URL(window.location.href).searchParams.get(key);
+    return v ?? fallback;
+  }
+
+  /** Filter state is driven by the URL so links can deep-link a pre-filtered
+   *  view (e.g. /diagnostics?code=W009) and reload/share keeps filters. */
+  let severityFilter = $state<SeverityFilter>(getParam('severity', 'all') as SeverityFilter);
+  let codeFilter = $state<string>(getParam('code', 'all'));
+  let search = $state<string>(getParam('q', ''));
 
   let poll: ReturnType<typeof setInterval> | null = null;
+
+  /** Push the current filter state back into the URL. `replaceState` keeps
+   *  the back button useful (goes to the previous page, not to each filter
+   *  toggle in between). */
+  function syncUrl() {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    const params = url.searchParams;
+
+    const writeOrClear = (key: string, value: string, def: string) => {
+      if (value === def || value === '') params.delete(key);
+      else params.set(key, value);
+    };
+
+    writeOrClear('severity', severityFilter, 'all');
+    writeOrClear('code', codeFilter, 'all');
+    writeOrClear('q', search, '');
+
+    const next = url.pathname + (params.toString() ? `?${params}` : '');
+    if (next !== url.pathname + url.search) {
+      void goto(next, { replaceState: true, keepFocus: true, noScroll: true });
+    }
+  }
+
+  $effect(() => {
+    severityFilter;
+    codeFilter;
+    search;
+    syncUrl();
+  });
 
   const stats = $derived.by(() => {
     if (!data) return { total: 0, error: 0, warn: 0, info: 0 };
@@ -249,7 +292,13 @@
       <span class="diag-glyph">
         {#if diag.severity === 'error'}✗{:else if diag.severity === 'warn'}⚠{:else}ℹ{/if}
       </span>
-      <span class="diag-code mono">{diag.code}</span>
+      <button
+        type="button"
+        class="diag-code mono"
+        class:active={codeFilter === diag.code}
+        title={codeFilter === diag.code ? 'Clear filter' : `Filter by ${diag.code}`}
+        onclick={() => (codeFilter = codeFilter === diag.code ? 'all' : diag.code)}
+      >{diag.code}</button>
       <span class="diag-message">{diag.message}</span>
     </div>
     {#if diag.label || diag.value}
@@ -453,6 +502,18 @@
     border-radius: 3px;
     font-size: 0.7rem;
     font-weight: 600;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  }
+  .diag-code:hover {
+    background: var(--bg-hover);
+    color: var(--fg-0);
+  }
+  .diag-code.active {
+    background: var(--accent-bg);
+    color: var(--accent);
+    border-color: var(--accent);
   }
   .diag-message {
     color: var(--fg-0);
