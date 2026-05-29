@@ -123,6 +123,13 @@ pub struct EntrypointConfig {
     /// Overrides the listener-level defaults for this entrypoint only.
     #[serde(default)]
     pub error_pages: BTreeMap<String, String>,
+    /// IP allow-list — list of IPs / CIDR ranges (IPv4 or IPv6). When
+    /// non-empty, a request whose resolved client IP matches none of the
+    /// entries is rejected with `403 Forbidden` before reaching auth,
+    /// rate-limit, or the backend. Empty (default) disables the filter.
+    /// See `ProxyConfig::trusted_proxies` for how the client IP is resolved.
+    #[serde(default)]
+    pub ip_allow_list: Vec<String>,
     /// Request header match conditions. When non-empty, a request is served by
     /// this entrypoint only if every listed header is present with the given
     /// value. Sōzu routes on host/path/method only, so this is enforced by a

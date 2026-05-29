@@ -342,6 +342,22 @@ services:
       - "sozune.http.svcmatch.matchQuery=version:2"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-ipallow:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcipallow.host=$HOST_IPALLOW"
+      - "sozune.http.svcipallow.ipAllowList=127.0.0.1,10.0.0.0/8"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-ipallow-deny:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcipallowdeny.host=$HOST_IPALLOW_DENY"
+      - "sozune.http.svcipallowdeny.ipAllowList=203.0.113.0/24"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-fauth:
     image: traefik/whoami
     labels:
@@ -422,6 +438,7 @@ declare -A WAIT_PATHS=(
     ["$HOST_ERRORPAGES"]="/"
     ["$HOST_WS"]="/"
     ["$HOST_SSE"]="/.well-known/mercure?topic=ready"
+    ["$HOST_IPALLOW"]="/"
 )
 ready=0
 for _ in $(seq 1 60); do

@@ -161,6 +161,24 @@
     {/if}
   </section>
 
+  {#if (entrypoint.config.ip_allow_list ?? []).length > 0}
+    <section class="card">
+      <h2>
+        IP allow-list
+        <span class="header-badge">{entrypoint.config.ip_allow_list?.length}</span>
+      </h2>
+      <p class="muted">
+        Requests from clients outside these ranges are rejected with
+        <span class="mono">403 Forbidden</span> before reaching the backend.
+      </p>
+      <div class="chips">
+        {#each entrypoint.config.ip_allow_list ?? [] as cidr}
+          <span class="chip mono">{cidr}</span>
+        {/each}
+      </div>
+    </section>
+  {/if}
+
   <section class="card">
     <h2>Backends</h2>
     {#if entrypoint.backends.length === 0}

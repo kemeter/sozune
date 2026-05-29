@@ -2,6 +2,7 @@ pub mod chain;
 mod compress;
 mod diag;
 mod forward_auth;
+pub mod ip_allow_list;
 mod proxy;
 pub mod rate_limit;
 mod request_match;
@@ -19,6 +20,7 @@ use crate::model::{Backend, EntrypointConfig};
 use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
+use ip_allow_list::{IpAllowList, IpAllowListMiddleware, TrustedProxies};
 use rate_limit::{RateLimitMiddleware, RateLimiter};
 use request_match::RequestMatchMiddleware;
 
@@ -174,21 +176,48 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || !config.plugins.is_empty()
         || !config.match_headers.is_empty()
         || !config.match_query.is_empty()
+        || !config.ip_allow_list.is_empty()
 }
 
 /// Build middleware route from entrypoint config.
 ///
-/// The stack is assembled in order: request-match (reject requests that don't
-/// meet header/query conditions), forward-auth, then rate-limit (all before the
-/// backend), then compression (on the response). `forward_auth_client` is the
-/// shared client from [`build_forward_auth_client`].
+/// The stack is assembled in order: **IP allow-list first** (a denied client
+/// never reaches anything else), then request-match (reject requests that
+/// don't meet header/query conditions), forward-auth, then rate-limit (all
+/// before the backend), then compression (on the response).
+/// `forward_auth_client` is the shared client from
+/// [`build_forward_auth_client`]. `trusted_proxies` comes from the global
+/// `ProxyConfig` and gates how `X-Forwarded-For` is interpreted by the
+/// allow-list — see [`ip_allow_list`] for the trust model.
 pub fn build_middleware_route(
     config: &EntrypointConfig,
     backends: &[Backend],
     forward_auth_client: &reqwest::Client,
     plugins: &PluginRegistry,
+    trusted_proxies: &TrustedProxies,
 ) -> Arc<MiddlewareRoute> {
     let mut middlewares: Vec<Arc<dyn Middleware>> = Vec::new();
+
+    // IP allow-list runs *first*: a request from a denied client never reaches
+    // request-match, auth, rate-limit, or the backend.
+    if !config.ip_allow_list.is_empty() {
+        let list = IpAllowList::new(&config.ip_allow_list);
+        if list.is_empty() {
+            // Every entry was invalid. Skip the middleware so the route stays
+            // reachable instead of being silently black-holed; the per-entry
+            // warnings are already logged by `IpAllowList::new`.
+            warn!(
+                "ip_allow_list for entrypoint with hosts {:?} has no valid entries; \
+                 middleware not installed (route stays open)",
+                config.hostnames
+            );
+        } else {
+            middlewares.push(Arc::new(IpAllowListMiddleware::new(
+                list,
+                trusted_proxies.clone(),
+            )));
+        }
+    }
 
     // Header/query match conditions run first: a request that doesn't match the
     // route's conditions is rejected (404) before auth, rate-limit, or backend.

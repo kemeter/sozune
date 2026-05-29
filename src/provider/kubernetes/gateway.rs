@@ -1109,6 +1109,7 @@ fn rule_to_entrypoints(
                     error_pages: std::collections::BTreeMap::new(),
                     match_headers: Vec::new(),
                     match_query: Vec::new(),
+                    ip_allow_list: Vec::new(),
                 },
                 source: Some(id),
             }

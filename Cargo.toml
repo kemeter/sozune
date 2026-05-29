@@ -16,6 +16,7 @@ sozu-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "ab4a6c9" }
 anyhow = "1.0.99"
 bollard = "0.20"
 async-trait = "0.1.89"
+ipnet = "2.11"
 serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

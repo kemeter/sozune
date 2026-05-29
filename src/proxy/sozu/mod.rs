@@ -163,6 +163,11 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     // Copy values needed for threads
     let max_buffers = config.max_buffers;
     let buffer_size = config.buffer_size;
+    // Compile the trusted-proxies CIDR list once at boot; it's read by every
+    // middleware-route rebuild via `handle_reload`. Shared across threads.
+    let trusted_proxies = Arc::new(middleware::ip_allow_list::TrustedProxies::new(
+        &config.trusted_proxies,
+    ));
 
     // HTTP Listener
     let mut http_builder = ListenerBuilder::new_http(SocketAddress::new_v4(
@@ -246,6 +251,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
 
     // Start configuration reload handler
     let storage_reload = Arc::clone(&storage);
+    let trusted_proxies_reload = Arc::clone(&trusted_proxies);
     let http_port = config.http.listen_address;
     let https_port = config.https.listen_address;
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
@@ -421,6 +427,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     &middleware_state,
                     middleware_port,
                     &plugins,
+                    &trusted_proxies_reload,
                 );
             }
         });
@@ -460,6 +467,7 @@ fn handle_reload(
     middleware_state: &MiddlewareState,
     middleware_port: u16,
     plugins: &middleware::PluginRegistry,
+    trusted_proxies: &middleware::ip_allow_list::TrustedProxies,
 ) -> RoutingSnapshot {
     info!("Received configuration reload request");
     let storage_read = match storage.read() {
@@ -478,7 +486,7 @@ fn handle_reload(
     apply_routing_diff(previous_snapshot, &current_snapshot, channels);
 
     // Update middleware route table
-    update_middleware_routes(&storage_read, middleware_state, plugins);
+    update_middleware_routes(&storage_read, middleware_state, plugins, trusted_proxies);
 
     match configure_sozu_routing(
         channels,
@@ -499,6 +507,7 @@ fn update_middleware_routes(
     storage: &BTreeMap<String, Entrypoint>,
     middleware_state: &MiddlewareState,
     plugins: &middleware::PluginRegistry,
+    trusted_proxies: &middleware::ip_allow_list::TrustedProxies,
 ) {
     let mut table = match middleware_state.write() {
         Ok(guard) => guard,
@@ -525,6 +534,7 @@ fn update_middleware_routes(
                 &entrypoint.backends,
                 &forward_auth_client,
                 plugins,
+                trusted_proxies,
             );
             debug!(
                 "Middleware route for {} (hosts: {:?}): {} middleware(s)",

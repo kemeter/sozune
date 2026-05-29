@@ -86,6 +86,7 @@ export interface EntrypointConfig {
   compress?: boolean;
   headers?: Record<string, string>;
   backend_timeout?: number | null;
+  ip_allow_list?: string[];
   [key: string]: unknown;
 }
 
