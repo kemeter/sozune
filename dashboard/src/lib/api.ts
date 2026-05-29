@@ -189,6 +189,69 @@ export function health(): Promise<unknown> {
   return request<unknown>('/health');
 }
 
+/** Read-only snapshot of the running config (auth-protected, admin only).
+ *  Mirrors `ConfigView` on the server: listener ports, ACME, providers,
+ *  dashboard listener, API listener. No user list. */
+export interface ConfigView {
+  version: string;
+  listeners: { http: { port: number }; https: { port: number } };
+  acme:
+    | {
+        enabled: boolean;
+        email: string;
+        staging: boolean;
+        challenge_port: number;
+        resolvers: Record<string, unknown>;
+      }
+    | null;
+  providers: {
+    docker?: { enabled: boolean; endpoint: string; expose_by_default: boolean } | null;
+    podman?: { enabled: boolean; endpoint: string; expose_by_default: boolean } | null;
+    swarm?: { enabled: boolean; endpoint: string; expose_by_default: boolean } | null;
+    kubernetes?: { enabled: boolean } | null;
+    nomad?: { enabled: boolean } | null;
+    consul?: { enabled: boolean } | null;
+    config_file?: { enabled: boolean; path: string; watch: boolean } | null;
+    http?: { enabled: boolean; url: string; poll_interval: number } | null;
+  };
+  dashboard: { enabled: boolean; listen_address: string };
+  api: { enabled: boolean; listen_address: string; cors_origins: string[] };
+}
+
+export function getConfig(): Promise<ConfigView> {
+  return request<ConfigView>('/config');
+}
+
+/** JSON view of the `/metrics` endpoint. Same numbers as the Prometheus
+ *  text exposition, in a shape the dashboard can read directly without
+ *  hand-rolling a parser. */
+export interface MetricsView {
+  static: {
+    entrypoints: number;
+    entrypoints_by_protocol: Record<string, number>;
+    entrypoints_tls: number;
+    backends: number;
+    backends_unhealthy: number;
+    diagnostics: { error: number; warn: number; info: number };
+    acme_enabled: boolean;
+  };
+  proxy: {
+    /** Unix timestamp (seconds) of the last successful Sōzu worker poll.
+     *  `0` if no poll has succeeded yet. */
+    last_poll_seconds: number;
+    /** Sōzu-emitted counters/gauges, keyed by their original `sozu` name
+     *  (dots become underscores). Values are integers; treat unknowns
+     *  defensively. */
+    metrics: Record<string, number>;
+  };
+}
+
+export function getMetrics(): Promise<MetricsView> {
+  // `request()` always sends `Accept: application/json`, so the metrics
+  // endpoint returns its JSON variant rather than the Prometheus text format.
+  return request<MetricsView>('/metrics');
+}
+
 export function me(): Promise<{ name: string; role: 'admin' | 'read-only' }> {
   return request<{ name: string; role: 'admin' | 'read-only' }>('/me');
 }

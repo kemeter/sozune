@@ -5,8 +5,11 @@
     listEntrypoints,
     listDiagnostics,
     listProviders,
-    getBaseUrl,
+    getConfig,
+    getMetrics,
+    type ConfigView,
     type Entrypoint,
+    type MetricsView,
     type Provider,
     type Diagnostic
   } from '$lib/api';
@@ -15,29 +18,71 @@
   let entrypoints = $state<Entrypoint[]>([]);
   let providers = $state<Provider[]>([]);
   let globalDiagnostics = $state<Diagnostic[]>([]);
-  let loading = $state(true);
+  let config = $state<ConfigView | null>(null);
+  let metrics = $state<MetricsView | null>(null);
+  /** `firstLoad` distinguishes "never loaded anything yet" from "polling on
+   *  top of cached data". The latter must keep the old payload visible so the
+   *  UI doesn't flicker back to zeros on every 5 s refresh. */
+  let firstLoad = $state(true);
+  let refreshing = $state(false);
   let error = $state<string | null>(null);
   let lastRefresh = $state<Date | null>(null);
   let poll: ReturnType<typeof setInterval> | null = null;
 
-  async function load(silent = false) {
-    if (!silent) loading = true;
+  async function load() {
+    refreshing = true;
     try {
-      const [eps, prov, diag] = await Promise.all([
+      const [eps, prov, diag, cfg, met] = await Promise.all([
         listEntrypoints(),
         listProviders(),
-        listDiagnostics()
+        listDiagnostics(),
+        // `/config` is admin-only; read-only viewers will 403 here. Treat
+        // failure as "no config" rather than as a page-wide error.
+        getConfig().catch(() => null),
+        // `/metrics` is unauthenticated and may take a worker-poll cycle to
+        // populate the proxy section. Failure or empty proxy → we just hide
+        // the live counters rather than fail the page.
+        getMetrics().catch(() => null)
       ]);
       entrypoints = eps;
       providers = prov.providers ?? [];
       globalDiagnostics = diag.global ?? [];
+      config = cfg;
+      metrics = met;
       error = null;
       lastRefresh = new Date();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      refreshing = false;
+      firstLoad = false;
     }
+  }
+
+  /** Pick a metric value defensively. Sōzu's keys vary across versions; we
+   *  accept a handful of candidates and return the first one present. */
+  function metric(...keys: string[]): number | null {
+    if (!metrics?.proxy.metrics) return null;
+    for (const k of keys) {
+      const v = metrics.proxy.metrics[k];
+      if (typeof v === 'number') return v;
+    }
+    return null;
+  }
+
+  const liveConnections = $derived(metric('connections', 'connections_active'));
+  const liveRequests = $derived(
+    metric('http_requests', 'http_requests_total', 'requests')
+  );
+  const liveErrors5xx = $derived(metric('http_errors_5xx', 'http_5xx', 'errors_5xx'));
+  const workerPollFresh = $derived(
+    !!metrics && metrics.proxy.last_poll_seconds > 0
+  );
+
+  function fmtCompact(n: number): string {
+    if (n < 1000) return String(n);
+    if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
+    return `${(n / 1_000_000).toFixed(1)}M`;
   }
 
   onMount(() => {
@@ -46,31 +91,34 @@
       return;
     }
     void load();
-    poll = setInterval(() => void load(true), 5000);
+    poll = setInterval(() => void load(), 5000);
   });
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
   });
 
-  /** Listener inventory. The API listener is authoritative (we know its URL).
-   *  HTTP/HTTPS/Dashboard fall back to Sōzune defaults — accurate for most
-   *  setups but operators who override them in config.yaml will see wrong
-   *  values until the API exposes them. */
+  /** Listener inventory, sourced from `/config` when available so we never
+   *  lie about ports. Falls back to the documented defaults only on the first
+   *  load (before `/config` answered) so the card isn't empty for 200 ms. */
   const listeners = $derived.by(() => {
-    let apiPort = '3035';
-    try {
-      apiPort = new URL(getBaseUrl()).port || '3035';
-    } catch {
-      // ignore
-    }
+    const httpPort = config?.listeners.http.port ?? 80;
+    const httpsPort = config?.listeners.https.port ?? 443;
+    const dashPort = parseListenPort(config?.dashboard.listen_address, 3038);
+    const apiPort = parseListenPort(config?.api.listen_address, 3035);
     return [
-      { name: 'HTTP', port: `:80` },
-      { name: 'HTTPS', port: `:443` },
+      { name: 'HTTP', port: `:${httpPort}` },
+      { name: 'HTTPS', port: `:${httpsPort}` },
       { name: 'API', port: `:${apiPort}` },
-      { name: 'DASHBOARD', port: `:3038` }
+      { name: 'DASHBOARD', port: `:${dashPort}` }
     ];
   });
+
+  function parseListenPort(addr: string | undefined, fallback: number): number {
+    if (!addr) return fallback;
+    const m = addr.match(/:(\d+)$/);
+    return m ? Number(m[1]) : fallback;
+  }
 
   const stats = $derived.by(() => {
     let backendsTotal = 0;
@@ -203,6 +251,42 @@
   });
 </script>
 
+{#snippet criticalSection()}
+  <section class="section">
+    <header class="section-head">
+      <h2 class="section-title">Critical · recent events</h2>
+      <span class="pill pill-err"
+        ><span class="dot"></span> {criticalRows.length} active</span
+      >
+    </header>
+    <table class="evt-table">
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Severity</th>
+          <th>Source</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each criticalRows as row}
+          <tr class="evt-row">
+            <td class="t-when">{row.when}</td>
+            <td><span class="sev-pill sev-pill-err">{row.sev}</span></td>
+            <td class="t-src mono">{row.source}</td>
+            <td class="t-det">{row.detail}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+    <footer class="section-foot">
+      <a class="link" style="color: var(--danger)" href="./entrypoints?health=degraded"
+        >Inspect impacted routes <span class="arr">→</span></a
+      >
+    </footer>
+  </section>
+{/snippet}
+
 <main class="overview">
   <header class="topbar">
     <div>
@@ -215,6 +299,9 @@
       <span class="status-pill status-{systemStatus.tone}">
         <span class="status-ind"></span> {systemStatus.label}
       </span>
+      {#if refreshing}
+        <span class="spinner" aria-label="refreshing" title="refreshing…"></span>
+      {/if}
       {#if lastRefresh}
         <span class="updated">updated {timeAgo(lastRefresh)}</span>
       {/if}
@@ -225,211 +312,274 @@
     <div class="alert"><strong>error</strong> {error}</div>
   {/if}
 
-  <section class="grid">
-    <!-- Routes -->
-    <article class="card">
-      <div class="head">
-        <span class="title">Routes</span>
-        <span class="pill pill-ok"><span class="dot"></span> running</span>
-      </div>
-      <div class="value">{stats.total}<small>entrypoints</small></div>
-      <div class="sub">
-        {stats.http} HTTP &nbsp;·&nbsp; {stats.tcp} TCP &nbsp;·&nbsp; {stats.udp} UDP
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./entrypoints">View all <span class="arr">→</span></a>
-      </div>
-    </article>
+  {#if firstLoad}
+    <!-- Skeleton: only shown until the first payload lands. After that, the
+         poll cycle re-runs `load()` but the previous values stay on screen. -->
+    <section class="grid">
+      {#each Array(8) as _}
+        <article class="card card-skeleton">
+          <div class="skeleton-line skeleton-title"></div>
+          <div class="skeleton-line skeleton-value"></div>
+          <div class="skeleton-line skeleton-sub"></div>
+        </article>
+      {/each}
+    </section>
+  {:else}
+    <!-- Promote the critical events table above the grid when something is
+         actually wrong — that's the first thing operators came to see. -->
+    {#if criticalRows.length > 0}
+      {@render criticalSection()}
+    {/if}
 
-    <!-- Backends -->
-    <article class="card">
-      <div class="head">
-        <span class="title">Backends</span>
-        <span class="pill pill-{stats.backendsDown > 0 ? 'err' : 'ok'}">
-          <span class="dot"></span>
-          {stats.backendsDown > 0 ? `${stats.backendsDown} down` : 'all up'}
-        </span>
-      </div>
-      <div class="value">
-        <span class="value-ok">{stats.backendsHealthy}</span><small>/ {stats.backendsTotal} healthy</small>
-      </div>
-      <div class="sub">{kindsLabel}</div>
-      <div class="foot">
-        <span class="healthy-pct mono">{stats.healthyPct}%</span>
-        <a class="link" href="./entrypoints">Inspect <span class="arr">→</span></a>
-      </div>
-    </article>
+    <section class="grid">
+      <!-- Routes -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Routes</span>
+          <span class="pill pill-ok"><span class="dot"></span> running</span>
+        </div>
+        <div class="value">{stats.total}<small>entrypoints</small></div>
+        <div class="sub">
+          {stats.http} HTTP &nbsp;·&nbsp; {stats.tcp} TCP &nbsp;·&nbsp; {stats.udp} UDP
+        </div>
+        <div class="foot">
+          {#if workerPollFresh && liveRequests !== null}
+            <span class="live mono" title="Total HTTP requests since startup">
+              <span class="live-dot"></span> {fmtCompact(liveRequests)} req
+            </span>
+          {:else}
+            <span></span>
+          {/if}
+          <a class="link" href="./entrypoints">View all <span class="arr">→</span></a>
+        </div>
+      </article>
 
-    <!-- Providers -->
-    <article class="card">
-      <div class="head">
-        <span class="title">Providers</span>
-        <span class="pill pill-ok">
-          <span class="dot"></span>
-          {enabledProviders.filter((p) => p.enabled).length} active
-        </span>
-      </div>
-      <div class="value">
-        {enabledProviders.filter((p) => p.enabled).length}<small>/ {providers.length} enabled</small>
-      </div>
-      <div class="prov-row">
-        {#each providers as p}
-          <span class="prov" class:on={p.enabled} class:off={!p.enabled}>
-            {p.name}{p.enabled ? ` · ${p.entrypoint_count}` : ''}
+      <!-- Backends -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Backends</span>
+          <span class="pill pill-{stats.backendsDown > 0 ? 'err' : 'ok'}">
+            <span class="dot"></span>
+            {stats.backendsDown > 0 ? `${stats.backendsDown} down` : 'all up'}
           </span>
-        {/each}
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./providers">Manage <span class="arr">→</span></a>
-      </div>
-    </article>
+        </div>
+        <div class="value">
+          <span class="value-ok">{stats.backendsHealthy}</span><small
+            >/ {stats.backendsTotal} healthy</small
+          >
+        </div>
+        <div class="sub">{kindsLabel}</div>
+        <div class="foot">
+          {#if workerPollFresh && liveConnections !== null}
+            <span class="live mono" title="Open connections right now">
+              <span class="live-dot"></span> {fmtCompact(liveConnections)} conn
+            </span>
+          {:else}
+            <span class="healthy-pct mono">{stats.healthyPct}%</span>
+          {/if}
+          <a
+            class="link"
+            href={stats.backendsDown > 0
+              ? './entrypoints?health=degraded'
+              : './entrypoints'}
+          >
+            {stats.backendsDown > 0 ? 'Inspect down' : 'Inspect'}
+            <span class="arr">→</span>
+          </a>
+        </div>
+      </article>
 
-    <!-- Diagnostics -->
-    <article class="card">
-      <div class="head">
-        <span class="title">Diagnostics</span>
-        <span
-          class="pill pill-{diagCounts.err > 0 ? 'err' : diagCounts.warn > 0 ? 'warn' : 'ok'}"
-        >
-          <span class="dot"></span>
-          {diagCounts.total > 0 ? `${diagCounts.total} active` : 'clean'}
-        </span>
-      </div>
-      <div class="value">
-        {diagCounts.total}<small>
-          {#if diagCounts.err > 0}<span class="value-err">{diagCounts.err} err</span>{/if}
-          {#if diagCounts.err > 0 && diagCounts.warn > 0}&nbsp;·&nbsp;{/if}
-          {#if diagCounts.warn > 0}<span class="value-warn">{diagCounts.warn} warn</span>{/if}
-          {#if diagCounts.total === 0}no issues detected{/if}
-        </small>
-      </div>
-      <div class="sub">
-        {#if diagCounts.total === 0}
-          Label parser, route collisions and runtime checks all pass.
-        {:else}
-          Configuration issues raised by the label parser and runtime lints.
-        {/if}
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./diagnostics">Review <span class="arr">→</span></a>
-      </div>
-    </article>
-
-    <!-- TLS -->
-    <article class="card">
-      <div class="head">
-        <span class="title">TLS</span>
-        <span class="pill pill-ok"><span class="dot"></span> {stats.tls} routes</span>
-      </div>
-      <div class="value">{stats.tls}<small>HTTPS entrypoints</small></div>
-      <div class="sub">
-        {stats.total - stats.tls} plain HTTP &nbsp;·&nbsp; certificate inventory coming
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./certificates">Certificates <span class="arr">→</span></a>
-      </div>
-    </article>
-
-    <!-- ACME (placeholder until /acme endpoint exposes status) -->
-    <article class="card">
-      <div class="head">
-        <span class="title">ACME</span>
-        <span class="pill pill-muted"><span class="dot"></span> see config</span>
-      </div>
-      <div class="value">—<small>status not exposed yet</small></div>
-      <div class="sub">
-        Let's Encrypt resolver state is configured in <code>acme.*</code>. A future API
-        endpoint will surface live state here.
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./settings">Settings <span class="arr">→</span></a>
-      </div>
-    </article>
-
-    <!-- Listeners -->
-    <article class="card">
-      <div class="head">
-        <span class="title">Listeners</span>
-        <span class="pill pill-ok"><span class="dot"></span> {listeners.length} bound</span>
-      </div>
-      <div class="value">{listeners.length}<small>ports</small></div>
-      <div class="lst">
-        {#each listeners as l}
-          <div class="lst-row"><b>{l.name}</b><span class="mono">{l.port}</span></div>
-        {/each}
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./health">Health <span class="arr">→</span></a>
-      </div>
-    </article>
-
-    <!-- Critical summary -->
-    <article class="card">
-      <div class="head">
-        <span class="title">Critical</span>
-        <span class="pill pill-{criticalRows.length > 0 ? 'err' : 'ok'}">
-          <span class="dot"></span>
-          {criticalRows.length > 0 ? 'action req.' : 'all clear'}
-        </span>
-      </div>
-      <div class="value">
-        <span class={criticalRows.length > 0 ? 'value-err' : 'value-ok'}
-          >{criticalRows.length}</span
-        ><small>{criticalRows.length === 1 ? 'event' : 'events'}</small>
-      </div>
-      <div class="sub">
-        {#if criticalRows.length > 0}
-          See the events table below for details.
-        {:else}
-          No backends down, no critical diagnostics. Everything routing.
-        {/if}
-      </div>
-      <div class="foot">
-        <span></span>
-        <a class="link" href="./diagnostics">Diagnostics <span class="arr">→</span></a>
-      </div>
-    </article>
-  </section>
-
-  {#if criticalRows.length > 0}
-    <section class="section">
-      <header class="section-head">
-        <h2 class="section-title">Critical · recent events</h2>
-        <span class="pill pill-err"
-          ><span class="dot"></span> {criticalRows.length} active</span
-        >
-      </header>
-      <table class="evt-table">
-        <thead>
-          <tr>
-            <th>When</th>
-            <th>Severity</th>
-            <th>Source</th>
-            <th>Detail</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each criticalRows as row}
-            <tr class="evt-row">
-              <td class="t-when">{row.when}</td>
-              <td><span class="sev-pill sev-pill-err">{row.sev}</span></td>
-              <td class="t-src mono">{row.source}</td>
-              <td class="t-det">{row.detail}</td>
-            </tr>
+      <!-- Providers -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Providers</span>
+          <span class="pill pill-ok">
+            <span class="dot"></span>
+            {enabledProviders.filter((p) => p.enabled).length} active
+          </span>
+        </div>
+        <div class="value">
+          {enabledProviders.filter((p) => p.enabled).length}<small
+            >/ {providers.length} enabled</small
+          >
+        </div>
+        <div class="prov-row">
+          {#each providers as p}
+            <span class="prov" class:on={p.enabled} class:off={!p.enabled}>
+              {p.name}{p.enabled ? ` · ${p.entrypoint_count}` : ''}
+            </span>
           {/each}
-        </tbody>
-      </table>
-      <footer class="section-foot">
-        <a class="link" style="color: var(--danger)" href="./diagnostics"
-          >Open diagnostics <span class="arr">→</span></a
-        >
-      </footer>
+        </div>
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./providers">Manage <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Diagnostics -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Diagnostics</span>
+          <span
+            class="pill pill-{diagCounts.err > 0
+              ? 'err'
+              : diagCounts.warn > 0
+                ? 'warn'
+                : 'ok'}"
+          >
+            <span class="dot"></span>
+            {diagCounts.total > 0 ? `${diagCounts.total} active` : 'clean'}
+          </span>
+        </div>
+        <div class="value">
+          {diagCounts.total}<small>
+            {#if diagCounts.err > 0}<span class="value-err">{diagCounts.err} err</span>{/if}
+            {#if diagCounts.err > 0 && diagCounts.warn > 0}&nbsp;·&nbsp;{/if}
+            {#if diagCounts.warn > 0}<span class="value-warn"
+                >{diagCounts.warn} warn</span
+              >{/if}
+            {#if diagCounts.total === 0}no issues detected{/if}
+          </small>
+        </div>
+        <div class="sub">
+          {#if diagCounts.total === 0}
+            Label parser, route collisions and runtime checks all pass.
+          {:else}
+            Configuration issues raised by the label parser and runtime lints.
+          {/if}
+        </div>
+        <div class="foot">
+          {#if workerPollFresh && liveErrors5xx !== null && liveErrors5xx > 0}
+            <span class="live mono" title="HTTP 5xx responses since startup">
+              <span class="live-dot live-dot-err"></span>
+              {fmtCompact(liveErrors5xx)} 5xx
+            </span>
+          {:else}
+            <span></span>
+          {/if}
+          <a
+            class="link"
+            href={diagCounts.err > 0
+              ? './diagnostics?severity=error'
+              : diagCounts.warn > 0
+                ? './diagnostics?severity=warn'
+                : './diagnostics'}
+          >
+            Review <span class="arr">→</span>
+          </a>
+        </div>
+      </article>
+
+      <!-- TLS -->
+      <article class="card">
+        <div class="head">
+          <span class="title">TLS</span>
+          <span class="pill pill-ok"><span class="dot"></span> {stats.tls} routes</span>
+        </div>
+        <div class="value">{stats.tls}<small>HTTPS entrypoints</small></div>
+        <div class="sub">
+          {stats.total - stats.tls} plain HTTP &nbsp;·&nbsp; certificate inventory coming
+        </div>
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./entrypoints?tls=on"
+            >TLS routes <span class="arr">→</span></a
+          >
+        </div>
+      </article>
+
+      <!-- ACME -->
+      <article class="card">
+        <div class="head">
+          <span class="title">ACME</span>
+          {#if config?.acme?.enabled}
+            <span class="pill pill-ok">
+              <span class="dot"></span>
+              {config.acme.staging ? 'staging' : 'production'}
+            </span>
+          {:else}
+            <span class="pill pill-muted"><span class="dot"></span> disabled</span>
+          {/if}
+        </div>
+        {#if config?.acme}
+          <div class="value">
+            {Object.keys(config.acme.resolvers).length}<small>
+              {Object.keys(config.acme.resolvers).length === 1
+                ? 'resolver'
+                : 'resolvers'}
+            </small>
+          </div>
+          <div class="sub">
+            Account email <b>{config.acme.email || '—'}</b><br />
+            Challenge port <span class="mono">:{config.acme.challenge_port}</span>
+          </div>
+        {:else}
+          <div class="value">—<small>not configured</small></div>
+          <div class="sub">
+            Configure under <code>acme.*</code> in <code>config.yaml</code> to enable
+            Let's Encrypt.
+          </div>
+        {/if}
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./certificates">Certificates <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Listeners -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Listeners</span>
+          <span class="pill pill-ok"
+            ><span class="dot"></span> {listeners.length} bound</span
+          >
+        </div>
+        <div class="value">{listeners.length}<small>ports</small></div>
+        <div class="lst">
+          {#each listeners as l}
+            <div class="lst-row"><b>{l.name}</b><span class="mono">{l.port}</span></div>
+          {/each}
+        </div>
+        <div class="foot">
+          <span></span>
+          <a class="link" href="./health">Health <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Critical summary -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Critical</span>
+          <span class="pill pill-{criticalRows.length > 0 ? 'err' : 'ok'}">
+            <span class="dot"></span>
+            {criticalRows.length > 0 ? 'action req.' : 'all clear'}
+          </span>
+        </div>
+        <div class="value">
+          <span class={criticalRows.length > 0 ? 'value-err' : 'value-ok'}
+            >{criticalRows.length}</span
+          ><small>{criticalRows.length === 1 ? 'event' : 'events'}</small>
+        </div>
+        <div class="sub">
+          {#if criticalRows.length > 0}
+            See the events table above for details.
+          {:else}
+            No backends down, no critical diagnostics. Everything routing.
+          {/if}
+        </div>
+        <div class="foot">
+          <span></span>
+          <a
+            class="link"
+            href={criticalRows.length > 0
+              ? './entrypoints?health=degraded'
+              : './diagnostics'}
+          >
+            {criticalRows.length > 0 ? 'Inspect' : 'Diagnostics'}
+            <span class="arr">→</span>
+          </a>
+        </div>
+      </article>
     </section>
   {/if}
 </main>
@@ -470,6 +620,57 @@
   }
   .updated {
     font-variant-numeric: tabular-nums;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 1.5px solid var(--fg-3);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    display: inline-block;
+    animation: spin 700ms linear infinite;
+    opacity: 0.7;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* First-load skeleton — only used while we have no data yet. */
+  .card-skeleton {
+    pointer-events: none;
+  }
+  .skeleton-line {
+    background: linear-gradient(
+      90deg,
+      var(--bg-2) 0%,
+      var(--bg-hover) 50%,
+      var(--bg-2) 100%
+    );
+    background-size: 200% 100%;
+    border-radius: 4px;
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+  .skeleton-title {
+    height: 10px;
+    width: 40%;
+  }
+  .skeleton-value {
+    height: 28px;
+    width: 60%;
+  }
+  .skeleton-sub {
+    height: 12px;
+    width: 80%;
+  }
+  @keyframes shimmer {
+    0% {
+      background-position: 100% 0;
+    }
+    100% {
+      background-position: -100% 0;
+    }
   }
 
   .alert {
@@ -606,6 +807,36 @@
   .healthy-pct {
     color: var(--fg-2);
     font-size: 13px;
+  }
+  /* Live counter coming from Sōzu's worker poll. The pulsing dot tells the
+   * viewer this number is fresh (≤5 s old) and not a cached gauge. */
+  .live {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg-1);
+    font-size: 12px;
+  }
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 6px rgba(63, 185, 80, 0.5);
+    animation: live-pulse 1.6s ease-in-out infinite;
+  }
+  .live-dot-err {
+    background: var(--danger);
+    box-shadow: 0 0 6px rgba(248, 81, 73, 0.5);
+  }
+  @keyframes live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
   }
   .link {
     color: var(--fg-2);
