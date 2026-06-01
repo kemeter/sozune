@@ -120,6 +120,8 @@ export type UnhealthyKind =
   | 'host_unreachable'
   | 'timeout'
   | 'dns_failure'
+  | 'bad_status'
+  | 'http_error'
   | 'other';
 
 export interface UnhealthyBackend {

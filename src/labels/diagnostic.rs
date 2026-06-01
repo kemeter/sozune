@@ -45,6 +45,7 @@ pub enum DiagnosticCode {
     W018RouteCollision,
     W019InvalidForwardAuth,
     W020InvalidErrorPage,
+    W021InvalidHealthCheck,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -78,6 +79,7 @@ impl DiagnosticCode {
             DiagnosticCode::W018RouteCollision => "W018",
             DiagnosticCode::W019InvalidForwardAuth => "W019",
             DiagnosticCode::W020InvalidErrorPage => "W020",
+            DiagnosticCode::W021InvalidHealthCheck => "W021",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }

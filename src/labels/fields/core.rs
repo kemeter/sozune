@@ -112,6 +112,79 @@ pub fn parse_bool(labels: &HashMap<String, String>, key: &str) -> bool {
     labels.get(key).is_some_and(|v| v == "true")
 }
 
+/// Parse the HTTP health-check labels:
+///
+/// - `<prefix>healthCheck.path` — when present and non-empty, enables the HTTP
+///   probe. A leading `/` is added if missing.
+/// - `<prefix>healthCheck.status` — optional exact status code; `None` accepts
+///   any 2xx/3xx. An invalid value emits `W021` and is dropped (the check stays
+///   on the 2xx/3xx default rather than being disabled).
+///
+/// Returns `None` when no `healthCheck.path` is set — the backend keeps the
+/// plain TCP probe.
+pub fn parse_health_check(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<crate::model::HealthCheckConfig> {
+    let path_key = format!("{prefix}healthCheck.path");
+    let raw_path = labels
+        .get(&path_key)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    let path = if raw_path.starts_with('/') {
+        raw_path.to_string()
+    } else {
+        format!("/{raw_path}")
+    };
+
+    let status_key = format!("{prefix}healthCheck.status");
+    let status = match labels.get(&status_key).map(|s| s.trim()) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(code) if (100..=599).contains(&code) => Some(code),
+            _ => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W021InvalidHealthCheck,
+                        "healthCheck.status is not a valid HTTP status code; falling back to the 2xx/3xx default",
+                    )
+                    .with_label(&status_key)
+                    .with_value(raw)
+                    .with_hint("expected an integer between 100 and 599, e.g. 200"),
+                );
+                None
+            }
+        },
+    };
+
+    let timeout_key = format!("{prefix}healthCheck.timeout");
+    let timeout_ms = match labels.get(&timeout_key).map(|s| s.trim()) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(ms) if ms > 0 => Some(ms),
+            _ => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W021InvalidHealthCheck,
+                        "healthCheck.timeout is not a positive integer; falling back to the default timeout",
+                    )
+                    .with_label(&timeout_key)
+                    .with_value(raw)
+                    .with_hint("expected milliseconds as a positive integer, e.g. 2000"),
+                );
+                None
+            }
+        },
+    };
+
+    Some(crate::model::HealthCheckConfig {
+        path,
+        status,
+        timeout_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +340,89 @@ mod tests {
         assert!(!parse_bool(&l, "c"));
         assert!(!parse_bool(&l, "d"));
         assert!(!parse_bool(&l, "missing"));
+    }
+
+    #[test]
+    fn health_check_absent_yields_none() {
+        let mut d = Vec::new();
+        assert!(parse_health_check(&labels(&[]), "sozune.http.web.", &mut d).is_none());
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn health_check_path_enables_with_defaults() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[("sozune.http.web.healthCheck.path", "/health")]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .expect("path enables the check");
+        assert_eq!(hc.path, "/health");
+        assert_eq!(hc.status, None);
+        assert_eq!(hc.timeout_ms, None);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn health_check_path_gets_leading_slash() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[("sozune.http.web.healthCheck.path", "health")]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(hc.path, "/health");
+    }
+
+    #[test]
+    fn health_check_parses_status_and_timeout() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.web.healthCheck.path", "/up"),
+                ("sozune.http.web.healthCheck.status", "204"),
+                ("sozune.http.web.healthCheck.timeout", "2000"),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(hc.status, Some(204));
+        assert_eq!(hc.timeout_ms, Some(2000));
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn health_check_invalid_status_warns_and_defaults() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.web.healthCheck.path", "/health"),
+                ("sozune.http.web.healthCheck.status", "999"),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(hc.status, None);
+        assert_eq!(d[0].code, DiagnosticCode::W021InvalidHealthCheck);
+    }
+
+    #[test]
+    fn health_check_invalid_timeout_warns_and_defaults() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.web.healthCheck.path", "/health"),
+                ("sozune.http.web.healthCheck.timeout", "nope"),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(hc.timeout_ms, None);
+        assert_eq!(d[0].code, DiagnosticCode::W021InvalidHealthCheck);
     }
 }
