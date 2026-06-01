@@ -244,6 +244,18 @@ export interface MetricsView {
      *  (dots become underscores). Values are integers; treat unknowns
      *  defensively. */
     metrics: Record<string, number>;
+    /** Latency histogram for requests served through the Sōzune middleware
+     *  layer (measured by Sōzune itself). Middleware-less routes are served
+     *  directly by Sōzu and not counted. Optional so older servers (without
+     *  this field) don't break the dashboard. */
+    middleware_request_duration_seconds?: {
+      /** `[upper_bound_seconds, cumulative_count]` pairs, ascending. */
+      buckets: [string, number][];
+      /** Sum of all observed request durations, in seconds. */
+      sum: number;
+      /** Total number of observed requests. */
+      count: number;
+    };
   };
 }
 

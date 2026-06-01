@@ -31,6 +31,9 @@ pub struct AppState {
     /// whether their `enabled` flag is set.
     pub providers: crate::config::ProvidersConfig,
     pub metrics: crate::proxy::metrics_snapshot::MetricsSnapshotStore,
+    /// Live request-latency histogram, written by the middleware proxy handler.
+    /// Same Arc as `MiddlewareAppState::request_metrics`.
+    pub request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
     /// Full parsed config snapshot. Shared (Arc) so we never clone the whole
     /// thing per request — `/config` reads it under no lock since the parsed
     /// config is immutable once Sōzune is up.
@@ -190,6 +193,7 @@ pub async fn serve(
     acme_enabled: bool,
     providers: crate::config::ProvidersConfig,
     metrics: crate::proxy::metrics_snapshot::MetricsSnapshotStore,
+    request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
 ) -> anyhow::Result<()> {
     if config.users.is_empty() {
         anyhow::bail!(
@@ -206,6 +210,7 @@ pub async fn serve(
         acme_enabled,
         providers,
         metrics,
+        request_metrics,
         config: app_config,
     };
 
@@ -776,6 +781,7 @@ mod tests {
             acme_enabled: false,
             providers: crate::config::ProvidersConfig::default(),
             metrics: crate::proxy::metrics_snapshot::new_store(),
+            request_metrics: crate::proxy::request_metrics::new_store(),
             config: Arc::new(crate::config::AppConfig::default()),
         }
     }

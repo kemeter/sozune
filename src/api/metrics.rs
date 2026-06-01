@@ -98,6 +98,24 @@ struct ProxyMetrics {
     last_poll_seconds: u64,
     /// Per-key proxy counters/gauges as reported by Sōzu workers.
     metrics: HashMap<String, i128>,
+    /// Latency histogram for requests served through the Sōzune middleware
+    /// layer (measured by Sōzune itself, not polled from Sōzu). Middleware-less
+    /// routes are served directly by Sōzu and not counted here. Additive
+    /// field — clients that don't know it simply ignore it.
+    middleware_request_duration_seconds: RequestDurationMetrics,
+}
+
+/// JSON shape of the request-latency histogram. The Prometheus renderer emits
+/// the same numbers as a `histogram` (`_bucket`/`_sum`/`_count`).
+#[derive(Debug, Serialize)]
+struct RequestDurationMetrics {
+    /// Cumulative bucket counts keyed by upper bound in seconds (stringified,
+    /// e.g. `"0.005"`). The implicit `+Inf` bucket equals `count`.
+    buckets: Vec<(String, u64)>,
+    /// Sum of all observed request durations, in seconds.
+    sum: f64,
+    /// Total number of observed requests.
+    count: u64,
 }
 
 impl Snapshot {
@@ -180,14 +198,14 @@ impl ProxyMetrics {
     fn collect(state: &AppState) -> Self {
         use crate::proxy::metrics_snapshot::MetricValue;
 
+        // A poisoned Sōzu-snapshot lock only zeroes the *polled* values; the
+        // request histogram lives in an independent atomic store, so we still
+        // read and report it below.
         let snap = match state.metrics.read() {
             Ok(g) => g.clone(),
             Err(e) => {
                 error!("metrics: snapshot lock poisoned: {}", e);
-                return ProxyMetrics {
-                    last_poll_seconds: 0,
-                    metrics: HashMap::new(),
-                };
+                crate::proxy::metrics_snapshot::MetricsSnapshot::default()
             }
         };
 
@@ -202,11 +220,30 @@ impl ProxyMetrics {
             metrics.insert(safe, v);
         }
 
+        let rd = state.request_metrics.snapshot();
+        let middleware_request_duration_seconds = RequestDurationMetrics {
+            buckets: rd
+                .buckets
+                .iter()
+                .map(|(bound, count)| (format_bound(*bound), *count))
+                .collect(),
+            sum: rd.sum_seconds,
+            count: rd.count,
+        };
+
         ProxyMetrics {
             last_poll_seconds: snap.last_poll_unix,
             metrics,
+            middleware_request_duration_seconds,
         }
     }
+}
+
+/// Format a bucket bound as a stable, dot-decimal string for the `le` label
+/// and JSON key, independent of locale. `0.005` → `"0.005"`.
+fn format_bound(bound: f64) -> String {
+    // The bounds are short decimals; `{}` renders them without trailing noise.
+    format!("{bound}")
 }
 
 fn render_prom(snap: &Snapshot) -> String {
@@ -297,7 +334,53 @@ fn render_prom(snap: &Snapshot) -> String {
         }
     }
 
+    render_request_duration(&mut out, &snap.proxy.middleware_request_duration_seconds);
+
     out
+}
+
+/// Render the middleware request-latency histogram in Prometheus exposition
+/// format: cumulative `_bucket{le=…}` series (including the mandatory
+/// `le="+Inf"`), then `_sum` and `_count`. Always emitted, even when empty
+/// (all zeros), so the series exist from the first scrape.
+///
+/// The metric is named `sozune_middleware_request_duration_seconds` — not
+/// `sozune_request_duration_seconds` — on purpose: it measures only requests
+/// that traverse the Sōzune middleware layer (routes with auth, rate-limit,
+/// matching, compression, …). Routes with no middleware are served directly by
+/// the Sōzu workers and never reach this timer; their latency lives in the
+/// Sōzu worker bridge instead.
+fn render_request_duration(out: &mut String, rd: &RequestDurationMetrics) {
+    let _ = writeln!(
+        out,
+        "# HELP sozune_middleware_request_duration_seconds Latency of requests served through the Sōzune middleware layer, in seconds. Middleware-less routes are served directly by Sōzu and not counted here."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE sozune_middleware_request_duration_seconds histogram"
+    );
+    for (bound, count) in &rd.buckets {
+        let _ = writeln!(
+            out,
+            "sozune_middleware_request_duration_seconds_bucket{{le=\"{bound}\"}} {count}"
+        );
+    }
+    // The `+Inf` bucket holds every observation, i.e. the total count.
+    let _ = writeln!(
+        out,
+        "sozune_middleware_request_duration_seconds_bucket{{le=\"+Inf\"}} {}",
+        rd.count
+    );
+    let _ = writeln!(
+        out,
+        "sozune_middleware_request_duration_seconds_sum {}",
+        rd.sum
+    );
+    let _ = writeln!(
+        out,
+        "sozune_middleware_request_duration_seconds_count {}",
+        rd.count
+    );
 }
 
 fn sanitize_metric_name(key: &str) -> String {
@@ -336,6 +419,7 @@ mod tests {
             acme_enabled: false,
             providers: crate::config::ProvidersConfig::default(),
             metrics: crate::proxy::metrics_snapshot::new_store(),
+            request_metrics: crate::proxy::request_metrics::new_store(),
             config: Arc::new(crate::config::AppConfig::default()),
         }
     }
@@ -478,6 +562,48 @@ mod tests {
         assert!(body.contains("sozune_proxy_last_poll_seconds 12345"));
         assert!(body.contains("sozune_proxy_metric{key=\"http_requests\"} 42"));
         assert!(body.contains("sozune_proxy_metric{key=\"connections\"} 7"));
+    }
+
+    #[test]
+    fn request_duration_histogram_present_and_zeroed_when_no_traffic() {
+        let body = render_prom(&Snapshot::collect(&empty_state()));
+        assert!(body.contains("# TYPE sozune_middleware_request_duration_seconds histogram"));
+        assert!(body.contains("sozune_middleware_request_duration_seconds_bucket{le=\"+Inf\"} 0"));
+        assert!(body.contains("sozune_middleware_request_duration_seconds_count 0"));
+        assert!(body.contains("sozune_middleware_request_duration_seconds_sum 0"));
+    }
+
+    #[test]
+    fn request_duration_histogram_reflects_recorded_requests() {
+        use std::time::Duration;
+        let state = empty_state();
+        // 20ms and 200ms: 20ms lands in le>=0.025, 200ms in le>=0.25.
+        state.request_metrics.record(Duration::from_millis(20));
+        state.request_metrics.record(Duration::from_millis(200));
+        let body = render_prom(&Snapshot::collect(&state));
+
+        assert!(body.contains("sozune_middleware_request_duration_seconds_count 2"));
+        // sum = 0.22s.
+        assert!(body.contains("sozune_middleware_request_duration_seconds_sum 0.22"));
+        // The 0.005 bucket caught neither; the +Inf bucket caught both.
+        assert!(body.contains("sozune_middleware_request_duration_seconds_bucket{le=\"0.005\"} 0"));
+        assert!(body.contains("sozune_middleware_request_duration_seconds_bucket{le=\"+Inf\"} 2"));
+        // The 0.25 bucket caught both (0.02 and 0.2 are <= 0.25).
+        assert!(body.contains("sozune_middleware_request_duration_seconds_bucket{le=\"0.25\"} 2"));
+        // The 0.025 bucket caught only the fast one.
+        assert!(body.contains("sozune_middleware_request_duration_seconds_bucket{le=\"0.025\"} 1"));
+    }
+
+    #[test]
+    fn request_duration_present_in_json() {
+        use std::time::Duration;
+        let state = empty_state();
+        state.request_metrics.record(Duration::from_millis(50));
+        let snap = Snapshot::collect(&state);
+        let json = serde_json::to_value(&snap).unwrap();
+        let rd = &json["proxy"]["middleware_request_duration_seconds"];
+        assert_eq!(rd["count"], 1);
+        assert!(rd["buckets"].is_array());
     }
 
     #[test]
