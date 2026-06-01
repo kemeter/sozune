@@ -8,6 +8,9 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
 use super::MiddlewareAppState;
 use super::chain::{self, RequestCtx};
 use super::diag;
@@ -50,178 +53,206 @@ pub async fn handle_proxy(
         }
     };
 
-    let (route, known_hosts) = {
-        let table = match state.route_table.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                error!(
-                    "internal state corrupted (middleware routing), restart required: {}",
-                    e
+    // One span per proxied request. The incoming W3C `traceparent` (if any) is
+    // attached as the parent so this request continues an upstream trace; the
+    // span's `trace_id` is logged and propagated to the backend below. When
+    // tracing is disabled the span is cheap and simply never exported.
+    let span = tracing::info_span!(
+        "proxy.request",
+        otel.name = %format!("{method} {host}"),
+        http.request.method = %method,
+        server.address = %host,
+        url.path = %path,
+        http.response.status_code = tracing::field::Empty,
+    );
+    // `set_parent` only errors if the otel context can't be attached (no
+    // active otel subscriber, i.e. tracing disabled) — harmless to ignore.
+    let _ = span.set_parent(crate::tracing_otel::extract_parent(req.headers()));
+
+    let fut = async move {
+        let (route, known_hosts) = {
+            let table = match state.route_table.read() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!(
+                        "internal state corrupted (middleware routing), restart required: {}",
+                        e
+                    );
+                    return diag::internal_error("middleware-routing-corrupted").into_response();
+                }
+            };
+            (table.get_route_by_host(&host), table.known_hosts())
+        };
+
+        let route = match route {
+            Some(r) => r,
+            None => {
+                info!(
+                    "no route for host '{}' (known: {})",
+                    host,
+                    known_hosts.len()
                 );
-                return diag::internal_error("middleware-routing-corrupted").into_response();
+                return diag::no_route_for_host(&host, &known_hosts).into_response();
             }
         };
-        (table.get_route_by_host(&host), table.known_hosts())
-    };
 
-    let route = match route {
-        Some(r) => r,
-        None => {
-            info!(
-                "no route for host '{}' (known: {})",
-                host,
-                known_hosts.len()
+        // Build the per-request context shared across middlewares.
+        let mut ctx = RequestCtx {
+            host: host.clone(),
+            client_addr,
+            is_tls: req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.eq_ignore_ascii_case("https"))
+                .unwrap_or(false),
+            client_encoding: None,
+            pending_response_headers: Vec::new(),
+        };
+
+        // Request phase: run the middleware stack in order. A middleware may mutate
+        // the request (e.g. forward-auth stamping headers) or short-circuit (e.g.
+        // forward-auth deny, rate limit).
+        if let Err(response) =
+            chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await
+        {
+            let duration = start.elapsed();
+            state.request_metrics.record(duration);
+            access_log(
+                &source_ip,
+                &method,
+                &host,
+                &path,
+                response.status().as_u16(),
+                duration,
+                "middleware",
             );
-            return diag::no_route_for_host(&host, &known_hosts).into_response();
+            return response.into_response();
         }
-    };
 
-    // Build the per-request context shared across middlewares.
-    let mut ctx = RequestCtx {
-        host: host.clone(),
-        client_addr,
-        is_tls: req
+        // Pick a backend using round-robin.
+        let (backend_host, backend_port) = match route.next_backend() {
+            Some(b) => b.clone(),
+            None => {
+                error!("No backends configured for host '{}'", host);
+                state.request_metrics.record(start.elapsed());
+                return diag::no_healthy_backend(&host, &route.backends).into_response();
+            }
+        };
+
+        // Build the forwarded URI.
+        let original_path = req.uri().path().to_string();
+        let query = req
+            .uri()
+            .query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+
+        let forwarded_path = original_path.clone();
+
+        let target_uri = format!(
+            "http://{}:{}{}{}",
+            backend_host, backend_port, forwarded_path, query
+        );
+
+        debug!(
+            "Proxying {} {} -> {}",
+            req.method(),
+            original_path,
+            target_uri
+        );
+
+        // Check for WebSocket upgrade.
+        let is_websocket = req
             .headers()
-            .get("x-forwarded-proto")
+            .get("upgrade")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("https"))
-            .unwrap_or(false),
-        client_encoding: None,
-        pending_response_headers: Vec::new(),
-    };
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
-    // Request phase: run the middleware stack in order. A middleware may mutate
-    // the request (e.g. forward-auth stamping headers) or short-circuit (e.g.
-    // forward-auth deny, rate limit).
-    if let Err(response) = chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await {
+        if is_websocket {
+            // WebSocket tunnels live for the whole connection (minutes to hours),
+            // so their duration is not a request latency — deliberately excluded
+            // from the request-duration histogram to avoid skewing the distribution.
+            return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query)
+                .await;
+        }
+
+        // Build the forwarded request.
+        let (mut parts, body) = req.into_parts();
+
+        // Propagate the trace downstream: write this span's context as the
+        // outgoing `traceparent` so the backend joins the same trace. No-op when
+        // tracing is disabled (the context is invalid/empty).
+        crate::tracing_otel::inject_context(
+            &tracing::Span::current().context(),
+            &mut parts.headers,
+        );
+
+        parts.uri = match target_uri.parse::<Uri>() {
+            Ok(uri) => uri,
+            Err(e) => {
+                error!("Failed to parse target URI '{}': {}", target_uri, e);
+                state.request_metrics.record(start.elapsed());
+                return diag::forwarding_failed("invalid-target-uri", &e.to_string())
+                    .into_response();
+            }
+        };
+
+        let forwarded_req = Request::from_parts(parts, body);
+
+        // Send the request to the real backend.
+        let timeout_secs = route.backend_timeout.unwrap_or(30);
+
+        let response_future = state.http_client.request(forwarded_req);
+
+        let result = if timeout_secs == 0 {
+            response_future.await.map_err(|e| e.to_string())
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                response_future,
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => {
+                    error!("Backend request to {} timed out", target_uri);
+                    state.request_metrics.record(start.elapsed());
+                    return diag::backend_timeout(&target_uri, timeout_secs).into_response();
+                }
+            }
+        };
+
+        let backend_response = match result {
+            Ok(resp) => {
+                let (parts, body) = resp.into_parts();
+                let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
+                Response::from_parts(parts, body)
+            }
+            Err(e) => {
+                error!("Failed to forward request to {}: {}", target_uri, e);
+                state.request_metrics.record(start.elapsed());
+                return diag::backend_unreachable(&format!("backend at {target_uri}: {e}"))
+                    .into_response();
+            }
+        };
+
+        // Response phase: run the middleware stack in reverse (onion model). This is
+        // where compression applies.
+        let response = chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
+
         let duration = start.elapsed();
         state.request_metrics.record(duration);
+        let status = response.status().as_u16();
+        tracing::Span::current().record("http.response.status_code", status);
         access_log(
-            &source_ip,
-            &method,
-            &host,
-            &path,
-            response.status().as_u16(),
-            duration,
-            "middleware",
+            &source_ip, &method, &host, &path, status, duration, "backend",
         );
-        return response.into_response();
-    }
 
-    // Pick a backend using round-robin.
-    let (backend_host, backend_port) = match route.next_backend() {
-        Some(b) => b.clone(),
-        None => {
-            error!("No backends configured for host '{}'", host);
-            state.request_metrics.record(start.elapsed());
-            return diag::no_healthy_backend(&host, &route.backends).into_response();
-        }
+        response.into_response()
     };
 
-    // Build the forwarded URI.
-    let original_path = req.uri().path().to_string();
-    let query = req
-        .uri()
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
-
-    let forwarded_path = original_path.clone();
-
-    let target_uri = format!(
-        "http://{}:{}{}{}",
-        backend_host, backend_port, forwarded_path, query
-    );
-
-    debug!(
-        "Proxying {} {} -> {}",
-        req.method(),
-        original_path,
-        target_uri
-    );
-
-    // Check for WebSocket upgrade.
-    let is_websocket = req
-        .headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-
-    if is_websocket {
-        // WebSocket tunnels live for the whole connection (minutes to hours),
-        // so their duration is not a request latency — deliberately excluded
-        // from the request-duration histogram to avoid skewing the distribution.
-        return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query).await;
-    }
-
-    // Build the forwarded request.
-    let (mut parts, body) = req.into_parts();
-
-    parts.uri = match target_uri.parse::<Uri>() {
-        Ok(uri) => uri,
-        Err(e) => {
-            error!("Failed to parse target URI '{}': {}", target_uri, e);
-            state.request_metrics.record(start.elapsed());
-            return diag::forwarding_failed("invalid-target-uri", &e.to_string()).into_response();
-        }
-    };
-
-    let forwarded_req = Request::from_parts(parts, body);
-
-    // Send the request to the real backend.
-    let timeout_secs = route.backend_timeout.unwrap_or(30);
-
-    let response_future = state.http_client.request(forwarded_req);
-
-    let result = if timeout_secs == 0 {
-        response_future.await.map_err(|e| e.to_string())
-    } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            response_future,
-        )
-        .await
-        {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_) => {
-                error!("Backend request to {} timed out", target_uri);
-                state.request_metrics.record(start.elapsed());
-                return diag::backend_timeout(&target_uri, timeout_secs).into_response();
-            }
-        }
-    };
-
-    let backend_response = match result {
-        Ok(resp) => {
-            let (parts, body) = resp.into_parts();
-            let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
-            Response::from_parts(parts, body)
-        }
-        Err(e) => {
-            error!("Failed to forward request to {}: {}", target_uri, e);
-            state.request_metrics.record(start.elapsed());
-            return diag::backend_unreachable(&format!("backend at {target_uri}: {e}"))
-                .into_response();
-        }
-    };
-
-    // Response phase: run the middleware stack in reverse (onion model). This is
-    // where compression applies.
-    let response = chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
-
-    let duration = start.elapsed();
-    state.request_metrics.record(duration);
-    access_log(
-        &source_ip,
-        &method,
-        &host,
-        &path,
-        response.status().as_u16(),
-        duration,
-        "backend",
-    );
-
-    response.into_response()
+    fut.instrument(span).await
 }
 
 /// Emit one access-log line for a completed request.
@@ -235,6 +266,10 @@ pub async fn handle_proxy(
 ///
 /// `phase` is `"backend"` for a normally-proxied response or `"middleware"`
 /// when a middleware short-circuited the request (auth deny, rate limit, …).
+///
+/// `trace_id` is the current request span's OpenTelemetry trace id (32 hex
+/// chars), or `"-"` when tracing is disabled / the trace id is invalid — so log
+/// pipelines can join an access line to its trace.
 fn access_log(
     client_ip: &str,
     method: &str,
@@ -245,6 +280,7 @@ fn access_log(
     phase: &'static str,
 ) {
     let duration_ms = duration.as_millis();
+    let trace_id = current_trace_id();
     info!(
         target: "access",
         client_ip,
@@ -254,8 +290,25 @@ fn access_log(
         status,
         duration_ms,
         phase,
-        "{client_ip} {method} {host} {path} {status} {duration_ms}ms ({phase})",
+        trace_id = %trace_id,
+        "{client_ip} {method} {host} {path} {status} {duration_ms}ms ({phase}) trace={trace_id}",
     );
+}
+
+/// Trace id of the current span as 32 lowercase hex chars, or `"-"` when there
+/// is no valid (sampled) trace context — e.g. tracing disabled. Returns a
+/// borrowed `"-"` on the hot path when tracing is off, so the disabled case
+/// allocates nothing.
+fn current_trace_id() -> std::borrow::Cow<'static, str> {
+    use opentelemetry::trace::TraceContextExt;
+    let cx = tracing::Span::current().context();
+    let span_ref = cx.span();
+    let sc = span_ref.span_context();
+    if sc.is_valid() {
+        std::borrow::Cow::Owned(sc.trace_id().to_string())
+    } else {
+        std::borrow::Cow::Borrowed("-")
+    }
 }
 
 /// Handle WebSocket upgrade by establishing a TCP tunnel to the backend

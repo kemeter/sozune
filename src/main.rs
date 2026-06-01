@@ -24,6 +24,7 @@ mod middleware;
 mod model;
 mod provider;
 mod proxy;
+mod tracing_otel;
 mod util;
 
 /// Shared lock serialising every test that mutates `std::env`. Tests across
@@ -43,10 +44,13 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = cli::resolve_config_path(cli.config.as_deref());
 
-    // Resolve the log format before installing the tracing subscriber: the
-    // subscriber is global and set once, so the access log's text/JSON shape
-    // has to be known up front. Env wins over YAML wins over the default.
-    init_tracing(resolve_log_format(&config_path).await);
+    // Resolve enough config before installing the tracing subscriber: it is
+    // global and set once, so the log format (text/JSON) and the optional OTLP
+    // tracing layer have to be known up front. Env wins over YAML wins over
+    // defaults. The returned guard keeps the OTLP exporter alive and flushes it
+    // on drop — bind it for the whole process.
+    let early_cfg = resolve_early_config(&config_path).await;
+    let _tracing_guard = init_tracing(&early_cfg.log, &early_cfg.tracing);
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(&config_path).await,
@@ -84,36 +88,71 @@ fn log_env_filter() -> tracing_subscriber::EnvFilter {
         .add_directive("tower=warn".parse().expect("valid log directive"))
 }
 
-fn init_tracing(format: config::LogFormat) {
-    let builder = tracing_subscriber::fmt().with_env_filter(log_env_filter());
-    match format {
-        config::LogFormat::Text => builder.init(),
-        // JSON: one object per line, with structured fields (e.g. the access
-        // log's `client_ip`, `status`, `duration_ms`) as top-level keys.
-        config::LogFormat::Json => builder.json().flatten_event(true).init(),
+/// Install the global tracing subscriber: a fmt layer (text or JSON) plus,
+/// when `tracing.enabled`, an OpenTelemetry OTLP layer. Returns the OTLP guard
+/// (kept alive by the caller, flushed on drop) or `None` when tracing is off or
+/// the exporter failed to build (in which case we degrade to logs-only).
+fn init_tracing(
+    log: &config::LogConfig,
+    tracing_cfg: &config::TracingConfig,
+) -> Option<tracing_otel::TracingGuard> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // The fmt layer mirrors the previous behaviour: text by default, or
+    // newline-delimited JSON with flattened fields.
+    let fmt_layer = match log.format {
+        config::LogFormat::Text => tracing_subscriber::fmt::layer().boxed(),
+        config::LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .boxed(),
+    };
+
+    let registry = tracing_subscriber::registry()
+        .with(log_env_filter())
+        .with(fmt_layer);
+
+    if !tracing_cfg.enabled {
+        registry.init();
+        return None;
+    }
+
+    match tracing_otel::build_layer(tracing_cfg) {
+        Ok((otel_layer, guard)) => {
+            registry.with(otel_layer).init();
+            info!(
+                "Distributed tracing enabled, exporting OTLP to {}",
+                tracing_cfg.endpoint
+            );
+            Some(guard)
+        }
+        Err(e) => {
+            // Don't crash on a bad collector endpoint — run logs-only.
+            registry.init();
+            error!("tracing: failed to initialise OTLP exporter, continuing without traces: {e}");
+            None
+        }
     }
 }
 
-/// Best-effort resolution of the log format before the config is fully loaded
-/// and validated. Env (`SOZUNE_LOG_FORMAT`) wins; otherwise we peek at the YAML
-/// `log.format` if a config file is present; otherwise the default (text). Any
-/// read/parse error is swallowed — the real validation happens in `serve`, and
-/// the default keeps logging working regardless.
-async fn resolve_log_format(config_path: &str) -> config::LogFormat {
-    if let Ok(v) = std::env::var("SOZUNE_LOG_FORMAT") {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "json" => return config::LogFormat::Json,
-            "text" => return config::LogFormat::Text,
-            _ => {}
-        }
-    }
-    if tokio::fs::try_exists(config_path).await.unwrap_or(false)
+/// Best-effort early config used only to set up tracing before the real config
+/// is loaded and validated in `serve`. Env wins over YAML wins over defaults;
+/// any read/parse error is swallowed and defaults stand (logging still works).
+async fn resolve_early_config(config_path: &str) -> config::AppConfig {
+    let mut cfg = if tokio::fs::try_exists(config_path).await.unwrap_or(false)
         && let Ok(content) = tokio::fs::read_to_string(config_path).await
-        && let Ok(cfg) = config_load::parse_yaml(std::path::Path::new(config_path), &content)
+        && let Ok(parsed) = config_load::parse_yaml(std::path::Path::new(config_path), &content)
     {
-        return cfg.log.format;
-    }
-    config::LogFormat::Text
+        parsed
+    } else {
+        config::AppConfig::default()
+    };
+    // Apply env overrides so SOZUNE_LOG_FORMAT / SOZUNE_TRACING_* win, exactly
+    // as they will in `serve`.
+    cfg.apply_env_overrides();
+    cfg
 }
 
 async fn serve(config_path: &str) -> anyhow::Result<()> {
@@ -423,8 +462,13 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 Ok(Ok(Err(e))) => error!("Proxy shut down with error: {}", e),
                 Ok(Err(e)) => error!("Proxy task panicked: {:?}", e),
                 Err(_) => {
-                    warn!("Graceful shutdown timed out, forcing exit");
-                    std::process::exit(1);
+                    // Don't `process::exit` here: that would skip `main`'s
+                    // tracing guard drop and lose the last span batch. Returning
+                    // the error unwinds cleanly so the guard flushes on the way
+                    // out, then `main` reports the failure.
+                    warn!("Graceful shutdown timed out");
+                    metrics_poll_task.abort();
+                    anyhow::bail!("graceful shutdown timed out after 10s");
                 }
             }
         }

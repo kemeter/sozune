@@ -10,6 +10,17 @@ services:
         extra_hosts:
             - "host.docker.internal:host-gateway"
 
+    # Traces backend. Receives Sōzune spans over OTLP/gRPC on :4317 and is
+    # queried by Grafana. Point `tracing.endpoint` at http://127.0.0.1:4317.
+    tempo:
+        image: grafana/tempo:latest
+        command: ["-config.file=/etc/tempo.yaml"]
+        ports:
+            - "3200:3200"   # Tempo query API (Grafana datasource)
+            - "4317:4317"   # OTLP/gRPC ingest
+        volumes:
+            - ./tests/observability/tempo.yaml:/etc/tempo.yaml:ro
+
     grafana:
         image: grafana/grafana:latest
         ports:
@@ -24,3 +35,4 @@ services:
             - ./tests/observability/dashboards:/var/lib/grafana/dashboards:ro
         depends_on:
             - prometheus
+            - tempo

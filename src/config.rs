@@ -17,10 +17,59 @@ pub struct AppConfig {
     /// Logging output configuration (text vs JSON).
     #[serde(default)]
     pub log: LogConfig,
+    /// Distributed tracing (OpenTelemetry OTLP export). Disabled by default.
+    #[serde(default)]
+    pub tracing: TracingConfig,
     /// WASM plugins declared by name. Each entry points at an http-wasm guest
     /// `.wasm`; entrypoints reference these by name to run them as middleware.
     #[serde(default)]
     pub plugins: HashMap<String, PluginConfig>,
+}
+
+/// Distributed-tracing configuration. When `enabled`, every proxied request
+/// opens an OpenTelemetry span, the incoming W3C `traceparent` is honoured as
+/// the parent, an outgoing `traceparent` is injected toward the backend, and
+/// spans are exported over OTLP to a collector (Jaeger, Tempo, Zipkin, …).
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct TracingConfig {
+    /// Master switch. Off by default — no spans, no exporter, zero overhead.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/gRPC collector endpoint, e.g. `http://collector:4317`.
+    #[serde(default = "default_tracing_endpoint")]
+    pub endpoint: String,
+    /// `service.name` reported on every span.
+    #[serde(default = "default_tracing_service_name")]
+    pub service_name: String,
+    /// Sampler. `parent_based_always_on` (default) follows the upstream
+    /// decision and otherwise samples everything; `ratio:<0..1>` samples a
+    /// fraction (still parent-based), e.g. `ratio:0.1`; `always_on` /
+    /// `always_off` force the decision.
+    #[serde(default = "default_tracing_sampler")]
+    pub sampler: String,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_tracing_endpoint(),
+            service_name: default_tracing_service_name(),
+            sampler: default_tracing_sampler(),
+        }
+    }
+}
+
+fn default_tracing_endpoint() -> String {
+    "http://127.0.0.1:4317".to_string()
+}
+
+fn default_tracing_service_name() -> String {
+    "sozune".to_string()
+}
+
+fn default_tracing_sampler() -> String {
+    "parent_based_always_on".to_string()
 }
 
 /// Logging output configuration. Controls the formatter used by the global
@@ -1097,6 +1146,7 @@ impl AppConfig {
         self.middleware.apply_env_overrides();
         self.dashboard.apply_env_overrides();
         self.log.apply_env_overrides();
+        self.tracing.apply_env_overrides();
 
         let acme_env_present = std::env::var("SOZUNE_ACME_ENABLED").is_ok()
             || std::env::var("SOZUNE_ACME_EMAIL").is_ok()
@@ -1386,6 +1436,23 @@ impl LogConfig {
                     let _ = other;
                 }
             }
+        }
+    }
+}
+
+impl TracingConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_bool("SOZUNE_TRACING_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_TRACING_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_string("SOZUNE_TRACING_SERVICE_NAME") {
+            self.service_name = v;
+        }
+        if let Some(v) = env_string("SOZUNE_TRACING_SAMPLER") {
+            self.sampler = v;
         }
     }
 }
