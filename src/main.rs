@@ -148,6 +148,10 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     // the API metrics endpoint.
     let metrics_store = proxy::metrics_snapshot::new_store();
 
+    // Live request-latency histogram, written by the middleware proxy handler
+    // and read by the API `/metrics` endpoint. Shared (same Arc) across both.
+    let request_metrics_store = proxy::request_metrics::new_store();
+
     // Notify ACME manager when storage changes (new TLS entrypoints)
     let acme_notify = Arc::new(Notify::new());
 
@@ -236,6 +240,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let acme_enabled_api = acme_enabled;
     let providers_api = config.providers.clone();
     let metrics_store_api = Arc::clone(&metrics_store);
+    let request_metrics_api = Arc::clone(&request_metrics_store);
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
@@ -249,6 +254,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 acme_enabled_api,
                 providers_api,
                 metrics_store_api,
+                request_metrics_api,
             )
             .await?;
         }
@@ -275,7 +281,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     // Start middleware server
     let middleware_task = tokio::spawn({
         let middleware_state = Arc::clone(&middleware_state);
-        async move { middleware::serve(middleware_port, middleware_state).await }
+        let request_metrics_mw = Arc::clone(&request_metrics_store);
+        async move { middleware::serve(middleware_port, middleware_state, request_metrics_mw).await }
     });
 
     // Start ACME module if enabled

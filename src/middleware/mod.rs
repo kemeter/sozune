@@ -39,6 +39,9 @@ pub fn build_forward_auth_client() -> reqwest::Client {
 pub struct MiddlewareAppState {
     pub route_table: Arc<RwLock<MiddlewareRouteTable>>,
     pub http_client: Client<hyper_util::client::legacy::connect::HttpConnector, axum::body::Body>,
+    /// Live request-latency histogram. The proxy handler records each
+    /// completed request here; the API `/metrics` endpoint reads the same Arc.
+    pub request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
 }
 
 pub type MiddlewareState = Arc<RwLock<MiddlewareRouteTable>>;
@@ -288,10 +291,15 @@ pub fn build_middleware_route(
 }
 
 /// Start the middleware reverse proxy server
-pub async fn serve(port: u16, route_table: MiddlewareState) -> anyhow::Result<()> {
+pub async fn serve(
+    port: u16,
+    route_table: MiddlewareState,
+    request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
+) -> anyhow::Result<()> {
     let app_state = MiddlewareAppState {
         route_table,
         http_client: Client::builder(TokioExecutor::new()).build_http(),
+        request_metrics,
     };
 
     let app = Router::new()

@@ -79,6 +79,26 @@
     !!metrics && metrics.proxy.last_poll_seconds > 0
   );
 
+  /** Middleware request-latency summary derived from the histogram Sōzune
+   *  measures itself. Covers only routes that go through the middleware layer;
+   *  middleware-less routes are served directly by Sōzu and not counted.
+   *  Average = sum / count; `null` until at least one request has been observed
+   *  (or on older servers without the field). */
+  const requestCount = $derived(
+    metrics?.proxy.middleware_request_duration_seconds?.count ?? null
+  );
+  const avgLatencyMs = $derived.by(() => {
+    const rd = metrics?.proxy.middleware_request_duration_seconds;
+    if (!rd || rd.count === 0) return null;
+    return (rd.sum / rd.count) * 1000;
+  });
+
+  function fmtLatency(ms: number): string {
+    if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
+    if (ms < 1000) return `${ms.toFixed(ms < 10 ? 1 : 0)}ms`;
+    return `${(ms / 1000).toFixed(2)}s`;
+  }
+
   function fmtCompact(n: number): string {
     if (n < 1000) return String(n);
     if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
@@ -542,6 +562,43 @@
         </div>
         <div class="foot">
           <span></span>
+          <a class="link" href="./health">Health <span class="arr">→</span></a>
+        </div>
+      </article>
+
+      <!-- Middleware latency -->
+      <article class="card">
+        <div class="head">
+          <span class="title">Mw latency</span>
+          {#if avgLatencyMs !== null}
+            <span class="pill pill-ok"><span class="dot"></span> live</span>
+          {:else}
+            <span class="pill pill-muted"><span class="dot"></span> no traffic</span>
+          {/if}
+        </div>
+        {#if avgLatencyMs !== null}
+          <div class="value">{fmtLatency(avgLatencyMs)}<small>avg request</small></div>
+          <div class="sub">
+            Mean over {fmtCompact(requestCount ?? 0)} middleware request{(requestCount ?? 0) ===
+            1
+              ? ''
+              : 's'}. Routes without middleware are served directly by Sōzu.
+          </div>
+        {:else}
+          <div class="value">—<small>avg request</small></div>
+          <div class="sub">
+            No middleware requests observed yet. Latency appears once traffic flows
+            through a route with middleware.
+          </div>
+        {/if}
+        <div class="foot">
+          {#if avgLatencyMs !== null}
+            <span class="live mono" title="Total requests through the middleware layer since startup">
+              <span class="live-dot"></span> {fmtCompact(requestCount ?? 0)} req
+            </span>
+          {:else}
+            <span></span>
+          {/if}
           <a class="link" href="./health">Health <span class="arr">→</span></a>
         </div>
       </article>
