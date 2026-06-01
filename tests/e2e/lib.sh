@@ -51,6 +51,8 @@ HOST_ERRORPAGES="errorpages.func-test.localhost"
 HOST_MATCH="match.func-test.localhost"
 HOST_IPALLOW="ipallow.func-test.localhost"
 HOST_IPALLOW_DENY="ipallow-deny.func-test.localhost"
+HOST_CLIENTIP="clientip.func-test.localhost"
+HOST_CLIENTIP_DENY="clientip-deny.func-test.localhost"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -140,6 +140,15 @@ pub struct EntrypointConfig {
     /// against the request's query string.
     #[serde(default)]
     pub match_query: Vec<MatchCondition>,
+    /// Client-IP route matcher — list of IPs / CIDR ranges (IPv4 or IPv6).
+    /// When non-empty, this entrypoint serves a request only if its resolved
+    /// client IP matches one of the entries; otherwise the request is rejected
+    /// with `404 Not Found`, as if the route didn't match. This is a *routing*
+    /// matcher (distinct from `ip_allow_list`, which is an access filter that
+    /// returns `403`). The client IP is resolved exactly like the allow-list —
+    /// see `ProxyConfig::trusted_proxies`.
+    #[serde(default)]
+    pub match_client_ip: Vec<String>,
 }
 
 /// One key/value match condition used by header and query matching. An empty

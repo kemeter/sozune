@@ -183,6 +183,7 @@ fn build_entrypoint(
     let parsed_error_pages = error_pages::parse_error_pages(labels, &prefix, diagnostics);
     let match_headers = request_match::parse_match_headers(labels, &prefix);
     let match_query = request_match::parse_match_query(labels, &prefix);
+    let match_client_ip = request_match::parse_match_client_ip(labels, &prefix);
     let ip_allow_list = ip_allow_list::parse_ip_allow_list(labels, &prefix);
 
     let protocol_enum = match protocol {
@@ -227,6 +228,7 @@ fn build_entrypoint(
             error_pages: parsed_error_pages,
             match_headers,
             match_query,
+            match_client_ip,
             ip_allow_list,
         },
         source: None,
@@ -297,6 +299,7 @@ fn build_tcp_entrypoint(
             error_pages: std::collections::BTreeMap::new(),
             match_headers: Vec::new(),
             match_query: Vec::new(),
+            match_client_ip: Vec::new(),
             ip_allow_list: Vec::new(),
         },
         source: None,
@@ -517,6 +520,27 @@ mod tests {
         let ep = r.entrypoints.get("http_api").expect("http_api emitted");
         assert_eq!(
             ep.config.ip_allow_list,
+            vec!["10.0.0.0/8".to_string(), "192.168.1.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn match_client_ip_label_is_threaded_into_config() {
+        // End-to-end: a `matchClientIP` label must surface in
+        // EntrypointConfig.match_client_ip. This is the routing matcher (404),
+        // distinct from the ipAllowList access filter (403) above.
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.api.host", "api.example.com"),
+                ("sozune.http.api.matchClientIP", "10.0.0.0/8, 192.168.1.5"),
+            ],
+            vec![net("bridge", "172.18.0.4")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_api").expect("http_api emitted");
+        assert_eq!(
+            ep.config.match_client_ip,
             vec!["10.0.0.0/8".to_string(), "192.168.1.5".to_string()]
         );
     }
