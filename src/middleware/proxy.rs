@@ -95,14 +95,14 @@ pub async fn handle_proxy(
     // forward-auth deny, rate limit).
     if let Err(response) = chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await {
         let duration = start.elapsed();
-        info!(
-            "{} {} {} {} {} {}ms (middleware)",
-            source_ip,
-            method,
-            host,
-            path,
+        access_log(
+            &source_ip,
+            &method,
+            &host,
+            &path,
             response.status().as_u16(),
-            duration.as_millis()
+            duration,
+            "middleware",
         );
         return response.into_response();
     }
@@ -202,17 +202,51 @@ pub async fn handle_proxy(
     let response = chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
 
     let duration = start.elapsed();
-    info!(
-        "{} {} {} {} {} {}ms",
-        source_ip,
-        method,
-        host,
-        path,
+    access_log(
+        &source_ip,
+        &method,
+        &host,
+        &path,
         response.status().as_u16(),
-        duration.as_millis()
+        duration,
+        "backend",
     );
 
     response.into_response()
+}
+
+/// Emit one access-log line for a completed request.
+///
+/// The event carries **structured fields** (`client_ip`, `method`, `host`,
+/// `path`, `status`, `duration_ms`, `phase`) on the `access` target. With the
+/// text formatter these render as the familiar
+/// `<ip> <method> <host> <path> <status> <ms>ms` line; with the JSON formatter
+/// (`log.format: json`) each field becomes a top-level key, so log pipelines
+/// can filter and aggregate without regex-parsing the message.
+///
+/// `phase` is `"backend"` for a normally-proxied response or `"middleware"`
+/// when a middleware short-circuited the request (auth deny, rate limit, …).
+fn access_log(
+    client_ip: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    status: u16,
+    duration: std::time::Duration,
+    phase: &'static str,
+) {
+    let duration_ms = duration.as_millis();
+    info!(
+        target: "access",
+        client_ip,
+        method,
+        host,
+        path,
+        status,
+        duration_ms,
+        phase,
+        "{client_ip} {method} {host} {path} {status} {duration_ms}ms ({phase})",
+    );
 }
 
 /// Handle WebSocket upgrade by establishing a TCP tunnel to the backend

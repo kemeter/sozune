@@ -41,9 +41,12 @@ pub use model::*;
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    init_tracing();
-
     let config_path = cli::resolve_config_path(cli.config.as_deref());
+
+    // Resolve the log format before installing the tracing subscriber: the
+    // subscriber is global and set once, so the access log's text/JSON shape
+    // has to be known up front. Env wins over YAML wins over the default.
+    init_tracing(resolve_log_format(&config_path).await);
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(&config_path).await,
@@ -62,27 +65,55 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("sozune=info".parse().expect("valid log directive"))
-                .add_directive("bollard=warn".parse().expect("valid log directive"))
-                .add_directive("hyper=warn".parse().expect("valid log directive"))
-                .add_directive("hyper_util=warn".parse().expect("valid log directive"))
-                .add_directive("rustls=warn".parse().expect("valid log directive"))
-                .add_directive("sozu_lib=warn".parse().expect("valid log directive"))
-                .add_directive(
-                    "sozu_command_lib=warn"
-                        .parse()
-                        .expect("valid log directive"),
-                )
-                .add_directive("mio=warn".parse().expect("valid log directive"))
-                .add_directive("h2=warn".parse().expect("valid log directive"))
-                .add_directive("kube=warn".parse().expect("valid log directive"))
-                .add_directive("tower=warn".parse().expect("valid log directive")),
+fn log_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("sozune=info".parse().expect("valid log directive"))
+        .add_directive("bollard=warn".parse().expect("valid log directive"))
+        .add_directive("hyper=warn".parse().expect("valid log directive"))
+        .add_directive("hyper_util=warn".parse().expect("valid log directive"))
+        .add_directive("rustls=warn".parse().expect("valid log directive"))
+        .add_directive("sozu_lib=warn".parse().expect("valid log directive"))
+        .add_directive(
+            "sozu_command_lib=warn"
+                .parse()
+                .expect("valid log directive"),
         )
-        .init();
+        .add_directive("mio=warn".parse().expect("valid log directive"))
+        .add_directive("h2=warn".parse().expect("valid log directive"))
+        .add_directive("kube=warn".parse().expect("valid log directive"))
+        .add_directive("tower=warn".parse().expect("valid log directive"))
+}
+
+fn init_tracing(format: config::LogFormat) {
+    let builder = tracing_subscriber::fmt().with_env_filter(log_env_filter());
+    match format {
+        config::LogFormat::Text => builder.init(),
+        // JSON: one object per line, with structured fields (e.g. the access
+        // log's `client_ip`, `status`, `duration_ms`) as top-level keys.
+        config::LogFormat::Json => builder.json().flatten_event(true).init(),
+    }
+}
+
+/// Best-effort resolution of the log format before the config is fully loaded
+/// and validated. Env (`SOZUNE_LOG_FORMAT`) wins; otherwise we peek at the YAML
+/// `log.format` if a config file is present; otherwise the default (text). Any
+/// read/parse error is swallowed — the real validation happens in `serve`, and
+/// the default keeps logging working regardless.
+async fn resolve_log_format(config_path: &str) -> config::LogFormat {
+    if let Ok(v) = std::env::var("SOZUNE_LOG_FORMAT") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "json" => return config::LogFormat::Json,
+            "text" => return config::LogFormat::Text,
+            _ => {}
+        }
+    }
+    if tokio::fs::try_exists(config_path).await.unwrap_or(false)
+        && let Ok(content) = tokio::fs::read_to_string(config_path).await
+        && let Ok(cfg) = config_load::parse_yaml(std::path::Path::new(config_path), &content)
+    {
+        return cfg.log.format;
+    }
+    config::LogFormat::Text
 }
 
 async fn serve(config_path: &str) -> anyhow::Result<()> {

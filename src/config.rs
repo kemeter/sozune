@@ -14,10 +14,33 @@ pub struct AppConfig {
     pub middleware: MiddlewareConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Logging output configuration (text vs JSON).
+    #[serde(default)]
+    pub log: LogConfig,
     /// WASM plugins declared by name. Each entry points at an http-wasm guest
     /// `.wasm`; entrypoints reference these by name to run them as middleware.
     #[serde(default)]
     pub plugins: HashMap<String, PluginConfig>,
+}
+
+/// Logging output configuration. Controls the formatter used by the global
+/// tracing subscriber — this affects *all* logs, including the per-request
+/// access log (emitted on the `access` target).
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct LogConfig {
+    /// `text` (default, human-readable) or `json` (one JSON object per line,
+    /// machine-parseable). JSON renders structured fields like `client_ip`,
+    /// `status`, and `duration_ms` as top-level keys.
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 /// Declaration of one WASM plugin artifact. The `config` blob is opaque to
@@ -1073,6 +1096,7 @@ impl AppConfig {
         self.proxy.apply_env_overrides();
         self.middleware.apply_env_overrides();
         self.dashboard.apply_env_overrides();
+        self.log.apply_env_overrides();
 
         let acme_env_present = std::env::var("SOZUNE_ACME_ENABLED").is_ok()
             || std::env::var("SOZUNE_ACME_EMAIL").is_ok()
@@ -1345,6 +1369,23 @@ impl MiddlewareConfig {
     fn apply_env_overrides(&mut self) {
         if let Some(v) = env_parse::<u16>("SOZUNE_MIDDLEWARE_PORT") {
             self.port = v;
+        }
+    }
+}
+
+impl LogConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_string("SOZUNE_LOG_FORMAT") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "json" => self.format = LogFormat::Json,
+                "text" => self.format = LogFormat::Text,
+                other => {
+                    // Unknown value: keep the current format. A warning here
+                    // would predate tracing init, so we stay silent and let the
+                    // documented default stand.
+                    let _ = other;
+                }
+            }
         }
     }
 }
@@ -1776,5 +1817,46 @@ https:
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.tcp.is_empty());
+    }
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        assert_eq!(LogConfig::default().format, LogFormat::Text);
+        // An AppConfig with no `log:` block also defaults to text.
+        let cfg: AppConfig = serde_yaml::from_str("{}").unwrap_or_default();
+        assert_eq!(cfg.log.format, LogFormat::Text);
+    }
+
+    #[test]
+    fn log_format_parses_json_from_yaml() {
+        let cfg: LogConfig = serde_yaml::from_str("format: json").unwrap();
+        assert_eq!(cfg.format, LogFormat::Json);
+        let cfg: LogConfig = serde_yaml::from_str("format: text").unwrap();
+        assert_eq!(cfg.format, LogFormat::Text);
+    }
+
+    #[test]
+    fn log_format_env_override_wins() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = LogConfig::default();
+        {
+            let _env = EnvGuard::new(&[("SOZUNE_LOG_FORMAT", "json")]);
+            cfg.apply_env_overrides();
+        }
+        assert_eq!(cfg.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_env_unknown_value_keeps_current() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = LogConfig {
+            format: LogFormat::Json,
+        };
+        {
+            let _env = EnvGuard::new(&[("SOZUNE_LOG_FORMAT", "garbage")]);
+            cfg.apply_env_overrides();
+        }
+        // Unknown value must not silently flip the format.
+        assert_eq!(cfg.format, LogFormat::Json);
     }
 }
