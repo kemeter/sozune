@@ -1099,6 +1099,7 @@ fn rule_to_entrypoints(
                     forward_auth: None,
                     headers: Vec::new(),
                     backend_timeout: None,
+                    health_check: None,
                     rate_limit: None,
                     sticky_session: false,
                     compress: false,

@@ -95,6 +95,11 @@ pub struct EntrypointConfig {
     pub headers: Vec<HeaderConfig>,
     #[serde(default)]
     pub backend_timeout: Option<u64>,
+    /// Active HTTP health check. When set, the health checker issues a
+    /// `GET <path>` against each backend and judges health on the status code
+    /// instead of a bare TCP connect. `None` (default) keeps the TCP probe.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
@@ -158,6 +163,27 @@ pub struct MatchCondition {
     pub key: String,
     #[serde(default)]
     pub value: String,
+}
+
+/// Active HTTP health-check parameters for an entrypoint's backends.
+///
+/// When present, the health checker sends `GET <path>` to each backend (over
+/// plain HTTP to `host:port`) and considers it healthy when the response status
+/// is accepted. With `status = None`, any `2xx`/`3xx` is healthy (the Traefik
+/// default); with `status = Some(code)`, only that exact code is.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct HealthCheckConfig {
+    /// Request path, e.g. `/health`. Leading slash recommended; the checker
+    /// prefixes one if missing.
+    pub path: String,
+    /// Exact status code required for "healthy". `None` accepts any 2xx/3xx.
+    #[serde(default)]
+    pub status: Option<u16>,
+    /// Per-check request timeout in milliseconds. `None` falls back to the
+    /// checker's global default (5s). Lets a deliberately slow `/health`
+    /// endpoint avoid being marked down at the global cutoff.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

@@ -172,6 +172,7 @@ fn build_entrypoint(
     let www_authenticate = labels.get(&format!("{prefix}wwwAuthenticate")).cloned();
     let priority = core::parse_priority(labels, &prefix, diagnostics);
     let backend_timeout = core::parse_backend_timeout(labels, &prefix, diagnostics);
+    let health_check = core::parse_health_check(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
@@ -218,6 +219,7 @@ fn build_entrypoint(
             forward_auth,
             headers,
             backend_timeout,
+            health_check,
             rate_limit,
             sticky_session,
             compress,
@@ -289,6 +291,7 @@ fn build_tcp_entrypoint(
             forward_auth: None,
             headers: Vec::new(),
             backend_timeout: None,
+            health_check: None,
             rate_limit: None,
             sticky_session: false,
             compress: false,
