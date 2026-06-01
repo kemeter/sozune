@@ -15,6 +15,22 @@ pub fn parse_match_query(labels: &HashMap<String, String>, prefix: &str) -> Vec<
     parse_conditions(labels, &format!("{prefix}matchQuery"))
 }
 
+/// Parse `<prefix>matchClientIP=cidr,cidr2,...` into a list of raw IP/CIDR
+/// strings. Validation (and dropping of invalid entries) happens later, in
+/// the matching layer, which shares the allow-list's CIDR parser. Empty
+/// tokens are dropped; order is preserved.
+pub fn parse_match_client_ip(labels: &HashMap<String, String>, prefix: &str) -> Vec<String> {
+    let raw = match labels.get(&format!("{prefix}matchClientIP")) {
+        Some(v) => v.trim(),
+        None => return Vec::new(),
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_conditions(labels: &HashMap<String, String>, key: &str) -> Vec<MatchCondition> {
     let raw = match labels.get(key) {
         Some(v) => v.trim(),
@@ -97,5 +113,27 @@ mod tests {
         let got = parse_match_headers(&l, "sozune.");
         assert_eq!(got[0].key, "X-Time");
         assert_eq!(got[0].value, "12:30");
+    }
+
+    #[test]
+    fn client_ip_absent_yields_empty() {
+        assert!(parse_match_client_ip(&labels(&[]), "sozune.").is_empty());
+    }
+
+    #[test]
+    fn client_ip_parses_list_preserving_order() {
+        let l = labels(&[(
+            "sozune.matchClientIP",
+            "10.0.0.0/8, 192.168.1.5 ,2001:db8::/32",
+        )]);
+        let got = parse_match_client_ip(&l, "sozune.");
+        assert_eq!(got, vec!["10.0.0.0/8", "192.168.1.5", "2001:db8::/32"]);
+    }
+
+    #[test]
+    fn client_ip_drops_empty_tokens() {
+        let l = labels(&[("sozune.matchClientIP", " , 10.0.0.1 , ")]);
+        let got = parse_match_client_ip(&l, "sozune.");
+        assert_eq!(got, vec!["10.0.0.1"]);
     }
 }

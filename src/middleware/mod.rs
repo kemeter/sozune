@@ -176,6 +176,7 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || !config.plugins.is_empty()
         || !config.match_headers.is_empty()
         || !config.match_query.is_empty()
+        || !config.match_client_ip.is_empty()
         || !config.ip_allow_list.is_empty()
 }
 
@@ -219,12 +220,33 @@ pub fn build_middleware_route(
         }
     }
 
-    // Header/query match conditions run first: a request that doesn't match the
-    // route's conditions is rejected (404) before auth, rate-limit, or backend.
-    if !config.match_headers.is_empty() || !config.match_query.is_empty() {
+    // Header/query/client-IP match conditions run first: a request that doesn't
+    // match the route's conditions is rejected (404) before auth, rate-limit, or
+    // backend. The client-IP matcher is a *routing* construct (404), not an
+    // access filter (403) — that's the `ip_allow_list` middleware above.
+    let client_ip = if config.match_client_ip.is_empty() {
+        None
+    } else {
+        let list = IpAllowList::new(&config.match_client_ip);
+        if list.is_empty() {
+            // Every entry was invalid. Drop the constraint rather than 404 every
+            // request; per-entry warnings are already logged by `IpAllowList::new`.
+            warn!(
+                "match_client_ip for entrypoint with hosts {:?} has no valid entries; \
+                 client-IP routing constraint dropped (route stays reachable)",
+                config.hostnames
+            );
+            None
+        } else {
+            Some(list)
+        }
+    };
+    if !config.match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
         middlewares.push(Arc::new(RequestMatchMiddleware::new(
             config.match_headers.clone(),
             config.match_query.clone(),
+            client_ip,
+            trusted_proxies.clone(),
         )));
     }
 

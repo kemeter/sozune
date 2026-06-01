@@ -4,23 +4,42 @@ use tracing::debug;
 
 use super::chain::{Flow, Middleware, RequestCtx};
 use super::diag;
+use super::ip_allow_list::{IpAllowList, TrustedProxies, resolve_client_ip};
 use crate::model::MatchCondition;
 
-/// Enforces header / query match conditions an entrypoint declares. Sōzu routes
-/// on host/path/method only, so when a route is additionally scoped to a header
-/// or query parameter we let Sōzu route it, then this middleware rejects with
-/// `404 Not Found` if a condition is not met — as if the route didn't match.
+/// Enforces header / query / client-IP match conditions an entrypoint declares.
+/// Sōzu routes on host/path/method only, so when a route is additionally scoped
+/// to a header, query parameter, or client IP we let Sōzu route it, then this
+/// middleware rejects with `404 Not Found` if a condition is not met — as if the
+/// route didn't match.
 ///
 /// `404` (not `403`) is deliberate: a failed match means "this route does not
-/// apply", which is a not-found, not a forbidden.
+/// apply", which is a not-found, not a forbidden. The client-IP matcher is thus
+/// a *routing* construct, distinct from the `ip_allow_list` *access filter*
+/// which returns `403`; both reuse the same CIDR parser and `X-Forwarded-For`
+/// trust model from [`super::ip_allow_list`].
 pub struct RequestMatchMiddleware {
     headers: Vec<MatchCondition>,
     query: Vec<MatchCondition>,
+    /// Client-IP allow-list for routing. `None` when no `matchClientIP` was set
+    /// (or every entry was invalid) — in that case the IP is not constrained.
+    client_ip: Option<IpAllowList>,
+    trusted: TrustedProxies,
 }
 
 impl RequestMatchMiddleware {
-    pub fn new(headers: Vec<MatchCondition>, query: Vec<MatchCondition>) -> Self {
-        Self { headers, query }
+    pub fn new(
+        headers: Vec<MatchCondition>,
+        query: Vec<MatchCondition>,
+        client_ip: Option<IpAllowList>,
+        trusted: TrustedProxies,
+    ) -> Self {
+        Self {
+            headers,
+            query,
+            client_ip,
+            trusted,
+        }
     }
 
     /// Every header condition must hold: the header is present and, when the
@@ -54,6 +73,20 @@ impl RequestMatchMiddleware {
                 .any(|(k, v)| *k == cond.key && (cond.value.is_empty() || *v == cond.value))
         })
     }
+
+    /// The client-IP condition holds when no `matchClientIP` is set, or when
+    /// the resolved client IP is in the configured list. A request with no
+    /// resolvable client IP (no TCP peer, no usable `X-Forwarded-For`) does
+    /// *not* match — the route is gated on IP identity it cannot establish.
+    fn client_ip_match(&self, req: &Request<Body>, ctx: &RequestCtx) -> bool {
+        let Some(list) = self.client_ip.as_ref() else {
+            return true;
+        };
+        match resolve_client_ip(req, ctx, &self.trusted) {
+            Some(ip) => list.allows(ip),
+            None => false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -63,7 +96,7 @@ impl Middleware for RequestMatchMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
-        if !self.headers_match(req) || !self.query_match(req) {
+        if !self.headers_match(req) || !self.query_match(req) || !self.client_ip_match(req, ctx) {
             debug!(
                 "request-match: conditions not met for {}, returning 404",
                 ctx.host
@@ -94,7 +127,7 @@ mod tests {
     }
 
     fn mw(headers: Vec<MatchCondition>, query: Vec<MatchCondition>) -> RequestMatchMiddleware {
-        RequestMatchMiddleware::new(headers, query)
+        RequestMatchMiddleware::new(headers, query, None, TrustedProxies::default())
     }
 
     #[test]
@@ -152,5 +185,67 @@ mod tests {
         let m = mw(vec![], vec![]);
         assert!(m.headers_match(&req(&[], "/")));
         assert!(m.query_match(&req(&[], "/")));
+    }
+
+    // ---- Client-IP matcher -----------------------------------------------
+
+    use std::net::{IpAddr, SocketAddr};
+    use std::str::FromStr;
+
+    fn ctx(peer: Option<&str>) -> RequestCtx {
+        RequestCtx {
+            host: "example.com".to_string(),
+            client_addr: peer.map(|p| SocketAddr::new(IpAddr::from_str(p).unwrap(), 12345)),
+            is_tls: false,
+            client_encoding: None,
+            pending_response_headers: Vec::new(),
+        }
+    }
+
+    fn ip_mw(entries: &[&str]) -> RequestMatchMiddleware {
+        let list = IpAllowList::new(&entries.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        RequestMatchMiddleware::new(vec![], vec![], Some(list), TrustedProxies::default())
+    }
+
+    #[test]
+    fn no_client_ip_matcher_matches_everything() {
+        let m = mw(vec![], vec![]);
+        assert!(m.client_ip_match(&req(&[], "/"), &ctx(Some("198.51.100.7"))));
+    }
+
+    #[test]
+    fn client_ip_in_range_matches() {
+        let m = ip_mw(&["10.0.0.0/8"]);
+        assert!(m.client_ip_match(&req(&[], "/"), &ctx(Some("10.1.2.3"))));
+    }
+
+    #[test]
+    fn client_ip_out_of_range_does_not_match() {
+        let m = ip_mw(&["10.0.0.0/8"]);
+        assert!(!m.client_ip_match(&req(&[], "/"), &ctx(Some("198.51.100.7"))));
+    }
+
+    #[test]
+    fn client_ip_unresolvable_does_not_match() {
+        // No TCP peer, no trusted proxies → no resolvable IP → route doesn't match.
+        let m = ip_mw(&["10.0.0.0/8"]);
+        assert!(!m.client_ip_match(&req(&[], "/"), &ctx(None)));
+    }
+
+    #[test]
+    fn client_ip_spoofed_xff_ignored_without_trusted_proxies() {
+        // Public peer spoofs XFF of an allowed IP. With no trusted proxies the
+        // peer is what's matched → out of range → no match.
+        let m = ip_mw(&["10.0.0.0/8"]);
+        let r = req(&[("x-forwarded-for", "10.0.0.1")], "/");
+        assert!(!m.client_ip_match(&r, &ctx(Some("198.51.100.7"))));
+    }
+
+    #[test]
+    fn all_invalid_client_ip_entries_yields_open_matcher() {
+        // Mirrors build_middleware_route: an all-invalid list becomes `None`
+        // upstream, so here we just assert IpAllowList reports it empty.
+        let list = IpAllowList::new(&["nope".to_string()]);
+        assert!(list.is_empty());
     }
 }

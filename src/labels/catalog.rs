@@ -35,6 +35,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "plugins",
     "matchHeaders",
     "matchQuery",
+    "matchClientIP",
     "ipAllowList",
 ];
 

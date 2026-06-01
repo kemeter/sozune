@@ -378,6 +378,7 @@ mod tests {
                 plugins: Vec::new(),
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
+                match_client_ip: Vec::new(),
                 ip_allow_list: Vec::new(),
             },
             source: Some("api".to_string()),
