@@ -41,6 +41,9 @@ JSON example:
       "buckets": [["0.005", 812], ["0.01", 970], ["0.025", 1020]],
       "sum": 7.42,
       "count": 1042
+    },
+    "middleware_requests_by_status": {
+      "1xx": 0, "2xx": 1001, "3xx": 12, "4xx": 25, "5xx": 4, "other": 0
     }
   }
 }
@@ -91,6 +94,27 @@ So: think of this as *"how slow is my middleware path"*, not *"how slow is every
 **What is counted** (among middleware routes): every request, including those that end in a proxy-level error (no healthy backend, backend timeout, backend unreachable) — their latency is real and worth watching. **Not counted:** WebSocket upgrades (the tunnel lives for the whole connection, so its duration is not a request latency and would skew the distribution) and requests rejected before routing (missing/unknown Host).
 
 The histogram is global — there are no `method`, `status`, or `host` labels, keeping cardinality flat regardless of traffic shape.
+
+## Error rate
+
+Alongside the latency histogram, Sōzune counts middleware-layer responses by **HTTP status class**, so you can track error rates without parsing logs.
+
+| Metric | Type | Description |
+|---|---|---|
+| `sozune_middleware_requests_total{class="…"}` | counter | Responses served through the middleware layer, one series per class: `1xx`, `2xx`, `3xx`, `4xx`, `5xx`, `other` |
+
+Proxy-level failures (no healthy backend, backend timeout, backend unreachable) count under their real status — typically `5xx` — so they show up in the error rate.
+
+```promql
+# 5xx error ratio over the last 5 minutes
+sum(rate(sozune_middleware_requests_total{class="5xx"}[5m]))
+  / sum(rate(sozune_middleware_requests_total[5m]))
+
+# 4xx + 5xx request rate
+sum(rate(sozune_middleware_requests_total{class=~"4xx|5xx"}[5m]))
+```
+
+Same scope as the histogram above: only requests through the middleware layer are counted.
 
 ## Sōzu worker bridge
 

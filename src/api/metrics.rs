@@ -103,6 +103,10 @@ struct ProxyMetrics {
     /// routes are served directly by Sōzu and not counted here. Additive
     /// field — clients that don't know it simply ignore it.
     middleware_request_duration_seconds: RequestDurationMetrics,
+    /// Per-status-class response counts for the middleware layer, keyed by
+    /// class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`). Same scope caveat as the
+    /// latency histogram.
+    middleware_requests_by_status: HashMap<&'static str, u64>,
 }
 
 /// JSON shape of the request-latency histogram. The Prometheus renderer emits
@@ -231,10 +235,17 @@ impl ProxyMetrics {
             count: rd.count,
         };
 
+        let middleware_requests_by_status = crate::proxy::request_metrics::STATUS_CLASS_LABELS
+            .iter()
+            .zip(rd.status_classes)
+            .map(|(label, count)| (*label, count))
+            .collect();
+
         ProxyMetrics {
             last_poll_seconds: snap.last_poll_unix,
             metrics,
             middleware_request_duration_seconds,
+            middleware_requests_by_status,
         }
     }
 }
@@ -335,8 +346,29 @@ fn render_prom(snap: &Snapshot) -> String {
     }
 
     render_request_duration(&mut out, &snap.proxy.middleware_request_duration_seconds);
+    render_requests_by_status(&mut out, &snap.proxy.middleware_requests_by_status);
 
     out
+}
+
+/// Render the per-status-class request counter as a labelled Prometheus
+/// counter. One series per class (`1xx`…`5xx`, `other`); divide a class by the
+/// total for an error rate, e.g.
+/// `rate(sozune_middleware_requests_total{class="5xx"}[5m])`.
+fn render_requests_by_status(out: &mut String, by_status: &HashMap<&'static str, u64>) {
+    let _ = writeln!(
+        out,
+        "# HELP sozune_middleware_requests_total Requests served through the Sōzune middleware layer, by HTTP status class."
+    );
+    let _ = writeln!(out, "# TYPE sozune_middleware_requests_total counter");
+    // Stable label order so scrapes are deterministic.
+    for class in crate::proxy::request_metrics::STATUS_CLASS_LABELS {
+        let count = by_status.get(class).copied().unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "sozune_middleware_requests_total{{class=\"{class}\"}} {count}"
+        );
+    }
 }
 
 /// Render the middleware request-latency histogram in Prometheus exposition
@@ -580,8 +612,10 @@ mod tests {
         use std::time::Duration;
         let state = empty_state();
         // 20ms and 200ms: 20ms lands in le>=0.025, 200ms in le>=0.25.
-        state.request_metrics.record(Duration::from_millis(20));
-        state.request_metrics.record(Duration::from_millis(200));
+        state.request_metrics.record(Duration::from_millis(20), 200);
+        state
+            .request_metrics
+            .record(Duration::from_millis(200), 200);
         let body = render_prom(&Snapshot::collect(&state));
 
         assert!(body.contains("sozune_middleware_request_duration_seconds_count 2"));
@@ -600,12 +634,38 @@ mod tests {
     fn request_duration_present_in_json() {
         use std::time::Duration;
         let state = empty_state();
-        state.request_metrics.record(Duration::from_millis(50));
+        state.request_metrics.record(Duration::from_millis(50), 200);
         let snap = Snapshot::collect(&state);
         let json = serde_json::to_value(&snap).unwrap();
         let rd = &json["proxy"]["middleware_request_duration_seconds"];
         assert_eq!(rd["count"], 1);
         assert!(rd["buckets"].is_array());
+    }
+
+    #[test]
+    fn requests_by_status_counters_rendered() {
+        use std::time::Duration;
+        let state = empty_state();
+        state.request_metrics.record(Duration::from_millis(5), 200);
+        state.request_metrics.record(Duration::from_millis(5), 200);
+        state.request_metrics.record(Duration::from_millis(5), 404);
+        state.request_metrics.record(Duration::from_millis(5), 503);
+        let body = render_prom(&Snapshot::collect(&state));
+        assert!(body.contains("# TYPE sozune_middleware_requests_total counter"));
+        assert!(body.contains("sozune_middleware_requests_total{class=\"2xx\"} 2"));
+        assert!(body.contains("sozune_middleware_requests_total{class=\"4xx\"} 1"));
+        assert!(body.contains("sozune_middleware_requests_total{class=\"5xx\"} 1"));
+        assert!(body.contains("sozune_middleware_requests_total{class=\"1xx\"} 0"));
+    }
+
+    #[test]
+    fn requests_by_status_present_in_json() {
+        use std::time::Duration;
+        let state = empty_state();
+        state.request_metrics.record(Duration::from_millis(5), 500);
+        let snap = Snapshot::collect(&state);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["proxy"]["middleware_requests_by_status"]["5xx"], 1);
     }
 
     #[test]

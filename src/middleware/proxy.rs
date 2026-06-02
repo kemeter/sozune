@@ -117,13 +117,14 @@ pub async fn handle_proxy(
             chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await
         {
             let duration = start.elapsed();
-            state.request_metrics.record(duration);
+            let status = response.status().as_u16();
+            state.request_metrics.record(duration, status);
             access_log(
                 &source_ip,
                 &method,
                 &host,
                 &path,
-                response.status().as_u16(),
+                status,
                 duration,
                 "middleware",
             );
@@ -135,8 +136,11 @@ pub async fn handle_proxy(
             Some(b) => b.clone(),
             None => {
                 error!("No backends configured for host '{}'", host);
-                state.request_metrics.record(start.elapsed());
-                return diag::no_healthy_backend(&host, &route.backends).into_response();
+                let resp = diag::no_healthy_backend(&host, &route.backends).into_response();
+                state
+                    .request_metrics
+                    .record(start.elapsed(), resp.status().as_u16());
+                return resp;
             }
         };
 
@@ -192,9 +196,12 @@ pub async fn handle_proxy(
             Ok(uri) => uri,
             Err(e) => {
                 error!("Failed to parse target URI '{}': {}", target_uri, e);
-                state.request_metrics.record(start.elapsed());
-                return diag::forwarding_failed("invalid-target-uri", &e.to_string())
-                    .into_response();
+                let resp =
+                    diag::forwarding_failed("invalid-target-uri", &e.to_string()).into_response();
+                state
+                    .request_metrics
+                    .record(start.elapsed(), resp.status().as_u16());
+                return resp;
             }
         };
 
@@ -217,8 +224,11 @@ pub async fn handle_proxy(
                 Ok(result) => result.map_err(|e| e.to_string()),
                 Err(_) => {
                     error!("Backend request to {} timed out", target_uri);
-                    state.request_metrics.record(start.elapsed());
-                    return diag::backend_timeout(&target_uri, timeout_secs).into_response();
+                    let resp = diag::backend_timeout(&target_uri, timeout_secs).into_response();
+                    state
+                        .request_metrics
+                        .record(start.elapsed(), resp.status().as_u16());
+                    return resp;
                 }
             }
         };
@@ -231,9 +241,12 @@ pub async fn handle_proxy(
             }
             Err(e) => {
                 error!("Failed to forward request to {}: {}", target_uri, e);
-                state.request_metrics.record(start.elapsed());
-                return diag::backend_unreachable(&format!("backend at {target_uri}: {e}"))
+                let resp = diag::backend_unreachable(&format!("backend at {target_uri}: {e}"))
                     .into_response();
+                state
+                    .request_metrics
+                    .record(start.elapsed(), resp.status().as_u16());
+                return resp;
             }
         };
 
@@ -242,8 +255,8 @@ pub async fn handle_proxy(
         let response = chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
 
         let duration = start.elapsed();
-        state.request_metrics.record(duration);
         let status = response.status().as_u16();
+        state.request_metrics.record(duration, status);
         tracing::Span::current().record("http.response.status_code", status);
         access_log(
             &source_ip, &method, &host, &path, status, duration, "backend",

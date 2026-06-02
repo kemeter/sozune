@@ -256,6 +256,10 @@ export interface MetricsView {
       /** Total number of observed requests. */
       count: number;
     };
+    /** Middleware-layer response counts by HTTP status class
+     *  (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`). Optional so older servers
+     *  don't break the dashboard. */
+    middleware_requests_by_status?: Record<string, number>;
   };
 }
 
