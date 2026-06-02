@@ -8,7 +8,7 @@ use crate::labels::fields::{
     ratelimit, redirect, request_match,
 };
 use crate::labels::network;
-use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, LoadBalancer, Protocol};
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
@@ -173,6 +173,7 @@ fn build_entrypoint(
     let priority = core::parse_priority(labels, &prefix, diagnostics);
     let backend_timeout = core::parse_backend_timeout(labels, &prefix, diagnostics);
     let health_check = core::parse_health_check(labels, &prefix, diagnostics);
+    let load_balancer = core::parse_load_balancer(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
@@ -220,6 +221,7 @@ fn build_entrypoint(
             headers,
             backend_timeout,
             health_check,
+            load_balancer,
             rate_limit,
             sticky_session,
             compress,
@@ -292,6 +294,7 @@ fn build_tcp_entrypoint(
             headers: Vec::new(),
             backend_timeout: None,
             health_check: None,
+            load_balancer: LoadBalancer::default(),
             rate_limit: None,
             sticky_session: false,
             compress: false,

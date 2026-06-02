@@ -13,6 +13,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "healthCheck.path",
     "healthCheck.status",
     "healthCheck.timeout",
+    "loadBalancer",
     "tls",
     "stripPrefix",
     "addPrefix",

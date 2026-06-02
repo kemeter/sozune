@@ -28,7 +28,9 @@
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gateway/>
 
 use super::gateway_filters;
-use crate::model::{Backend, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol};
+use crate::model::{
+    Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
+};
 use futures_util::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
@@ -1100,6 +1102,7 @@ fn rule_to_entrypoints(
                     headers: Vec::new(),
                     backend_timeout: None,
                     health_check: None,
+                    load_balancer: LoadBalancer::default(),
                     rate_limit: None,
                     sticky_session: false,
                     compress: false,

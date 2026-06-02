@@ -130,7 +130,7 @@ impl HttpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Backend, EntrypointConfig, Protocol};
+    use crate::model::{Backend, EntrypointConfig, LoadBalancer, Protocol};
     use axum::{Router, routing::get};
 
     fn sample_entrypoints_json() -> String {
@@ -160,6 +160,7 @@ mod tests {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
+                load_balancer: LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

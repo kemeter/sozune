@@ -838,7 +838,9 @@ mod health_tests {
 #[cfg(test)]
 mod merge_tests {
     use super::*;
-    use crate::model::{Backend, EntrypointConfig, PathConfig, PathRuleType, Protocol};
+    use crate::model::{
+        Backend, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
+    };
 
     fn ep(host: &str, path: Option<&str>, ip: &str) -> Entrypoint {
         Entrypoint {
@@ -870,6 +872,7 @@ mod merge_tests {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
+                load_balancer: LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

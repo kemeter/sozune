@@ -402,7 +402,7 @@ fn write_gauge(out: &mut String, name: &str, help: &str, value: usize) {
 mod tests {
     use super::*;
     use crate::config::ApiUser;
-    use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
+    use crate::model::{Backend, Entrypoint, EntrypointConfig, LoadBalancer, Protocol};
     use crate::proxy::health::{UnhealthyKind, UnhealthyReason};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, RwLock};
@@ -448,6 +448,7 @@ mod tests {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
+                load_balancer: LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

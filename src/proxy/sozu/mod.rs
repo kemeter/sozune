@@ -31,6 +31,18 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
+/// Map Sōzune's [`LoadBalancer`](crate::model::LoadBalancer) to the Sōzu
+/// worker's `LoadBalancingAlgorithms` discriminant.
+fn lb_algorithm(lb: crate::model::LoadBalancer) -> LoadBalancingAlgorithms {
+    use crate::model::LoadBalancer;
+    match lb {
+        LoadBalancer::RoundRobin => LoadBalancingAlgorithms::RoundRobin,
+        LoadBalancer::Random => LoadBalancingAlgorithms::Random,
+        LoadBalancer::PowerOfTwo => LoadBalancingAlgorithms::PowerOfTwo,
+        LoadBalancer::LeastConnections => LoadBalancingAlgorithms::LeastLoaded,
+    }
+}
+
 /// Snapshot of the storage at the moment of the last successful reload, keyed
 /// by `cluster_id`. Used to compute the diff between two reloads.
 ///
@@ -660,7 +672,7 @@ fn configure_http_entrypoint(
         sticky_session: entrypoint.config.sticky_session,
         https_redirect: entrypoint.config.https_redirect,
         proxy_protocol: None,
-        load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+        load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
         load_metric: None,
         answer_503: None,
         http2: None,
@@ -926,7 +938,7 @@ fn configure_tcp_entrypoint(
         sticky_session: false,
         https_redirect: false,
         proxy_protocol: None,
-        load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+        load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
         load_metric: None,
         answer_503: None,
         http2: None,

@@ -6,7 +6,9 @@ use crate::diagnostics::{self, DiagnosticsStore};
 use crate::labels::candidate::{Candidate, NetworkInfo};
 use crate::labels::diagnostic::log_diagnostics;
 use crate::labels::source::LabelSource;
-use crate::model::{Backend, Entrypoint, EntrypointConfig, PathConfig, PathRuleType, Protocol};
+use crate::model::{
+    Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
+};
 use crate::provider::Provider;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -1008,6 +1010,7 @@ impl IngressParseCtx<'_> {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
+                load_balancer: LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

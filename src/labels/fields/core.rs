@@ -185,6 +185,49 @@ pub fn parse_health_check(
     })
 }
 
+/// Parse the `<prefix>loadBalancer` label into a [`LoadBalancer`]. Accepts
+/// `round_robin`/`roundrobin`, `random`, `power_of_two`/`poweroftwo`,
+/// `least_connections`/`leastconn`/`leastconnections` (case-insensitive,
+/// hyphens/underscores ignored). Absent → default (round-robin). An
+/// unrecognised value emits `W022` and falls back to round-robin.
+pub fn parse_load_balancer(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> crate::model::LoadBalancer {
+    use crate::model::LoadBalancer;
+    let key = format!("{prefix}loadBalancer");
+    let Some(raw) = labels.get(&key).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return LoadBalancer::default();
+    };
+    // Normalise: lowercase, drop `-`/`_` so `least-conn` == `least_conn`.
+    let norm: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .collect();
+    match norm.as_str() {
+        "roundrobin" | "rr" => LoadBalancer::RoundRobin,
+        "random" => LoadBalancer::Random,
+        "poweroftwo" | "p2c" => LoadBalancer::PowerOfTwo,
+        "leastconnections" | "leastconn" | "leastconnection" | "leastloaded" => {
+            LoadBalancer::LeastConnections
+        }
+        _ => {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W022InvalidLoadBalancer,
+                    "loadBalancer is not a recognised algorithm; falling back to round_robin",
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint("one of: round_robin, random, power_of_two, least_connections"),
+            );
+            LoadBalancer::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +467,54 @@ mod tests {
         .unwrap();
         assert_eq!(hc.timeout_ms, None);
         assert_eq!(d[0].code, DiagnosticCode::W021InvalidHealthCheck);
+    }
+
+    #[test]
+    fn load_balancer_absent_defaults_to_round_robin() {
+        use crate::model::LoadBalancer;
+        let mut d = Vec::new();
+        assert_eq!(
+            parse_load_balancer(&labels(&[]), "sozune.http.web.", &mut d),
+            LoadBalancer::RoundRobin
+        );
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn load_balancer_parses_known_algorithms() {
+        use crate::model::LoadBalancer;
+        let cases = [
+            ("round_robin", LoadBalancer::RoundRobin),
+            ("random", LoadBalancer::Random),
+            ("power_of_two", LoadBalancer::PowerOfTwo),
+            ("least_connections", LoadBalancer::LeastConnections),
+            // Aliases / casing / separators.
+            ("leastconn", LoadBalancer::LeastConnections),
+            ("Least-Connections", LoadBalancer::LeastConnections),
+            ("POWEROFTWO", LoadBalancer::PowerOfTwo),
+        ];
+        for (raw, want) in cases {
+            let mut d = Vec::new();
+            let got = parse_load_balancer(
+                &labels(&[("sozune.http.web.loadBalancer", raw)]),
+                "sozune.http.web.",
+                &mut d,
+            );
+            assert_eq!(got, want, "input {raw}");
+            assert!(d.is_empty(), "input {raw} should not warn");
+        }
+    }
+
+    #[test]
+    fn load_balancer_unknown_warns_and_defaults() {
+        use crate::model::LoadBalancer;
+        let mut d = Vec::new();
+        let got = parse_load_balancer(
+            &labels(&[("sozune.http.web.loadBalancer", "magic")]),
+            "sozune.http.web.",
+            &mut d,
+        );
+        assert_eq!(got, LoadBalancer::RoundRobin);
+        assert_eq!(d[0].code, DiagnosticCode::W022InvalidLoadBalancer);
     }
 }
