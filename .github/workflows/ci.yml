@@ -10,6 +10,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Static checks only — formatting and linters, Rust and dashboard. No tests,
+  # no release build. This is the "is it clean?" gate.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: oven-sh/setup-bun@v2
+
+      # The binary embeds the dashboard build (rust-embed), so clippy needs the
+      # dashboard assets present to compile.
+      - name: Build dashboard
+        run: cd dashboard && bun install --frozen-lockfile && bun run build
+
+      - name: Dashboard type-check
+        run: cd dashboard && bun run check
+
+      - name: Dashboard lint (biome)
+        run: cd dashboard && bun run lint
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Rust format
+        run: cargo fmt -- --check
+
+      - name: Rust clippy
+        run: cargo clippy --bin sozune --all-targets -- -D warnings
+
+  # The actual test suite.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -24,19 +60,29 @@ jobs:
         run: cd dashboard && bun install --frozen-lockfile && bun run build
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check
-        run: cargo check
-
-      - name: Test
+      - name: Cargo test
         run: cargo test --bin sozune
 
-      - name: Clippy
-        run: cargo clippy -- -W warnings
+  # Verify a clean release build (also catches embed/asset issues).
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
 
-      - name: Format
-        run: cargo fmt -- --check
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build dashboard
+        run: cd dashboard && bun install --frozen-lockfile && bun run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cargo build (release)
+        run: cargo build --release --locked

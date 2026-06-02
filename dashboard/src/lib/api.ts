@@ -198,15 +198,13 @@ export function health(): Promise<unknown> {
 export interface ConfigView {
   version: string;
   listeners: { http: { port: number }; https: { port: number } };
-  acme:
-    | {
-        enabled: boolean;
-        email: string;
-        staging: boolean;
-        challenge_port: number;
-        resolvers: Record<string, unknown>;
-      }
-    | null;
+  acme: {
+    enabled: boolean;
+    email: string;
+    staging: boolean;
+    challenge_port: number;
+    resolvers: Record<string, unknown>;
+  } | null;
   providers: {
     docker?: { enabled: boolean; endpoint: string; expose_by_default: boolean } | null;
     podman?: { enabled: boolean; endpoint: string; expose_by_default: boolean } | null;

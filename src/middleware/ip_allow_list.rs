@@ -118,9 +118,7 @@ pub fn resolve_client_ip(
     if trusted.is_empty() {
         return peer;
     }
-    let Some(peer_ip) = peer else {
-        return None;
-    };
+    let peer_ip = peer?;
     if !trusted.contains(peer_ip) {
         return Some(peer_ip);
     }
@@ -134,10 +132,10 @@ pub fn resolve_client_ip(
     {
         for token in value.split(',').rev() {
             let token = token.trim();
-            if let Ok(ip) = IpAddr::from_str(token) {
-                if !trusted.contains(ip) {
-                    return Some(ip);
-                }
+            if let Ok(ip) = IpAddr::from_str(token)
+                && !trusted.contains(ip)
+            {
+                return Some(ip);
             }
         }
     }

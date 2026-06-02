@@ -27,15 +27,6 @@ mod proxy;
 mod tracing_otel;
 mod util;
 
-/// Shared lock serialising every test that mutates `std::env`. Tests across
-/// modules race on the global environment otherwise (and edition 2024 marks
-/// `set_var`/`remove_var` `unsafe` for exactly this reason).
-#[cfg(test)]
-pub(crate) mod test_env {
-    use std::sync::Mutex;
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
-}
-
 pub use model::*;
 
 #[tokio::main]
@@ -271,31 +262,23 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let unhealthy_backends = health_checker.unhealthy_backends();
 
     let storage_server = storage.clone();
-    let reload_tx_api = reload_tx.clone();
     let api_config = config.api.clone();
-    let app_config_api = Arc::new(config.clone());
-    let unhealthy_api = Arc::clone(&unhealthy_backends);
-    let diagnostics_api = Arc::clone(&diagnostics_store);
-    let acme_enabled_api = acme_enabled;
-    let providers_api = config.providers.clone();
-    let metrics_store_api = Arc::clone(&metrics_store);
-    let request_metrics_api = Arc::clone(&request_metrics_store);
+    let api_state = api::server::AppState {
+        storage: storage_server,
+        reload_tx: reload_tx.clone(),
+        users: config.api.users.clone(),
+        unhealthy_backends: Arc::clone(&unhealthy_backends),
+        diagnostics: Arc::clone(&diagnostics_store),
+        acme_enabled,
+        providers: config.providers.clone(),
+        metrics: Arc::clone(&metrics_store),
+        request_metrics: Arc::clone(&request_metrics_store),
+        config: Arc::new(config.clone()),
+    };
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
-            api::server::serve(
-                api_config,
-                app_config_api,
-                storage_server,
-                reload_tx_api,
-                unhealthy_api,
-                diagnostics_api,
-                acme_enabled_api,
-                providers_api,
-                metrics_store_api,
-                request_metrics_api,
-            )
-            .await?;
+            api::server::serve(api_config, api_state).await?;
         }
 
         Ok::<(), anyhow::Error>(())
@@ -478,4 +461,14 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
     debug!("All tasks completed");
     Ok(())
+}
+
+/// Shared lock serialising every test that mutates `std::env`. Tests across
+/// modules race on the global environment otherwise (and edition 2024 marks
+/// `set_var`/`remove_var` `unsafe` for exactly this reason). Kept at the end of
+/// the file so no non-test item follows a `#[cfg(test)]` module.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::Mutex;
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 }
