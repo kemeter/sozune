@@ -29,7 +29,7 @@ signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 futures-util = "0.3"
 notify = "8.2.0"
 instant-acme = "0.8"
-cheti = { git = "https://github.com/kemeter/cheti", rev = "d996136f09f7a60af7649535c908289a8ed8b57e" }
+cheti = { git = "https://github.com/kemeter/cheti", rev = "39987633dd4f53d1399231ec3d83225df97683c5" }
 http-wasm-host = { git = "https://github.com/kemeter/http-wasm", rev = "3f82f100b1e139890657ea6c333a0092dedc9871" }
 rcgen = { version = "0.14", features = ["pem"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
