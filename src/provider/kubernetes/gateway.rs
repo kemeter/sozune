@@ -1260,7 +1260,6 @@ mod tests {
                 } else {
                     Some(parent_refs)
                 },
-                ..Default::default()
             },
             status: Default::default(),
         }

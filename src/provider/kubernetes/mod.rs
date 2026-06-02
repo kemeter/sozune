@@ -1079,6 +1079,12 @@ mod tests {
     use k8s_openapi::api::core::v1::ServiceSpec;
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions};
     use kube::api::ObjectMeta;
+
+    /// One HTTP path under a host in a test Ingress: `(path, path_type,
+    /// service_name, service_port)`.
+    type TestIngressPath<'a> = (&'a str, &'a str, &'a str, i32);
+    /// One host rule: `(Some(host) | None, [paths])`.
+    type TestIngressRule<'a> = (Option<&'a str>, Vec<TestIngressPath<'a>>);
     use std::collections::BTreeMap;
 
     fn make_provider(expose_by_default: bool) -> KubernetesProvider {
@@ -1358,7 +1364,7 @@ mod tests {
         name: &str,
         namespace: &str,
         class: Option<&str>,
-        rules: Vec<(Option<&str>, Vec<(&str, &str, &str, i32)>)>,
+        rules: Vec<TestIngressRule>,
         tls_hosts: Vec<&str>,
     ) -> Ingress {
         use k8s_openapi::api::networking::v1::{

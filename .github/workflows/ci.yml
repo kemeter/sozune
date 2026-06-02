@@ -23,6 +23,9 @@ jobs:
       - name: Build dashboard
         run: cd dashboard && bun install --frozen-lockfile && bun run build
 
+      - name: Type-check dashboard
+        run: cd dashboard && bun run check
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -36,7 +39,7 @@ jobs:
         run: cargo test --bin sozune
 
       - name: Clippy
-        run: cargo clippy -- -W warnings
+        run: cargo clippy --bin sozune --all-targets -- -D warnings
 
       - name: Format
         run: cargo fmt -- --check

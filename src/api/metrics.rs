@@ -401,7 +401,7 @@ fn write_gauge(out: &mut String, name: &str, help: &str, value: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiUser, Role};
+    use crate::config::ApiUser;
     use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
     use crate::proxy::health::{UnhealthyKind, UnhealthyReason};
     use std::collections::{BTreeMap, HashMap};

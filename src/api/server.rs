@@ -183,36 +183,14 @@ fn forbidden(message: &str) -> Response {
         .into_response()
 }
 
-pub async fn serve(
-    config: ApiConfig,
-    app_config: Arc<crate::config::AppConfig>,
-    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
-    reload_tx: mpsc::Sender<()>,
-    unhealthy_backends: Arc<RwLock<UnhealthyMap>>,
-    diagnostics: crate::diagnostics::DiagnosticsStore,
-    acme_enabled: bool,
-    providers: crate::config::ProvidersConfig,
-    metrics: crate::proxy::metrics_snapshot::MetricsSnapshotStore,
-    request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
-) -> anyhow::Result<()> {
-    if config.users.is_empty() {
+/// Run the API server. The caller assembles the [`AppState`] (it owns all the
+/// shared stores); `config` carries the listener address and CORS origins.
+pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
+    if state.users.is_empty() {
         anyhow::bail!(
             "API enabled but no users configured. Add at least one entry under `api.users`."
         );
     }
-
-    let state = AppState {
-        storage,
-        reload_tx,
-        users: config.users.clone(),
-        unhealthy_backends,
-        diagnostics,
-        acme_enabled,
-        providers,
-        metrics,
-        request_metrics,
-        config: app_config,
-    };
 
     let protected = Router::new()
         .route(
