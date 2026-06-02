@@ -14,19 +14,27 @@ export type Theme = 'dark' | 'light';
 const STORAGE_KEY = 'sozune.theme';
 
 function systemPreference(): Theme {
-  if (typeof window === 'undefined' || !window.matchMedia) return 'dark';
+  if (typeof window === 'undefined' || !window.matchMedia) {
+    return 'dark';
+  }
   return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 }
 
 export function loadTheme(): Theme {
-  if (typeof localStorage === 'undefined') return 'dark';
+  if (typeof localStorage === 'undefined') {
+    return 'dark';
+  }
   const stored = localStorage.getItem(STORAGE_KEY);
-  if (stored === 'dark' || stored === 'light') return stored;
+  if (stored === 'dark' || stored === 'light') {
+    return stored;
+  }
   return systemPreference();
 }
 
 export function applyTheme(theme: Theme): void {
-  if (typeof document === 'undefined') return;
+  if (typeof document === 'undefined') {
+    return;
+  }
   if (theme === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
   } else {
@@ -35,6 +43,8 @@ export function applyTheme(theme: Theme): void {
 }
 
 export function saveTheme(theme: Theme): void {
-  if (typeof localStorage === 'undefined') return;
+  if (typeof localStorage === 'undefined') {
+    return;
+  }
   localStorage.setItem(STORAGE_KEY, theme);
 }
