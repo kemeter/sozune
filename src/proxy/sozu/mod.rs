@@ -5,7 +5,7 @@ mod channel;
 
 use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
-use crate::model::{Entrypoint, Protocol};
+use crate::model::{Entrypoint, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::metrics_snapshot;
 use acme::{add_certificate, register_acme_challenge_cluster};
@@ -33,8 +33,7 @@ use tracing::{debug, error, info};
 
 /// Map Sōzune's [`LoadBalancer`](crate::model::LoadBalancer) to the Sōzu
 /// worker's `LoadBalancingAlgorithms` discriminant.
-fn lb_algorithm(lb: crate::model::LoadBalancer) -> LoadBalancingAlgorithms {
-    use crate::model::LoadBalancer;
+fn lb_algorithm(lb: LoadBalancer) -> LoadBalancingAlgorithms {
     match lb {
         LoadBalancer::RoundRobin => LoadBalancingAlgorithms::RoundRobin,
         LoadBalancer::Random => LoadBalancingAlgorithms::Random,

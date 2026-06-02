@@ -1,5 +1,6 @@
 use crate::api::auth::{AuthOutcome, Identity, check};
 use crate::config::{ApiConfig, ApiUser, Role};
+use crate::labels::diagnostic::Diagnostic;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
 use crate::proxy::health::UnhealthyMap;
 use axum::extract::{Path, Request, State};
@@ -56,7 +57,7 @@ pub struct AppState {
 fn entrypoint_payload(
     entrypoint: &Entrypoint,
     unhealthy: &UnhealthyMap,
-    diagnostics: &HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>>,
+    diagnostics: &HashMap<String, Vec<Diagnostic>>,
 ) -> serde_json::Value {
     let unhealthy_for_ep: Vec<serde_json::Value> = entrypoint
         .backends
@@ -75,7 +76,7 @@ fn entrypoint_payload(
         })
         .collect();
 
-    let diags_for_ep: Vec<crate::labels::diagnostic::Diagnostic> = diagnostics
+    let diags_for_ep: Vec<Diagnostic> = diagnostics
         .get(&entrypoint.id)
         .or_else(|| {
             entrypoint
@@ -334,7 +335,7 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
 /// deduplicated, callers should treat the map as additive.
 fn merge_collision_lints(
     storage: &BTreeMap<String, Entrypoint>,
-    diagnostics: &mut HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>>,
+    diagnostics: &mut HashMap<String, Vec<Diagnostic>>,
 ) {
     let pairs: Vec<(&str, &Entrypoint)> =
         storage.iter().map(|(id, ep)| (id.as_str(), ep)).collect();
@@ -343,9 +344,7 @@ fn merge_collision_lints(
     }
 }
 
-fn read_diagnostics(
-    state: &AppState,
-) -> HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>> {
+fn read_diagnostics(state: &AppState) -> HashMap<String, Vec<Diagnostic>> {
     match state.diagnostics.read() {
         Ok(guard) => guard.clone(),
         Err(e) => {
@@ -362,7 +361,7 @@ fn read_diagnostics(
 /// recomputed global lints (e.g. ACME-without-TLS) and runtime collision
 /// lints (W018) that are not stored at parse time.
 async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let mut grouped: HashMap<String, Vec<crate::labels::diagnostic::Diagnostic>> =
+    let mut grouped: HashMap<String, Vec<Diagnostic>> =
         crate::diagnostics::snapshot(&state.diagnostics)
             .into_iter()
             .collect();
@@ -405,7 +404,7 @@ async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<se
 /// Recompute lints that span the full entrypoint set (not attached to a
 /// single candidate). Today: only `W015 ACME enabled but no entrypoint
 /// declares tls=true`.
-fn global_lints(state: &AppState) -> Vec<crate::labels::diagnostic::Diagnostic> {
+fn global_lints(state: &AppState) -> Vec<Diagnostic> {
     let storage = match state.storage.read() {
         Ok(g) => g,
         Err(e) => {
@@ -713,7 +712,7 @@ async fn delete_entrypoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::LoadBalancer;
+    use crate::model::{LoadBalancer, PathConfig, PathRuleType};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -1678,8 +1677,8 @@ mod tests {
             protocol: Protocol::Http,
             config: EntrypointConfig {
                 hostnames: vec![host.to_string()],
-                path: path.map(|p| crate::model::PathConfig {
-                    rule_type: crate::model::PathRuleType::Prefix,
+                path: path.map(|p| PathConfig {
+                    rule_type: PathRuleType::Prefix,
                     value: p.to_string(),
                 }),
                 tls: false,
@@ -1720,8 +1719,8 @@ mod tests {
         }
     }
 
-    fn diag_w001(label: &str, value: &str) -> crate::labels::diagnostic::Diagnostic {
-        crate::labels::diagnostic::Diagnostic::new(
+    fn diag_w001(label: &str, value: &str) -> Diagnostic {
+        Diagnostic::new(
             crate::labels::diagnostic::DiagnosticCode::W001InvalidPort,
             "port is not a valid u16, falling back to 80",
         )

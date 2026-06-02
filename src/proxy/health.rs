@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::model::Entrypoint;
+use crate::model::{Entrypoint, HealthCheckConfig};
 
 /// Map of backend `host:port` keys to the reason they were marked down. Shared
 /// between [`HealthChecker`] and the API layer so `GET /entrypoints` can return
@@ -264,11 +264,7 @@ impl HealthChecker {
 
     /// HTTP probe: `GET http://<addr><path>`. Healthy when the status is
     /// accepted — exactly `hc.status` when set, else any 2xx/3xx.
-    async fn probe_http(
-        &self,
-        addr: &str,
-        hc: &crate::model::HealthCheckConfig,
-    ) -> Result<(), UnhealthyReason> {
+    async fn probe_http(&self, addr: &str, hc: &HealthCheckConfig) -> Result<(), UnhealthyReason> {
         let now = now_epoch_secs();
         let url = format!("http://{addr}{}", hc.path);
 
@@ -324,7 +320,7 @@ impl HealthChecker {
 #[derive(Debug, Clone)]
 struct BackendProbe {
     addr: String,
-    health_check: Option<crate::model::HealthCheckConfig>,
+    health_check: Option<HealthCheckConfig>,
 }
 
 #[cfg(test)]
@@ -338,15 +334,15 @@ mod tests {
         }
     }
 
-    fn http_probe(addr: &str, hc: crate::model::HealthCheckConfig) -> BackendProbe {
+    fn http_probe(addr: &str, hc: HealthCheckConfig) -> BackendProbe {
         BackendProbe {
             addr: addr.to_string(),
             health_check: Some(hc),
         }
     }
 
-    fn hc(path: &str, status: Option<u16>) -> crate::model::HealthCheckConfig {
-        crate::model::HealthCheckConfig {
+    fn hc(path: &str, status: Option<u16>) -> HealthCheckConfig {
+        HealthCheckConfig {
             path: path.to_string(),
             status,
             timeout_ms: None,

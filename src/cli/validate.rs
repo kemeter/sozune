@@ -6,6 +6,7 @@ use crate::config::AppConfig;
 use crate::labels::diagnostic::Severity;
 use crate::labels::source::LabelSource;
 use crate::labels::{self, Candidate};
+use crate::model::Entrypoint;
 use crate::provider::docker::DockerProvider;
 use crate::provider::nomad::NomadProvider;
 use crate::provider::podman::PodmanProvider;
@@ -82,7 +83,7 @@ pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
 /// Run cross-cutting lints (collisions) and attach the resulting diagnostics
 /// to the candidates that own the offending routes.
 fn apply_collection_lints(report: &mut ValidationReport) {
-    let pairs: Vec<(&str, &crate::model::Entrypoint)> = report
+    let pairs: Vec<(&str, &Entrypoint)> = report
         .candidates
         .iter()
         .flat_map(|c| {
@@ -106,7 +107,7 @@ fn global_acme_lint(
     report: &ValidationReport,
 ) -> Option<crate::labels::diagnostic::Diagnostic> {
     let acme_on = config.acme.as_ref().is_some_and(|a| a.enabled);
-    let all_eps: Vec<&crate::model::Entrypoint> = report
+    let all_eps: Vec<&Entrypoint> = report
         .candidates
         .iter()
         .flat_map(|c| c.entrypoints.values())

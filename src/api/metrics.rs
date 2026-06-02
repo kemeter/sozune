@@ -18,6 +18,7 @@
 
 use crate::api::server::AppState;
 use crate::labels::diagnostic::Severity;
+use crate::model::Protocol;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -133,9 +134,9 @@ impl Snapshot {
                 let mut by_proto: HashMap<&'static str, usize> = HashMap::new();
                 for ep in guard.values() {
                     let key = match ep.protocol {
-                        crate::model::Protocol::Http => "http",
-                        crate::model::Protocol::Tcp => "tcp",
-                        crate::model::Protocol::Udp => "udp",
+                        Protocol::Http => "http",
+                        Protocol::Tcp => "tcp",
+                        Protocol::Udp => "udp",
                     };
                     *by_proto.entry(key).or_insert(0) += 1;
                 }

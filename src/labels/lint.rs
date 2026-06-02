@@ -124,7 +124,9 @@ pub fn lint_acme_without_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Backend, EntrypointConfig, LoadBalancer, RateLimitConfig};
+    use crate::model::{
+        Backend, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, RateLimitConfig,
+    };
 
     fn ep(host: &str, path: Option<&str>, tls: bool, https_redirect: bool) -> Entrypoint {
         Entrypoint {
@@ -134,8 +136,8 @@ mod tests {
             protocol: Protocol::Http,
             config: EntrypointConfig {
                 hostnames: vec![host.into()],
-                path: path.map(|p| crate::model::PathConfig {
-                    rule_type: crate::model::PathRuleType::Prefix,
+                path: path.map(|p| PathConfig {
+                    rule_type: PathRuleType::Prefix,
                     value: p.into(),
                 }),
                 tls,
