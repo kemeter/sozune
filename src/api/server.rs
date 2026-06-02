@@ -713,6 +713,7 @@ async fn delete_entrypoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::LoadBalancer;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -1047,7 +1048,7 @@ mod tests {
                         headers: Vec::new(),
                         backend_timeout: None,
                         health_check: None,
-                        load_balancer: crate::model::LoadBalancer::default(),
+                        load_balancer: LoadBalancer::default(),
                         rate_limit: None,
                         sticky_session: false,
                         compress: false,
@@ -1520,7 +1521,7 @@ mod tests {
                         headers: Vec::new(),
                         backend_timeout: None,
                         health_check: None,
-                        load_balancer: crate::model::LoadBalancer::default(),
+                        load_balancer: LoadBalancer::default(),
                         rate_limit: None,
                         sticky_session: false,
                         compress: false,
@@ -1625,7 +1626,7 @@ mod tests {
                         headers: Vec::new(),
                         backend_timeout: None,
                         health_check: None,
-                        load_balancer: crate::model::LoadBalancer::default(),
+                        load_balancer: LoadBalancer::default(),
                         rate_limit: None,
                         sticky_session: false,
                         compress: false,
@@ -1693,7 +1694,7 @@ mod tests {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
-                load_balancer: crate::model::LoadBalancer::default(),
+                load_balancer: LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

@@ -124,7 +124,7 @@ pub fn lint_acme_without_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Backend, EntrypointConfig, RateLimitConfig};
+    use crate::model::{Backend, EntrypointConfig, LoadBalancer, RateLimitConfig};
 
     fn ep(host: &str, path: Option<&str>, tls: bool, https_redirect: bool) -> Entrypoint {
         Entrypoint {
@@ -156,7 +156,7 @@ mod tests {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
-                load_balancer: crate::model::LoadBalancer::default(),
+                load_balancer: LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

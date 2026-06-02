@@ -8,7 +8,7 @@ use crate::labels::fields::{
     ratelimit, redirect, request_match,
 };
 use crate::labels::network;
-use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, LoadBalancer, Protocol};
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
@@ -294,7 +294,7 @@ fn build_tcp_entrypoint(
             headers: Vec::new(),
             backend_timeout: None,
             health_check: None,
-            load_balancer: crate::model::LoadBalancer::default(),
+            load_balancer: LoadBalancer::default(),
             rate_limit: None,
             sticky_session: false,
             compress: false,
