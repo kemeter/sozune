@@ -374,6 +374,14 @@ services:
       - "sozune.http.svcclientipdeny.matchClientIP=10.0.0.0/8"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-lb:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svclb.host=$HOST_LB"
+      - "sozune.http.svclb.loadBalancer=least_connections"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-fauth:
     image: traefik/whoami
     labels:
@@ -456,6 +464,7 @@ declare -A WAIT_PATHS=(
     ["$HOST_SSE"]="/.well-known/mercure?topic=ready"
     ["$HOST_IPALLOW"]="/"
     ["$HOST_CLIENTIP"]="/"
+    ["$HOST_LB"]="/"
 )
 ready=0
 for _ in $(seq 1 60); do

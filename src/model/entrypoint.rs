@@ -102,6 +102,10 @@ pub struct EntrypointConfig {
     pub health_check: Option<HealthCheckConfig>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Load-balancing algorithm across this entrypoint's backends. Defaults to
+    /// round-robin. Maps to Sōzu's `LoadBalancingAlgorithms`.
+    #[serde(default)]
+    pub load_balancer: LoadBalancer,
     #[serde(default)]
     pub sticky_session: bool,
     #[serde(default)]
@@ -163,6 +167,22 @@ pub struct MatchCondition {
     pub key: String,
     #[serde(default)]
     pub value: String,
+}
+
+/// Load-balancing algorithm across an entrypoint's backends. Mirrors the
+/// algorithms Sōzu's worker supports; `RoundRobin` is the default.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancer {
+    /// Cycle through backends in order (default).
+    #[default]
+    RoundRobin,
+    /// Pick a backend at random.
+    Random,
+    /// Power-of-two-choices: sample two backends, pick the less loaded.
+    PowerOfTwo,
+    /// Send to the backend with the fewest active connections.
+    LeastConnections,
 }
 
 /// Active HTTP health-check parameters for an entrypoint's backends.

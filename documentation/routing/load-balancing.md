@@ -1,10 +1,29 @@
 # Load balancing
 
-Sōzune balances traffic across multiple backends with round-robin. Weighted distribution and sticky sessions are opt-in.
+Sōzune balances traffic across multiple backends. Round-robin is the default; other algorithms, weighted distribution, and sticky sessions are opt-in.
 
 ## Default — round-robin
 
 Sōzu spreads requests evenly across all healthy backends of a cluster. No configuration needed; this is always on.
+
+## Choosing the algorithm
+
+Set `loadBalancer` to pick how requests are distributed across the backends:
+
+```yaml
+labels:
+  - "sozune.http.app.host=app.example.com"
+  - "sozune.http.app.loadBalancer=least_connections"
+```
+
+| Value | Behaviour |
+|---|---|
+| `round_robin` (default) | Cycle through backends in order. |
+| `least_connections` | Send to the backend with the fewest active connections — good for uneven request durations. |
+| `power_of_two` | Sample two backends at random, pick the less loaded. Cheaper than full least-connections at scale, nearly as good. |
+| `random` | Pick a backend at random. |
+
+Values are case-insensitive and accept hyphens or underscores (`least-connections` == `least_connections`); common aliases work too (`leastconn`, `rr`, `p2c`). An unrecognised value falls back to round-robin and raises a `W022` diagnostic. The setting applies to both HTTP and TCP entrypoints, and is also available as `load_balancer` on the REST/YAML entrypoint payload.
 
 ## Multiple backends from Docker
 
@@ -77,8 +96,5 @@ Sticky sessions are best-effort affinity, not absolute pinning.
 
 ## What's not supported
 
-- **Least-connections** algorithm
-- **Power-of-two-choices** algorithm (available in Sōzu, not exposed here)
-- **Custom hashing** (consistent hashing, IP hash)
-
-Round-robin is the only algorithm currently exposed by Sōzune.
+- **Custom hashing** (consistent hashing, IP hash) — not exposed by Sōzu.
+- **Per-backend weights from Docker labels** — weights are settable via the REST/YAML payload only (see above).

@@ -156,6 +156,7 @@ mod tests {
                 headers: Vec::new(),
                 backend_timeout: None,
                 health_check: None,
+                load_balancer: crate::model::LoadBalancer::default(),
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,
