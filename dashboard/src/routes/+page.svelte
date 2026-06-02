@@ -74,7 +74,12 @@
   const liveRequests = $derived(
     metric('http_requests', 'http_requests_total', 'requests')
   );
-  const liveErrors5xx = $derived(metric('http_errors_5xx', 'http_5xx', 'errors_5xx'));
+  // Prefer Sōzune's own middleware status-class counter (always present,
+  // reliable); fall back to the Sōzu worker metrics for older servers.
+  const liveErrors5xx = $derived(
+    metrics?.proxy.middleware_requests_by_status?.['5xx'] ??
+      metric('http_errors_5xx', 'http_5xx', 'errors_5xx')
+  );
   const workerPollFresh = $derived(
     !!metrics && metrics.proxy.last_poll_seconds > 0
   );

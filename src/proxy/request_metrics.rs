@@ -41,6 +41,25 @@ pub struct RequestMetrics {
     /// Sum of all observed durations, in milliseconds, to avoid float atomics.
     /// Rendered as seconds (`/ 1000`) in the `_sum` series.
     sum_millis: AtomicU64,
+    /// Per-status-class response counters: index 0 = 1xx, 1 = 2xx, 2 = 3xx,
+    /// 3 = 4xx, 4 = 5xx, 5 = other (status < 100 or > 599, shouldn't happen).
+    status_classes: [AtomicU64; 6],
+}
+
+/// Labels for the six status-class counters, aligned with
+/// `RequestMetrics::status_classes` / `RequestMetricsSnapshot::status_classes`.
+pub const STATUS_CLASS_LABELS: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+/// Map an HTTP status code to its `status_classes` index.
+fn status_class_index(status: u16) -> usize {
+    match status {
+        100..=199 => 0,
+        200..=299 => 1,
+        300..=399 => 2,
+        400..=499 => 3,
+        500..=599 => 4,
+        _ => 5,
+    }
 }
 
 impl Default for RequestMetrics {
@@ -52,15 +71,17 @@ impl Default for RequestMetrics {
                 .collect(),
             count: AtomicU64::new(0),
             sum_millis: AtomicU64::new(0),
+            status_classes: Default::default(),
         }
     }
 }
 
 impl RequestMetrics {
-    /// Record one completed request. Increments every bucket whose bound is
-    /// `>= duration` (so buckets are cumulative on read), the total count, and
-    /// the running sum.
-    pub fn record(&self, duration: Duration) {
+    /// Record one completed request: its latency (into the histogram) and its
+    /// response status class (into the per-class counters). Increments every
+    /// bucket whose bound is `>= duration`, the total count, the running sum,
+    /// and the matching status-class counter.
+    pub fn record(&self, duration: Duration, status: u16) {
         let secs = duration.as_secs_f64();
         for (i, bound) in BUCKET_BOUNDS_SECONDS.iter().enumerate() {
             if secs <= *bound {
@@ -71,6 +92,7 @@ impl RequestMetrics {
         // Saturating millis: a single request over ~584M years would overflow.
         self.sum_millis
             .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+        self.status_classes[status_class_index(status)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Read a consistent-enough snapshot for rendering. Values are read with
@@ -85,6 +107,7 @@ impl RequestMetrics {
                 .collect(),
             count: self.count.load(Ordering::Relaxed),
             sum_seconds: self.sum_millis.load(Ordering::Relaxed) as f64 / 1000.0,
+            status_classes: std::array::from_fn(|i| self.status_classes[i].load(Ordering::Relaxed)),
         }
     }
 }
@@ -99,6 +122,9 @@ pub struct RequestMetricsSnapshot {
     pub count: u64,
     /// Sum of all observed durations, in seconds (`_sum`).
     pub sum_seconds: f64,
+    /// Response counts per status class, aligned with [`STATUS_CLASS_LABELS`]
+    /// (`1xx, 2xx, 3xx, 4xx, 5xx, other`).
+    pub status_classes: [u64; 6],
 }
 
 pub fn new_store() -> RequestMetricsStore {
@@ -120,13 +146,14 @@ mod tests {
         assert_eq!(s.count, 0);
         assert_eq!(s.sum_seconds, 0.0);
         assert!(s.buckets.iter().all(|(_, c)| *c == 0));
+        assert_eq!(s.status_classes, [0; 6]);
     }
 
     #[test]
     fn record_increments_count_and_sum() {
         let m = RequestMetrics::default();
-        m.record(ms(20));
-        m.record(ms(30));
+        m.record(ms(20), 200);
+        m.record(ms(30), 200);
         let s = m.snapshot();
         assert_eq!(s.count, 2);
         // 50ms total = 0.05s.
@@ -137,7 +164,7 @@ mod tests {
     fn buckets_are_cumulative() {
         let m = RequestMetrics::default();
         // 20ms = 0.02s: falls in every bucket with bound >= 0.025.
-        m.record(ms(20));
+        m.record(ms(20), 200);
         let s = m.snapshot();
         // bound 0.005 and 0.01 must NOT count it; 0.025 and up must.
         for (bound, c) in &s.buckets {
@@ -152,7 +179,7 @@ mod tests {
     #[test]
     fn fast_request_lands_in_first_bucket() {
         let m = RequestMetrics::default();
-        m.record(Duration::from_micros(100)); // 0.0001s <= 0.005
+        m.record(Duration::from_micros(100), 200); // 0.0001s <= 0.005
         let s = m.snapshot();
         assert_eq!(s.buckets[0].1, 1);
         assert_eq!(s.count, 1);
@@ -161,10 +188,34 @@ mod tests {
     #[test]
     fn slow_request_only_in_count_not_top_bucket() {
         let m = RequestMetrics::default();
-        m.record(Duration::from_secs(30)); // beyond the 10s top bound
+        m.record(Duration::from_secs(30), 200); // beyond the 10s top bound
         let s = m.snapshot();
         // No finite bucket counts it; only the total count (the +Inf bucket).
         assert!(s.buckets.iter().all(|(_, c)| *c == 0));
         assert_eq!(s.count, 1);
+    }
+
+    #[test]
+    fn status_classes_are_bucketed_by_first_digit() {
+        let m = RequestMetrics::default();
+        m.record(ms(1), 200);
+        m.record(ms(1), 204);
+        m.record(ms(1), 301);
+        m.record(ms(1), 404);
+        m.record(ms(1), 500);
+        m.record(ms(1), 503);
+        let s = m.snapshot();
+        // [1xx, 2xx, 3xx, 4xx, 5xx, other]
+        assert_eq!(s.status_classes, [0, 2, 1, 1, 2, 0]);
+        assert_eq!(s.count, 6);
+    }
+
+    #[test]
+    fn out_of_range_status_goes_to_other() {
+        let m = RequestMetrics::default();
+        m.record(ms(1), 99);
+        m.record(ms(1), 700);
+        let s = m.snapshot();
+        assert_eq!(s.status_classes[5], 2); // "other"
     }
 }
