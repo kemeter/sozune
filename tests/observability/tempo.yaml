@@ -1,0 +1,20 @@
+# Minimal single-binary Tempo for the demo stack: accept OTLP/gRPC on :4317,
+# store traces locally. Not production-tuned — just enough to view Sōzune
+# traces in Grafana.
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal

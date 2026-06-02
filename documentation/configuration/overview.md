@@ -54,6 +54,8 @@ middleware:
 | `acme` | Let's Encrypt provisioning. |
 | `proxy` | Sōzu listeners and runtime tuning. |
 | `middleware` | Internal middleware proxy port. |
+| `log` | Log output format (`text` or `json`). |
+| `tracing` | OpenTelemetry distributed tracing (OTLP export). Off by default. See [Observability](../advanced/observability.md#distributed-tracing-opentelemetry). |
 
 ## Providers
 
@@ -174,6 +176,11 @@ Every field above can be overridden through an environment variable. The env var
 | `acme.staging` | `SOZUNE_ACME_STAGING` |
 | `acme.challenge_port` | `SOZUNE_ACME_CHALLENGE_PORT` |
 | `middleware.port` | `SOZUNE_MIDDLEWARE_PORT` |
+| `log.format` | `SOZUNE_LOG_FORMAT` |
+| `tracing.enabled` | `SOZUNE_TRACING_ENABLED` |
+| `tracing.endpoint` | `SOZUNE_TRACING_ENDPOINT` |
+| `tracing.service_name` | `SOZUNE_TRACING_SERVICE_NAME` |
+| `tracing.sampler` | `SOZUNE_TRACING_SAMPLER` |
 
 Booleans accept `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`.
 

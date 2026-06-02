@@ -131,10 +131,53 @@ Then open:
 - Prometheus: `http://127.0.0.1:9090`
 - Grafana: `http://127.0.0.1:3000` — login `admin` / `admin`, dashboard "Sozune Overview" auto-loaded
 
-The dashboard JSON, Prometheus scrape config, and Grafana provisioning files live under `tests/observability/`. Copy them into your own stack to ingest Sōzune in production.
+The stack also ships **Grafana Tempo** (a traces backend) wired as a datasource, so the same `docker compose -f compose.metrics.yaml up -d` gives you both metrics and traces. Tempo listens for OTLP/gRPC on `:4317` — point Sōzune's `tracing.endpoint` there.
+
+The dashboard JSON, Prometheus scrape config, Tempo config, and Grafana provisioning files live under `tests/observability/`. Copy them into your own stack to ingest Sōzune in production.
+
+## Distributed tracing (OpenTelemetry)
+
+Beyond metrics, Sōzune can emit a **trace span per proxied request** and export it over **OTLP/gRPC** to a collector (Jaeger, Grafana Tempo, Zipkin via OTel, …). Disabled by default — no spans, no exporter, zero overhead.
+
+### Enable it
+
+```yaml
+tracing:
+  enabled: true
+  endpoint: "http://127.0.0.1:4317"   # OTLP/gRPC collector
+  service_name: "sozune"               # service.name on every span
+  sampler: "parent_based_always_on"    # see below
+```
+
+Every field has an environment override: `SOZUNE_TRACING_ENABLED`, `SOZUNE_TRACING_ENDPOINT`, `SOZUNE_TRACING_SERVICE_NAME`, `SOZUNE_TRACING_SAMPLER` (env wins over YAML).
+
+### What you get
+
+- **One span per request** named `proxy.request`, with attributes `http.request.method`, `server.address`, `url.path`, and `http.response.status_code`.
+- **W3C context propagation, both ways.** An incoming `traceparent` header is honoured as the span's parent (so Sōzune continues an upstream trace); an outgoing `traceparent` is injected toward the backend (so the backend joins the same trace).
+- **Trace correlation in logs.** Each access-log line carries the `trace_id` (a `trace=` field in text, a `"trace_id"` key in JSON), so you can jump from a log line to its trace. It is `-` when tracing is off.
+
+### Sampling
+
+The `sampler` controls which traces are recorded:
+
+| Value | Behaviour |
+|---|---|
+| `parent_based_always_on` (default) | Follow the upstream sampling decision; if there is none, sample. The right default for a proxy — if the caller is tracing, so are we. |
+| `parent_based_always_off` | Follow the upstream decision; otherwise drop. |
+| `always_on` / `always_off` | Force the decision regardless of parent. |
+| `ratio:<0..1>` | Parent-based ratio sampling, e.g. `ratio:0.1` records ~10% of root traces. |
+
+### Scope
+
+Like the latency histogram and access log, only requests that traverse the Sōzune **middleware layer** produce a span — middleware-less routes are served directly by Sōzu and are not traced here.
+
+### Try it with the demo stack
+
+`compose.metrics.yaml` includes Tempo. With it up, set `tracing.enabled: true` and `tracing.endpoint: http://127.0.0.1:4317`, send a request through Sōzune, then open Grafana → Explore → Tempo and search recent traces.
 
 ## What it does not do
 
-- **No tracing.** Sōzune does not emit OpenTelemetry spans today. A scrape-only metrics interface is intentional — if you need traces, an OTel collector can scrape `/metrics` and re-emit as OTLP.
+- **No span for middleware-less routes.** Requests served directly by the Sōzu workers (no auth/rate-limit/etc.) never reach the Axum handler that opens the span, so they are not traced. Same boundary as the access log and the latency histogram.
 - **No _per-route_ latency histograms.** Sōzune exposes one **global** histogram for the middleware path (`sozune_middleware_request_duration_seconds`, see above), but does not break it down per route, host, or method — that would explode cardinality. It also does not cover middleware-less routes (served directly by Sōzu). Sōzu's own `Histogram` and `Percentiles` worker metrics are still skipped on the bridge because their bucket bounds are not part of the protocol contract; only `Gauge`, `Count`, and `Time` worker values are forwarded.
 - **No metric labels for hostnames, paths, or clusters.** Adding them would explode cardinality on large parks. Use Sōzu's per-cluster query directly if you need that granularity.
