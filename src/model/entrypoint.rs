@@ -104,6 +104,10 @@ pub struct EntrypointConfig {
     /// up to N attempts. `None` (default) disables retries.
     #[serde(default)]
     pub retry: Option<RetryConfig>,
+    /// Per-route circuit breaker. When set, a backend that fails too often is
+    /// short-circuited with `503` until it recovers. `None` (default) disables.
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
     /// Load-balancing algorithm across this entrypoint's backends. Defaults to
@@ -221,6 +225,20 @@ pub struct RetryConfig {
     /// Total number of attempts (the first try plus retries). `2` means one
     /// retry. Values `<= 1` are treated as "no retry" by the parser.
     pub attempts: u32,
+}
+
+/// Per-route circuit-breaker tunables. The breaker trips when the recent
+/// failure ratio (responses `>= 500` or transport errors) reaches `threshold`
+/// over a window of at least `min_requests`, stays open for `cooldown_secs`,
+/// then half-opens to probe recovery. Mirrors Traefik's defaults (50% / 10s).
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Failure ratio in `(0.0, 1.0]` that trips the breaker.
+    pub threshold: f64,
+    /// Minimum recent observations before the ratio is evaluated.
+    pub min_requests: u32,
+    /// Seconds the breaker stays open before probing again.
+    pub cooldown_secs: u64,
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

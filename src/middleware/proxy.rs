@@ -15,6 +15,15 @@ use super::MiddlewareAppState;
 use super::chain::{self, RequestCtx};
 use super::diag;
 
+/// Monotonic milliseconds since the process started, for circuit-breaker
+/// cooldown timing. Monotonic (not wall-clock) so clock changes don't confuse
+/// the breaker.
+fn monotonic_ms() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Main proxy handler: identifies the route by Host header,
 /// applies middleware stack, and forwards to the real backend.
 pub async fn handle_proxy(
@@ -129,6 +138,21 @@ pub async fn handle_proxy(
                 "middleware",
             );
             return response.into_response();
+        }
+
+        // Circuit breaker: if the route's breaker is open, short-circuit with
+        // 503 before touching the backend. `should_allow` also handles the
+        // open→half-open transition after the cooldown.
+        let cb_now = monotonic_ms();
+        if let Some(cb) = route.circuit_breaker.as_ref()
+            && !cb.should_allow(cb_now)
+        {
+            warn!("circuit breaker open for host '{}', short-circuiting", host);
+            let resp = diag::circuit_open(&host).into_response();
+            state
+                .request_metrics
+                .record(start.elapsed(), resp.status().as_u16());
+            return resp;
         }
 
         // Pick a backend using round-robin.
@@ -277,6 +301,11 @@ pub async fn handle_proxy(
                     "Failed to forward request to {} after {} attempt(s): {}",
                     target_uri, attempts, last_err
                 );
+                // All attempts failed: count it as a backend failure for the
+                // circuit breaker.
+                if let Some(cb) = route.circuit_breaker.as_ref() {
+                    cb.record(true, monotonic_ms());
+                }
                 // Preserve the distinct 504 for a timeout; 502 otherwise.
                 let resp = if last_was_timeout {
                     diag::backend_timeout(&target_uri, timeout_secs).into_response()
@@ -298,6 +327,11 @@ pub async fn handle_proxy(
         let duration = start.elapsed();
         let status = response.status().as_u16();
         state.request_metrics.record(duration, status);
+        // Feed the circuit breaker: a 5xx is a backend fault, anything else is
+        // a success for breaker purposes (4xx is the client's fault).
+        if let Some(cb) = route.circuit_breaker.as_ref() {
+            cb.record(status >= 500, monotonic_ms());
+        }
         tracing::Span::current().record("http.response.status_code", status);
         access_log(
             &source_ip, &method, &host, &path, status, duration, "backend",

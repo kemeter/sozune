@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod circuit_breaker;
 mod compress;
 mod diag;
 mod forward_auth;
@@ -64,6 +65,9 @@ pub struct MiddlewareRoute {
     /// Total forward attempts (first try + retries) on a connection-level
     /// failure or timeout. `1` (or `0`) means no retry — the default.
     pub retry_attempts: u32,
+    /// Per-route circuit breaker, shared across requests so its state persists.
+    /// `None` when the route doesn't configure one.
+    pub circuit_breaker: Option<Arc<circuit_breaker::CircuitBreaker>>,
     pub middlewares: Vec<Arc<dyn Middleware>>,
 }
 
@@ -187,6 +191,8 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         // Retry is enforced in the middleware proxy handler, so a route that
         // only configures retry still has to go through it.
         || config.retry.as_ref().is_some_and(|r| r.attempts > 1)
+        // The circuit breaker is enforced in the middleware proxy handler.
+        || config.circuit_breaker.is_some()
 }
 
 /// Build middleware route from entrypoint config.
@@ -285,6 +291,10 @@ pub fn build_middleware_route(
         middlewares.push(Arc::new(CompressMiddleware));
     }
 
+    let circuit_breaker = config
+        .circuit_breaker
+        .map(|cfg| Arc::new(circuit_breaker::CircuitBreaker::new(cfg)));
+
     Arc::new(MiddlewareRoute {
         backends: backends
             .iter()
@@ -293,6 +303,7 @@ pub fn build_middleware_route(
         backend_counter: AtomicUsize::new(0),
         backend_timeout: config.backend_timeout,
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
+        circuit_breaker,
         middlewares,
     })
 }

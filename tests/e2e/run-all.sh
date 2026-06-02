@@ -386,6 +386,14 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcretry.host=$HOST_RETRY"
       - "sozune.http.svcretry.retry.attempts=3"
+  svc-cb:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svccb.host=$HOST_CB"
+      - "sozune.http.svccb.circuitBreaker.threshold=0.5"
+      - "sozune.http.svccb.circuitBreaker.minRequests=10"
+      - "sozune.http.svccb.circuitBreaker.cooldown=5"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-fauth:
@@ -472,6 +480,7 @@ declare -A WAIT_PATHS=(
     ["$HOST_CLIENTIP"]="/"
     ["$HOST_LB"]="/"
     ["$HOST_RETRY"]="/"
+    ["$HOST_CB"]="/"
 )
 ready=0
 for _ in $(seq 1 60); do

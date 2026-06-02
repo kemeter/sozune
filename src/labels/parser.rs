@@ -175,6 +175,7 @@ fn build_entrypoint(
     let health_check = core::parse_health_check(labels, &prefix, diagnostics);
     let load_balancer = core::parse_load_balancer(labels, &prefix, diagnostics);
     let retry = core::parse_retry(labels, &prefix, diagnostics);
+    let circuit_breaker = core::parse_circuit_breaker(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
@@ -224,6 +225,7 @@ fn build_entrypoint(
             health_check,
             load_balancer,
             retry,
+            circuit_breaker,
             rate_limit,
             sticky_session,
             compress,
@@ -298,6 +300,7 @@ fn build_tcp_entrypoint(
             health_check: None,
             load_balancer: LoadBalancer::default(),
             retry: None,
+            circuit_breaker: None,
             rate_limit: None,
             sticky_session: false,
             compress: false,
