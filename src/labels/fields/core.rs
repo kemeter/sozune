@@ -1,4 +1,5 @@
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::model::{HealthCheckConfig, LoadBalancer, RetryConfig};
 use std::collections::HashMap;
 
 /// Parse a port label, falling back to the protocol default when absent or
@@ -126,7 +127,7 @@ pub fn parse_health_check(
     labels: &HashMap<String, String>,
     prefix: &str,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Option<crate::model::HealthCheckConfig> {
+) -> Option<HealthCheckConfig> {
     let path_key = format!("{prefix}healthCheck.path");
     let raw_path = labels
         .get(&path_key)
@@ -178,7 +179,7 @@ pub fn parse_health_check(
         },
     };
 
-    Some(crate::model::HealthCheckConfig {
+    Some(HealthCheckConfig {
         path,
         status,
         timeout_ms,
@@ -194,8 +195,7 @@ pub fn parse_load_balancer(
     labels: &HashMap<String, String>,
     prefix: &str,
     diagnostics: &mut Vec<Diagnostic>,
-) -> crate::model::LoadBalancer {
-    use crate::model::LoadBalancer;
+) -> LoadBalancer {
     let key = format!("{prefix}loadBalancer");
     let Some(raw) = labels.get(&key).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         return LoadBalancer::default();
@@ -224,6 +224,38 @@ pub fn parse_load_balancer(
                 .with_hint("one of: round_robin, random, power_of_two, least_connections"),
             );
             LoadBalancer::default()
+        }
+    }
+}
+
+/// Parse the `<prefix>retry.attempts` label into a [`RetryConfig`]. The value
+/// is the total number of attempts (first try + retries). Absent, `<= 1`, or
+/// invalid → `None` (no retry); an invalid value emits `W023`.
+pub fn parse_retry(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<RetryConfig> {
+    let key = format!("{prefix}retry.attempts");
+    let raw = labels
+        .get(&key)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    match raw.parse::<u32>() {
+        // 0 or 1 attempt means "no retry" — nothing to configure.
+        Ok(attempts) if attempts <= 1 => None,
+        Ok(attempts) => Some(RetryConfig { attempts }),
+        Err(_) => {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W023InvalidRetry,
+                    "retry.attempts is not a valid positive integer; retries disabled",
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint("expected the total number of attempts as an integer >= 2, e.g. 3"),
+            );
+            None
         }
     }
 }
@@ -471,7 +503,6 @@ mod tests {
 
     #[test]
     fn load_balancer_absent_defaults_to_round_robin() {
-        use crate::model::LoadBalancer;
         let mut d = Vec::new();
         assert_eq!(
             parse_load_balancer(&labels(&[]), "sozune.http.web.", &mut d),
@@ -481,8 +512,14 @@ mod tests {
     }
 
     #[test]
+    fn retry_absent_is_none() {
+        let mut d = Vec::new();
+        assert!(parse_retry(&labels(&[]), "sozune.http.web.", &mut d).is_none());
+        assert!(d.is_empty());
+    }
+
+    #[test]
     fn load_balancer_parses_known_algorithms() {
-        use crate::model::LoadBalancer;
         let cases = [
             ("round_robin", LoadBalancer::RoundRobin),
             ("random", LoadBalancer::Random),
@@ -507,7 +544,6 @@ mod tests {
 
     #[test]
     fn load_balancer_unknown_warns_and_defaults() {
-        use crate::model::LoadBalancer;
         let mut d = Vec::new();
         let got = parse_load_balancer(
             &labels(&[("sozune.http.web.loadBalancer", "magic")]),
@@ -516,5 +552,52 @@ mod tests {
         );
         assert_eq!(got, LoadBalancer::RoundRobin);
         assert_eq!(d[0].code, DiagnosticCode::W022InvalidLoadBalancer);
+    }
+
+    #[test]
+    fn retry_parses_attempts() {
+        let mut d = Vec::new();
+        let r = parse_retry(
+            &labels(&[("sozune.http.web.retry.attempts", "3")]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .expect("3 attempts enables retry");
+        assert_eq!(r.attempts, 3);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn retry_one_or_zero_is_no_retry() {
+        let mut d = Vec::new();
+        assert!(
+            parse_retry(
+                &labels(&[("sozune.http.web.retry.attempts", "1")]),
+                "sozune.http.web.",
+                &mut d
+            )
+            .is_none()
+        );
+        assert!(
+            parse_retry(
+                &labels(&[("sozune.http.web.retry.attempts", "0")]),
+                "sozune.http.web.",
+                &mut d
+            )
+            .is_none()
+        );
+        assert!(d.is_empty(), "1/0 are valid values, no warning");
+    }
+
+    #[test]
+    fn retry_invalid_warns_and_disables() {
+        let mut d = Vec::new();
+        let r = parse_retry(
+            &labels(&[("sozune.http.web.retry.attempts", "lots")]),
+            "sozune.http.web.",
+            &mut d,
+        );
+        assert!(r.is_none());
+        assert_eq!(d[0].code, DiagnosticCode::W023InvalidRetry);
     }
 }

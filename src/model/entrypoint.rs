@@ -100,6 +100,10 @@ pub struct EntrypointConfig {
     /// instead of a bare TCP connect. `None` (default) keeps the TCP probe.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Retry a failed forward to the backend (connection error or timeout)
+    /// up to N attempts. `None` (default) disables retries.
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
     /// Load-balancing algorithm across this entrypoint's backends. Defaults to
@@ -204,6 +208,19 @@ pub struct HealthCheckConfig {
     /// endpoint avoid being marked down at the global cutoff.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+/// Retry policy for forwarding a request to a backend.
+///
+/// Retries cover **connection-level failures and timeouts** — the backend
+/// never produced a response. A response that arrives (even a 5xx) is *not*
+/// retried: the backend acted on the request, so a blind replay could double a
+/// side effect. This matches Traefik's default retry semantics.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct RetryConfig {
+    /// Total number of attempts (the first try plus retries). `2` means one
+    /// retry. Values `<= 1` are treated as "no retry" by the parser.
+    pub attempts: u32,
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

@@ -47,6 +47,7 @@ pub enum DiagnosticCode {
     W020InvalidErrorPage,
     W021InvalidHealthCheck,
     W022InvalidLoadBalancer,
+    W023InvalidRetry,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -82,6 +83,7 @@ impl DiagnosticCode {
             DiagnosticCode::W020InvalidErrorPage => "W020",
             DiagnosticCode::W021InvalidHealthCheck => "W021",
             DiagnosticCode::W022InvalidLoadBalancer => "W022",
+            DiagnosticCode::W023InvalidRetry => "W023",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }

@@ -205,44 +205,85 @@ pub async fn handle_proxy(
             }
         };
 
-        let forwarded_req = Request::from_parts(parts, body);
-
-        // Send the request to the real backend.
         let timeout_secs = route.backend_timeout.unwrap_or(30);
 
-        let response_future = state.http_client.request(forwarded_req);
-
-        let result = if timeout_secs == 0 {
-            response_future.await.map_err(|e| e.to_string())
-        } else {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                response_future,
-            )
-            .await
-            {
-                Ok(result) => result.map_err(|e| e.to_string()),
-                Err(_) => {
-                    error!("Backend request to {} timed out", target_uri);
-                    let resp = diag::backend_timeout(&target_uri, timeout_secs).into_response();
-                    state
-                        .request_metrics
-                        .record(start.elapsed(), resp.status().as_u16());
-                    return resp;
-                }
+        // Buffer the request body up front so each retry can replay it. The
+        // body has to be owned bytes — a streaming body can only be sent once.
+        // With no retry (`attempts <= 1`) this is still a single send.
+        let attempts = route.retry_attempts.max(1);
+        let body_bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                error!("Failed to buffer request body for {}: {}", target_uri, e);
+                let resp = diag::forwarding_failed("request-body", &e.to_string()).into_response();
+                state
+                    .request_metrics
+                    .record(start.elapsed(), resp.status().as_u16());
+                return resp;
             }
         };
 
-        let backend_response = match result {
-            Ok(resp) => {
-                let (parts, body) = resp.into_parts();
-                let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
-                Response::from_parts(parts, body)
+        // Send to the backend, retrying connection-level failures and timeouts
+        // (the backend produced no response). A response that arrives — even a
+        // 5xx — is returned as-is and never retried, so a side effect is not
+        // replayed.
+        let mut last_err = String::new();
+        let mut last_was_timeout = false;
+        let mut backend_response = None;
+        for attempt in 1..=attempts {
+            let forwarded_req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+            let response_future = state.http_client.request(forwarded_req);
+
+            // `Ok(resp)` on success, `Err((msg, is_timeout))` otherwise.
+            let result = if timeout_secs == 0 {
+                response_future.await.map_err(|e| (e.to_string(), false))
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    response_future,
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(|e| (e.to_string(), false)),
+                    Err(_) => Err((format!("timed out after {timeout_secs}s"), true)),
+                }
+            };
+
+            match result {
+                Ok(resp) => {
+                    let (parts, body) = resp.into_parts();
+                    let body =
+                        Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
+                    backend_response = Some(Response::from_parts(parts, body));
+                    break;
+                }
+                Err((msg, is_timeout)) => {
+                    last_err = msg;
+                    last_was_timeout = is_timeout;
+                    if attempt < attempts {
+                        debug!(
+                            "Backend {} attempt {}/{} failed ({}); retrying",
+                            target_uri, attempt, attempts, last_err
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                error!("Failed to forward request to {}: {}", target_uri, e);
-                let resp = diag::backend_unreachable(&format!("backend at {target_uri}: {e}"))
-                    .into_response();
+        }
+
+        let backend_response = match backend_response {
+            Some(resp) => resp,
+            None => {
+                error!(
+                    "Failed to forward request to {} after {} attempt(s): {}",
+                    target_uri, attempts, last_err
+                );
+                // Preserve the distinct 504 for a timeout; 502 otherwise.
+                let resp = if last_was_timeout {
+                    diag::backend_timeout(&target_uri, timeout_secs).into_response()
+                } else {
+                    diag::backend_unreachable(&format!("backend at {target_uri}: {last_err}"))
+                        .into_response()
+                };
                 state
                     .request_metrics
                     .record(start.elapsed(), resp.status().as_u16());
