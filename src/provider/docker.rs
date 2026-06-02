@@ -873,6 +873,7 @@ mod merge_tests {
                 backend_timeout: None,
                 health_check: None,
                 load_balancer: LoadBalancer::default(),
+                retry: None,
                 rate_limit: None,
                 sticky_session: false,
                 compress: false,

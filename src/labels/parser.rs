@@ -174,6 +174,7 @@ fn build_entrypoint(
     let backend_timeout = core::parse_backend_timeout(labels, &prefix, diagnostics);
     let health_check = core::parse_health_check(labels, &prefix, diagnostics);
     let load_balancer = core::parse_load_balancer(labels, &prefix, diagnostics);
+    let retry = core::parse_retry(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
@@ -222,6 +223,7 @@ fn build_entrypoint(
             backend_timeout,
             health_check,
             load_balancer,
+            retry,
             rate_limit,
             sticky_session,
             compress,
@@ -295,6 +297,7 @@ fn build_tcp_entrypoint(
             backend_timeout: None,
             health_check: None,
             load_balancer: LoadBalancer::default(),
+            retry: None,
             rate_limit: None,
             sticky_session: false,
             compress: false,

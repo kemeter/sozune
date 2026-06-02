@@ -14,6 +14,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "healthCheck.status",
     "healthCheck.timeout",
     "loadBalancer",
+    "retry.attempts",
     "tls",
     "stripPrefix",
     "addPrefix",

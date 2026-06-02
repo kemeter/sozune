@@ -61,6 +61,9 @@ pub struct MiddlewareRoute {
     pub backends: Vec<(String, u16)>,
     pub backend_counter: AtomicUsize,
     pub backend_timeout: Option<u64>,
+    /// Total forward attempts (first try + retries) on a connection-level
+    /// failure or timeout. `1` (or `0`) means no retry — the default.
+    pub retry_attempts: u32,
     pub middlewares: Vec<Arc<dyn Middleware>>,
 }
 
@@ -181,6 +184,9 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || !config.match_query.is_empty()
         || !config.match_client_ip.is_empty()
         || !config.ip_allow_list.is_empty()
+        // Retry is enforced in the middleware proxy handler, so a route that
+        // only configures retry still has to go through it.
+        || config.retry.as_ref().is_some_and(|r| r.attempts > 1)
 }
 
 /// Build middleware route from entrypoint config.
@@ -286,6 +292,7 @@ pub fn build_middleware_route(
             .collect(),
         backend_counter: AtomicUsize::new(0),
         backend_timeout: config.backend_timeout,
+        retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
         middlewares,
     })
 }
