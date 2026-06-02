@@ -1104,6 +1104,7 @@ fn rule_to_entrypoints(
                     health_check: None,
                     load_balancer: LoadBalancer::default(),
                     retry: None,
+                    circuit_breaker: None,
                     rate_limit: None,
                     sticky_session: false,
                     compress: false,

@@ -92,6 +92,16 @@ pub fn no_match(host: &str) -> Response<Body> {
     )
 }
 
+/// 503 Service Unavailable — the route's circuit breaker is open, so the
+/// request is short-circuited instead of hitting a failing backend.
+pub fn circuit_open(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "circuit-open",
+        format!("sozune: circuit breaker open for host '{host}', backend is failing.\n"),
+    )
+}
+
 fn diag_response(status: StatusCode, reason: &str, debug_body: String) -> Response<Body> {
     let body = if debug_enabled() {
         debug_body

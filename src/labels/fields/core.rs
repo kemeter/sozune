@@ -1,5 +1,5 @@
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::model::{HealthCheckConfig, LoadBalancer, RetryConfig};
+use crate::model::{CircuitBreakerConfig, HealthCheckConfig, LoadBalancer, RetryConfig};
 use std::collections::HashMap;
 
 /// Parse a port label, falling back to the protocol default when absent or
@@ -260,6 +260,99 @@ pub fn parse_retry(
     }
 }
 
+/// Parse the `<prefix>circuitBreaker.*` labels into a [`CircuitBreakerConfig`].
+///
+/// The presence of **any** `circuitBreaker.*` field enables the breaker;
+/// omitted fields use the Traefik-flavoured defaults. Recognised fields:
+///
+/// - `circuitBreaker.threshold` — failure ratio in `(0, 1]` (default `0.5`)
+/// - `circuitBreaker.minRequests` — window size before evaluating (default `20`)
+/// - `circuitBreaker.cooldown` — open duration in seconds (default `10`)
+///
+/// Invalid values emit `W024` and fall back to the default for that field.
+pub fn parse_circuit_breaker(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<CircuitBreakerConfig> {
+    use crate::middleware::circuit_breaker as cb;
+
+    let t_key = format!("{prefix}circuitBreaker.threshold");
+    let m_key = format!("{prefix}circuitBreaker.minRequests");
+    let c_key = format!("{prefix}circuitBreaker.cooldown");
+
+    // Enabled only if at least one field is present.
+    let present = [&t_key, &m_key, &c_key]
+        .iter()
+        .any(|k| labels.get(*k).is_some_and(|v| !v.trim().is_empty()));
+    if !present {
+        return None;
+    }
+
+    let threshold = match labels.get(&t_key).map(|s| s.trim()) {
+        None | Some("") => cb::DEFAULT_THRESHOLD,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(v) if v > 0.0 && v <= 1.0 => v,
+            _ => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W024InvalidCircuitBreaker,
+                        "circuitBreaker.threshold must be a ratio in (0, 1]; using the default",
+                    )
+                    .with_label(&t_key)
+                    .with_value(raw)
+                    .with_hint("e.g. 0.5 trips at a 50% failure rate"),
+                );
+                cb::DEFAULT_THRESHOLD
+            }
+        },
+    };
+
+    let min_requests = match labels.get(&m_key).map(|s| s.trim()) {
+        None | Some("") => cb::DEFAULT_MIN_REQUESTS,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W024InvalidCircuitBreaker,
+                        "circuitBreaker.minRequests must be a positive integer; using the default",
+                    )
+                    .with_label(&m_key)
+                    .with_value(raw)
+                    .with_hint("number of recent requests before evaluating the failure rate"),
+                );
+                cb::DEFAULT_MIN_REQUESTS
+            }
+        },
+    };
+
+    let cooldown_secs = match labels.get(&c_key).map(|s| s.trim()) {
+        None | Some("") => cb::DEFAULT_COOLDOWN_SECS,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W024InvalidCircuitBreaker,
+                        "circuitBreaker.cooldown must be a positive integer (seconds); using the default",
+                    )
+                    .with_label(&c_key)
+                    .with_value(raw)
+                    .with_hint("seconds the breaker stays open before probing again"),
+                );
+                cb::DEFAULT_COOLDOWN_SECS
+            }
+        },
+    };
+
+    Some(CircuitBreakerConfig {
+        threshold,
+        min_requests,
+        cooldown_secs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +605,13 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_absent_is_none() {
+        let mut d = Vec::new();
+        assert!(parse_circuit_breaker(&labels(&[]), "sozune.http.web.", &mut d).is_none());
+        assert!(d.is_empty());
+    }
+
+    #[test]
     fn retry_absent_is_none() {
         let mut d = Vec::new();
         assert!(parse_retry(&labels(&[]), "sozune.http.web.", &mut d).is_none());
@@ -568,6 +668,23 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_any_field_enables_with_defaults() {
+        use crate::middleware::circuit_breaker as cb;
+        let mut d = Vec::new();
+        let c = parse_circuit_breaker(
+            &labels(&[("sozune.http.web.circuitBreaker.threshold", "0.3")]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .expect("any field enables the breaker");
+        assert_eq!(c.threshold, 0.3);
+        // Omitted fields fall back to defaults.
+        assert_eq!(c.min_requests, cb::DEFAULT_MIN_REQUESTS);
+        assert_eq!(c.cooldown_secs, cb::DEFAULT_COOLDOWN_SECS);
+        assert!(d.is_empty());
+    }
+
+    #[test]
     fn retry_one_or_zero_is_no_retry() {
         let mut d = Vec::new();
         assert!(
@@ -599,5 +716,38 @@ mod tests {
         );
         assert!(r.is_none());
         assert_eq!(d[0].code, DiagnosticCode::W023InvalidRetry);
+    }
+
+    #[test]
+    fn circuit_breaker_parses_all_fields() {
+        let mut d = Vec::new();
+        let c = parse_circuit_breaker(
+            &labels(&[
+                ("sozune.http.web.circuitBreaker.threshold", "0.8"),
+                ("sozune.http.web.circuitBreaker.minRequests", "50"),
+                ("sozune.http.web.circuitBreaker.cooldown", "30"),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(c.threshold, 0.8);
+        assert_eq!(c.min_requests, 50);
+        assert_eq!(c.cooldown_secs, 30);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn circuit_breaker_invalid_threshold_warns_and_defaults() {
+        use crate::middleware::circuit_breaker as cb;
+        let mut d = Vec::new();
+        let c = parse_circuit_breaker(
+            &labels(&[("sozune.http.web.circuitBreaker.threshold", "5")]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(c.threshold, cb::DEFAULT_THRESHOLD);
+        assert_eq!(d[0].code, DiagnosticCode::W024InvalidCircuitBreaker);
     }
 }

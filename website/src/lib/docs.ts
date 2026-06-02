@@ -84,6 +84,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'compress',
     'backend-timeout',
     'retry',
+    'circuit-breaker',
     'wasm-plugins',
   ],
   tls: ['overview', 'acme'],
