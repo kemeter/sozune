@@ -117,6 +117,7 @@ pub async fn handle_proxy(
                 .unwrap_or(false),
             client_encoding: None,
             pending_response_headers: Vec::new(),
+            in_flight_guards: Vec::new(),
         };
 
         // Request phase: run the middleware stack in order. A middleware may mutate

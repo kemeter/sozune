@@ -3,6 +3,7 @@ pub mod circuit_breaker;
 mod compress;
 mod diag;
 mod forward_auth;
+pub mod in_flight_req;
 pub mod ip_allow_list;
 mod proxy;
 pub mod rate_limit;
@@ -21,6 +22,7 @@ use crate::model::{Backend, EntrypointConfig};
 use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
+use in_flight_req::{InFlightLimiter, InFlightReqMiddleware};
 use ip_allow_list::{IpAllowList, IpAllowListMiddleware, TrustedProxies};
 use rate_limit::{RateLimitMiddleware, RateLimiter};
 use request_match::RequestMatchMiddleware;
@@ -181,6 +183,7 @@ pub fn build_plugin_registry(
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.backend_timeout.is_some()
         || config.rate_limit.is_some()
+        || config.in_flight_req.is_some()
         || config.compress
         || config.forward_auth.is_some()
         || !config.plugins.is_empty()
@@ -275,6 +278,12 @@ pub fn build_middleware_route(
     if let Some(rl) = config.rate_limit.as_ref() {
         middlewares.push(Arc::new(RateLimitMiddleware::new(RateLimiter::new(
             rl.average, rl.burst,
+        ))));
+    }
+
+    if let Some(max) = config.in_flight_req {
+        middlewares.push(Arc::new(InFlightReqMiddleware::new(InFlightLimiter::new(
+            max,
         ))));
     }
 

@@ -110,6 +110,12 @@ pub struct EntrypointConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Maximum number of concurrent in-flight requests per client IP for this
+    /// route. When the limit is reached, further requests from that IP are
+    /// rejected with `503 Service Unavailable` until an in-flight request
+    /// completes. `None` (default) disables the limiter.
+    #[serde(default)]
+    pub in_flight_req: Option<u64>,
     /// Load-balancing algorithm across this entrypoint's backends. Defaults to
     /// round-robin. Maps to Sōzu's `LoadBalancingAlgorithms`.
     #[serde(default)]

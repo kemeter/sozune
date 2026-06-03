@@ -249,6 +249,18 @@ services:
       - "sozune.http.svcratelimit.ratelimit.burst=3"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-inflight:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svcinflight.host=$HOST_INFLIGHT"
+      - "sozune.http.svcinflight.inFlightReq=2"
+      # Generous backend timeout so the slow `?wait=` probe requests below
+      # actually hold their in-flight slots instead of being cut at the 2s
+      # default — otherwise the slots free before the over-limit probe lands.
+      - "sozune.http.svcinflight.backendTimeout=10"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-compress:
     image: traefik/whoami
     labels:
@@ -470,6 +482,7 @@ declare -A WAIT_PATHS=(
     ["$HOST_ADD_PREFIX"]="/"
     ["$HOST_REDIRECT"]="/"
     ["$HOST_RATELIMIT"]="/"
+    ["$HOST_INFLIGHT"]="/"
     ["$HOST_COMPRESS"]="/"
     ["$HOST_TIMEOUT"]="/"
     ["$HOST_REGEX"]="/users/0"

@@ -102,6 +102,15 @@ pub fn circuit_open(host: &str) -> Response<Body> {
     )
 }
 
+/// 503 Service Unavailable — too many concurrent in-flight requests from this client.
+pub fn too_many_in_flight(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "too-many-in-flight",
+        format!("sozune: too many concurrent requests for host '{host}'.\n"),
+    )
+}
+
 fn diag_response(status: StatusCode, reason: &str, debug_body: String) -> Response<Body> {
     let body = if debug_enabled() {
         debug_body

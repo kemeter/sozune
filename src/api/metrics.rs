@@ -485,6 +485,7 @@ mod tests {
                 retry: None,
                 circuit_breaker: None,
                 rate_limit: None,
+                in_flight_req: None,
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,

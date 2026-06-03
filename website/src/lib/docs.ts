@@ -79,6 +79,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'auth',
     'headers',
     'rate-limit',
+    'in-flight-req',
     'redirects',
     'strip-prefix',
     'compress',

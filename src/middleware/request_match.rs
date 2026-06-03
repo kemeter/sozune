@@ -199,6 +199,7 @@ mod tests {
             is_tls: false,
             client_encoding: None,
             pending_response_headers: Vec::new(),
+            in_flight_guards: Vec::new(),
         }
     }
 
