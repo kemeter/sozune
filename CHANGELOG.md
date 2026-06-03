@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.14.0-dev]
+
 ### TLS / ACME
 
 - DNS-01 challenge support via named resolvers — declare `acme.resolvers` with `challenge: dns-01` and a provider (Cloudflare, OVH, Gandi, Scaleway), then point an entrypoint at it with `acme.resolver: <name>`. Provider credentials are read from environment variables, never inlined in YAML. DNS-01 solving is delegated to [cheti](https://github.com/kemeter/cheti).
