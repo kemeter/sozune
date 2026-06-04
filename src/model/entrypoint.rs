@@ -81,6 +81,14 @@ pub struct EntrypointConfig {
     /// request path. Maps to Sōzu's `rewrite_path`, same template grammar.
     #[serde(default)]
     pub rewrite_path: Option<String>,
+    /// Transparent URL rewrite applied to the forwarded request (Gateway API
+    /// `urlRewrite` filter). Unlike `rewrite_host` / `rewrite_path` above —
+    /// which only shape a permanent redirect's `Location` — this rewrites the
+    /// request the backend receives, with no redirect to the client. When
+    /// set, it takes precedence over `strip_prefix` / `add_prefix`. Maps onto
+    /// Sōzu's native frontend `rewrite_path` / `rewrite_host`.
+    #[serde(default)]
+    pub rewrite: Option<UrlRewrite>,
     /// Port to write into a permanent redirect's `Location`. Maps to Sōzu's
     /// `rewrite_port`.
     #[serde(default)]
@@ -285,6 +293,33 @@ pub enum RedirectScheme {
     UseSame,
     UseHttp,
     UseHttps,
+}
+
+/// Transparent URL rewrite, mapped from the Gateway API `urlRewrite` filter.
+/// Either field (or both) may be set; an all-`None` value is a no-op.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct UrlRewrite {
+    /// Path rewrite — full-path replacement or prefix replacement.
+    #[serde(default)]
+    pub path: Option<PathRewrite>,
+    /// Replacement value for the request's `Host` header (literal authority).
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+/// How the request path is rewritten before it reaches the backend.
+///
+/// - `ReplaceFullPath(new)` — the whole path becomes `new`, regardless of the
+///   request's trailing segments.
+/// - `ReplacePrefixMatch(new)` — the route's matched prefix is swapped for
+///   `new`, keeping any trailing segments (`/api/users` with `from=/api`,
+///   `new=/v2` → `/v2/users`). The matched (old) prefix comes from the
+///   entrypoint's `path` at build time; this carries only the replacement.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum PathRewrite {
+    ReplaceFullPath(String),
+    ReplacePrefixMatch(String),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]

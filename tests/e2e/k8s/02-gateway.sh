@@ -160,12 +160,13 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# Filters: any HTTPRoute filter (urlRewrite, requestRedirect, etc.)
-# causes the entire route to be dropped, AND the rejection is reflected
-# in status with reason=UnsupportedValue. Routing as if the filter
-# wasn't there would silently rewrite user intent.
+# Unsupported filters (requestMirror, extensionRef) still cause the whole
+# route to be dropped, AND the rejection is reflected in status with
+# reason=UnsupportedValue. Routing as if the filter wasn't there would
+# silently misrepresent intent. (requestRedirect, header modifiers and
+# urlRewrite are supported and tested separately below.)
 # ----------------------------------------------------------------------
-log "[02] Gateway: route declaring an HTTPRoute filter is dropped with status"
+log "[02] Gateway: route declaring an unsupported filter is dropped with status"
 
 kubectl apply -n sozune-test -f - >/dev/null 2>&1 <<'YAML'
 apiVersion: gateway.networking.k8s.io/v1
@@ -184,11 +185,11 @@ spec:
             type: PathPrefix
             value: /
       filters:
-        - type: URLRewrite
-          urlRewrite:
-            path:
-              type: ReplacePrefixMatch
-              replacePrefixMatch: /rewritten
+        - type: RequestMirror
+          requestMirror:
+            backendRef:
+              name: svcb
+              port: 80
       backendRefs:
         - name: svcb
           port: 80
@@ -199,7 +200,7 @@ filtered_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
     "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
 filtered_status=${filtered_status:-000}
 if [[ "$filtered_status" == "404" ]]; then
-    pass "route with urlRewrite filter is not served (got 404)"
+    pass "route with requestMirror filter is not served (got 404)"
 else
     fail "filtered route was served (got $filtered_status, expected 404)"
 fi
@@ -319,9 +320,75 @@ else
     fail "header-modifier route status wrong (reason='$header_reason', expected Accepted)"
 fi
 
+# ----------------------------------------------------------------------
+# urlRewrite filter (ReplacePrefixMatch): a route declaring it is SERVED
+# and the request path is transparently rewritten before reaching the
+# backend (no redirect to the client). whoami echoes the request line it
+# received, so we can assert the backend saw the rewritten path.
+# ----------------------------------------------------------------------
+log "[02] Gateway: route with urlRewrite ReplacePrefixMatch rewrites the backend path"
+
+kubectl apply -n sozune-test -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rewrite-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-rewrite.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /rewritten
+      backendRefs:
+        - name: svcb
+          port: 80
+YAML
+sleep 4
+
+rewrite_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: gw-rewrite.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/api/users" 2>/dev/null)
+rewrite_status=${rewrite_status:-000}
+if [[ "$rewrite_status" == "200" ]]; then
+    pass "route with urlRewrite is served (got 200, no redirect)"
+else
+    fail "urlRewrite route not served as expected (got $rewrite_status, expected 200)"
+fi
+
+# whoami echoes the request line; the backend must see /rewritten/users,
+# not the original /api/users.
+rewrite_body=$(curl -s --max-time 2 \
+    -H "Host: gw-rewrite.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/api/users" 2>/dev/null || true)
+if echo "$rewrite_body" | grep -qiE "(GET|RequestURI:?) /rewritten/users"; then
+    pass "urlRewrite ReplacePrefixMatch rewrote /api/users -> /rewritten/users at the backend"
+else
+    fail "backend did not see the rewritten path /rewritten/users (whoami body did not echo it)"
+fi
+
+# Supported filter → Accepted=True.
+rewrite_reason=$(kubectl get httproute rewrite-route -n sozune-test \
+    -o jsonpath="{.status.parents[?(@.controllerName=='kemeter.io/sozune')].conditions[?(@.type=='Accepted')].reason}" 2>/dev/null)
+if [[ "$rewrite_reason" == "Accepted" ]]; then
+    pass "urlRewrite route has Accepted=True reason=Accepted in status"
+else
+    fail "urlRewrite route status wrong (reason='$rewrite_reason', expected Accepted)"
+fi
+
 # Cleanup of the dynamically-applied resources to leave the cluster
 # tidy if the suite is re-run.
-kubectl delete httproute filtered-route foreign-route header-route -n sozune-test >/dev/null 2>&1 || true
+kubectl delete httproute filtered-route foreign-route header-route rewrite-route -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gateway foreign-gw -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gatewayclass foreign >/dev/null 2>&1 || true
 

@@ -537,19 +537,20 @@ fn apply_route(
     // re_resolve_all from the Gateway watcher) and deactivate cleanly
     // when one disappears.
     //
-    // Routes that declare unsupported filters (urlRewrite, requestMirror,
-    // extensionRef) are also dropped: routing them as if the filter wasn't
-    // there would silently rewrite user intent. Worse than refusing the
-    // route — better to surface the problem so the user knows to fall back
-    // to Ingress annotations until filter support lands. (requestRedirect,
-    // requestHeaderModifier and responseHeaderModifier are honoured.)
+    // Routes that declare unsupported filters (requestMirror, extensionRef)
+    // or the conflicting requestRedirect+urlRewrite pair are also dropped:
+    // routing them as if the filter wasn't there would silently rewrite
+    // user intent. Worse than refusing the route — better to surface the
+    // problem so the user knows to fall back to Ingress annotations until
+    // filter support lands. (requestRedirect, requestHeaderModifier,
+    // responseHeaderModifier and urlRewrite are honoured.)
     let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
         (RouteOutcome::NotMine, Vec::new())
     } else if route_has_unsupported_filters(route) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect — excluding its path-rewrite and 302 forms — plus requestHeaderModifier and responseHeaderModifier are supported; urlRewrite, requestMirror and extensionRef are not) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported; requestMirror and extensionRef are not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -771,10 +772,11 @@ pub fn route_to_entrypoints(route: &HTTPRoute, resolver: &dyn ServiceResolver) -
 }
 
 /// True iff at least one rule in the route declares filters sōzune
-/// can't faithfully execute today (`urlRewrite`, `requestMirror`,
-/// `extensionRef`, or a `requestRedirect` in an unmappable form).
-/// `requestRedirect`, `requestHeaderModifier` and
-/// `responseHeaderModifier` are supported. The HTTPRoute watcher uses
+/// can't faithfully execute today (`requestMirror`, `extensionRef`, a
+/// `requestRedirect` in an unmappable form, an empty `urlRewrite`, or the
+/// conflicting `requestRedirect`+`urlRewrite` pair on one rule).
+/// `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`
+/// and `urlRewrite` are supported. The HTTPRoute watcher uses
 /// this as an early reject so the user sees a clear log line and a
 /// `ResolvedRefs=False` status condition rather than wrong behaviour.
 pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
@@ -857,7 +859,7 @@ fn build_route_status(
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters sōzune cannot represent (urlRewrite, requestMirror and extensionRef are unsupported; requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier and responseHeaderModifier are supported)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
         ),
         RouteOutcome::NotMine => unreachable!("filtered out above"),
     };
@@ -985,15 +987,17 @@ fn rule_to_entrypoints(
     // Gateway API: each entry in `filters` is meant to mutate the
     // request/response before/after it reaches the backend. We honour the
     // ones we can map faithfully: `requestRedirect` → Sōzu's native
-    // frontend redirect, and `requestHeaderModifier` /
-    // `responseHeaderModifier` → Sōzu's native frontend header edits. A
-    // rule carrying any filter we can't represent (urlRewrite,
-    // requestMirror, extensionRef) is refused outright: routing it as if
-    // the filter weren't there would silently rewrite user intent. The
-    // watcher also gates on `route_has_unsupported_filters` to set the
-    // route status, but we re-check here so a direct call can't slip an
-    // unsupported filter through.
-    let (redirect, header_edits) = match rule.filters.as_deref() {
+    // frontend redirect, `requestHeaderModifier` / `responseHeaderModifier`
+    // → Sōzu's native frontend header edits, and `urlRewrite` → Sōzu's
+    // native frontend path/host rewrite (transparent, no redirect). A rule
+    // carrying any filter we can't represent (requestMirror, extensionRef),
+    // or the conflicting requestRedirect+urlRewrite pair, is refused
+    // outright: routing it as if the filter weren't there would silently
+    // rewrite user intent. The watcher also gates on
+    // `route_has_unsupported_filters` to set the route status, but we
+    // re-check here so a direct call can't slip an unsupported filter
+    // through.
+    let (redirect, header_edits, url_rewrite) = match rule.filters.as_deref() {
         Some(filters) if !filters.is_empty() => {
             if !gateway_filters::rule_filters_supported(filters) {
                 return Vec::new();
@@ -1001,9 +1005,10 @@ fn rule_to_entrypoints(
             (
                 gateway_filters::redirect_from_filter(filters),
                 gateway_filters::header_edits_from_filters(filters),
+                gateway_filters::url_rewrite_from_filter(filters),
             )
         }
-        _ => (None, Vec::new()),
+        _ => (None, Vec::new(), None),
     };
 
     let Some(backend_refs) = rule.backend_refs.as_ref() else {
@@ -1103,6 +1108,7 @@ fn rule_to_entrypoints(
                     rewrite_host: redirect.as_ref().and_then(|r| r.host.clone()),
                     rewrite_path: redirect.as_ref().and_then(|r| r.path.clone()),
                     rewrite_port: redirect.as_ref().and_then(|r| r.port),
+                    rewrite: url_rewrite.clone(),
                     www_authenticate: None,
                     priority: 0,
                     auth: None,
@@ -1704,11 +1710,12 @@ mod tests {
 
     // ---------- Filters & multi-match tests ----------
 
-    use crate::model::entrypoint::HeaderDirection;
+    use crate::model::entrypoint::{HeaderDirection, PathRewrite};
     use gateway_api::apis::standard::httproutes::{
         HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestHeaderModifier,
         HTTPRouteRulesFiltersRequestHeaderModifierSet, HTTPRouteRulesFiltersResponseHeaderModifier,
-        HTTPRouteRulesFiltersResponseHeaderModifierSet,
+        HTTPRouteRulesFiltersResponseHeaderModifierSet, HTTPRouteRulesFiltersUrlRewrite,
+        HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
     };
 
     fn rule_with_filter(
@@ -1853,6 +1860,80 @@ mod tests {
         };
         let r = route_with(
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_has_unsupported_filters(&r));
+        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+    }
+
+    #[test]
+    fn route_with_url_rewrite_replace_prefix_maps_to_rewrite_field() {
+        let filter = HTTPRouteRulesFilters {
+            url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+                hostname: None,
+                path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+                    replace_full_path: None,
+                    replace_prefix_match: Some("/v2".into()),
+                    r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                }),
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 1);
+        let rw = eps[0].config.rewrite.as_ref().unwrap();
+        assert_eq!(rw.path, Some(PathRewrite::ReplacePrefixMatch("/v2".into())));
+        assert_eq!(rw.hostname, None);
+    }
+
+    #[test]
+    fn route_with_url_rewrite_hostname_sets_rewrite_hostname() {
+        let filter = HTTPRouteRulesFilters {
+            url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+                hostname: Some("internal.svc".into()),
+                path: None,
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        let eps = route_to_entrypoints(&r, &r1());
+        let rw = eps[0].config.rewrite.as_ref().unwrap();
+        assert_eq!(rw.hostname.as_deref(), Some("internal.svc"));
+        assert_eq!(rw.path, None);
+    }
+
+    #[test]
+    fn route_mixing_redirect_and_url_rewrite_is_unsupported() {
+        // Conflicting intents over the frontend rewrite — the whole route
+        // is dropped, not partially applied.
+        let redirect = HTTPRouteRulesFilters {
+            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rewrite = HTTPRouteRulesFilters {
+            url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+                hostname: Some("internal.svc".into()),
+                path: None,
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(
+                vec![backend("api", 80)],
+                vec![redirect, rewrite],
+            )],
             vec!["app.example.com".into()],
         );
         assert!(route_has_unsupported_filters(&r));
