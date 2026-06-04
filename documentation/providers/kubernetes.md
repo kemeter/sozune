@@ -236,7 +236,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
 - `backendRef.weight` — propagated to the load balancer.
-- `spec.rules[].filters[]` — `requestRedirect` (see [HTTPRoute filters](#httproute-filters) below). Other filter types are not supported yet.
+- `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier` (see [HTTPRoute filters](#httproute-filters) below). `urlRewrite`, `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — for every `parentRef` Sōzune owns, the route's `status.parents[]` is updated with the standard `Accepted` and `ResolvedRefs` conditions (`controllerName: kemeter.io/sozune`). Visible via `kubectl describe httproute <name>`. Other controllers' entries are preserved untouched.
 
@@ -256,10 +256,23 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 
 - Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
 - `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
-- HTTPRoute `filters` other than `requestRedirect` — `urlRewrite`, `requestHeaderModifier` / `responseHeaderModifier`, `requestMirror`. Declaring one of these (or a `requestRedirect` we can't represent, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands.
+- HTTPRoute `filters` `urlRewrite`, `requestMirror`, and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, and `responseHeaderModifier` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
 
 ### HTTPRoute filters
+
+| Filter | Supported | Notes |
+|---|---|---|
+| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` and `302` are dropped (see below) |
+| `requestHeaderModifier` | Yes | `set`/`remove` map directly; `add` is applied as `set` (see below) |
+| `responseHeaderModifier` | Yes | Same as above, on the response |
+| `urlRewrite` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
+| `requestMirror` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
+| `extensionRef` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
+
+A rule may combine any of the supported filters (e.g. a `requestRedirect` together with a `requestHeaderModifier`); all are honoured together. A rule carrying any unsupported filter drops the whole route.
+
+#### requestRedirect
 
 Sōzune maps the `requestRedirect` filter onto Sōzu's native frontend redirect — no extra middleware hop. A rule may declare a redirect alongside its `backendRefs`:
 
@@ -289,7 +302,37 @@ rules:
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
 | `path.replacePrefixMatch` | — | **not supported**: keeping the request's trailing segments needs a path capture Sōzune doesn't set up for redirect rules, so the route is dropped |
 
-A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch`, a `302` status, or combined with another filter is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
+A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` or a `302` status is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
+
+#### requestHeaderModifier / responseHeaderModifier
+
+Header modifiers map onto Sōzu's native frontend header edits — no extra middleware hop. `requestHeaderModifier` edits the request before it reaches the backend; `responseHeaderModifier` edits the response on the way back.
+
+```yaml
+rules:
+  - filters:
+      - type: RequestHeaderModifier
+        requestHeaderModifier:
+          set:
+            - name: X-Env
+              value: prod
+          remove:
+            - X-Debug
+      - type: ResponseHeaderModifier
+        responseHeaderModifier:
+          set:
+            - name: X-Powered-By
+              value: sozune
+    backendRefs:
+      - name: web-svc
+        port: 80
+```
+
+| Field | Mapped to | Notes |
+|---|---|---|
+| `set` | header set | overwrites the header with the given value |
+| `remove` | header delete | maps to an empty-value frontend edit, which deletes the header |
+| `add` | header set | **caveat**: Sōzu has no frontend append-without-replace, so `add` is applied as `set` (existing values are replaced, not appended) and a `WARN` is logged. The route is **not** dropped — set-semantics is what most `add` users want |
 
 ### How resolution works
 
@@ -311,7 +354,7 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute does support cross-namespace `backendRefs`.)
-- **Gateway API: HTTPRoute only.** `Gateway`, `GatewayClass`, `GRPCRoute`, `TCPRoute`, `ReferenceGrant`, and HTTPRoute filters are not yet implemented. See the Gateway API section above for details.
+- **Gateway API: HTTPRoute only.** `Gateway`, `GatewayClass`, `GRPCRoute`, `TCPRoute`, `ReferenceGrant`, and the `urlRewrite` / `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented. `requestRedirect`, `requestHeaderModifier`, and `responseHeaderModifier` filters are supported. See the Gateway API section above for details.
 
 ## Environment variables
 

@@ -537,19 +537,19 @@ fn apply_route(
     // re_resolve_all from the Gateway watcher) and deactivate cleanly
     // when one disappears.
     //
-    // Routes that declare unsupported filters (requestRedirect,
-    // urlRewrite, header modifiers, mirror, etc.) are also dropped:
-    // routing them as if the filter wasn't there would silently rewrite
-    // user intent. Worse than refusing the route — better to surface
-    // the problem so the user knows to fall back to Ingress annotations
-    // until filter support lands.
+    // Routes that declare unsupported filters (urlRewrite, requestMirror,
+    // extensionRef) are also dropped: routing them as if the filter wasn't
+    // there would silently rewrite user intent. Worse than refusing the
+    // route — better to surface the problem so the user knows to fall back
+    // to Ingress annotations until filter support lands. (requestRedirect,
+    // requestHeaderModifier and responseHeaderModifier are honoured.)
     let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
         (RouteOutcome::NotMine, Vec::new())
     } else if route_has_unsupported_filters(route) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (only requestRedirect is supported, and not its path-rewrite or 302 forms) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect — excluding its path-rewrite and 302 forms — plus requestHeaderModifier and responseHeaderModifier are supported; urlRewrite, requestMirror and extensionRef are not) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -771,8 +771,11 @@ pub fn route_to_entrypoints(route: &HTTPRoute, resolver: &dyn ServiceResolver) -
 }
 
 /// True iff at least one rule in the route declares filters sōzune
-/// can't faithfully execute today. The HTTPRoute watcher uses this as
-/// an early reject so the user sees a clear log line and a
+/// can't faithfully execute today (`urlRewrite`, `requestMirror`,
+/// `extensionRef`, or a `requestRedirect` in an unmappable form).
+/// `requestRedirect`, `requestHeaderModifier` and
+/// `responseHeaderModifier` are supported. The HTTPRoute watcher uses
+/// this as an early reject so the user sees a clear log line and a
 /// `ResolvedRefs=False` status condition rather than wrong behaviour.
 pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
     route
@@ -854,7 +857,7 @@ fn build_route_status(
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters sōzune cannot represent (only requestRedirect is supported, excluding its path-rewrite and 302 forms)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (urlRewrite, requestMirror and extensionRef are unsupported; requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier and responseHeaderModifier are supported)".to_string(),
         ),
         RouteOutcome::NotMine => unreachable!("filtered out above"),
     };
@@ -980,22 +983,27 @@ fn rule_to_entrypoints(
     resolver: &dyn ServiceResolver,
 ) -> Vec<Entrypoint> {
     // Gateway API: each entry in `filters` is meant to mutate the
-    // request before it reaches the backend. We honour the ones we can
-    // map faithfully (`requestRedirect` → Sōzu's native frontend
-    // redirect). A rule carrying any filter we can't represent is
-    // refused outright: routing it as if the filter weren't there would
-    // silently rewrite user intent. The watcher also gates on
-    // `route_has_unsupported_filters` to set the route status, but we
-    // re-check here so a direct call can't slip an unsupported filter
-    // through.
-    let redirect = match rule.filters.as_deref() {
+    // request/response before/after it reaches the backend. We honour the
+    // ones we can map faithfully: `requestRedirect` → Sōzu's native
+    // frontend redirect, and `requestHeaderModifier` /
+    // `responseHeaderModifier` → Sōzu's native frontend header edits. A
+    // rule carrying any filter we can't represent (urlRewrite,
+    // requestMirror, extensionRef) is refused outright: routing it as if
+    // the filter weren't there would silently rewrite user intent. The
+    // watcher also gates on `route_has_unsupported_filters` to set the
+    // route status, but we re-check here so a direct call can't slip an
+    // unsupported filter through.
+    let (redirect, header_edits) = match rule.filters.as_deref() {
         Some(filters) if !filters.is_empty() => {
             if !gateway_filters::rule_filters_supported(filters) {
                 return Vec::new();
             }
-            gateway_filters::redirect_from_filter(filters)
+            (
+                gateway_filters::redirect_from_filter(filters),
+                gateway_filters::header_edits_from_filters(filters),
+            )
         }
-        _ => None,
+        _ => (None, Vec::new()),
     };
 
     let Some(backend_refs) = rule.backend_refs.as_ref() else {
@@ -1099,7 +1107,7 @@ fn rule_to_entrypoints(
                     priority: 0,
                     auth: None,
                     forward_auth: None,
-                    headers: Vec::new(),
+                    headers: header_edits.clone(),
                     backend_timeout: None,
                     health_check: None,
                     load_balancer: LoadBalancer::default(),
@@ -1696,7 +1704,12 @@ mod tests {
 
     // ---------- Filters & multi-match tests ----------
 
-    use gateway_api::apis::standard::httproutes::HTTPRouteRulesFilters;
+    use crate::model::entrypoint::HeaderDirection;
+    use gateway_api::apis::standard::httproutes::{
+        HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestHeaderModifier,
+        HTTPRouteRulesFiltersRequestHeaderModifierSet, HTTPRouteRulesFiltersResponseHeaderModifier,
+        HTTPRouteRulesFiltersResponseHeaderModifierSet,
+    };
 
     fn rule_with_filter(
         backends: Vec<HTTPRouteRulesBackendRefs>,
@@ -1753,6 +1766,97 @@ mod tests {
             eps[0].config.redirect_scheme,
             Some(RedirectScheme::UseHttps)
         );
+    }
+
+    #[test]
+    fn route_with_request_header_modifier_populates_headers() {
+        let filter = HTTPRouteRulesFilters {
+            request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                    name: "X-Env".into(),
+                    value: "prod".into(),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.headers.len(), 1);
+        assert_eq!(eps[0].config.headers[0].name, "X-Env");
+        assert_eq!(eps[0].config.headers[0].value, "prod");
+        assert_eq!(eps[0].config.headers[0].direction, HeaderDirection::Request);
+    }
+
+    #[test]
+    fn route_with_response_header_modifier_uses_response_direction() {
+        let filter = HTTPRouteRulesFilters {
+            response_header_modifier: Some(HTTPRouteRulesFiltersResponseHeaderModifier {
+                set: Some(vec![HTTPRouteRulesFiltersResponseHeaderModifierSet {
+                    name: "X-Powered-By".into(),
+                    value: "sozune".into(),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps[0].config.headers.len(), 1);
+        assert_eq!(
+            eps[0].config.headers[0].direction,
+            HeaderDirection::Response
+        );
+    }
+
+    #[test]
+    fn route_mixing_redirect_and_header_modifier_is_accepted() {
+        let filter = HTTPRouteRulesFilters {
+            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+                ..Default::default()
+            }),
+            request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                    name: "X-Env".into(),
+                    value: "prod".into(),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(&r));
+        let eps = route_to_entrypoints(&r, &r1());
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(eps[0].config.headers.len(), 1);
+    }
+
+    #[test]
+    fn route_with_request_mirror_is_still_unsupported() {
+        let filter = HTTPRouteRulesFilters {
+            request_mirror: Some(Default::default()),
+            ..Default::default()
+        };
+        let r = route_with(
+            vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_has_unsupported_filters(&r));
+        assert!(route_to_entrypoints(&r, &r1()).is_empty());
     }
 
     #[test]
