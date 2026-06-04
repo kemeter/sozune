@@ -34,6 +34,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "wwwAuthenticate",
     "ratelimit.average",
     "ratelimit.burst",
+    "inFlightReq",
     "auth.basic",
     "forwardAuth.address",
     "forwardAuth.responseHeaders",

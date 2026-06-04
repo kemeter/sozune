@@ -49,6 +49,7 @@ pub enum DiagnosticCode {
     W022InvalidLoadBalancer,
     W023InvalidRetry,
     W024InvalidCircuitBreaker,
+    W025InvalidInFlightReq,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -86,6 +87,7 @@ impl DiagnosticCode {
             DiagnosticCode::W022InvalidLoadBalancer => "W022",
             DiagnosticCode::W023InvalidRetry => "W023",
             DiagnosticCode::W024InvalidCircuitBreaker => "W024",
+            DiagnosticCode::W025InvalidInFlightReq => "W025",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }

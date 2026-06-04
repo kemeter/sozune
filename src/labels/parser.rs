@@ -4,8 +4,8 @@ use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
-    auth, core, error_pages, forward_auth, headers, host, ip_allow_list, methods, path, plugins,
-    ratelimit, redirect, request_match,
+    auth, core, error_pages, forward_auth, headers, host, in_flight_req, ip_allow_list, methods,
+    path, plugins, ratelimit, redirect, request_match,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, LoadBalancer, Protocol};
@@ -177,6 +177,7 @@ fn build_entrypoint(
     let retry = core::parse_retry(labels, &prefix, diagnostics);
     let circuit_breaker = core::parse_circuit_breaker(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
+    let in_flight_req = in_flight_req::parse_in_flight_req(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
@@ -227,6 +228,7 @@ fn build_entrypoint(
             retry,
             circuit_breaker,
             rate_limit,
+            in_flight_req,
             sticky_session,
             compress,
             entrypoint: None,
@@ -302,6 +304,7 @@ fn build_tcp_entrypoint(
             retry: None,
             circuit_breaker: None,
             rate_limit: None,
+            in_flight_req: None,
             sticky_session: false,
             compress: false,
             entrypoint: Some(entrypoint_ref),

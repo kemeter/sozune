@@ -4,6 +4,7 @@ pub mod error_pages;
 pub mod forward_auth;
 pub mod headers;
 pub mod host;
+pub mod in_flight_req;
 pub mod ip_allow_list;
 pub mod methods;
 pub mod path;

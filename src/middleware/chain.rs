@@ -21,6 +21,11 @@ pub struct RequestCtx {
     /// response headers from `handle_request`). Applied to the final response
     /// on the way out. `(lowercase_name, value)` pairs.
     pub pending_response_headers: Vec<(String, String)>,
+    /// In-flight request slot guards held for the lifetime of this context. The
+    /// in-flight-req middleware pushes one on `on_request`; each guard releases
+    /// its per-IP slot when this context is dropped — on every proxy return
+    /// path, not just the response phase.
+    pub in_flight_guards: Vec<super::in_flight_req::InFlightGuard>,
 }
 
 /// Outcome of a middleware's request phase.
