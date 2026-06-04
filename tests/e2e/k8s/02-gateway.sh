@@ -254,9 +254,74 @@ else
     fail "kubectl describe output missing fields: ${missing[*]}"
 fi
 
+# ----------------------------------------------------------------------
+# requestHeaderModifier filter: a route declaring it is SERVED (not dropped)
+# and the header is injected before the request reaches the backend. The
+# backend (traefik/whoami) echoes received request headers in its body, so
+# we can assert the injected header arrives.
+# ----------------------------------------------------------------------
+log "[02] Gateway: route with requestHeaderModifier is served and injects the header"
+
+kubectl apply -n sozune-test -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: header-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-header.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Gateway-Test
+                value: injected
+      backendRefs:
+        - name: svcb
+          port: 80
+YAML
+sleep 4
+
+header_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: gw-header.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+header_status=${header_status:-000}
+if [[ "$header_status" == "200" ]]; then
+    pass "route with requestHeaderModifier is served (got 200)"
+else
+    fail "header-modifier route not served (got $header_status, expected 200)"
+fi
+
+# whoami echoes the request headers it received in the response body.
+header_body=$(curl -s --max-time 2 \
+    -H "Host: gw-header.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || true)
+if echo "$header_body" | grep -qi "X-Gateway-Test: injected"; then
+    pass "requestHeaderModifier injected X-Gateway-Test into the backend request"
+else
+    fail "injected header not seen by the backend (whoami body did not echo X-Gateway-Test)"
+fi
+
+# The route must also report Accepted=True (it is supported now).
+header_reason=$(kubectl get httproute header-route -n sozune-test \
+    -o jsonpath="{.status.parents[?(@.controllerName=='kemeter.io/sozune')].conditions[?(@.type=='Accepted')].reason}" 2>/dev/null)
+if [[ "$header_reason" == "Accepted" ]]; then
+    pass "header-modifier route has Accepted=True reason=Accepted in status"
+else
+    fail "header-modifier route status wrong (reason='$header_reason', expected Accepted)"
+fi
+
 # Cleanup of the dynamically-applied resources to leave the cluster
 # tidy if the suite is re-run.
-kubectl delete httproute filtered-route foreign-route -n sozune-test >/dev/null 2>&1 || true
+kubectl delete httproute filtered-route foreign-route header-route -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gateway foreign-gw -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gatewayclass foreign >/dev/null 2>&1 || true
 
