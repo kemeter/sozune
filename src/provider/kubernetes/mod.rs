@@ -1002,6 +1002,7 @@ impl IngressParseCtx<'_> {
                 redirect_template: None,
                 rewrite_host: None,
                 rewrite_path: None,
+                rewrite: None,
                 rewrite_port: None,
                 www_authenticate: None,
                 priority: 0,

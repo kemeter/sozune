@@ -493,6 +493,7 @@ mod tests {
                 add_prefix: None,
                 rewrite_host: None,
                 rewrite_path: None,
+                rewrite: None,
                 rewrite_port: None,
                 forward_auth: None,
                 acme: None,

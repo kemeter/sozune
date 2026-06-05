@@ -5,8 +5,8 @@
 //! its lifecycle.
 
 use crate::model::{
-    AuthConfig, HeaderConfig, HeaderDirection, PathConfig, PathRuleType, RedirectPolicy,
-    RedirectScheme,
+    AuthConfig, HeaderConfig, HeaderDirection, PathConfig, PathRewrite, PathRuleType,
+    RedirectPolicy, RedirectScheme, UrlRewrite,
 };
 use sozu_command_lib::proto::command::{
     Header, HeaderPosition, PathRule, RedirectPolicy as SozuRedirectPolicy,
@@ -88,8 +88,23 @@ pub(super) fn build_path_and_rewrite(
     path_config: Option<&PathConfig>,
     strip_prefix: bool,
     add_prefix: Option<&str>,
+    rewrite: Option<&UrlRewrite>,
     cluster_id: &str,
 ) -> (PathRule, Option<String>) {
+    // The Gateway API `urlRewrite` filter is an explicit, complete rewrite
+    // intent — it wins over the coarser strip_prefix / add_prefix knobs when
+    // both are set. (hostname rewrites live on a separate frontend field and
+    // don't affect the path rule built here.)
+    if let Some(path_mode) = rewrite.and_then(|rw| rw.path.as_ref()) {
+        if strip_prefix || add_prefix.is_some() {
+            warn!(
+                "urlRewrite path rewrite and strip_prefix/add_prefix are mutually exclusive on {}; urlRewrite takes precedence",
+                cluster_id
+            );
+        }
+        return build_url_rewrite_path(path_config, path_mode, cluster_id);
+    }
+
     if strip_prefix && add_prefix.is_some() {
         warn!(
             "strip_prefix and add_prefix are mutually exclusive on {}; add_prefix takes precedence",
@@ -226,13 +241,152 @@ fn build_add_prefix_rewrite(
     }
 }
 
+/// Build the path rule + native Sōzu rewrite string for a Gateway API
+/// `urlRewrite` path filter (transparent rewrite, no redirect).
+///
+/// - `ReplaceFullPath(new)`: match the route path, rewrite to the literal
+///   `new` regardless of any trailing segments. For a Prefix path the rule is
+///   a regex that also matches sub-paths so the whole match collapses to
+///   `new`; for an Exact path it's an exact match.
+/// - `ReplacePrefixMatch(new)`: match the route prefix and keep the trailing
+///   segments, swapping only the prefix. Mirrors strip_prefix's capture
+///   (`^/api(?:/(.*))?$` → `{new}/$PATH[1]`), so `/api/users` → `/v2/users`
+///   and a bare `/api` → `/v2/` (empty capture, same as strip_prefix).
+fn build_url_rewrite_path(
+    path_config: Option<&PathConfig>,
+    mode: &PathRewrite,
+    cluster_id: &str,
+) -> (PathRule, Option<String>) {
+    match mode {
+        PathRewrite::ReplaceFullPath(new) => build_replace_full_path(path_config, new),
+        PathRewrite::ReplacePrefixMatch(new) => {
+            build_replace_prefix_match(path_config, new, cluster_id)
+        }
+    }
+}
+
+fn build_replace_full_path(
+    path_config: Option<&PathConfig>,
+    new: &str,
+) -> (PathRule, Option<String>) {
+    let rewrite = Some(new.to_string());
+    match path_config {
+        // No route path constraint — match any path and collapse to `new`.
+        None => (
+            PathRule {
+                value: "^/.*$".to_string(),
+                kind: 1,
+            },
+            rewrite,
+        ),
+        Some(pc) => match pc.rule_type {
+            PathRuleType::Prefix => {
+                let escaped = regex_escape(pc.value.trim_end_matches('/'));
+                let pattern = format!("^{}(?:/.*)?$", escaped);
+                (
+                    PathRule {
+                        value: pattern,
+                        kind: 1,
+                    },
+                    rewrite,
+                )
+            }
+            PathRuleType::Exact => (
+                PathRule {
+                    value: pc.value.clone(),
+                    kind: 2,
+                },
+                rewrite,
+            ),
+            PathRuleType::Regex => (
+                PathRule {
+                    value: pc.value.clone(),
+                    kind: 1,
+                },
+                rewrite,
+            ),
+        },
+    }
+}
+
+fn build_replace_prefix_match(
+    path_config: Option<&PathConfig>,
+    new: &str,
+    cluster_id: &str,
+) -> (PathRule, Option<String>) {
+    // Reuse add_prefix's normalisation: trim trailing slash, ensure a single
+    // leading slash, empty → "". With an empty replacement the prefix is just
+    // stripped, leaving the suffix (`/$PATH[1]`), matching strip_prefix.
+    let normalized = normalize_add_prefix(new);
+    let suffix_rewrite = format!("{normalized}/$PATH[1]");
+
+    let Some(pc) = path_config else {
+        // ReplacePrefixMatch is only meaningful with a PathPrefix match; with
+        // no route path we have no prefix to swap, so match any path and
+        // prepend the replacement (the whole path is the "suffix").
+        return (
+            PathRule {
+                value: "^/?(.*)$".to_string(),
+                kind: 1,
+            },
+            Some(suffix_rewrite),
+        );
+    };
+
+    match pc.rule_type {
+        PathRuleType::Prefix => {
+            let escaped = regex_escape(pc.value.trim_end_matches('/'));
+            // Same capture as strip_prefix: the trailing segments (if any)
+            // land in $PATH[1]. `/api/users` → `/v2/users`; a bare `/api`
+            // (empty capture) → `/v2/`, mirroring strip_prefix's `/` result.
+            let pattern = format!("^{}(?:/(.*))?$", escaped);
+            (
+                PathRule {
+                    value: pattern,
+                    kind: 1,
+                },
+                Some(suffix_rewrite),
+            )
+        }
+        PathRuleType::Exact => {
+            // An exact match has no trailing segments to keep — the path is
+            // exactly the prefix, so it becomes exactly the replacement.
+            let target = if normalized.is_empty() {
+                "/".to_string()
+            } else {
+                normalized
+            };
+            (
+                PathRule {
+                    value: pc.value.clone(),
+                    kind: 2,
+                },
+                Some(target),
+            )
+        }
+        PathRuleType::Regex => {
+            warn!(
+                "urlRewrite ReplacePrefixMatch on a Regex path is not supported natively for {}; leaving the request path unchanged",
+                cluster_id
+            );
+            (
+                PathRule {
+                    value: pc.value.clone(),
+                    kind: 1,
+                },
+                None,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn add_prefix_without_path_matches_root_and_prepends() {
-        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/foo"), "test");
+        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/foo"), None, "test");
         assert_eq!(path_rule.kind, 1, "expected regex kind for capture");
         assert_eq!(path_rule.value, "^(/.*)$");
         assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
@@ -240,19 +394,19 @@ mod tests {
 
     #[test]
     fn add_prefix_normalizes_missing_leading_slash() {
-        let (_, rewrite) = build_path_and_rewrite(None, false, Some("foo"), "test");
+        let (_, rewrite) = build_path_and_rewrite(None, false, Some("foo"), None, "test");
         assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
     }
 
     #[test]
     fn add_prefix_strips_trailing_slash() {
-        let (_, rewrite) = build_path_and_rewrite(None, false, Some("/foo/"), "test");
+        let (_, rewrite) = build_path_and_rewrite(None, false, Some("/foo/"), None, "test");
         assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
     }
 
     #[test]
     fn add_prefix_empty_value_is_treated_as_no_op() {
-        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/"), "test");
+        let (path_rule, rewrite) = build_path_and_rewrite(None, false, Some("/"), None, "test");
         assert_eq!(path_rule.value, "/");
         assert_eq!(path_rule.kind, 0);
         assert!(rewrite.is_none());
@@ -264,7 +418,8 @@ mod tests {
             rule_type: PathRuleType::Prefix,
             value: "/api".to_string(),
         };
-        let (path_rule, rewrite) = build_path_and_rewrite(Some(&path), false, Some("/foo"), "test");
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, Some("/foo"), None, "test");
         assert_eq!(path_rule.kind, 1);
         assert!(path_rule.value.contains("/api"));
         assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
@@ -276,7 +431,8 @@ mod tests {
             rule_type: PathRuleType::Exact,
             value: "/health".to_string(),
         };
-        let (path_rule, rewrite) = build_path_and_rewrite(Some(&path), false, Some("/foo"), "test");
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, Some("/foo"), None, "test");
         assert_eq!(path_rule.kind, 2);
         assert_eq!(path_rule.value, "/health");
         assert_eq!(rewrite.as_deref(), Some("/foo/health"));
@@ -285,15 +441,124 @@ mod tests {
     #[test]
     fn add_prefix_takes_precedence_over_strip_prefix() {
         // Mutually exclusive: when both set, add_prefix wins.
-        let (_, rewrite) = build_path_and_rewrite(None, true, Some("/foo"), "test");
+        let (_, rewrite) = build_path_and_rewrite(None, true, Some("/foo"), None, "test");
         assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
     }
 
     #[test]
     fn no_add_prefix_keeps_default_behaviour() {
-        let (path_rule, rewrite) = build_path_and_rewrite(None, false, None, "test");
+        let (path_rule, rewrite) = build_path_and_rewrite(None, false, None, None, "test");
         assert_eq!(path_rule.value, "/");
         assert_eq!(path_rule.kind, 0);
+        assert!(rewrite.is_none());
+    }
+
+    fn url_rewrite(path: Option<PathRewrite>, hostname: Option<&str>) -> UrlRewrite {
+        UrlRewrite {
+            path,
+            hostname: hostname.map(String::from),
+        }
+    }
+
+    #[test]
+    fn url_rewrite_replace_full_path_on_prefix_collapses_to_literal() {
+        // `/api` (Prefix) → ReplaceFullPath("/new"): any sub-path collapses
+        // to the literal `/new`.
+        let path = PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".to_string(),
+        };
+        let rw = url_rewrite(Some(PathRewrite::ReplaceFullPath("/new".into())), None);
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
+        assert_eq!(path_rule.kind, 1);
+        assert_eq!(path_rule.value, "^/api(?:/.*)?$");
+        assert_eq!(rewrite.as_deref(), Some("/new"));
+    }
+
+    #[test]
+    fn url_rewrite_replace_full_path_on_exact_uses_exact_match() {
+        let path = PathConfig {
+            rule_type: PathRuleType::Exact,
+            value: "/health".to_string(),
+        };
+        let rw = url_rewrite(Some(PathRewrite::ReplaceFullPath("/up".into())), None);
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
+        assert_eq!(path_rule.kind, 2);
+        assert_eq!(path_rule.value, "/health");
+        assert_eq!(rewrite.as_deref(), Some("/up"));
+    }
+
+    #[test]
+    fn url_rewrite_replace_prefix_keeps_suffix() {
+        // `/api` (Prefix) → ReplacePrefixMatch("/v2"): suffix preserved.
+        // `/api/users` → `/v2/users`; a bare `/api` → `/v2/` (empty capture).
+        let path = PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".to_string(),
+        };
+        let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
+        assert_eq!(path_rule.kind, 1);
+        assert_eq!(path_rule.value, "^/api(?:/(.*))?$");
+        assert_eq!(rewrite.as_deref(), Some("/v2/$PATH[1]"));
+    }
+
+    #[test]
+    fn url_rewrite_replace_prefix_normalizes_replacement() {
+        // A replacement with a trailing slash and no leading slash is
+        // normalised like add_prefix: `v2/` → `/v2`.
+        let path = PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".to_string(),
+        };
+        let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("v2/".into())), None);
+        let (_, rewrite) = build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
+        assert_eq!(rewrite.as_deref(), Some("/v2/$PATH[1]"));
+    }
+
+    #[test]
+    fn url_rewrite_replace_prefix_on_exact_uses_static_target() {
+        let path = PathConfig {
+            rule_type: PathRuleType::Exact,
+            value: "/api".to_string(),
+        };
+        let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
+        assert_eq!(path_rule.kind, 2);
+        assert_eq!(path_rule.value, "/api");
+        assert_eq!(rewrite.as_deref(), Some("/v2"));
+    }
+
+    #[test]
+    fn url_rewrite_takes_precedence_over_strip_and_add_prefix() {
+        let path = PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".to_string(),
+        };
+        let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
+        let (_, rewrite) =
+            build_path_and_rewrite(Some(&path), true, Some("/foo"), Some(&rw), "test");
+        assert_eq!(rewrite.as_deref(), Some("/v2/$PATH[1]"));
+    }
+
+    #[test]
+    fn url_rewrite_hostname_only_leaves_path_rule_unchanged() {
+        // A hostname-only rewrite carries no path mode; the path rule is
+        // built from the route path as usual (the hostname is wired onto the
+        // frontend's rewrite_host elsewhere).
+        let path = PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".to_string(),
+        };
+        let rw = url_rewrite(None, Some("internal.svc"));
+        let (path_rule, rewrite) =
+            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
+        assert_eq!(path_rule.kind, 0);
+        assert_eq!(path_rule.value, "/api");
         assert!(rewrite.is_none());
     }
 }

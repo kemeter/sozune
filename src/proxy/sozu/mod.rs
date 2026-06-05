@@ -710,6 +710,7 @@ fn configure_http_entrypoint(
             entrypoint.config.path.as_ref(),
             entrypoint.config.strip_prefix,
             entrypoint.config.add_prefix.as_deref(),
+            entrypoint.config.rewrite.as_ref(),
             cluster_id,
         );
 
@@ -725,7 +726,18 @@ fn configure_http_entrypoint(
             .rewrite_path
             .clone()
             .or(frontend_rewrite_path);
-        let frontend_rewrite_host = entrypoint.config.rewrite_host.clone();
+        // A urlRewrite hostname is a transparent rewrite of the forwarded
+        // request's Host header (Sōzu's native frontend rewrite_host). It
+        // shares the field with a redirect's rewrite_host; the two never
+        // co-exist on one rule (redirect+urlRewrite is rejected upstream),
+        // so the redirect value takes the field when present.
+        let frontend_rewrite_host = entrypoint.config.rewrite_host.clone().or_else(|| {
+            entrypoint
+                .config
+                .rewrite
+                .as_ref()
+                .and_then(|r| r.hostname.clone())
+        });
         let frontend_rewrite_port = entrypoint.config.rewrite_port.map(|p| p as u32);
 
         for method in methods_for_frontend(&entrypoint.config.methods) {
@@ -1103,6 +1115,7 @@ fn remove_http_frontends(
         entrypoint.config.path.as_ref(),
         entrypoint.config.strip_prefix,
         entrypoint.config.add_prefix.as_deref(),
+        entrypoint.config.rewrite.as_ref(),
         cluster_id,
     );
 

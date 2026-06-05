@@ -2,19 +2,24 @@
 //! `EntrypointConfig`.
 //!
 //! Supported filters: `requestRedirect` (mapped onto Sōzu's native
-//! frontend redirect — scheme, hostname, port, status code) and
+//! frontend redirect — scheme, hostname, port, status code),
 //! `requestHeaderModifier` / `responseHeaderModifier` (mapped onto Sōzu's
-//! native frontend header edits — see [`header_edits_from_filters`]).
+//! native frontend header edits — see [`header_edits_from_filters`]), and
+//! `urlRewrite` (transparent path / hostname rewrite onto Sōzu's native
+//! frontend `rewrite_path` / `rewrite_host` — see [`url_rewrite_from_filter`]).
 //! Filters or sub-fields we can't honour faithfully cause the whole rule
 //! to be refused upstream — routing as if they weren't there would
 //! silently rewrite user intent. See [`redirect_from_filter`] and
 //! [`rule_filters_supported`].
 
-use crate::model::entrypoint::{HeaderConfig, HeaderDirection, RedirectPolicy, RedirectScheme};
+use crate::model::entrypoint::{
+    HeaderConfig, HeaderDirection, PathRewrite, RedirectPolicy, RedirectScheme, UrlRewrite,
+};
 use gateway_api::apis::standard::httproutes::{
     HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestHeaderModifier,
     HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectScheme,
-    HTTPRouteRulesFiltersResponseHeaderModifier,
+    HTTPRouteRulesFiltersResponseHeaderModifier, HTTPRouteRulesFiltersUrlRewrite,
+    HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
 };
 use tracing::warn;
 
@@ -34,22 +39,35 @@ pub struct RedirectMapping {
 /// Whether every filter on a rule is one we can faithfully execute.
 ///
 /// Supported filters: a mappable `requestRedirect` (see
-/// [`redirect_from_filter`]), `requestHeaderModifier`, and
-/// `responseHeaderModifier`. Any mix of those on a rule is accepted.
-/// `requestMirror`, `urlRewrite`, and `extensionRef` remain unsupported —
-/// a rule carrying any of them (alone or mixed with supported filters) is
-/// still refused, since partial execution would misrepresent intent.
+/// [`redirect_from_filter`]), `requestHeaderModifier`,
+/// `responseHeaderModifier`, and `urlRewrite` (see
+/// [`url_rewrite_from_filter`]). Header modifiers freely mix with either a
+/// redirect or a rewrite. `requestRedirect` and `urlRewrite` *conflict*,
+/// though — one redirects the client, the other transparently rewrites the
+/// forwarded request, and both fight over Sōzu's frontend `rewrite_path` —
+/// so a rule carrying both is refused. `requestMirror` and `extensionRef`
+/// remain unsupported; a rule carrying either (alone or mixed) is refused,
+/// since partial execution would misrepresent intent.
 pub fn rule_filters_supported(filters: &[HTTPRouteRulesFilters]) -> bool {
+    let has_redirect = filters.iter().any(|f| f.request_redirect.is_some());
+    let has_rewrite = filters.iter().any(|f| f.url_rewrite.is_some());
+    if has_redirect && has_rewrite {
+        // Conflicting intents over the same frontend rewrite — refuse.
+        return false;
+    }
     filters.iter().all(filter_supported)
 }
 
 fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
     // An entry carrying a still-unsupported variant fails outright.
-    if filter.request_mirror.is_some()
-        || filter.url_rewrite.is_some()
-        || filter.extension_ref.is_some()
-    {
+    if filter.request_mirror.is_some() || filter.extension_ref.is_some() {
         return false;
+    }
+    // A `urlRewrite` must carry something we recognise (a path mode and/or a
+    // hostname). An empty rewrite block is a no-op we refuse, like an empty
+    // filter entry — it signals an intent we can't see.
+    if let Some(rw) = filter.url_rewrite.as_ref() {
+        return url_rewrite_mapping(rw).is_some();
     }
     // A `requestRedirect` must be in a form we can map; an empty filter
     // entry (no variant populated) carries nothing we recognise and is
@@ -189,6 +207,48 @@ fn push_response_header_edits(
     );
 }
 
+/// Extract the transparent URL rewrite a rule's filters describe, if any.
+///
+/// Returns `Some` for the first `urlRewrite` filter that carries a path mode
+/// and/or a hostname. Returns `None` when the rule declares no `urlRewrite`
+/// (the caller then leaves `EntrypointConfig.rewrite` unset). The unsupported
+/// cases (empty rewrite, redirect+rewrite conflict) never reach here —
+/// [`rule_filters_supported`] gates them first.
+pub fn url_rewrite_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<UrlRewrite> {
+    filters
+        .iter()
+        .find_map(|f| f.url_rewrite.as_ref())
+        .and_then(url_rewrite_mapping)
+}
+
+/// Map a single `urlRewrite` filter onto a [`UrlRewrite`].
+///
+/// `None` means the filter is a no-op we can't act on (no path mode and no
+/// hostname). A path's `ReplaceFullPath` / `ReplacePrefixMatch` carries its
+/// replacement string; an empty path block (a `type` with neither field
+/// populated) is treated as no path rewrite.
+fn url_rewrite_mapping(rw: &HTTPRouteRulesFiltersUrlRewrite) -> Option<UrlRewrite> {
+    let path = rw.path.as_ref().and_then(path_rewrite_mapping);
+    let hostname = rw.hostname.clone();
+    if path.is_none() && hostname.is_none() {
+        return None;
+    }
+    Some(UrlRewrite { path, hostname })
+}
+
+fn path_rewrite_mapping(p: &HTTPRouteRulesFiltersUrlRewritePath) -> Option<PathRewrite> {
+    match p.r#type {
+        HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => p
+            .replace_full_path
+            .clone()
+            .map(PathRewrite::ReplaceFullPath),
+        HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => p
+            .replace_prefix_match
+            .clone()
+            .map(PathRewrite::ReplacePrefixMatch),
+    }
+}
+
 /// Extract the redirect mapping a rule's filters describe, if any.
 ///
 /// Returns `Some` when the rule has exactly one `requestRedirect` filter
@@ -257,6 +317,7 @@ mod tests {
     use gateway_api::apis::standard::httproutes::{
         HTTPRouteRulesFiltersRequestRedirectPath, HTTPRouteRulesFiltersRequestRedirectPathType,
     };
+    // `HTTPRouteRulesFiltersUrlRewrite*` come in via `super::*`.
 
     fn redirect_filter(
         scheme: Option<HTTPRouteRulesFiltersRequestRedirectScheme>,
@@ -356,18 +417,101 @@ mod tests {
         assert!(!rule_filters_supported(&f));
     }
 
+    fn url_rewrite_filter(rw: HTTPRouteRulesFiltersUrlRewrite) -> HTTPRouteRulesFilters {
+        HTTPRouteRulesFilters {
+            url_rewrite: Some(rw),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn url_rewrite_is_unsupported() {
-        let f = HTTPRouteRulesFilters {
-            request_redirect: None,
-            request_header_modifier: None,
-            response_header_modifier: None,
-            request_mirror: None,
-            url_rewrite: Some(Default::default()),
-            extension_ref: None,
-            r#type: Default::default(),
-        };
+    fn empty_url_rewrite_is_unsupported() {
+        // A `urlRewrite` block with neither path nor hostname carries an
+        // intent we can't see — refuse rather than route it as a no-op.
+        let f = url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite::default());
         assert!(!rule_filters_supported(&[f]));
+    }
+
+    #[test]
+    fn url_rewrite_replace_full_path_is_supported() {
+        let f = vec![url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+                replace_full_path: Some("/new".into()),
+                replace_prefix_match: None,
+                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath,
+            }),
+        })];
+        assert!(rule_filters_supported(&f));
+        let rw = url_rewrite_from_filter(&f).unwrap();
+        assert_eq!(rw.path, Some(PathRewrite::ReplaceFullPath("/new".into())));
+        assert_eq!(rw.hostname, None);
+    }
+
+    #[test]
+    fn url_rewrite_replace_prefix_match_is_supported() {
+        let f = vec![url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+                replace_full_path: None,
+                replace_prefix_match: Some("/v2".into()),
+                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+            }),
+        })];
+        assert!(rule_filters_supported(&f));
+        let rw = url_rewrite_from_filter(&f).unwrap();
+        assert_eq!(rw.path, Some(PathRewrite::ReplacePrefixMatch("/v2".into())));
+    }
+
+    #[test]
+    fn url_rewrite_hostname_is_supported() {
+        let f = vec![url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: Some("internal.svc".into()),
+            path: None,
+        })];
+        assert!(rule_filters_supported(&f));
+        let rw = url_rewrite_from_filter(&f).unwrap();
+        assert_eq!(rw.hostname.as_deref(), Some("internal.svc"));
+        assert_eq!(rw.path, None);
+    }
+
+    #[test]
+    fn redirect_combined_with_url_rewrite_is_unsupported() {
+        // Conflicting intents over the same frontend rewrite — refuse.
+        let redirect = redirect_filter(
+            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            None,
+            None,
+            None,
+        );
+        let rewrite = url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: Some("internal.svc".into()),
+            path: None,
+        });
+        assert!(!rule_filters_supported(&[redirect, rewrite]));
+    }
+
+    #[test]
+    fn url_rewrite_mixed_with_header_modifier_is_supported() {
+        let mut f = url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+                replace_full_path: None,
+                replace_prefix_match: Some("/v2".into()),
+                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+            }),
+        });
+        f.request_header_modifier = Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+            set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                name: "X-Env".into(),
+                value: "prod".into(),
+            }]),
+            ..Default::default()
+        });
+        let filters = vec![f];
+        assert!(rule_filters_supported(&filters));
+        assert!(url_rewrite_from_filter(&filters).is_some());
+        assert_eq!(header_edits_from_filters(&filters).len(), 1);
     }
 
     #[test]
