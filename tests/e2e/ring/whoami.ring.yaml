@@ -1,0 +1,17 @@
+# Ring deployment for the Sozune e2e suite. Three whoami replicas, tagged so
+# Sozune routes whoami.ring-test.localhost to them.
+#
+# No `ports` block: Ring forbids a `ports` entry entirely once replicas > 1
+# (every replica would race for the same host port). Sozune routes to each
+# instance's guest IP directly; whoami listens on port 80, which the parser's
+# default backend port matches — so no explicit port label is needed here.
+deployments:
+  sozune-e2e-whoami:
+    name: sozune-e2e-whoami
+    namespace: sozune-e2e
+    runtime: docker
+    image: "traefik/whoami:latest"
+    replicas: 3
+    labels:
+      - sozune.enable: "true"
+      - sozune.http.web.host: "whoami.ring-test.localhost"

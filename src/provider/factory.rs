@@ -10,6 +10,7 @@ use crate::provider::{
     kubernetes::{KubernetesProvider, gateway},
     nomad::NomadProvider,
     podman::PodmanProvider,
+    ring::RingProvider,
     swarm::SwarmProvider,
 };
 use anyhow::Context;
@@ -313,6 +314,33 @@ pub async fn start_services(
                 .await
             {
                 error!("Consul provider failed: {}", e);
+            }
+        });
+    }
+
+    // Start Ring provider if enabled
+    if let Some(ring_config) = &config.providers.ring
+        && ring_config.enabled
+    {
+        info!("Starting Ring provider");
+        let ring_provider =
+            RingProvider::new(ring_config.clone()).context("Failed to create Ring provider")?;
+        let storage_ring = Arc::clone(&storage);
+        let reload_tx_ring = reload_tx.clone();
+        let acme_notify_ring = Arc::clone(&acme_notify);
+        let diagnostics_ring = Arc::clone(&diagnostics);
+
+        tokio::spawn(async move {
+            if let Err(e) = ring_provider
+                .start_polling(
+                    storage_ring,
+                    reload_tx_ring,
+                    acme_notify_ring,
+                    diagnostics_ring,
+                )
+                .await
+            {
+                error!("Ring provider failed: {}", e);
             }
         });
     }

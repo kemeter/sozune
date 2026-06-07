@@ -74,7 +74,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'load-balancing',
     'tcp',
   ],
-  providers: ['docker', 'podman', 'swarm', 'kubernetes', 'nomad', 'consul', 'http'],
+  providers: ['docker', 'podman', 'swarm', 'kubernetes', 'nomad', 'consul', 'ring', 'http'],
   middleware: [
     'auth',
     'headers',

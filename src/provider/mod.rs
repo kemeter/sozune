@@ -13,12 +13,13 @@ pub const SWARM: &str = "swarm";
 pub const KUBERNETES: &str = "kubernetes";
 pub const NOMAD: &str = "nomad";
 pub const CONSUL: &str = "consul";
+pub const RING: &str = "ring";
 pub const HTTP: &str = "http";
 pub const CONFIG: &str = "config";
 
 /// Every provider known to sōzune, in display order for `/providers`.
 pub const ALL: &[&str] = &[
-    DOCKER, PODMAN, SWARM, KUBERNETES, NOMAD, CONSUL, HTTP, CONFIG,
+    DOCKER, PODMAN, SWARM, KUBERNETES, NOMAD, CONSUL, RING, HTTP, CONFIG,
 ];
 
 #[async_trait]
@@ -34,4 +35,5 @@ pub mod http;
 pub mod kubernetes;
 pub mod nomad;
 pub mod podman;
+pub mod ring;
 pub mod swarm;
