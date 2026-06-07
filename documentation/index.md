@@ -4,15 +4,13 @@ The modern reverse proxy. Routing you can read, configured the way you already d
 
 Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Podman, Swarm, Kubernetes, Nomad, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
 
-![Sōzune dashboard](/documentation/assets/dashboard-entrypoints.png)
-
 ## Why Sōzune
 
 - **Multi-platform service discovery** — Docker, Podman, Swarm, Kubernetes, Nomad, an HTTP endpoint, or a YAML file.
 - **Automatic HTTPS** — ACME provisioning and renewal, no intervention.
 - **HTTP/2 by default** — negotiated through ALPN on every TLS listener.
 - **Hot reload** — the REST API applies changes on the fly, no downtime.
-- **Built-in diagnostics** — an `X-Sozune-Diagnostic` header on every routing failure, plus explanatory `502` bodies and a did-you-mean for mistyped hosts under `SOZUNE_DEBUG`.
+- **Built-in diagnostics** — an `X-Sozune-Diagnostic` header on every routing failure, plus explanatory `502` bodies and a did-you-mean for mistyped hosts under `SOZUNE_DEBUG`. See [Debugging](/documentation/advanced/debugging).
 
 ## How it works
 
@@ -28,7 +26,7 @@ Sōzune is a reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu).
   ┌──────────────────┐          │    │ ACME/TLS  │             │  └──────────────────┘
   │ shop.domain.com  │── TCP ───┘    │ Hot reload│             │  ┌──────────────────┐
   └──────────────────┘               └───────────┘             └─▶│ Bare metal / VM  │
-                                                                   └──────────────────┘
+                                                                  └──────────────────┘
 ```
 
 Sōzune watches your platform for service definitions, builds routes from labels, tags,
