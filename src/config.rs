@@ -179,6 +179,7 @@ pub struct ProvidersConfig {
     pub kubernetes: Option<KubernetesConfig>,
     pub nomad: Option<NomadConfig>,
     pub consul: Option<ConsulConfig>,
+    pub ring: Option<RingConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -288,6 +289,46 @@ pub struct NomadConfig {
         deserialize_with = "deserialize_nomad_expose_by_default_with_env"
     )]
     pub expose_by_default: bool,
+}
+
+/// Ring provider configuration. Discovers services from a Ring cluster's
+/// `GET /deployments` API and routes to each running instance's guest address.
+#[derive(Deserialize, Debug, Clone)]
+pub struct RingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ring HTTP API endpoint (e.g. `http://127.0.0.1:3030`).
+    #[serde(default = "default_ring_endpoint")]
+    pub endpoint: String,
+    /// Optional PAT (scope `deployments:read`), sent as `Authorization: Bearer`.
+    #[serde(default)]
+    pub token: String,
+    /// Polling interval, in seconds (Ring has no blocking-query mechanism).
+    #[serde(default = "default_ring_poll_interval")]
+    pub poll_interval: u64,
+    /// Expose every running deployment even without `sozune.enable=true`.
+    #[serde(default)]
+    pub expose_by_default: bool,
+}
+
+fn default_ring_endpoint() -> String {
+    "http://127.0.0.1:3030".to_string()
+}
+
+fn default_ring_poll_interval() -> u64 {
+    10
+}
+
+impl Default for RingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_ring_endpoint(),
+            token: String::new(),
+            poll_interval: default_ring_poll_interval(),
+            expose_by_default: false,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1221,6 +1262,17 @@ impl ProvidersConfig {
                 .apply_env_overrides();
         }
 
+        let ring_env = std::env::var("SOZUNE_PROVIDER_RING_ENABLED").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_RING_ENDPOINT").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_RING_TOKEN").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_RING_POLL_INTERVAL").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_RING_EXPOSE_BY_DEFAULT").is_ok();
+        if ring_env || self.ring.is_some() {
+            self.ring
+                .get_or_insert_with(RingConfig::default)
+                .apply_env_overrides();
+        }
+
         let config_file_env = std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_ENABLED").is_ok()
             || std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_PATH").is_ok()
             || std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_WATCH").is_ok();
@@ -1339,6 +1391,26 @@ impl NomadConfig {
             self.poll_interval = v;
         }
         if let Some(v) = env_bool("SOZUNE_PROVIDER_NOMAD_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
+    }
+}
+
+impl RingConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_RING_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_RING_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_RING_TOKEN") {
+            self.token = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_RING_POLL_INTERVAL") {
+            self.poll_interval = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_RING_EXPOSE_BY_DEFAULT") {
             self.expose_by_default = v;
         }
     }

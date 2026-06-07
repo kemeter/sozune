@@ -10,6 +10,7 @@ use crate::model::Entrypoint;
 use crate::provider::docker::DockerProvider;
 use crate::provider::nomad::NomadProvider;
 use crate::provider::podman::PodmanProvider;
+use crate::provider::ring::RingProvider;
 
 #[derive(Args, Debug)]
 pub struct ValidateArgs {
@@ -179,6 +180,23 @@ async fn collect_candidates(
             },
             Err(e) => eprintln!(
                 "nomad: invalid configuration: {e}\n  → check providers.nomad.address and providers.nomad.token in the config file"
+            ),
+        }
+    }
+
+    if want("ring")
+        && let Some(ring_cfg) = &config.providers.ring
+        && ring_cfg.enabled
+    {
+        match RingProvider::new(ring_cfg.clone()) {
+            Ok(provider) => match provider.collect().await {
+                Ok(mut cs) => candidates.append(&mut cs),
+                Err(e) => eprintln!(
+                    "ring: could not list deployments: {e}\n  → check providers.ring.endpoint (default: http://127.0.0.1:3030) and that the Ring API is reachable"
+                ),
+            },
+            Err(e) => eprintln!(
+                "ring: invalid configuration: {e}\n  → check providers.ring.endpoint and providers.ring.token in the config file"
             ),
         }
     }
