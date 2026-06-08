@@ -2,6 +2,7 @@ mod acme;
 mod addr;
 mod builders;
 mod channel;
+mod worker;
 
 use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
@@ -125,12 +126,9 @@ fn spawn_tcp_workers(
         let listener_name = tcp_cfg.name.clone();
         let listener_port = tcp_cfg.listen;
         let handle = thread::spawn(move || {
-            if let Err(e) = sozu_lib::tcp::testing::start_tcp_worker(
-                listener_config,
-                max_buffers,
-                buffer_size,
-                proxy_chan,
-            ) {
+            if let Err(e) =
+                worker::start_tcp_worker(listener_config, max_buffers, buffer_size, proxy_chan)
+            {
                 error!("TCP worker `{}` failed: {}", listener_name, e);
             }
         });
@@ -212,18 +210,15 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("Could not create HTTPS channel: {}", e))?;
 
     let worker_http_handle = thread::spawn(move || {
-        if let Err(e) = sozu_lib::http::testing::start_http_worker(
-            http_listener,
-            proxy_channel,
-            max_buffers,
-            buffer_size,
-        ) {
+        if let Err(e) =
+            worker::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
+        {
             error!("HTTP server failed: {}", e);
         }
     });
 
     let worker_https_handle = thread::spawn(move || {
-        if let Err(e) = sozu_lib::https::testing::start_https_worker(
+        if let Err(e) = worker::start_https_worker(
             https_listener,
             proxy_channel_https,
             max_buffers,
