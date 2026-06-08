@@ -92,3 +92,17 @@ if [[ "$hostregex_ko" != "200" ]]; then
 else
     fail "regex hostname: cdnabc should not match but returned 200"
 fi
+
+# A regex-leading hostname (slash in position 0, e.g. `/cdn[0-9]+/.`) used to
+# underflow Sōzu's pattern-trie (`pos - 1` -> usize::MAX) and panic the worker
+# on insert/lookup — fixed upstream in sozu 2.1.0. Assert Sōzune is still alive
+# by hitting a normal route: if the worker had panicked installing the regex
+# frontend, this would time out (000) or 502 instead of routing cleanly.
+survive_ok=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $HOST_A" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "000")
+if [[ "$survive_ok" == "200" ]]; then
+    pass "regex-leading hostname did not crash the worker (normal route still 200)"
+else
+    fail "worker may have panicked on regex-leading hostname: $HOST_A returned $survive_ok"
+fi
