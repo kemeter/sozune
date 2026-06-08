@@ -5,7 +5,7 @@ mod channel;
 
 use crate::config::ProxyConfig;
 use crate::middleware::{self, MiddlewareState};
-use crate::model::{Entrypoint, LoadBalancer, Protocol};
+use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::metrics_snapshot;
 use acme::{add_certificate, register_acme_challenge_cluster};
@@ -25,7 +25,7 @@ use sozu_command_lib::{
         request::RequestType, response_content::ContentType,
     },
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -582,6 +582,15 @@ fn configure_sozu_routing(
         // so anything still in `previous` is already live in the workers and
         // re-adding it makes Sōzu reject the command as a duplicate.
         if previous.get(cluster_id) == Some(entrypoint) {
+            continue;
+        }
+
+        // Backends-only change: apply_routing_diff() already updated the
+        // backends in place and left the frontend live. Re-adding here would
+        // duplicate the frontend/backends, so skip it.
+        if let Some(old) = previous.get(cluster_id)
+            && is_backends_only_change(old, entrypoint)
+        {
             continue;
         }
 
@@ -1177,6 +1186,104 @@ fn remove_http_frontends(
     }
 }
 
+/// Add a specific subset of an entrypoint's backends (used by the in-place
+/// backend diff). `backend_index_base` is the positional offset so the
+/// generated `backend_id`s don't collide with backends already registered.
+fn add_backends(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+    backends: &[&Backend],
+) {
+    for backend_entry in backends {
+        let address = match parse_backend_address(backend_entry) {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!("Failed to parse backend address {backend_entry} for add: {e}");
+                continue;
+            }
+        };
+        // Stable, address-derived id so add and remove agree regardless of
+        // position in the backend list.
+        let backend_id = format!(
+            "{cluster_id}-backend-{}-{}",
+            backend_entry.address, backend_entry.port
+        );
+        let add = AddBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+            load_balancing_parameters: Some(LoadBalancingParams {
+                weight: backend_entry.weight as i32,
+            }),
+            sticky_id: None,
+            backup: None,
+        };
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("add-backend-http-{backend_id}"),
+            RequestType::AddBackend(add.clone()),
+        ) {
+            debug!("Failed to add HTTP backend {backend_id} (may already exist): {e}");
+        }
+        if entrypoint.config.tls
+            && let Err(e) = send_to_worker(
+                command_channel_https,
+                format!("add-backend-https-{backend_id}"),
+                RequestType::AddBackend(add),
+            )
+        {
+            debug!("Failed to add HTTPS backend {backend_id} (may already exist): {e}");
+        }
+    }
+}
+
+/// Remove a specific subset of backends by address-derived id (mirror of
+/// [`add_backends`]).
+fn remove_backend_set(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    backends: &[&Backend],
+    tls: bool,
+) {
+    for backend_entry in backends {
+        let address = match parse_backend_address(backend_entry) {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!("Failed to parse backend address {backend_entry} for removal: {e}");
+                continue;
+            }
+        };
+        let backend_id = format!(
+            "{cluster_id}-backend-{}-{}",
+            backend_entry.address, backend_entry.port
+        );
+        let remove = RemoveBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+        };
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("rm-backend-http-{backend_id}"),
+            RequestType::RemoveBackend(remove.clone()),
+        ) {
+            debug!("Failed to remove HTTP backend {backend_id}: {e}");
+        }
+        if tls
+            && let Err(e) = send_to_worker(
+                command_channel_https,
+                format!("rm-backend-https-{backend_id}"),
+                RequestType::RemoveBackend(remove),
+            )
+        {
+            debug!("Failed to remove HTTPS backend {backend_id}: {e}");
+        }
+    }
+}
+
 fn remove_backends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -1272,6 +1379,114 @@ fn remove_acme_frontends(
     }
 }
 
+/// True when two versions of an entrypoint differ **only in their backend set**
+/// — everything that composes the Sōzu frontend (routing rules, middleware, TLS,
+/// error pages, plugins, …) is identical. When this holds, a reload must NOT
+/// tear the frontend down: doing so opens a window where the route 404s. Instead
+/// the caller diffs only the backends, leaving the live frontend in place
+/// (zero-downtime scale).
+///
+/// Default-deny by construction: we compare the whole `config` (and `protocol`)
+/// rather than an allow-list of fields, so any new `EntrypointConfig` field is
+/// treated as a frontend change automatically — a forgotten field can never be
+/// silently classified as "backends-only" and dropped on reload.
+fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
+    old.protocol == new.protocol && old.config == new.config
+}
+
+/// True when a changed cluster can be reloaded by diffing only its backends
+/// (zero-downtime scale), instead of tearing the frontend down and re-adding it.
+///
+/// Two conditions must hold:
+/// - [`frontend_unchanged`]: nothing but the backend set differs, and
+/// - the entrypoint does **not** route through the middleware server. When
+///   middleware is active the Sōzu cluster holds a single synthetic backend
+///   pointing at `127.0.0.1:<middleware_port>` — the real backend addresses are
+///   never registered in Sōzu, so an in-place backend diff would inject real
+///   addresses that bypass the middleware. Those changes take the regular
+///   remove-then-readd path, which rebuilds the synthetic backend correctly.
+fn is_backends_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
+    old.protocol == Protocol::Http
+        && frontend_unchanged(old, new)
+        && !middleware::needs_middleware(&new.config)
+}
+
+/// Diff the backend sets of a cluster whose frontend is unchanged, **adding new
+/// backends before removing departed ones** so the cluster never drops below
+/// its live capacity (no request hits an empty cluster). Backends are matched
+/// by address, not by positional index.
+/// Pure decision step for [`diff_backends_in_place`]: given the old and new
+/// backend sets, return the backends to (re-)add and the backends to remove,
+/// matched by address. A backend is `added` when its address is new **or** its
+/// weight changed (re-adding the same address+id updates the weight in place on
+/// Sōzu); it is `removed` when its address disappears entirely. Extracted so the
+/// matching logic — including the weight-only case — is unit-testable without a
+/// live worker channel.
+fn backend_diff<'a>(
+    old: &'a Entrypoint,
+    new: &'a Entrypoint,
+) -> (Vec<&'a Backend>, Vec<&'a Backend>) {
+    let addr = |b: &Backend| format!("{}:{}", b.address, b.port);
+    // Map address -> weight on the old side so we can spot a weight-only change
+    // (same address, different weight). Sōzu carries weight in AddBackend's
+    // load-balancing params; the only way to update a live backend's weight is
+    // to re-send AddBackend with the same address+id, which it applies in place.
+    let old_weights: HashMap<String, u32> =
+        old.backends.iter().map(|b| (addr(b), b.weight)).collect();
+    let new_addrs: HashSet<String> = new.backends.iter().map(addr).collect();
+
+    // Add backends that are new OR whose weight changed (before removing any),
+    // so capacity never dips. Re-adding an existing address with a new weight is
+    // an idempotent in-place update on Sōzu's side, not a duplicate.
+    let added = new
+        .backends
+        .iter()
+        .filter(|b| match old_weights.get(&addr(b)) {
+            None => true,                                // brand-new address
+            Some(&old_weight) => b.weight != old_weight, // weight-only change
+        })
+        .collect();
+
+    // Remove backends whose address is gone entirely (a re-weighted backend is
+    // still present in `new`, so it is never in this set).
+    let removed = old
+        .backends
+        .iter()
+        .filter(|b| !new_addrs.contains(&addr(b)))
+        .collect();
+
+    (added, removed)
+}
+
+fn diff_backends_in_place(
+    channels: &mut Channels,
+    cluster_id: &str,
+    old: &Entrypoint,
+    new: &Entrypoint,
+) {
+    let (added, removed) = backend_diff(old, new);
+
+    if !added.is_empty() {
+        add_backends(
+            &mut channels.http,
+            &mut channels.https,
+            cluster_id,
+            new,
+            &added,
+        );
+    }
+
+    if !removed.is_empty() {
+        remove_backend_set(
+            &mut channels.http,
+            &mut channels.https,
+            cluster_id,
+            &removed,
+            new.config.tls,
+        );
+    }
+}
+
 fn apply_routing_diff(
     previous: &RoutingSnapshot,
     current: &RoutingSnapshot,
@@ -1316,6 +1531,18 @@ fn apply_routing_diff(
         if let Some(new) = current.get(cluster_id)
             && old != new
         {
+            // Backends-only change (e.g. scale up/down): keep the live frontend
+            // in place and diff just the backends (add-before-remove). Tearing
+            // the frontend down here is what opened a 404 window during a
+            // rescale. configure_sozu_routing() skips re-adding such clusters
+            // (see is_backends_only_change check there), so this is the whole
+            // update.
+            if is_backends_only_change(old, new) {
+                info!("Updating backends in place for cluster: {}", cluster_id);
+                diff_backends_in_place(channels, cluster_id, old, new);
+                continue;
+            }
+
             info!("Updating changed cluster: {}", cluster_id);
             match old.protocol {
                 Protocol::Http => {
@@ -1458,5 +1685,245 @@ fn apply_listener_error_pages(
     }
     if !filtered.is_empty() {
         builder.with_answers(filtered);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Backend, EntrypointConfig};
+
+    fn base_ep(backends: Vec<Backend>) -> Entrypoint {
+        Entrypoint {
+            id: "svc".into(),
+            backends,
+            name: "svc".into(),
+            protocol: Protocol::Http,
+            source: None,
+            config: EntrypointConfig {
+                hostnames: vec!["app.example.com".into()],
+                path: None,
+                tls: false,
+                strip_prefix: false,
+                add_prefix: None,
+                https_redirect: false,
+                https_redirect_port: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite: None,
+                rewrite_port: None,
+                www_authenticate: None,
+                priority: 0,
+                auth: None,
+                forward_auth: None,
+                headers: Vec::new(),
+                backend_timeout: None,
+                health_check: None,
+                retry: None,
+                circuit_breaker: None,
+                rate_limit: None,
+                in_flight_req: None,
+                load_balancer: Default::default(),
+                sticky_session: false,
+                compress: false,
+                entrypoint: None,
+                methods: Vec::new(),
+                acme: None,
+                plugins: Vec::new(),
+                error_pages: Default::default(),
+                ip_allow_list: Vec::new(),
+                match_headers: Vec::new(),
+                match_query: Vec::new(),
+                match_client_ip: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn scale_changes_only_backends_keeps_frontend() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let new = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+        ]);
+        // Only the backend set differs → eligible for the in-place backend diff
+        // (no frontend teardown).
+        assert!(frontend_unchanged(&old, &new));
+        assert!(is_backends_only_change(&old, &new));
+        assert_ne!(old, new, "the entrypoints do differ (backends)");
+    }
+
+    #[test]
+    fn hostname_change_is_a_frontend_change() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.hostnames = vec!["other.example.com".into()];
+        assert!(!frontend_unchanged(&old, &new));
+        assert!(!is_backends_only_change(&old, &new));
+    }
+
+    #[test]
+    fn header_change_is_a_frontend_change() {
+        use crate::model::{HeaderConfig, HeaderDirection};
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.headers = vec![HeaderConfig {
+            name: "X-Foo".into(),
+            value: "bar".into(),
+            direction: HeaderDirection::Request,
+        }];
+        assert!(!frontend_unchanged(&old, &new));
+    }
+
+    #[test]
+    fn redirect_change_is_a_frontend_change() {
+        use crate::model::RedirectScheme;
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.redirect_scheme = Some(RedirectScheme::UseHttps);
+        assert!(!frontend_unchanged(&old, &new));
+    }
+
+    // The fields below all feed the Sōzu frontend / cluster config but were
+    // absent from the original hand-written allow-list, so a change to any of
+    // them alone was silently misclassified as "backends-only" and dropped on
+    // reload. Comparing the whole `config` closes that gap; these guard it.
+
+    #[test]
+    fn priority_change_is_a_frontend_change() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.priority = 10;
+        assert!(!frontend_unchanged(&old, &new));
+    }
+
+    #[test]
+    fn rate_limit_change_is_a_frontend_change() {
+        use crate::model::RateLimitConfig;
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.rate_limit = Some(RateLimitConfig {
+            average: 100,
+            burst: 200,
+        });
+        assert!(!frontend_unchanged(&old, &new));
+        // Also middleware-bearing, so doubly ineligible for the in-place diff.
+        assert!(!is_backends_only_change(&old, &new));
+    }
+
+    #[test]
+    fn forward_auth_change_is_a_frontend_change() {
+        use crate::model::ForwardAuthConfig;
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.forward_auth = Some(ForwardAuthConfig {
+            address: "http://auth.internal".into(),
+            response_headers: Vec::new(),
+            trust_forward_header: false,
+        });
+        assert!(!frontend_unchanged(&old, &new));
+        assert!(!is_backends_only_change(&old, &new));
+    }
+
+    #[test]
+    fn error_pages_change_is_a_frontend_change() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config
+            .error_pages
+            .insert("404".into(), "Not here".into());
+        assert!(!frontend_unchanged(&old, &new));
+    }
+
+    #[test]
+    fn plugins_change_is_a_frontend_change() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.plugins = vec!["my-wasm-plugin".into()];
+        assert!(!frontend_unchanged(&old, &new));
+    }
+
+    #[test]
+    fn compress_change_is_a_frontend_change() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        new.config.compress = true;
+        assert!(!frontend_unchanged(&old, &new));
+    }
+
+    #[test]
+    fn backend_diff_scale_up_adds_only_new_backend() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let new = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+        ]);
+        let (added, removed) = backend_diff(&old, &new);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].address, "10.0.0.2");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn backend_diff_scale_down_removes_departed_backend() {
+        let old = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+        ]);
+        let new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let (added, removed) = backend_diff(&old, &new);
+        assert!(added.is_empty());
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].address, "10.0.0.2");
+    }
+
+    #[test]
+    fn backend_diff_weight_only_change_re_adds_backend() {
+        // Same address, different weight: must be re-added (so Sōzu updates the
+        // weight in place) and never removed. Matching on address alone would
+        // drop the new weight silently.
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80).with_weight(100)]);
+        let new = base_ep(vec![Backend::new("10.0.0.1", 80).with_weight(50)]);
+        let (added, removed) = backend_diff(&old, &new);
+        assert_eq!(added.len(), 1, "re-weighted backend must be re-added");
+        assert_eq!(added[0].weight, 50);
+        assert!(
+            removed.is_empty(),
+            "a re-weighted backend is still present, never removed"
+        );
+    }
+
+    #[test]
+    fn backend_diff_unchanged_backends_are_noop() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80).with_weight(100)]);
+        let new = base_ep(vec![Backend::new("10.0.0.1", 80).with_weight(100)]);
+        let (added, removed) = backend_diff(&old, &new);
+        assert!(added.is_empty(), "identical weight → no re-add");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn middleware_entrypoint_is_not_a_backends_only_change() {
+        // Same config on both sides, only the backend set grows — frontend is
+        // unchanged. But the entrypoint routes through the middleware server
+        // (compress = true), so the Sōzu cluster holds a synthetic backend, not
+        // these addresses. An in-place backend diff would inject real backends
+        // that bypass the middleware, so this must take the remove-then-readd
+        // path instead.
+        let mut old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        old.config.compress = true;
+        let mut new = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+        ]);
+        new.config.compress = true;
+        assert!(frontend_unchanged(&old, &new));
+        assert!(
+            !is_backends_only_change(&old, &new),
+            "middleware-routed entrypoints must not use the in-place backend diff"
+        );
     }
 }
