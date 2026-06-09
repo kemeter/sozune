@@ -4,8 +4,9 @@ mod builders;
 mod channel;
 mod worker;
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, TcpRateLimit};
 use crate::middleware::ip_allow_list::IpAllowList;
+use crate::middleware::rate_limit::{RateLimitResult, RateLimiter};
 use crate::middleware::{self, MiddlewareState};
 use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
@@ -109,6 +110,7 @@ struct TcpForwarderSpec {
     public_port: u16,
     loopback_port: u16,
     allow_list: Vec<String>,
+    rate_limit: Option<TcpRateLimit>,
 }
 
 /// Grab a free loopback port by binding `127.0.0.1:0` and reading the assigned
@@ -125,6 +127,16 @@ fn pick_loopback_port() -> anyhow::Result<u16> {
 /// accepted ones to the loopback Sōzu worker with `copy_bidirectional`.
 async fn run_tcp_forwarder(spec: TcpForwarderSpec) {
     let allow = IpAllowList::new(&spec.allow_list);
+    // Anti-flood: a token-bucket conn-rate limiter, plus an exempt list of
+    // source ranges that are never limited (e.g. internal Docker ranges that
+    // open startup bursts). Both are None/empty when no rate_limit is set.
+    let (limiter, exempt) = match &spec.rate_limit {
+        Some(rl) => (
+            Some(RateLimiter::with_rate(rl.max_conns, rl.per_seconds)),
+            IpAllowList::new(&rl.exempt),
+        ),
+        None => (None, IpAllowList::new(&[])),
+    };
     let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, spec.public_port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -157,6 +169,21 @@ async fn run_tcp_forwarder(spec: TcpForwarderSpec) {
                 peer.ip()
             );
             continue; // `inbound` dropped here → connection closed
+        }
+        // Anti-flood: drop if the source exceeds its conn-rate, unless exempt.
+        if let Some(limiter) = &limiter
+            && !exempt.allows(peer.ip())
+            && matches!(
+                limiter.check(&peer.ip().to_string()),
+                RateLimitResult::Limited
+            )
+        {
+            debug!(
+                "TCP forwarder `{}` rate-limited connection from {}",
+                spec.name,
+                peer.ip()
+            );
+            continue;
         }
         let name = spec.name.clone();
         tokio::spawn(async move {
@@ -248,6 +275,7 @@ fn spawn_tcp_workers(
             public_port: tcp_cfg.listen,
             loopback_port,
             allow_list: tcp_cfg.ip_allow_list.clone(),
+            rate_limit: tcp_cfg.rate_limit.clone(),
         });
         handles.push(handle);
     }
@@ -2448,6 +2476,7 @@ mod tests {
             loopback_port: backend_port,
             // 127.0.0.1 is allowed (the test client connects from loopback).
             allow_list: vec!["127.0.0.1/32".into()],
+            rate_limit: None,
         }));
         // Give the forwarder a moment to bind.
         sleep(Duration::from_millis(100)).await;
@@ -2466,6 +2495,7 @@ mod tests {
             loopback_port: backend_port,
             // Only a foreign IP is allowed, so the loopback test client is denied.
             allow_list: vec!["10.0.0.1/32".into()],
+            rate_limit: None,
         }));
         sleep(Duration::from_millis(100)).await;
 
@@ -2484,10 +2514,63 @@ mod tests {
             public_port,
             loopback_port: backend_port,
             allow_list: Vec::new(), // empty = allow all
+            rate_limit: None,
         }));
         sleep(Duration::from_millis(100)).await;
 
         let echoed = try_connect_and_echo(public_port, b"open-house").await;
         assert_eq!(echoed.as_deref(), Some(&b"open-house"[..]));
+    }
+
+    #[tokio::test]
+    async fn forwarder_rate_limits_a_flooding_peer() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        // Burst of 2, slow refill: the 3rd rapid connection is dropped.
+        tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
+            name: "test".into(),
+            public_port,
+            loopback_port: backend_port,
+            allow_list: Vec::new(),
+            rate_limit: Some(TcpRateLimit {
+                max_conns: 2,
+                per_seconds: 60,
+                exempt: Vec::new(),
+            }),
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        // First two connections fit the burst.
+        assert!(try_connect_and_echo(public_port, b"one").await.is_some());
+        assert!(try_connect_and_echo(public_port, b"two").await.is_some());
+        // The third, before the bucket refills, is rate-limited (dropped).
+        assert!(
+            try_connect_and_echo(public_port, b"three").await.is_none(),
+            "third rapid connection should be rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_rate_limit_exempts_listed_source() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        // Same tight limit, but loopback is exempt → never throttled.
+        tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
+            name: "test".into(),
+            public_port,
+            loopback_port: backend_port,
+            allow_list: Vec::new(),
+            rate_limit: Some(TcpRateLimit {
+                max_conns: 1,
+                per_seconds: 60,
+                exempt: vec!["127.0.0.1/32".into()],
+            }),
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        // Well past the burst of 1, but exempt, so all succeed.
+        assert!(try_connect_and_echo(public_port, b"a").await.is_some());
+        assert!(try_connect_and_echo(public_port, b"b").await.is_some());
+        assert!(try_connect_and_echo(public_port, b"c").await.is_some());
     }
 }

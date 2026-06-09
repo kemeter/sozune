@@ -30,3 +30,36 @@ if [[ "$deny_reply" != *"denied-peer"* ]]; then
 else
     fail "denied peer unexpectedly received an echo (got: '$deny_reply')"
 fi
+
+log "[25] TCP anti-flood: a connection flood gets throttled"
+
+# Listener tcpflood allows a burst of 2 (per_seconds 60 → effectively no refill
+# during the test). The first connection echoes; a rapid flood beyond the burst
+# must produce at least one dropped (empty) reply. We assert the robust
+# invariants — first connection works, and the flood is not fully served —
+# rather than pinning exactly which connection is the first to be dropped
+# (socat's per-connection fork timing makes that brittle).
+if wait_for_tcp_open "127.0.0.1" "$TCP_FLOOD_PORT"; then
+    pass "rate-limited TCP listener on $TCP_FLOOD_PORT is open"
+else
+    fail "rate-limited TCP listener on $TCP_FLOOD_PORT did not open"
+fi
+
+first=$(tcp_send "127.0.0.1" "$TCP_FLOOD_PORT" "flood-first")
+if [[ "$first" == *"flood-first"* ]]; then
+    pass "first connection within the burst is forwarded"
+else
+    fail "first burst connection did not echo (got: '$first')"
+fi
+
+# Hammer past the burst; count how many of several rapid connections are dropped.
+dropped=0
+for n in 1 2 3 4 5 6; do
+    reply=$(tcp_send "127.0.0.1" "$TCP_FLOOD_PORT" "flood-$n")
+    [[ "$reply" != *"flood-$n"* ]] && dropped=$((dropped + 1))
+done
+if (( dropped > 0 )); then
+    pass "flood beyond the burst is rate-limited ($dropped/6 connections dropped)"
+else
+    fail "no connection was throttled despite exceeding the burst"
+fi

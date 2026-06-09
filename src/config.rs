@@ -527,6 +527,22 @@ pub struct TcpListenerConfig {
     /// in front is the more robust choice; see the TCP routing docs.
     #[serde(default)]
     pub ip_allow_list: Vec<String>,
+    /// Per-source connection-rate limit (anti-flood), enforced by the
+    /// pre-accept forwarder. Absent = no limit.
+    #[serde(default)]
+    pub rate_limit: Option<TcpRateLimit>,
+}
+
+/// Per-source connection-rate limit for a TCP listener. A token bucket: a burst
+/// of `max_conns` is absorbed at once, then refills at `max_conns / per_seconds`
+/// per second. Sources matching `exempt` (CIDRs / bare IPs) are never limited —
+/// e.g. internal Docker ranges that open startup connection bursts.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct TcpRateLimit {
+    pub max_conns: u32,
+    pub per_seconds: u32,
+    #[serde(default)]
+    pub exempt: Vec<String>,
 }
 
 /// A static UDP listener. Like `TcpListenerConfig`, it is referenced by name
@@ -1879,6 +1895,36 @@ tcp:
         );
         // Absent ip_allow_list defaults to empty (allow all).
         assert!(config.tcp[1].ip_allow_list.is_empty());
+    }
+
+    #[test]
+    fn test_tcp_rate_limit_deserialization() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+tcp:
+  - name: postgres
+    listen: 5432
+    rate_limit:
+      max_conns: 10
+      per_seconds: 3
+      exempt: ["172.16.0.0/12"]
+  - name: redis
+    listen: 6379
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let rl = config.tcp[0]
+            .rate_limit
+            .as_ref()
+            .expect("rate_limit present");
+        assert_eq!(rl.max_conns, 10);
+        assert_eq!(rl.per_seconds, 3);
+        assert_eq!(rl.exempt, vec!["172.16.0.0/12".to_string()]);
+        // Absent rate_limit stays None (no limit).
+        assert!(config.tcp[1].rate_limit.is_none());
     }
 
     #[test]
