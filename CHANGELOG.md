@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - Wildcard certificates — `*.example.com` can now be issued through a DNS-01 resolver. Attempting a wildcard on an HTTP-01 resolver fails loudly. Wildcard certs are stored under `_wildcard_.example.com/` on disk.
 - Entrypoints with `tls: true` but no `acme.resolver` keep the existing HTTP-01 behaviour on `challenge_port` — no migration needed.
 - ACME account persistence and certificate renewal checks now use cheti (`FileAccountStore`, `needs_renewal`), replacing the in-tree X.509 parser. Storage layout is unchanged (`certs_dir/account_credentials.json`).
+- HTTP/2 listener tuning — `proxy.https.http2.alpn_protocols` and `http2.disable_http11` let you control ALPN on the TLS listener (force HTTP/1.1-only, or h2-only). Both default to unset, keeping the existing behaviour (ALPN `["h2", "http/1.1"]`, HTTP/2 negotiated by default).
 
 ### Routing
 

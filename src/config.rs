@@ -514,6 +514,23 @@ pub struct HttpsConfig {
         deserialize_with = "crate::error_pages::deserialize_error_pages"
     )]
     pub error_pages: BTreeMap<String, String>,
+    /// HTTP/2 negotiation on the TLS listener.
+    #[serde(default)]
+    pub http2: Http2Config,
+}
+
+/// HTTP/2 listener settings. Both fields default to `None`, which leaves
+/// Sōzu's own defaults untouched (ALPN `["h2", "http/1.1"]`, HTTP/1.1 enabled).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct Http2Config {
+    /// ALPN protocols advertised on the TLS listener. `None` keeps Sōzu's
+    /// default `["h2", "http/1.1"]`. Valid values: `"h2"`, `"http/1.1"`.
+    #[serde(default)]
+    pub alpn_protocols: Option<Vec<String>>,
+    /// Disable HTTP/1.1 on the listener (h2-only). `None` keeps it enabled.
+    /// Incompatible with `alpn_protocols` containing `"http/1.1"`.
+    #[serde(default)]
+    pub disable_http11: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -731,6 +748,7 @@ impl Default for HttpsConfig {
         Self {
             listen_address: default_https_port(),
             error_pages: BTreeMap::new(),
+            http2: Http2Config::default(),
         }
     }
 }
@@ -2081,6 +2099,38 @@ https:
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.tcp.is_empty());
+    }
+
+    #[test]
+    fn https_http2_defaults_to_unset() {
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.https.http2.alpn_protocols.is_none());
+        assert!(config.https.http2.disable_http11.is_none());
+    }
+
+    #[test]
+    fn https_http2_block_is_parsed() {
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+  http2:
+    alpn_protocols: ["http/1.1"]
+    disable_http11: false
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.https.http2.alpn_protocols,
+            Some(vec!["http/1.1".to_string()])
+        );
+        assert_eq!(config.https.http2.disable_http11, Some(false));
     }
 
     #[test]

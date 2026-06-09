@@ -418,6 +418,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         config.https.listen_address,
     ));
     apply_listener_error_pages(&mut https_builder, &config.https.error_pages, "HTTPS");
+    apply_listener_http2(&mut https_builder, &config.https.http2);
     let https_listener = https_builder
         .to_tls(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
@@ -2170,12 +2171,64 @@ fn apply_listener_error_pages(
     }
 }
 
+/// Apply the `http2` config block onto a `ListenerBuilder`. Each field is only
+/// touched when set, so leaving the block empty keeps Sōzu's own defaults (ALPN
+/// `["h2", "http/1.1"]`, HTTP/1.1 enabled). The auto-DoS combination
+/// `disable_http11 = true` with `http/1.1` in the ALPN list is rejected later by
+/// `to_tls`, so no validation is duplicated here.
+fn apply_listener_http2(builder: &mut ListenerBuilder, http2: &crate::config::Http2Config) {
+    if let Some(alpn) = &http2.alpn_protocols {
+        builder.with_alpn_protocols(Some(alpn.clone()));
+    }
+    if let Some(disable) = http2.disable_http11 {
+        builder.disable_http11 = Some(disable);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Http2Config;
     use crate::model::{Backend, EntrypointConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
     use tokio::time::{sleep, timeout};
+
+    fn tls_listener_with_http2(
+        http2: &Http2Config,
+    ) -> sozu_command_lib::proto::command::HttpsListenerConfig {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(0, 0, 0, 0, 8443));
+        apply_listener_http2(&mut builder, http2);
+        builder.to_tls(None).expect("to_tls should succeed")
+    }
+
+    #[test]
+    fn http2_default_advertises_h2_and_http11() {
+        let cfg = tls_listener_with_http2(&Http2Config::default());
+        assert!(cfg.alpn_protocols.iter().any(|p| p == "h2"));
+        assert!(cfg.alpn_protocols.iter().any(|p| p == "http/1.1"));
+    }
+
+    #[test]
+    fn http2_alpn_override_forces_http11_only() {
+        let http2 = Http2Config {
+            alpn_protocols: Some(vec!["http/1.1".into()]),
+            disable_http11: None,
+        };
+        let cfg = tls_listener_with_http2(&http2);
+        assert_eq!(cfg.alpn_protocols, vec!["http/1.1".to_string()]);
+        assert!(!cfg.alpn_protocols.iter().any(|p| p == "h2"));
+    }
+
+    #[test]
+    fn http2_disable_http11_is_propagated() {
+        let http2 = Http2Config {
+            alpn_protocols: Some(vec!["h2".into()]),
+            disable_http11: Some(true),
+        };
+        let cfg = tls_listener_with_http2(&http2);
+        assert_eq!(cfg.disable_http11, Some(true));
+        assert_eq!(cfg.alpn_protocols, vec!["h2".to_string()]);
+    }
 
     fn base_ep(backends: Vec<Backend>) -> Entrypoint {
         Entrypoint {
