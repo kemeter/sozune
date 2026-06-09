@@ -19,7 +19,30 @@ When `tls=true`, Sōzune:
 
 ## HTTP/2
 
-HTTP/2 is enabled out of the box: TLS ALPN advertises both `h2` and `http/1.1`, so clients that support h2 get h2 and the rest fall back to HTTP/1.1. ALPN behaviour is delegated to Sōzu's listener defaults — Sōzune does not currently expose ALPN configuration of its own.
+HTTP/2 is enabled out of the box: TLS ALPN advertises both `h2` and `http/1.1`, so clients that support h2 get h2 and the rest fall back to HTTP/1.1.
+
+You can override the ALPN negotiation through the `proxy.https.http2` config block. Leaving it unset keeps the default above.
+
+```yaml
+proxy:
+  https:
+    http2:
+      # ALPN protocols advertised on the listener. Valid values: "h2", "http/1.1".
+      # Omit to keep the default ["h2", "http/1.1"].
+      alpn_protocols: ["h2", "http/1.1"]
+      # Disable HTTP/1.1 on the listener (h2-only). Defaults to false.
+      disable_http11: false
+```
+
+Common setups:
+
+| Goal | Config |
+|---|---|
+| Default (h2 + HTTP/1.1) | omit the `http2` block |
+| Force HTTP/1.1 only (disable h2) | `alpn_protocols: ["http/1.1"]` |
+| HTTP/2 only (no HTTP/1.1 fallback) | `alpn_protocols: ["h2"]` and `disable_http11: true` |
+
+> `disable_http11: true` together with `http/1.1` in `alpn_protocols` is rejected at startup — the listener would advertise a protocol it then refuses, which is a self-inflicted denial of service.
 
 ## SNI
 
@@ -35,5 +58,4 @@ The following are not currently exposed by Sōzune; they fall back to Sōzu defa
 
 - Cipher suites
 - Minimum TLS version
-- ALPN protocol list (always `h2, http/1.1`)
 - Manual certificate injection — ACME is the only source. There is no path to provide a self-signed cert, a wildcard purchased elsewhere, or a cert managed by another tool.
