@@ -520,6 +520,13 @@ pub struct HttpsConfig {
 pub struct TcpListenerConfig {
     pub name: String,
     pub listen: u16,
+    /// CIDRs / bare IPs allowed to connect to this listener, checked at
+    /// `accept()` by the pre-accept forwarder. Empty = allow all. A bare IP is
+    /// promoted to `/32` (or `/128`). Note: this is an application-level filter
+    /// — for a database exposed to the internet, a kernel firewall (nftables)
+    /// in front is the more robust choice; see the TCP routing docs.
+    #[serde(default)]
+    pub ip_allow_list: Vec<String>,
 }
 
 /// A static UDP listener. Like `TcpListenerConfig`, it is referenced by name
@@ -1847,6 +1854,31 @@ udp:
         assert_eq!(config.udp[0].listen, 53);
         assert_eq!(config.udp[1].name, "syslog");
         assert_eq!(config.udp[1].listen, 514);
+    }
+
+    #[test]
+    fn test_tcp_ip_allow_list_deserialization() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+tcp:
+  - name: postgres
+    listen: 5432
+    ip_allow_list: ["94.23.3.96", "172.16.0.0/12"]
+  - name: redis
+    listen: 6379
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tcp.len(), 2);
+        assert_eq!(
+            config.tcp[0].ip_allow_list,
+            vec!["94.23.3.96".to_string(), "172.16.0.0/12".to_string()]
+        );
+        // Absent ip_allow_list defaults to empty (allow all).
+        assert!(config.tcp[1].ip_allow_list.is_empty());
     }
 
     #[test]
