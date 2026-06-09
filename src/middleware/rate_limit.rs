@@ -9,12 +9,13 @@ use tracing::warn;
 use super::chain::{Flow, Middleware, RequestCtx};
 use super::diag;
 
-/// Token bucket rate limiter per source IP
+/// Token bucket rate limiter per source IP. `average` is the sustained refill
+/// rate (tokens per second, fractional) and `burst` the bucket capacity.
 #[derive(Debug)]
 pub struct RateLimiter {
     buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
-    average: u64,
-    burst: u64,
+    average: f64,
+    burst: f64,
 }
 
 #[derive(Debug)]
@@ -33,8 +34,22 @@ impl RateLimiter {
     pub fn new(average: u64, burst: u64) -> Self {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
-            average,
-            burst,
+            average: average as f64,
+            burst: burst as f64,
+        }
+    }
+
+    /// Build a limiter from a connection-rate spec: allow `max_conns` per
+    /// `per_seconds` window. The sustained rate is `max_conns / per_seconds`
+    /// tokens/s and the bucket capacity is `max_conns`, so a full burst of
+    /// `max_conns` is absorbed at once, then refills at the sustained rate.
+    /// `per_seconds == 0` is treated as 1 to avoid a divide-by-zero.
+    pub fn with_rate(max_conns: u32, per_seconds: u32) -> Self {
+        let per = per_seconds.max(1) as f64;
+        Self {
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+            average: max_conns as f64 / per,
+            burst: max_conns as f64,
         }
     }
 
@@ -50,13 +65,13 @@ impl RateLimiter {
         let bucket = buckets
             .entry(source_ip.to_string())
             .or_insert_with(|| TokenBucket {
-                tokens: self.burst as f64,
+                tokens: self.burst,
                 last_refill: now,
             });
 
         // Refill tokens based on elapsed time
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.average as f64).min(self.burst as f64);
+        bucket.tokens = (bucket.tokens + elapsed * self.average).min(self.burst);
         bucket.last_refill = now;
 
         // Try to consume a token

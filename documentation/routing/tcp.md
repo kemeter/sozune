@@ -74,12 +74,31 @@ nft add rule inet filter input tcp dport 5432 drop
 
 Sōzune neither reads nor manages these rules — they live entirely in your firewall. The allow-list above is enough on its own for most deployments; the firewall is an optional hardening layer.
 
+## Anti-flood (per-source connection rate)
+
+A listener can cap the connection rate per source IP, enforced by the same forwarder:
+
+```yaml
+proxy:
+  tcp:
+    - name: postgres
+      listen: 5432
+      rate_limit:
+        max_conns: 10        # burst absorbed at once
+        per_seconds: 3       # sustained refill: max_conns / per_seconds per second
+        exempt: ["172.16.0.0/12"]
+```
+
+This is a token bucket: a source may open `max_conns` connections back-to-back (the burst), after which it refills at `max_conns / per_seconds` per second. A source over its budget is dropped at `accept()`. Sources matching `exempt` are never limited — use it for internal ranges (e.g. Docker) that open legitimate startup bursts.
+
+It covers the same ground as HAProxy's `stick-table … conn_rate(3s)` + `reject if { src_conn_rate gt N } !exempt`. The token bucket smooths the rate rather than counting a fixed 3-second window, so a brief startup burst is tolerated and a sustained flood is throttled — without the boundary double-burst a fixed window allows. Absent `rate_limit` = no limit.
+
 ## Limitations
 
 - **No TLS termination.** Sōzu's TCP path is pure passthrough — TLS bytes flow as-is. For client-side STARTTLS protocols (PostgreSQL, MySQL) this is fine; for terminating TLS, use an HTTPS entrypoint instead.
 - **No half-close.** Sōzu treats a client `FIN` as a full disconnect, so protocols that rely on half-closing one direction to signal end-of-stream may misbehave. Most request/response and long-lived stream protocols are unaffected.
-- **The allow-list is filtered after `accept()`**, not before the handshake — see the firewall note above for pre-handshake dropping.
-- **No connection-rate limit yet.** Per-source anti-flood is not yet wired (Sōzu 2.1.0's native `max_connections_per_ip` is a candidate); only the IP allow-list is enforced today.
+- **The allow-list and rate limit are filtered after `accept()`**, not before the handshake — see the firewall note above for pre-handshake dropping.
+- **The rate limit resets on restart.** Token buckets are in-memory per process; a Sōzune restart clears them. Listeners (and their limits) are static config, applied at boot.
 
 ## Errors and diagnostics
 

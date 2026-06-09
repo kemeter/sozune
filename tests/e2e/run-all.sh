@@ -88,6 +88,11 @@ proxy:
     - name: tcpdeny
       listen: $TCP_DENY_PORT
       ip_allow_list: ["10.0.0.0/8"]
+    - name: tcpflood
+      listen: $TCP_FLOOD_PORT
+      rate_limit:
+        max_conns: 2
+        per_seconds: 60
   udp:
     - name: udpecho
       listen: $UDP_ECHO_PORT
@@ -479,6 +484,15 @@ services:
       - "sozune.enable=true"
       - "sozune.tcp.tcpdeny.entrypoint=tcpdeny"
       - "sozune.tcp.tcpdeny.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tcpflood:
+    image: alpine/socat
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "EXEC:cat"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.tcpflood.entrypoint=tcpflood"
+      - "sozune.tcp.tcpflood.port=9000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 
