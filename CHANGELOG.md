@@ -17,12 +17,17 @@ All notable changes to this project will be documented in this file.
 ### Routing
 
 - `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.
+- UDP load balancing — UDP listeners now load-balance datagrams across backends with flow affinity: datagrams from the same source IP form a virtual flow pinned to one backend. Two flow-affine algorithms are available, set per service via `sozune.udp.<svc>.loadBalancer`: `hrw` (Highest-Random-Weight / rendezvous hashing, stable under backend churn, recommended) and `maglev` (consistent hashing with O(1) lookup, for large backend sets). `round_robin`, `random`, `power_of_two`, and `least_connections` are also accepted. Requesting `hrw`/`maglev` on an HTTP or TCP service emits `W022` and falls back to round-robin. See [UDP routing docs](documentation/routing/udp.md#load-balancing).
+- Source-IP allow-list on TCP listeners — restrict which source IPs may connect to a TCP listener with `ip_allow_list` (CIDRs or bare IPs), checked at `accept()` on the public port. Empty (default) allows all. See [TCP routing docs](documentation/routing/tcp.md#source-ip-allow-list).
+- Per-source connection-rate anti-flood on TCP listeners — cap how fast a single source IP may open new connections with `rate_limit` (`max_conns` per `per_seconds`) on a `proxy.tcp` listener; excess connections are dropped before `accept()`. See [TCP routing docs](documentation/routing/tcp.md#anti-flood-per-source-connection-rate).
 
 ### Middleware
 
 - Custom error pages — serve a custom body when Sōzune returns `404`, `503` or any of the 12 statuses Sōzu can template (`301, 400, 401, 404, 408, 413, 421, 429, 502, 503, 504, 507`). Two scopes compose: listener-level defaults (`proxy.http.error_pages` / `proxy.https.error_pages`) and entrypoint-level overrides (`entrypoints[*].error_pages`). Three value shapes are accepted — inline body (wrapped into a valid HTTP/1.1 response on your behalf), full HTTP/1.1 response (passed through), or `file://path` (loaded from disk). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.errorPages.<code>=<body>`, inline only — `file://` is refused from provider labels for security), the HTTP provider, the YAML config file, and the REST API. See [Error pages docs](documentation/middleware/error-pages.md).
 - `forwardAuth` — delegate authentication to an external service (e.g. Authelia, Authentik). The proxy issues a sub-request to the auth service before each protected request and forwards selected response headers (`Remote-User`, `Remote-Email`, `Remote-Groups`) to the backend. Supports `address`, `responseHeaders` (comma-separated), and `trustForwardHeader`. See [Forward auth docs](documentation/middleware/forward-auth.md).
 - `inFlightReq` — cap the number of concurrent in-flight requests per client IP on a route; excess requests get `503`. Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.inFlightReq=N`), the HTTP provider, the YAML config file, and the REST API. See [In-flight request docs](documentation/middleware/in-flight-req.md).
+- Circuit breaker — stop forwarding to a backend whose recent failure rate crosses a threshold: the breaker opens, answers `503` immediately for a cooldown, then probes once and closes when healthy. Per route, configured with `circuitBreaker.threshold` (default `0.5`), `circuitBreaker.minRequests` (default `20`), and `circuitBreaker.cooldown` seconds (default `10`); `5xx` and connection errors count as failures, `4xx` does not. Available via Docker/Swarm/Podman/Nomad labels, the HTTP provider, the YAML config file, and the REST API. See [Circuit breaker docs](documentation/middleware/circuit-breaker.md).
+- Retry on backend failure — retry a request when forwarding fails before any response (connection refused/reset, or backend timeout). `sozune.http.<svc>.retry.attempts` is the total number of tries (`3` = up to two retries); responses that arrive — even `5xx` — are never retried, so non-idempotent side effects aren't replayed. Available via Docker/Swarm/Podman/Nomad labels, the HTTP provider, the YAML config file, and the REST API. See [Retry docs](documentation/middleware/retry.md).
 
 ### Docker provider
 
@@ -31,6 +36,10 @@ All notable changes to this project will be documented in this file.
 ### HTTP provider
 
 - Optional auth header on outgoing fetches — `providers.http.auth.header` and `auth.value` send an arbitrary header (typically `Authorization: Bearer <token>`) with every poll. Useful when the upstream config service sits behind its own auth layer.
+
+### Providers
+
+- Ring provider — discover entrypoints from a [Ring](https://github.com/kemeter/ring) cluster (a lightweight container / microVM orchestrator). Enable with `providers.ring` (`endpoint`, optional `token`, `poll_interval`, `expose_by_default`); Sōzune polls Ring's `GET /deployments` HTTP API, turns each deployment's `sozune.*` labels into routes, and fans a multi-replica deployment out to one backend per running instance. Discovery is interval-based and only triggers a reload when the Ring-sourced view changes. See [Ring provider docs](documentation/providers/ring.md).
 
 ### Fixes
 
