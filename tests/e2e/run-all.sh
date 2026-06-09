@@ -82,6 +82,12 @@ proxy:
       listen: $TCP_ECHO_PORT
     - name: tcprr
       listen: $TCP_RR_PORT
+    - name: tcpallow
+      listen: $TCP_ALLOW_PORT
+      ip_allow_list: ["127.0.0.1/32"]
+    - name: tcpdeny
+      listen: $TCP_DENY_PORT
+      ip_allow_list: ["10.0.0.0/8"]
   udp:
     - name: udpecho
       listen: $UDP_ECHO_PORT
@@ -455,6 +461,24 @@ services:
       - "sozune.enable=true"
       - "sozune.udp.udpecho.entrypoint=udpecho"
       - "sozune.udp.udpecho.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tcpallow:
+    image: alpine/socat
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "EXEC:cat"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.tcpallow.entrypoint=tcpallow"
+      - "sozune.tcp.tcpallow.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tcpdeny:
+    image: alpine/socat
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "EXEC:cat"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.tcpdeny.entrypoint=tcpdeny"
+      - "sozune.tcp.tcpdeny.port=9000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 

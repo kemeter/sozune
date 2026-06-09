@@ -5,6 +5,7 @@ mod channel;
 mod worker;
 
 use crate::config::ProxyConfig;
+use crate::middleware::ip_allow_list::IpAllowList;
 use crate::middleware::{self, MiddlewareState};
 use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
@@ -28,9 +29,12 @@ use sozu_command_lib::{
     },
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 
 /// Map Sōzune's [`LoadBalancer`](crate::model::LoadBalancer) to the Sōzu
@@ -96,11 +100,94 @@ fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnaps
         .collect()
 }
 
+/// One pre-accept TCP forwarder to spawn: bind the public port, gate the peer
+/// IP at `accept()`, and forward accepted connections to the loopback port the
+/// Sōzu worker bound. Carries the raw allow-list CIDRs (compiled once in the
+/// forwarder task).
+struct TcpForwarderSpec {
+    name: String,
+    public_port: u16,
+    loopback_port: u16,
+    allow_list: Vec<String>,
+}
+
+/// Grab a free loopback port by binding `127.0.0.1:0` and reading the assigned
+/// port, then releasing it so the Sōzu worker can bind it. There is a tiny race
+/// between release and the worker's bind; if lost, the worker's `to_tcp()` fails
+/// loudly at startup rather than corrupting state — acceptable.
+fn pick_loopback_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Accept loop for one TCP listener: bind the public port, drop connections
+/// whose peer IP is not in the allow-list (empty list = allow all), and splice
+/// accepted ones to the loopback Sōzu worker with `copy_bidirectional`.
+async fn run_tcp_forwarder(spec: TcpForwarderSpec) {
+    let allow = IpAllowList::new(&spec.allow_list);
+    let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, spec.public_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(
+                "TCP forwarder `{}` failed to bind 0.0.0.0:{}: {}",
+                spec.name, spec.public_port, e
+            );
+            return;
+        }
+    };
+    info!(
+        "TCP forwarder `{}` listening on 0.0.0.0:{} → 127.0.0.1:{}",
+        spec.name, spec.public_port, spec.loopback_port
+    );
+    let loopback = (Ipv4Addr::LOCALHOST, spec.loopback_port);
+
+    loop {
+        let (inbound, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("TCP forwarder `{}` accept error: {}", spec.name, e);
+                continue;
+            }
+        };
+        // Empty allow-list = allow all (never black-hole the listener).
+        if !allow.is_empty() && !allow.allows(peer.ip()) {
+            debug!(
+                "TCP forwarder `{}` denied connection from {}",
+                spec.name,
+                peer.ip()
+            );
+            continue; // `inbound` dropped here → connection closed
+        }
+        let name = spec.name.clone();
+        tokio::spawn(async move {
+            let mut inbound = inbound;
+            let mut outbound = match TcpStream::connect(loopback).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(
+                        "TCP forwarder `{}` could not reach loopback worker: {}",
+                        name, e
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
+                debug!("TCP forwarder `{}` connection closed: {}", name, e);
+            }
+        });
+    }
+}
+
 fn spawn_tcp_workers(
     config: &ProxyConfig,
-) -> anyhow::Result<(L4Channels, Vec<thread::JoinHandle<()>>)> {
+) -> anyhow::Result<(
+    L4Channels,
+    Vec<thread::JoinHandle<()>>,
+    Vec<TcpForwarderSpec>,
+)> {
     let mut channels: L4Channels = HashMap::new();
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut forwarders: Vec<TcpForwarderSpec> = Vec::new();
     let max_buffers = config.max_buffers;
     let buffer_size = config.buffer_size;
     let timeout = Duration::from_millis(config.startup_delay_ms);
@@ -113,14 +200,19 @@ fn spawn_tcp_workers(
             );
         }
 
+        // Sōzu binds a private loopback port; Sōzune owns the public port via
+        // the pre-accept forwarder. The TCP frontend therefore targets the
+        // loopback port — stored as `L4ListenerChannel.port`, which
+        // configure_tcp_entrypoint already uses to build the frontend address.
+        let loopback_port = pick_loopback_port()?;
         let listener_config =
-            ListenerBuilder::new_tcp(SocketAddress::new_v4(0, 0, 0, 0, tcp_cfg.listen))
+            ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, loopback_port))
                 .to_tcp(None)
                 .map_err(|e| {
                     anyhow::anyhow!(
-                        "Could not create TCP listener `{}` on :{}: {}",
+                        "Could not create TCP listener `{}` on 127.0.0.1:{}: {}",
                         tcp_cfg.name,
-                        tcp_cfg.listen,
+                        loopback_port,
                         e
                     )
                 })?;
@@ -130,7 +222,6 @@ fn spawn_tcp_workers(
         })?;
 
         let listener_name = tcp_cfg.name.clone();
-        let listener_port = tcp_cfg.listen;
         let handle = thread::spawn(move || {
             if let Err(e) =
                 worker::start_tcp_worker(listener_config, max_buffers, buffer_size, proxy_chan)
@@ -141,21 +232,27 @@ fn spawn_tcp_workers(
 
         wait_for_worker_ready(&mut command, &format!("TCP[{}]", tcp_cfg.name), timeout)?;
         info!(
-            "Sōzu TCP worker `{}` running on 0.0.0.0:{}",
-            tcp_cfg.name, listener_port
+            "Sōzu TCP worker `{}` running on 127.0.0.1:{} (public :{})",
+            tcp_cfg.name, loopback_port, tcp_cfg.listen
         );
 
         channels.insert(
             tcp_cfg.name.clone(),
             L4ListenerChannel {
-                port: listener_port,
+                port: loopback_port,
                 channel: command,
             },
         );
+        forwarders.push(TcpForwarderSpec {
+            name: tcp_cfg.name.clone(),
+            public_port: tcp_cfg.listen,
+            loopback_port,
+            allow_list: tcp_cfg.ip_allow_list.clone(),
+        });
         handles.push(handle);
     }
 
-    Ok((channels, handles))
+    Ok((channels, handles, forwarders))
 }
 
 fn spawn_udp_workers(
@@ -328,8 +425,16 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     wait_for_worker_ready(&mut command_channel_https, "HTTPS", timeout)?;
 
     // Spawn one Sōzu TCP worker per declared listener.
-    let (tcp_channels, tcp_worker_handles) = spawn_tcp_workers(config)?;
+    let (tcp_channels, tcp_worker_handles, tcp_forwarders) = spawn_tcp_workers(config)?;
     let (udp_channels, udp_worker_handles) = spawn_udp_workers(config)?;
+
+    // Spawn one pre-accept forwarder per TCP listener: it owns the public port,
+    // gates the peer IP against the listener's allow-list, and forwards to the
+    // loopback Sōzu worker. Done here, before `handle` is moved into the reload
+    // thread below.
+    for spec in tcp_forwarders {
+        handle.spawn(run_tcp_forwarder(spec));
+    }
 
     // Initial configuration will be handled by provider reload signals
     info!("Waiting for providers to populate configuration");
@@ -1075,7 +1180,10 @@ fn configure_tcp_entrypoint(
 
     let tcp_front = RequestTcpFrontend {
         cluster_id: cluster_id.to_string(),
-        address: SocketAddress::new_v4(0, 0, 0, 0, listener_port),
+        // The Sōzu TCP worker binds loopback (the public port is owned by the
+        // pre-accept forwarder), so the frontend address must match: 127.0.0.1,
+        // not 0.0.0.0. `listener_port` is the loopback port here.
+        address: SocketAddress::new_v4(127, 0, 0, 1, listener_port),
         ..Default::default()
     };
 
@@ -1953,7 +2061,10 @@ fn remove_tcp_entrypoint(tcp_channels: &mut L4Channels, cluster_id: &str, entryp
 
     let tcp_front = RequestTcpFrontend {
         cluster_id: cluster_id.to_string(),
-        address: SocketAddress::new_v4(0, 0, 0, 0, listener_port),
+        // The Sōzu TCP worker binds loopback (the public port is owned by the
+        // pre-accept forwarder), so the frontend address must match: 127.0.0.1,
+        // not 0.0.0.0. `listener_port` is the loopback port here.
+        address: SocketAddress::new_v4(127, 0, 0, 1, listener_port),
         ..Default::default()
     };
     if let Err(e) = send_to_worker(
@@ -2035,6 +2146,8 @@ fn apply_listener_error_pages(
 mod tests {
     use super::*;
     use crate::model::{Backend, EntrypointConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+    use tokio::time::{sleep, timeout};
 
     fn base_ep(backends: Vec<Backend>) -> Entrypoint {
         Entrypoint {
@@ -2281,5 +2394,100 @@ mod tests {
         assert_eq!(lb_algorithm(LoadBalancer::LeastConnections), S::LeastLoaded);
         assert_eq!(lb_algorithm(LoadBalancer::Hrw), S::Hrw);
         assert_eq!(lb_algorithm(LoadBalancer::Maglev), S::Maglev);
+    }
+
+    #[test]
+    fn pick_loopback_port_returns_a_usable_port() {
+        let port = pick_loopback_port().expect("should pick a port");
+        assert_ne!(port, 0);
+        // The port was released, so we can bind it again.
+        let rebind = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port));
+        assert!(rebind.is_ok(), "freed loopback port should be re-bindable");
+    }
+
+    // A tiny echo server on loopback, standing in for the Sōzu worker behind the
+    // forwarder. Returns the port it bound.
+    async fn spawn_echo_backend() -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.split();
+                    let _ = copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn try_connect_and_echo(port: u16, payload: &[u8]) -> Option<Vec<u8>> {
+        let mut s = timeout(
+            Duration::from_secs(1),
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        s.write_all(payload).await.ok()?;
+        let mut buf = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(1), s.read_exact(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        Some(buf)
+    }
+
+    #[tokio::test]
+    async fn forwarder_passes_allowed_peer_through_to_backend() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
+            name: "test".into(),
+            public_port,
+            loopback_port: backend_port,
+            // 127.0.0.1 is allowed (the test client connects from loopback).
+            allow_list: vec!["127.0.0.1/32".into()],
+        }));
+        // Give the forwarder a moment to bind.
+        sleep(Duration::from_millis(100)).await;
+
+        let echoed = try_connect_and_echo(public_port, b"hello-forwarder").await;
+        assert_eq!(echoed.as_deref(), Some(&b"hello-forwarder"[..]));
+    }
+
+    #[tokio::test]
+    async fn forwarder_drops_peer_outside_allow_list() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
+            name: "test".into(),
+            public_port,
+            loopback_port: backend_port,
+            // Only a foreign IP is allowed, so the loopback test client is denied.
+            allow_list: vec!["10.0.0.1/32".into()],
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        // The TCP connection is accepted then immediately closed without
+        // forwarding, so no echo comes back.
+        let echoed = try_connect_and_echo(public_port, b"should-be-dropped").await;
+        assert_eq!(echoed, None, "denied peer must not receive a backend echo");
+    }
+
+    #[tokio::test]
+    async fn forwarder_empty_allow_list_allows_all() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
+            name: "test".into(),
+            public_port,
+            loopback_port: backend_port,
+            allow_list: Vec::new(), // empty = allow all
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        let echoed = try_connect_and_echo(public_port, b"open-house").await;
+        assert_eq!(echoed.as_deref(), Some(&b"open-house"[..]));
     }
 }
