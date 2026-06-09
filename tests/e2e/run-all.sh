@@ -82,6 +82,9 @@ proxy:
       listen: $TCP_ECHO_PORT
     - name: tcprr
       listen: $TCP_RR_PORT
+  udp:
+    - name: udpecho
+      listen: $UDP_ECHO_PORT
   max_buffers: 500
   buffer_size: 16384
   startup_delay_ms: 1000
@@ -443,6 +446,15 @@ services:
       - "sozune.enable=true"
       - "sozune.tcp.tcprr.entrypoint=tcprr"
       - "sozune.tcp.tcprr.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-udpecho:
+    image: alpine/socat
+    command: ["UDP-LISTEN:9000,fork,reuseaddr", "EXEC:cat"]
+    labels:
+      - "sozune.enable=true"
+      - "sozune.udp.udpecho.entrypoint=udpecho"
+      - "sozune.udp.udpecho.port=9000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 

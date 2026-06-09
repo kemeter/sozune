@@ -6,6 +6,14 @@
 use crate::model::Backend;
 use sozu_command_lib::proto::command::SocketAddress;
 
+/// Stable, address-derived backend id for an L4 cluster. Matching the HTTP
+/// scheme (`{cluster}-backend-{address}-{port}`), it makes add and remove agree
+/// regardless of a backend's position in the list — so a provider re-emitting
+/// the same backends in a different order never orphans or mis-removes one.
+pub(super) fn l4_backend_id(cluster_id: &str, backend: &Backend) -> String {
+    format!("{cluster_id}-backend-{}-{}", backend.address, backend.port)
+}
+
 pub(super) fn parse_backend_address(backend: &Backend) -> anyhow::Result<SocketAddress> {
     // Bracket bare IPv6 literals so `<addr>:<port>` parses correctly. IPv4
     // addresses and bracketed IPv6 already round-trip through `<addr>:<port>`.

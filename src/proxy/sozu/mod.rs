@@ -10,7 +10,7 @@ use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::metrics_snapshot;
 use acme::{add_certificate, register_acme_challenge_cluster};
-use addr::parse_backend_address;
+use addr::{l4_backend_id, parse_backend_address};
 use builders::{
     build_authorized_hashes, build_frontend_headers, build_path_and_rewrite, map_redirect_policy,
     map_redirect_scheme, methods_for_frontend,
@@ -20,10 +20,11 @@ use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
-        QueryMetricsOptions, RemoveBackend, Request, RequestHttpFrontend, RequestTcpFrontend,
-        ResponseStatus, RulePosition, SocketAddress, WorkerRequest, WorkerResponse,
-        request::RequestType, response_content::ContentType,
+        ActivateListener, AddBackend, Cluster, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, PathRule, QueryMetricsOptions, RemoveBackend, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, ResponseStatus, RulePosition,
+        SocketAddress, UdpClusterConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        response_content::ContentType,
     },
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -40,6 +41,8 @@ fn lb_algorithm(lb: LoadBalancer) -> LoadBalancingAlgorithms {
         LoadBalancer::Random => LoadBalancingAlgorithms::Random,
         LoadBalancer::PowerOfTwo => LoadBalancingAlgorithms::PowerOfTwo,
         LoadBalancer::LeastConnections => LoadBalancingAlgorithms::LeastLoaded,
+        LoadBalancer::Hrw => LoadBalancingAlgorithms::Hrw,
+        LoadBalancer::Maglev => LoadBalancingAlgorithms::Maglev,
     }
 }
 
@@ -56,16 +59,18 @@ fn lb_algorithm(lb: LoadBalancer) -> LoadBalancingAlgorithms {
 /// class of bug impossible.
 type RoutingSnapshot = BTreeMap<String, Entrypoint>;
 
-/// Command channel for a single Sōzu TCP worker, paired with the port it
-/// binds. We need the port at routing time to build `RequestTcpFrontend`.
-struct TcpListenerChannel {
+/// Command channel for a single Sōzu L4 (TCP or UDP) worker, paired with the
+/// port it binds. We need the port at routing time to build the
+/// `RequestTcpFrontend` / `RequestUdpFrontend`. TCP and UDP share the same shape
+/// — one worker binds one listener — so they share this type.
+struct L4ListenerChannel {
     port: u16,
     channel: Channel<WorkerRequest, WorkerResponse>,
 }
 
-/// TCP workers keyed by listener name (matches `proxy.tcp[].name`).
-/// One worker = one listener.
-type TcpChannels = HashMap<String, TcpListenerChannel>;
+/// L4 workers keyed by listener name (matches `proxy.tcp[].name` /
+/// `proxy.udp[].name`). One worker = one listener.
+type L4Channels = HashMap<String, L4ListenerChannel>;
 
 /// Bundle of every Sōzu worker channel a reload needs to talk to, plus the
 /// ports they're bound on. Grouped together because every function in the
@@ -74,7 +79,8 @@ type TcpChannels = HashMap<String, TcpListenerChannel>;
 struct Channels {
     http: Channel<WorkerRequest, WorkerResponse>,
     https: Channel<WorkerRequest, WorkerResponse>,
-    tcp: TcpChannels,
+    tcp: L4Channels,
+    udp: L4Channels,
     http_port: u16,
     https_port: u16,
     /// Loopback port serving the ACME HTTP-01 challenge responder, when
@@ -85,15 +91,15 @@ struct Channels {
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
     storage
         .iter()
-        .filter(|(_, ep)| matches!(ep.protocol, Protocol::Http | Protocol::Tcp))
+        .filter(|(_, ep)| matches!(ep.protocol, Protocol::Http | Protocol::Tcp | Protocol::Udp))
         .map(|(id, ep)| (id.clone(), ep.clone()))
         .collect()
 }
 
 fn spawn_tcp_workers(
     config: &ProxyConfig,
-) -> anyhow::Result<(TcpChannels, Vec<thread::JoinHandle<()>>)> {
-    let mut channels: TcpChannels = HashMap::new();
+) -> anyhow::Result<(L4Channels, Vec<thread::JoinHandle<()>>)> {
+    let mut channels: L4Channels = HashMap::new();
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let max_buffers = config.max_buffers;
     let buffer_size = config.buffer_size;
@@ -141,7 +147,95 @@ fn spawn_tcp_workers(
 
         channels.insert(
             tcp_cfg.name.clone(),
-            TcpListenerChannel {
+            L4ListenerChannel {
+                port: listener_port,
+                channel: command,
+            },
+        );
+        handles.push(handle);
+    }
+
+    Ok((channels, handles))
+}
+
+fn spawn_udp_workers(
+    config: &ProxyConfig,
+) -> anyhow::Result<(L4Channels, Vec<thread::JoinHandle<()>>)> {
+    let mut channels: L4Channels = HashMap::new();
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let max_buffers = config.max_buffers;
+    let buffer_size = config.buffer_size;
+    let timeout = Duration::from_millis(config.startup_delay_ms);
+
+    for udp_cfg in &config.udp {
+        if channels.contains_key(&udp_cfg.name) {
+            anyhow::bail!(
+                "duplicate UDP listener name `{}` in proxy.udp",
+                udp_cfg.name
+            );
+        }
+
+        // Build the listener config up front so a bad address fails before we
+        // spawn the worker thread.
+        let listener_config =
+            ListenerBuilder::new_udp(SocketAddress::new_v4(0, 0, 0, 0, udp_cfg.listen))
+                .to_udp(None)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Could not create UDP listener `{}` on :{}: {}",
+                        udp_cfg.name,
+                        udp_cfg.listen,
+                        e
+                    )
+                })?;
+
+        let (mut command, proxy_chan) = Channel::generate(1000, 10000).map_err(|e| {
+            anyhow::anyhow!("Could not create UDP channel for `{}`: {}", udp_cfg.name, e)
+        })?;
+
+        let listener_name = udp_cfg.name.clone();
+        let listener_port = udp_cfg.listen;
+        // Unlike TCP/HTTP/HTTPS, `start_udp_worker` takes no listener to
+        // pre-activate (Sōzu builds the `UdpProxy` internally). The bare worker
+        // starts here; we install the listener over the channel below.
+        let handle = thread::spawn(move || {
+            if let Err(e) = worker::start_udp_worker(proxy_chan, max_buffers, buffer_size) {
+                error!("UDP worker `{}` failed: {}", listener_name, e);
+            }
+        });
+
+        wait_for_worker_ready(&mut command, &format!("UDP[{}]", udp_cfg.name), timeout)?;
+
+        // Register then bind the listener (AddUdpListener records it, the socket
+        // is bound by ActivateListener), the same two-step Sōzu uses natively.
+        let address = SocketAddress::new_v4(0, 0, 0, 0, listener_port);
+        send_to_worker(
+            &mut command,
+            format!("add-udp-listener-{}", udp_cfg.name),
+            RequestType::AddUdpListener(listener_config),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to add UDP listener `{}`: {}", udp_cfg.name, e))?;
+        send_to_worker(
+            &mut command,
+            format!("activate-udp-listener-{}", udp_cfg.name),
+            RequestType::ActivateListener(ActivateListener {
+                address,
+                proxy: ListenerType::Udp.into(),
+                from_scm: false,
+            }),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to activate UDP listener `{}`: {}", udp_cfg.name, e)
+        })?;
+
+        info!(
+            "Sōzu UDP worker `{}` running on 0.0.0.0:{}",
+            udp_cfg.name, listener_port
+        );
+
+        channels.insert(
+            udp_cfg.name.clone(),
+            L4ListenerChannel {
                 port: listener_port,
                 channel: command,
             },
@@ -235,6 +329,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
 
     // Spawn one Sōzu TCP worker per declared listener.
     let (tcp_channels, tcp_worker_handles) = spawn_tcp_workers(config)?;
+    let (udp_channels, udp_worker_handles) = spawn_udp_workers(config)?;
 
     // Initial configuration will be handled by provider reload signals
     info!("Waiting for providers to populate configuration");
@@ -271,6 +366,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         http: command_channel,
         https: command_channel_https,
         tcp: tcp_channels,
+        udp: udp_channels,
         http_port,
         https_port,
         acme_challenge_port,
@@ -453,6 +549,12 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     for handle in tcp_worker_handles {
         if let Err(e) = handle.join() {
             error!("TCP worker thread panicked: {:?}", e);
+        }
+    }
+
+    for handle in udp_worker_handles {
+        if let Err(e) = handle.join() {
+            error!("UDP worker thread panicked: {:?}", e);
         }
     }
 
@@ -639,10 +741,7 @@ fn configure_sozu_routing(
                 configure_tcp_entrypoint(&mut channels.tcp, cluster_id, entrypoint);
             }
             Protocol::Udp => {
-                debug!(
-                    "UDP protocol not yet implemented for entrypoint: {}",
-                    entrypoint.name
-                );
+                configure_udp_entrypoint(&mut channels.udp, cluster_id, entrypoint);
             }
         }
 
@@ -915,7 +1014,7 @@ fn configure_http_entrypoint(
 }
 
 fn configure_tcp_entrypoint(
-    tcp_channels: &mut TcpChannels,
+    tcp_channels: &mut L4Channels,
     cluster_id: &str,
     entrypoint: &Entrypoint,
 ) {
@@ -991,7 +1090,7 @@ fn configure_tcp_entrypoint(
         );
     }
 
-    for (idx, backend_entry) in entrypoint.backends.iter().enumerate() {
+    for backend_entry in &entrypoint.backends {
         let address = match parse_backend_address(backend_entry) {
             Ok(addr) => addr,
             Err(e) => {
@@ -1003,9 +1102,10 @@ fn configure_tcp_entrypoint(
             }
         };
         let weight = backend_entry.weight as i32;
+        let backend_id = l4_backend_id(cluster_id, backend_entry);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: format!("{}-backend-{}", cluster_id, idx),
+            backend_id: backend_id.clone(),
             address,
             load_balancing_parameters: Some(LoadBalancingParams { weight }),
             sticky_id: None,
@@ -1013,11 +1113,175 @@ fn configure_tcp_entrypoint(
         };
         if let Err(e) = send_to_worker(
             channel,
-            format!("add-backend-tcp-{}-{}", cluster_id, idx),
+            format!("add-backend-tcp-{backend_id}"),
             RequestType::AddBackend(backend),
         ) {
-            debug!("Failed to add TCP backend {}-{}: {}", cluster_id, idx, e);
+            debug!("Failed to add TCP backend {backend_id} (may already exist): {e}");
         }
+    }
+}
+
+fn configure_udp_entrypoint(
+    udp_channels: &mut L4Channels,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+) {
+    debug!(
+        "Configuring UDP cluster `{}` (backends: {:?})",
+        entrypoint.name, entrypoint.backends
+    );
+    let listener_name = match entrypoint.config.entrypoint.as_deref() {
+        Some(name) => name,
+        None => {
+            error!(
+                "UDP entrypoint `{}` has no listener reference, skipping",
+                entrypoint.name
+            );
+            return;
+        }
+    };
+
+    let listener = match udp_channels.get_mut(listener_name) {
+        Some(c) => c,
+        None => {
+            error!(
+                "UDP entrypoint `{}` references undeclared listener `{}`, skipping. \
+                 Declare it under `proxy.udp` in the config.",
+                entrypoint.name, listener_name
+            );
+            return;
+        }
+    };
+    let listener_port = listener.port;
+    let channel = &mut listener.channel;
+
+    // A `udp` block is required for Sōzu to treat this as a UDP cluster; we use
+    // its defaults (source-IP flow affinity). HRW/Maglev, set via
+    // `load_balancing`, are the flow-affine algorithms that key on that affinity.
+    let cluster = Cluster {
+        cluster_id: cluster_id.to_string(),
+        sticky_session: false,
+        https_redirect: false,
+        proxy_protocol: None,
+        load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
+        load_metric: None,
+        answer_503: None,
+        http2: None,
+        authorized_hashes: Vec::new(),
+        https_redirect_port: None,
+        www_authenticate: None,
+        udp: Some(UdpClusterConfig::default()),
+        ..Default::default()
+    };
+
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("add-cluster-udp-{}", cluster_id),
+        RequestType::AddCluster(cluster),
+    ) {
+        debug!(
+            "Failed to add UDP cluster {} on listener {} (may already exist): {}",
+            cluster_id, listener_name, e
+        );
+    }
+
+    let udp_front = RequestUdpFrontend {
+        cluster_id: cluster_id.to_string(),
+        address: SocketAddress::new_v4(0, 0, 0, 0, listener_port),
+        ..Default::default()
+    };
+
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("add-frontend-udp-{}", cluster_id),
+        RequestType::AddUdpFrontend(udp_front),
+    ) {
+        debug!(
+            "Failed to add UDP frontend for cluster {} on listener {}: {}",
+            cluster_id, listener_name, e
+        );
+    }
+
+    for backend_entry in &entrypoint.backends {
+        let address = match parse_backend_address(backend_entry) {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!(
+                    "Invalid UDP backend address {} for {}: {}",
+                    backend_entry, cluster_id, e
+                );
+                continue;
+            }
+        };
+        let weight = backend_entry.weight as i32;
+        let backend_id = l4_backend_id(cluster_id, backend_entry);
+        let backend = AddBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+            load_balancing_parameters: Some(LoadBalancingParams { weight }),
+            sticky_id: None,
+            backup: None,
+        };
+        if let Err(e) = send_to_worker(
+            channel,
+            format!("add-backend-udp-{backend_id}"),
+            RequestType::AddBackend(backend),
+        ) {
+            debug!("Failed to add UDP backend {backend_id} (may already exist): {e}");
+        }
+    }
+}
+
+fn remove_udp_entrypoint(udp_channels: &mut L4Channels, cluster_id: &str, entrypoint: &Entrypoint) {
+    let Some(listener_name) = entrypoint.config.entrypoint.as_deref() else {
+        return;
+    };
+    let Some(listener) = udp_channels.get_mut(listener_name) else {
+        return;
+    };
+    let listener_port = listener.port;
+    let channel = &mut listener.channel;
+
+    for backend_entry in &entrypoint.backends {
+        let address = match parse_backend_address(backend_entry) {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        let backend_id = l4_backend_id(cluster_id, backend_entry);
+        let remove = RemoveBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+        };
+        if let Err(e) = send_to_worker(
+            channel,
+            format!("rm-backend-udp-{backend_id}"),
+            RequestType::RemoveBackend(remove),
+        ) {
+            debug!("Failed to remove UDP backend {backend_id}: {e}");
+        }
+    }
+
+    let udp_front = RequestUdpFrontend {
+        cluster_id: cluster_id.to_string(),
+        address: SocketAddress::new_v4(0, 0, 0, 0, listener_port),
+        ..Default::default()
+    };
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("rm-frontend-udp-{}", cluster_id),
+        RequestType::RemoveUdpFrontend(udp_front),
+    ) {
+        debug!("Failed to remove UDP frontend for {}: {}", cluster_id, e);
+    }
+
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("rm-cluster-udp-{}", cluster_id),
+        RequestType::RemoveCluster(cluster_id.to_string()),
+    ) {
+        debug!("Failed to remove UDP cluster {}: {}", cluster_id, e);
     }
 }
 
@@ -1400,10 +1664,14 @@ fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
 ///   never registered in Sōzu, so an in-place backend diff would inject real
 ///   addresses that bypass the middleware. Those changes take the regular
 ///   remove-then-readd path, which rebuilds the synthetic backend correctly.
+///
+/// Applies to every protocol: HTTP, TCP, and UDP all register real backend
+/// addresses directly, so a rescale can diff them in place. For UDP this also
+/// avoids tearing down the datagram frontend mid-reload (which would drop
+/// in-flight flows). Middleware only exists on HTTP, so the check is a no-op for
+/// L4 but kept uniform.
 fn is_backends_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
-    old.protocol == Protocol::Http
-        && frontend_unchanged(old, new)
-        && !middleware::needs_middleware(&new.config)
+    frontend_unchanged(old, new) && !middleware::needs_middleware(&new.config)
 }
 
 /// Diff the backend sets of a cluster whose frontend is unchanged, **adding new
@@ -1461,24 +1729,103 @@ fn diff_backends_in_place(
 ) {
     let (added, removed) = backend_diff(old, new);
 
-    if !added.is_empty() {
-        add_backends(
-            &mut channels.http,
-            &mut channels.https,
-            cluster_id,
-            new,
-            &added,
-        );
+    match new.protocol {
+        Protocol::Http => {
+            if !added.is_empty() {
+                add_backends(
+                    &mut channels.http,
+                    &mut channels.https,
+                    cluster_id,
+                    new,
+                    &added,
+                );
+            }
+            if !removed.is_empty() {
+                remove_backend_set(
+                    &mut channels.http,
+                    &mut channels.https,
+                    cluster_id,
+                    &removed,
+                    new.config.tls,
+                );
+            }
+        }
+        Protocol::Tcp => {
+            l4_diff_backends_in_place(&mut channels.tcp, "tcp", cluster_id, new, &added, &removed)
+        }
+        Protocol::Udp => {
+            l4_diff_backends_in_place(&mut channels.udp, "udp", cluster_id, new, &added, &removed)
+        }
+    }
+}
+
+/// Apply an in-place backend diff to a single L4 (TCP or UDP) listener channel:
+/// add new backends before removing departed ones so the cluster never dips
+/// below live capacity, leaving the frontend untouched. Backend ids are
+/// address-derived (see [`l4_backend_id`]) so add and remove agree regardless of
+/// position in the backend list.
+fn l4_diff_backends_in_place(
+    channels: &mut L4Channels,
+    proto: &str,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+    added: &[&Backend],
+    removed: &[&Backend],
+) {
+    let Some(listener_name) = entrypoint.config.entrypoint.as_deref() else {
+        return;
+    };
+    let Some(listener) = channels.get_mut(listener_name) else {
+        return;
+    };
+    let channel = &mut listener.channel;
+
+    for backend_entry in added {
+        let address = match parse_backend_address(backend_entry) {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!("Failed to parse {proto} backend address {backend_entry} for add: {e}");
+                continue;
+            }
+        };
+        let backend_id = l4_backend_id(cluster_id, backend_entry);
+        let add = AddBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+            load_balancing_parameters: Some(LoadBalancingParams {
+                weight: backend_entry.weight as i32,
+            }),
+            sticky_id: None,
+            backup: None,
+        };
+        if let Err(e) = send_to_worker(
+            channel,
+            format!("add-backend-{proto}-{backend_id}"),
+            RequestType::AddBackend(add),
+        ) {
+            debug!("Failed to add {proto} backend {backend_id} (may already exist): {e}");
+        }
     }
 
-    if !removed.is_empty() {
-        remove_backend_set(
-            &mut channels.http,
-            &mut channels.https,
-            cluster_id,
-            &removed,
-            new.config.tls,
-        );
+    for backend_entry in removed {
+        let address = match parse_backend_address(backend_entry) {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        let backend_id = l4_backend_id(cluster_id, backend_entry);
+        let remove = RemoveBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: backend_id.clone(),
+            address,
+        };
+        if let Err(e) = send_to_worker(
+            channel,
+            format!("rm-backend-{proto}-{backend_id}"),
+            RequestType::RemoveBackend(remove),
+        ) {
+            debug!("Failed to remove {proto} backend {backend_id}: {e}");
+        }
     }
 }
 
@@ -1515,7 +1862,9 @@ fn apply_routing_diff(
                 Protocol::Tcp => {
                     remove_tcp_entrypoint(&mut channels.tcp, cluster_id, old);
                 }
-                Protocol::Udp => {}
+                Protocol::Udp => {
+                    remove_udp_entrypoint(&mut channels.udp, cluster_id, old);
+                }
             }
         }
     }
@@ -1564,17 +1913,15 @@ fn apply_routing_diff(
                 Protocol::Tcp => {
                     remove_tcp_entrypoint(&mut channels.tcp, cluster_id, old);
                 }
-                Protocol::Udp => {}
+                Protocol::Udp => {
+                    remove_udp_entrypoint(&mut channels.udp, cluster_id, old);
+                }
             }
         }
     }
 }
 
-fn remove_tcp_entrypoint(
-    tcp_channels: &mut TcpChannels,
-    cluster_id: &str,
-    entrypoint: &Entrypoint,
-) {
+fn remove_tcp_entrypoint(tcp_channels: &mut L4Channels, cluster_id: &str, entrypoint: &Entrypoint) {
     let Some(listener_name) = entrypoint.config.entrypoint.as_deref() else {
         return;
     };
@@ -1584,22 +1931,23 @@ fn remove_tcp_entrypoint(
     let listener_port = listener.port;
     let channel = &mut listener.channel;
 
-    for (idx, backend_entry) in entrypoint.backends.iter().enumerate() {
+    for backend_entry in &entrypoint.backends {
         let address = match parse_backend_address(backend_entry) {
             Ok(addr) => addr,
             Err(_) => continue,
         };
+        let backend_id = l4_backend_id(cluster_id, backend_entry);
         let remove = RemoveBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: format!("{}-backend-{}", cluster_id, idx),
+            backend_id: backend_id.clone(),
             address,
         };
         if let Err(e) = send_to_worker(
             channel,
-            format!("rm-backend-tcp-{}-{}", cluster_id, idx),
+            format!("rm-backend-tcp-{backend_id}"),
             RequestType::RemoveBackend(remove),
         ) {
-            debug!("Failed to remove TCP backend {}-{}: {}", cluster_id, idx, e);
+            debug!("Failed to remove TCP backend {backend_id}: {e}");
         }
     }
 
@@ -1920,5 +2268,18 @@ mod tests {
             !is_backends_only_change(&old, &new),
             "middleware-routed entrypoints must not use the in-place backend diff"
         );
+    }
+
+    #[test]
+    fn lb_algorithm_maps_every_variant() {
+        // Each Sōzune LoadBalancer maps to its Sōzu counterpart. HRW and Maglev
+        // are the flow-affine algorithms added for UDP.
+        use LoadBalancingAlgorithms as S;
+        assert_eq!(lb_algorithm(LoadBalancer::RoundRobin), S::RoundRobin);
+        assert_eq!(lb_algorithm(LoadBalancer::Random), S::Random);
+        assert_eq!(lb_algorithm(LoadBalancer::PowerOfTwo), S::PowerOfTwo);
+        assert_eq!(lb_algorithm(LoadBalancer::LeastConnections), S::LeastLoaded);
+        assert_eq!(lb_algorithm(LoadBalancer::Hrw), S::Hrw);
+        assert_eq!(lb_algorithm(LoadBalancer::Maglev), S::Maglev);
     }
 }

@@ -23,7 +23,12 @@ pub enum DiagnosticCode {
     #[allow(dead_code)]
     E003InspectFailed,
     E004NoServices,
-    E005MissingTcpEntrypoint,
+    /// Missing `entrypoint` reference on an L4 (TCP or UDP) service.
+    E005MissingL4Entrypoint,
+    /// Missing `port` on a UDP service. Unlike TCP/HTTP there is no sensible
+    /// default for a datagram protocol, so the route is dropped rather than
+    /// silently bound to the HTTP fallback port.
+    E006MissingUdpPort,
     // Warnings — silent fallbacks today
     W001InvalidPort,
     W002InvalidPriority,
@@ -62,7 +67,8 @@ impl DiagnosticCode {
             DiagnosticCode::E002MissingHost => "E002",
             DiagnosticCode::E003InspectFailed => "E003",
             DiagnosticCode::E004NoServices => "E004",
-            DiagnosticCode::E005MissingTcpEntrypoint => "E005",
+            DiagnosticCode::E005MissingL4Entrypoint => "E005",
+            DiagnosticCode::E006MissingUdpPort => "E006",
             DiagnosticCode::W001InvalidPort => "W001",
             DiagnosticCode::W002InvalidPriority => "W002",
             DiagnosticCode::W003InvalidTimeout => "W003",

@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::model::{Entrypoint, HealthCheckConfig};
+use crate::model::{Entrypoint, HealthCheckConfig, Protocol};
 
 /// Map of backend `host:port` keys to the reason they were marked down. Shared
 /// between [`HealthChecker`] and the API layer so `GET /entrypoints` can return
@@ -209,6 +209,12 @@ impl HealthChecker {
 
         let mut backends: HashMap<String, BackendProbe> = HashMap::new();
         for entrypoint in storage.values() {
+            // UDP backends are connectionless — a TCP/HTTP probe always fails
+            // (ConnectionRefused) and would wrongly mark them down. Sōzu has its
+            // own UDP health checks; leave UDP out of this checker.
+            if entrypoint.protocol == Protocol::Udp {
+                continue;
+            }
             for backend in &entrypoint.backends {
                 let key = backend.to_string();
                 let entry = backends.entry(key.clone()).or_insert_with(|| BackendProbe {

@@ -15,6 +15,7 @@ API_PORT=18888
 MIDDLEWARE_PORT=13037
 TCP_ECHO_PORT=15555
 TCP_RR_PORT=15556
+UDP_ECHO_PORT=15557
 API_USER="admin"
 API_PASSWORD="test-secret-token"
 API_PASSWORD_HASH=$(printf '%s' "$API_PASSWORD" | sha256sum | cut -d' ' -f1)
@@ -107,6 +108,13 @@ wait_for_tcp_open() {
         i=$((i + 1))
     done
     return 1
+}
+
+# Send a UDP datagram and capture the reply. `nc -u -w 2` waits up to 2s for the
+# backend's echo to come back through Sōzune's UDP flow before closing.
+udp_send() {
+    local host="$1" port="$2" payload="$3"
+    printf '%s' "$payload" | timeout 5 nc -u -w 2 "$host" "$port" 2>/dev/null || true
 }
 
 wait_for_not_404() {
