@@ -200,11 +200,7 @@ pub fn start_tcp_worker(
 /// three, this worker takes **no listener config to pre-activate**: it starts a
 /// bare UDP-capable `Server` and the listener is installed later, the same way
 /// Sōzu does natively, by sending `AddUdpListener` + `ActivateListener` over the
-/// `channel` (wired from the reload path). Blocks on the event loop until stop.
-// Not wired yet: the UDP reload path (`configure_udp_entrypoint`, spawning the
-// worker from `proxy.udp[]`) lands in a follow-up. Kept here because shipping the
-// launcher is the point of this change — it unblocks that follow-up.
-#[allow(dead_code)]
+/// `channel` (wired from `spawn_udp_workers`). Blocks on the event loop until stop.
 pub fn start_udp_worker(
     channel: ProxyChannel,
     max_buffers: usize,

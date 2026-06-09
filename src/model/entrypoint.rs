@@ -205,6 +205,12 @@ pub enum LoadBalancer {
     PowerOfTwo,
     /// Send to the backend with the fewest active connections.
     LeastConnections,
+    /// Highest-Random-Weight (rendezvous) hashing on the flow key. Flow-affine
+    /// and stable under backend churn — the recommended choice for UDP.
+    Hrw,
+    /// Maglev consistent hashing: an O(1) lookup table, flow-affine, suited to
+    /// large backend sets.
+    Maglev,
 }
 
 /// Active HTTP health-check parameters for an entrypoint's backends.

@@ -8,7 +8,7 @@ use crate::labels::fields::{
     path, plugins, ratelimit, redirect, request_match,
 };
 use crate::labels::network;
-use crate::model::{Backend, Entrypoint, EntrypointConfig, LoadBalancer, Protocol};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
@@ -142,8 +142,26 @@ fn build_entrypoint(
     backend_ip: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Entrypoint> {
+    // TCP and UDP are L4: no hostname, just a named listener + backends.
     if protocol == "tcp" {
-        return build_tcp_entrypoint(labels, service_name, backend_ip, diagnostics);
+        return build_l4_entrypoint(
+            labels,
+            "tcp",
+            Protocol::Tcp,
+            service_name,
+            backend_ip,
+            diagnostics,
+        );
+    }
+    if protocol == "udp" {
+        return build_l4_entrypoint(
+            labels,
+            "udp",
+            Protocol::Udp,
+            service_name,
+            backend_ip,
+            diagnostics,
+        );
     }
 
     let prefix = format!("sozune.{protocol}.{service_name}.");
@@ -173,7 +191,8 @@ fn build_entrypoint(
     let priority = core::parse_priority(labels, &prefix, diagnostics);
     let backend_timeout = core::parse_backend_timeout(labels, &prefix, diagnostics);
     let health_check = core::parse_health_check(labels, &prefix, diagnostics);
-    let load_balancer = core::parse_load_balancer(labels, &prefix, diagnostics);
+    // HTTP has no flow key, so hrw/maglev are not honored here (W022).
+    let load_balancer = core::parse_load_balancer(labels, &prefix, false, diagnostics);
     let retry = core::parse_retry(labels, &prefix, diagnostics);
     let circuit_breaker = core::parse_circuit_breaker(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
@@ -246,13 +265,19 @@ fn build_entrypoint(
     })
 }
 
-fn build_tcp_entrypoint(
+/// Build an L4 (TCP or UDP) entrypoint from labels. Both protocols share the
+/// same shape — a named listener reference plus backends, no hostname/path — so
+/// they go through one builder parameterized by `proto` (the label segment,
+/// `"tcp"` / `"udp"`) and `protocol` (the model enum).
+fn build_l4_entrypoint(
     labels: &HashMap<String, String>,
+    proto: &str,
+    protocol: Protocol,
     service_name: &str,
     backend_ip: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Entrypoint> {
-    let prefix = format!("sozune.tcp.{service_name}.");
+    let prefix = format!("sozune.{proto}.{service_name}.");
     let entrypoint_key = format!("{prefix}entrypoint");
 
     let entrypoint_ref = match labels.get(&entrypoint_key) {
@@ -260,26 +285,48 @@ fn build_tcp_entrypoint(
         _ => {
             diagnostics.push(
                 Diagnostic::new(
-                    DiagnosticCode::E005MissingTcpEntrypoint,
-                    "TCP service requires an entrypoint reference",
+                    DiagnosticCode::E005MissingL4Entrypoint,
+                    format!("{} service requires an entrypoint reference", proto.to_uppercase()),
                 )
                 .with_label(&entrypoint_key)
-                .with_hint(
-                    "set `sozune.tcp.<name>.entrypoint=<listener-name>` matching a listener declared in `proxy.tcp`",
-                ),
+                .with_hint(format!(
+                    "set `sozune.{proto}.<name>.entrypoint=<listener-name>` matching a listener declared in `proxy.{proto}`",
+                )),
             );
             return None;
         }
     };
 
-    let port = core::parse_port(labels, &prefix, "tcp", diagnostics);
+    // UDP is a datagram protocol with no sensible default port (the HTTP 8080
+    // fallback is meaningless for DNS/syslog/NTP/…), so require it explicitly and
+    // drop the route when absent rather than binding the backend to a dead port.
+    if proto == "udp" {
+        let port_key = format!("{prefix}port");
+        if !labels.contains_key(&port_key) {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::E006MissingUdpPort,
+                    "UDP service requires an explicit port",
+                )
+                .with_label(&port_key)
+                .with_hint(format!(
+                    "set `sozune.udp.{service_name}.port=<backend-port>` (no default applies to datagram services)",
+                )),
+            );
+            return None;
+        }
+    }
+
+    let port = core::parse_port(labels, &prefix, proto, diagnostics);
     let priority = core::parse_priority(labels, &prefix, diagnostics);
+    // Flow-affine algorithms (hrw/maglev) are only honored for UDP.
+    let load_balancer = core::parse_load_balancer(labels, &prefix, proto == "udp", diagnostics);
 
     Some(Entrypoint {
-        id: format!("tcp_{service_name}"),
+        id: format!("{proto}_{service_name}"),
         backends: vec![Backend::new(backend_ip, port)],
         name: service_name.to_string(),
-        protocol: Protocol::Tcp,
+        protocol,
         config: EntrypointConfig {
             hostnames: Vec::new(),
             path: None,
@@ -302,7 +349,7 @@ fn build_tcp_entrypoint(
             headers: Vec::new(),
             backend_timeout: None,
             health_check: None,
-            load_balancer: LoadBalancer::default(),
+            load_balancer,
             retry: None,
             circuit_breaker: None,
             rate_limit: None,
@@ -517,7 +564,72 @@ mod tests {
         );
         let r = parse(&c);
         assert!(r.entrypoints.is_empty());
-        assert!(has_code(&r, DiagnosticCode::E005MissingTcpEntrypoint));
+        assert!(has_code(&r, DiagnosticCode::E005MissingL4Entrypoint));
+    }
+
+    #[test]
+    fn udp_service_needs_no_host_and_routes_as_l4() {
+        // A UDP service is L4 like TCP: no `host` label required (no E002), just
+        // a listener reference and a port.
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.udp.dns.entrypoint", "dnslistener"),
+                ("sozune.udp.dns.port", "53"),
+            ],
+            vec![net("bridge", "10.0.0.7")],
+        );
+        let r = parse(&c);
+        let udp = r.entrypoints.get("udp_dns").unwrap();
+        assert!(matches!(udp.protocol, Protocol::Udp));
+        assert_eq!(udp.config.entrypoint.as_deref(), Some("dnslistener"));
+        assert_eq!(udp.backends[0].port, 53);
+        assert!(udp.config.hostnames.is_empty());
+        assert!(!has_code(&r, DiagnosticCode::E002MissingHost));
+    }
+
+    #[test]
+    fn udp_without_entrypoint_label_is_dropped_with_e005() {
+        let c = candidate(
+            &[("sozune.enable", "true"), ("sozune.udp.dns.port", "53")],
+            vec![net("bridge", "10.0.0.7")],
+        );
+        let r = parse(&c);
+        assert!(r.entrypoints.is_empty());
+        assert!(has_code(&r, DiagnosticCode::E005MissingL4Entrypoint));
+    }
+
+    #[test]
+    fn udp_without_port_label_is_dropped_with_e006() {
+        // Unlike TCP, a UDP service has no sensible default port, so a missing
+        // `port` label drops the route (E006) instead of binding to 8080.
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.udp.dns.entrypoint", "dnslistener"),
+            ],
+            vec![net("bridge", "10.0.0.7")],
+        );
+        let r = parse(&c);
+        assert!(r.entrypoints.is_empty());
+        assert!(has_code(&r, DiagnosticCode::E006MissingUdpPort));
+    }
+
+    #[test]
+    fn tcp_without_port_label_still_defaults() {
+        // TCP keeps its existing 8080 fallback — only UDP requires an explicit
+        // port. A TCP service with just an entrypoint reference still routes.
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.tcp.db.entrypoint", "dblistener"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let tcp = r.entrypoints.get("tcp_db").unwrap();
+        assert_eq!(tcp.backends[0].port, 8080);
+        assert!(!has_code(&r, DiagnosticCode::E006MissingUdpPort));
     }
 
     #[test]

@@ -188,12 +188,21 @@ pub fn parse_health_check(
 
 /// Parse the `<prefix>loadBalancer` label into a [`LoadBalancer`]. Accepts
 /// `round_robin`/`roundrobin`, `random`, `power_of_two`/`poweroftwo`,
-/// `least_connections`/`leastconn`/`leastconnections` (case-insensitive,
-/// hyphens/underscores ignored). Absent → default (round-robin). An
-/// unrecognised value emits `W022` and falls back to round-robin.
+/// `least_connections`/`leastconn`/`leastconnections`, and the flow-affine
+/// `hrw`/`rendezvous` and `maglev` (case-insensitive, hyphens/underscores
+/// ignored). Absent → default (round-robin). An unrecognised value emits `W022`
+/// and falls back to round-robin.
+///
+/// `flow_affine_supported` is true only for UDP. The flow-affine algorithms
+/// (`hrw`/`maglev`) key on a flow identity Sōzu only computes for UDP; on
+/// HTTP/TCP it has no flow key and silently round-robins. So when those algos
+/// are requested on a protocol that can't honor them, we emit `W022` and fall
+/// back to round-robin explicitly rather than letting the request degrade
+/// silently.
 pub fn parse_load_balancer(
     labels: &HashMap<String, String>,
     prefix: &str,
+    flow_affine_supported: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> LoadBalancer {
     let key = format!("{prefix}loadBalancer");
@@ -213,6 +222,20 @@ pub fn parse_load_balancer(
         "leastconnections" | "leastconn" | "leastconnection" | "leastloaded" => {
             LoadBalancer::LeastConnections
         }
+        "hrw" | "rendezvous" | "maglev" if !flow_affine_supported => {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W022InvalidLoadBalancer,
+                    "flow-affine loadBalancer (hrw/maglev) is only honored for UDP; falling back to round_robin",
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint("use hrw/maglev on a `sozune.udp.*` service, or pick round_robin/random/power_of_two/least_connections here"),
+            );
+            LoadBalancer::default()
+        }
+        "hrw" | "rendezvous" => LoadBalancer::Hrw,
+        "maglev" => LoadBalancer::Maglev,
         _ => {
             diagnostics.push(
                 Diagnostic::new(
@@ -221,7 +244,9 @@ pub fn parse_load_balancer(
                 )
                 .with_label(&key)
                 .with_value(raw)
-                .with_hint("one of: round_robin, random, power_of_two, least_connections"),
+                .with_hint(
+                    "one of: round_robin, random, power_of_two, least_connections, hrw, maglev",
+                ),
             );
             LoadBalancer::default()
         }
@@ -598,7 +623,7 @@ mod tests {
     fn load_balancer_absent_defaults_to_round_robin() {
         let mut d = Vec::new();
         assert_eq!(
-            parse_load_balancer(&labels(&[]), "sozune.http.web.", &mut d),
+            parse_load_balancer(&labels(&[]), "sozune.http.web.", false, &mut d),
             LoadBalancer::RoundRobin
         );
         assert!(d.is_empty());
@@ -620,21 +645,27 @@ mod tests {
 
     #[test]
     fn load_balancer_parses_known_algorithms() {
+        // flow_affine_supported=true (UDP) so hrw/maglev parse without warning.
         let cases = [
             ("round_robin", LoadBalancer::RoundRobin),
             ("random", LoadBalancer::Random),
             ("power_of_two", LoadBalancer::PowerOfTwo),
             ("least_connections", LoadBalancer::LeastConnections),
+            ("hrw", LoadBalancer::Hrw),
+            ("maglev", LoadBalancer::Maglev),
             // Aliases / casing / separators.
             ("leastconn", LoadBalancer::LeastConnections),
             ("Least-Connections", LoadBalancer::LeastConnections),
             ("POWEROFTWO", LoadBalancer::PowerOfTwo),
+            ("rendezvous", LoadBalancer::Hrw),
+            ("MAGLEV", LoadBalancer::Maglev),
         ];
         for (raw, want) in cases {
             let mut d = Vec::new();
             let got = parse_load_balancer(
-                &labels(&[("sozune.http.web.loadBalancer", raw)]),
-                "sozune.http.web.",
+                &labels(&[("sozune.udp.dns.loadBalancer", raw)]),
+                "sozune.udp.dns.",
+                true,
                 &mut d,
             );
             assert_eq!(got, want, "input {raw}");
@@ -648,10 +679,32 @@ mod tests {
         let got = parse_load_balancer(
             &labels(&[("sozune.http.web.loadBalancer", "magic")]),
             "sozune.http.web.",
+            false,
             &mut d,
         );
         assert_eq!(got, LoadBalancer::RoundRobin);
         assert_eq!(d[0].code, DiagnosticCode::W022InvalidLoadBalancer);
+    }
+
+    #[test]
+    fn flow_affine_algorithms_warn_and_default_when_unsupported() {
+        // hrw/maglev on a non-UDP (no flow key) protocol must not silently
+        // degrade to round-robin: W022 is emitted and the result is round-robin.
+        for raw in ["hrw", "rendezvous", "maglev"] {
+            let mut d = Vec::new();
+            let got = parse_load_balancer(
+                &labels(&[("sozune.http.web.loadBalancer", raw)]),
+                "sozune.http.web.",
+                false,
+                &mut d,
+            );
+            assert_eq!(got, LoadBalancer::RoundRobin, "input {raw}");
+            assert_eq!(
+                d[0].code,
+                DiagnosticCode::W022InvalidLoadBalancer,
+                "input {raw} should warn"
+            );
+        }
     }
 
     #[test]

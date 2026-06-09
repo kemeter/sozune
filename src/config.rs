@@ -440,6 +440,8 @@ pub struct ProxyConfig {
     pub https: HttpsConfig,
     #[serde(default)]
     pub tcp: Vec<TcpListenerConfig>,
+    #[serde(default)]
+    pub udp: Vec<UdpListenerConfig>,
     #[serde(
         default = "default_max_buffers",
         deserialize_with = "deserialize_max_buffers_with_env"
@@ -516,6 +518,15 @@ pub struct HttpsConfig {
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct TcpListenerConfig {
+    pub name: String,
+    pub listen: u16,
+}
+
+/// A static UDP listener. Like `TcpListenerConfig`, it is referenced by name
+/// from a `udp` entrypoint's `entrypoint` field; one Sōzu worker binds one
+/// listener. Datagram services (DNS, syslog, NTP, …) attach as backends.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct UdpListenerConfig {
     pub name: String,
     pub listen: u16,
 }
@@ -707,6 +718,7 @@ impl Default for ProxyConfig {
             http: Default::default(),
             https: Default::default(),
             tcp: Vec::new(),
+            udp: Vec::new(),
             max_buffers: default_max_buffers(),
             buffer_size: default_buffer_size(),
             startup_delay_ms: default_startup_delay_ms(),
@@ -1813,6 +1825,41 @@ reload_debounce_ms: 750
         assert_eq!(config.startup_delay_ms, 2000);
         assert_eq!(config.cluster_setup_delay_ms, 1000);
         assert_eq!(config.reload_debounce_ms, 750);
+    }
+
+    #[test]
+    fn test_udp_listeners_deserialization() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+udp:
+  - name: dns
+    listen: 53
+  - name: syslog
+    listen: 514
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.udp.len(), 2);
+        assert_eq!(config.udp[0].name, "dns");
+        assert_eq!(config.udp[0].listen, 53);
+        assert_eq!(config.udp[1].name, "syslog");
+        assert_eq!(config.udp[1].listen, 514);
+    }
+
+    #[test]
+    fn test_udp_defaults_to_empty() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.udp.is_empty());
     }
 
     #[test]
