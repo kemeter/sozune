@@ -14,8 +14,10 @@ SERIES='sozune_middleware_requests_total{class="4xx"}'
 
 # Value of the 4xx counter (0 if the line is absent).
 count_4xx() {
-    curl -s --max-time 2 "$METRICS_URL" 2>/dev/null \
-        | grep -F "$SERIES" | awk '{print $2}' | head -1
+    # `|| true`: a missing series makes `grep` exit non-zero under
+    # `set -euo pipefail`, which would abort the runner via the substitution.
+    { curl -s --max-time 2 "$METRICS_URL" 2>/dev/null \
+        | grep -F "$SERIES" | awk '{print $2}' | head -1; } || true
 }
 
 log "[20] Error rate: status-class counters are exposed"

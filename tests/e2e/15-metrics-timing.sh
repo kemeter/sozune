@@ -19,8 +19,11 @@ HIST="sozune_middleware_request_duration_seconds"
 # Helper: value of a single metric line by exact name.
 metric_value() {
     local name="$1"
-    curl -s --max-time 2 "$METRICS_URL" 2>/dev/null \
-        | grep -E "^${name} " | awk '{print $2}' | head -1
+    # `|| true`: under `set -euo pipefail`, a missing metric makes `grep` exit
+    # non-zero (and `head` closing the pipe early can SIGPIPE `awk`), which would
+    # otherwise abort the whole runner mid-suite via the command substitution.
+    { curl -s --max-time 2 "$METRICS_URL" 2>/dev/null \
+        | grep -E "^${name} " | awk '{print $2}' | head -1; } || true
 }
 
 log "[15] Timing metrics: histogram series are present"
@@ -65,9 +68,9 @@ fi
 
 log "[15] Timing metrics: +Inf bucket equals the total count"
 
-inf=$(curl -s --max-time 2 "$METRICS_URL" 2>/dev/null \
+inf=$({ curl -s --max-time 2 "$METRICS_URL" 2>/dev/null \
     | grep -E "${HIST}_bucket\{le=\"\+Inf\"\}" \
-    | awk '{print $2}' | head -1)
+    | awk '{print $2}' | head -1; } || true)
 inf=${inf:-0}
 count=$(metric_value "${HIST}_count")
 count=${count:-0}
@@ -79,9 +82,9 @@ fi
 
 log "[15] Timing metrics: JSON view carries the histogram"
 
-json_count=$(curl -s --max-time 2 -H "Accept: application/json" "$METRICS_URL" 2>/dev/null \
+json_count=$({ curl -s --max-time 2 -H "Accept: application/json" "$METRICS_URL" 2>/dev/null \
     | grep -oE '"middleware_request_duration_seconds":\{[^}]*"count":[0-9]+' \
-    | grep -oE '"count":[0-9]+' | grep -oE '[0-9]+' | head -1)
+    | grep -oE '"count":[0-9]+' | grep -oE '[0-9]+' | head -1; } || true)
 if [[ -n "$json_count" ]]; then
     pass "JSON /metrics exposes proxy.middleware_request_duration_seconds.count ($json_count)"
 else
