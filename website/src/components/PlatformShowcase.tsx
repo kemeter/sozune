@@ -13,6 +13,19 @@ interface Platform {
 
 const PLATFORMS: Platform[] = [
   {
+    id: 'ring',
+    label: 'Ring',
+    language: 'yaml',
+    code: `# api.yaml — Ring deployment
+name: api
+image: my-api:latest
+replicas: 3
+labels:
+  sozune.enable: "true"
+  sozune.http.web.host: "api.example.com"
+  sozune.http.web.port: "8080"`,
+  },
+  {
     id: 'docker',
     label: 'Docker',
     language: 'yaml',
