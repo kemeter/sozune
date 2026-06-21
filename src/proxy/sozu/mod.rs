@@ -17,7 +17,7 @@ use builders::{
     build_authorized_hashes, build_frontend_headers, build_path_and_rewrite, map_redirect_policy,
     map_redirect_scheme, methods_for_frontend,
 };
-use channel::{send_to_worker, wait_for_worker_ready};
+use channel::{send_to_worker, wait_for_worker_ready, with_reload_budget};
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
@@ -744,24 +744,39 @@ fn handle_reload(
 
     let current_snapshot = snapshot_from_storage(&storage_read);
 
-    apply_routing_diff(previous_snapshot, &current_snapshot, channels);
+    // Bound the total time this reload can spend blocking on worker acks. Every
+    // send_to_worker below shares this single deadline, so a worker that goes
+    // silent mid-reload can stall the event loop for at most RELOAD_BUDGET, not
+    // PER_COMMAND_TIMEOUT × (number of commands). A healthy reload of hundreds of
+    // entrypoints finishes in well under this; the budget only bites when a
+    // worker is genuinely unresponsive.
+    with_reload_budget(RELOAD_BUDGET, || {
+        apply_routing_diff(previous_snapshot, &current_snapshot, channels);
 
-    // Update middleware route table
-    update_middleware_routes(&storage_read, middleware_state, plugins, trusted_proxies);
+        // Update middleware route table
+        update_middleware_routes(&storage_read, middleware_state, plugins, trusted_proxies);
 
-    match configure_sozu_routing(
-        channels,
-        &storage_read,
-        previous_snapshot,
-        cluster_setup_delay_ms,
-        middleware_port,
-    ) {
-        Ok(()) => info!("Configuration reloaded successfully"),
-        Err(e) => error!("Failed to reload configuration: {}", e),
-    }
+        match configure_sozu_routing(
+            channels,
+            &storage_read,
+            previous_snapshot,
+            cluster_setup_delay_ms,
+            middleware_port,
+        ) {
+            Ok(()) => info!("Configuration reloaded successfully"),
+            Err(e) => error!("Failed to reload configuration: {}", e),
+        }
+    });
 
     current_snapshot
 }
+
+/// Upper bound on the total time a single reload may block the event loop
+/// waiting on worker acks. Generous enough for a large healthy reload (each
+/// command answers in single-digit ms), but it caps the worst case when a worker
+/// goes silent: the loop is frozen for at most this long instead of growing with
+/// the number of commands. See `channel::with_reload_budget`.
+const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 
 /// Rebuild the middleware route table from current storage
 fn update_middleware_routes(
