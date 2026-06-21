@@ -9,61 +9,59 @@ use sozu_command_lib::{
     },
 };
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, error, info};
 
 /// Per-command deadline for a worker ack. Long enough that a healthy worker
-/// (which answers in single-digit ms) is never cut off, short enough that a
-/// single silent worker doesn't dominate the reload budget on its own.
+/// (which answers in single-digit ms) is never cut off.
 const PER_COMMAND_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// How many *consecutive* command timeouts mark a worker as unresponsive. Once
+/// reached, the rest of the reload fails fast instead of each command blocking
+/// for `PER_COMMAND_TIMEOUT`. A worker that keeps acking (even on a large, slow
+/// reload of many entrypoints) never trips this, because every successful ack
+/// resets the counter — only a genuinely silent worker accumulates failures.
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
 thread_local! {
-    /// Deadline for the whole reload currently in flight, set by
-    /// `with_reload_budget`. Every `send_to_worker` on this thread shortens its
-    /// own wait to never run past it. Once the budget is spent, further commands
-    /// fail fast instead of each blocking for `PER_COMMAND_TIMEOUT` — that linear
-    /// accumulation across a reload's ~30 commands is what froze proxying when a
-    /// worker went silent mid-reload (see issues/send-to-worker-blocking-stalls-reload.md).
-    static RELOAD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Number of consecutive `send_to_worker` timeouts within the reload in
+    /// flight. `None` outside a reload (standalone calls are never short-circuited).
+    /// Counts timeouts, not wall-clock: a big healthy reload is unaffected, but a
+    /// silent worker is cut off after `MAX_CONSECUTIVE_TIMEOUTS` instead of
+    /// freezing the event loop for `PER_COMMAND_TIMEOUT × command count`
+    /// (see issues/send-to-worker-blocking-stalls-reload.md).
+    static CONSECUTIVE_TIMEOUTS: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-/// Run `f` under a reload budget: every `send_to_worker` it triggers shares a
-/// single deadline `budget` from now, so the total time the reload can block the
-/// event loop is bounded regardless of how many commands it issues. Restores any
-/// previous deadline on the way out (reloads never nest today, but this keeps the
-/// guard honest and panic-safe).
-pub(super) fn with_reload_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> T {
-    let deadline = Instant::now() + budget;
-    let previous = RELOAD_DEADLINE.replace(Some(deadline));
-    // Restore on unwind too, so a panic mid-reload can't leave a stale deadline
-    // pinned on the thread for the next reload.
-    let _restore = RestoreDeadline(previous);
+/// Run `f` as a reload: `send_to_worker` calls it triggers share a consecutive
+/// -timeout counter, so once a worker is shown unresponsive the remaining
+/// commands fail fast. Restores any previous state on the way out (reloads don't
+/// nest today, but this keeps the guard panic-safe).
+pub(super) fn with_reload_budget<T>(f: impl FnOnce() -> T) -> T {
+    let previous = CONSECUTIVE_TIMEOUTS.replace(Some(0));
+    let _restore = RestoreCounter(previous);
     f()
 }
 
-struct RestoreDeadline(Option<Instant>);
+struct RestoreCounter(Option<u32>);
 
-impl Drop for RestoreDeadline {
+impl Drop for RestoreCounter {
     fn drop(&mut self) {
-        RELOAD_DEADLINE.set(self.0);
+        CONSECUTIVE_TIMEOUTS.set(self.0);
     }
 }
 
-/// Time left in the current reload budget, capped at `PER_COMMAND_TIMEOUT`.
-/// Returns `None` when the budget is already exhausted (caller must fail fast)
-/// and `Some(PER_COMMAND_TIMEOUT)` when no reload budget is active (standalone
-/// calls keep their original behaviour).
-fn command_timeout() -> Option<Duration> {
-    match RELOAD_DEADLINE.get() {
-        None => Some(PER_COMMAND_TIMEOUT),
-        Some(deadline) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                None
-            } else {
-                Some(remaining.min(PER_COMMAND_TIMEOUT))
-            }
-        }
+/// Whether the current reload has already given up on the worker (too many
+/// consecutive timeouts). Always `false` outside a reload.
+fn worker_given_up() -> bool {
+    matches!(CONSECUTIVE_TIMEOUTS.get(), Some(n) if n >= MAX_CONSECUTIVE_TIMEOUTS)
+}
+
+/// Record the outcome of a command so the consecutive-timeout counter tracks the
+/// worker's responsiveness. A success resets it; a timeout increments it.
+fn record_command_outcome(timed_out: bool) {
+    if let Some(n) = CONSECUTIVE_TIMEOUTS.get() {
+        CONSECUTIVE_TIMEOUTS.set(Some(if timed_out { n + 1 } else { 0 }));
     }
 }
 
@@ -113,25 +111,28 @@ pub(super) fn send_to_worker(
     // queued, or never received it — that silent drift caused entrypoint
     // desync against the live worker in the past. Return the actual failure.
     //
-    // The deadline is the lesser of `PER_COMMAND_TIMEOUT` and the time left in
-    // the current reload budget (see `with_reload_budget`). If the budget is
-    // already spent, fail immediately: a previous command in this reload has
-    // already shown the worker unresponsive, so re-waiting the full timeout for
-    // every remaining command is what froze the event loop.
-    let Some(initial) = command_timeout() else {
+    // Within a reload, if the worker has already timed out on
+    // `MAX_CONSECUTIVE_TIMEOUTS` commands in a row it is treated as unresponsive
+    // and the rest of the reload fails fast — re-waiting the full timeout for
+    // every remaining command is what froze the event loop. A reload of many
+    // healthy (if slow) entrypoints is unaffected: each ack resets the counter.
+    if worker_given_up() {
         return Err(anyhow::anyhow!(
-            "Worker did not ack {}; reload budget exhausted (worker unresponsive)",
-            id
+            "Worker did not ack {}; gave up after {} consecutive timeouts (worker unresponsive)",
+            id,
+            MAX_CONSECUTIVE_TIMEOUTS
         ));
-    };
-    let deadline = std::time::Instant::now() + initial;
+    }
+
+    let deadline = std::time::Instant::now() + PER_COMMAND_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            record_command_outcome(true);
             return Err(anyhow::anyhow!(
                 "Worker did not ack {} within {:?}; configuration may be desynced",
                 id,
-                initial
+                PER_COMMAND_TIMEOUT
             ));
         }
         match channel.read_message_blocking_timeout(Some(remaining)) {
@@ -139,12 +140,16 @@ pub(super) fn send_to_worker(
                 if response.id == id {
                     if response.status == ResponseStatus::Failure as i32 {
                         error!("Worker rejected command {}: {}", id, response.message);
+                        // A rejection means the worker answered, so it is
+                        // responsive — reset the timeout streak.
+                        record_command_outcome(false);
                         return Err(anyhow::anyhow!(
                             "Worker rejected {}: {}",
                             id,
                             response.message
                         ));
                     }
+                    record_command_outcome(false);
                     return Ok(());
                 }
                 // Not our response, keep reading
@@ -154,6 +159,12 @@ pub(super) fn send_to_worker(
                 );
             }
             Err(e) => {
+                // The blocking read consumed its timeout (or the channel
+                // errored) without an ack. Either way the worker did not answer,
+                // so count it toward the consecutive-timeout streak: a silent
+                // worker surfaces here as `TimeoutReached`, and this is what lets
+                // the reload give up instead of re-blocking on every command.
+                record_command_outcome(true);
                 return Err(anyhow::anyhow!(
                     "Channel error while waiting for ack of {}: {}",
                     id,
@@ -341,31 +352,30 @@ mod repro_tests {
         );
     }
 
-    /// The fix: under `with_reload_budget`, the same flood of commands to a
-    /// silent worker is bounded by the *single* budget, not N × per-command.
-    /// After the first command spends the budget, the rest fail fast, so the
-    /// total stall stays ~budget regardless of how many commands follow.
+    /// The fix: under `with_reload_budget`, a flood of commands to a silent
+    /// worker is short-circuited after `MAX_CONSECUTIVE_TIMEOUTS` failures, so
+    /// the total stall is bounded by that constant (× PER_COMMAND_TIMEOUT), NOT
+    /// by the number of commands. The remaining commands fail fast.
     #[test]
     fn reload_budget_caps_total_stall_on_a_silent_worker() {
         let (mut command, _proxy) = Channel::<WorkerRequest, WorkerResponse>::generate(1000, 10000)
             .expect("generate channel pair");
 
-        let budget = Duration::from_millis(200);
-        let commands = 30;
-
-        let started = Instant::now();
+        let commands = 50;
         let mut fast_fails = 0;
-        with_reload_budget(budget, || {
+        let started = Instant::now();
+        with_reload_budget(|| {
             for i in 0..commands {
+                let before = Instant::now();
                 let r = send_to_worker(
                     &mut command,
                     format!("probe-{i}"),
                     RequestType::Status(Status {}),
                 );
                 assert!(r.is_err(), "silent worker must never ack");
-                // Once the budget is spent, command_timeout() returns None and
-                // send_to_worker fails immediately.
-                if started.elapsed() > budget {
+                // After the worker is given up on, commands return ~instantly
+                // instead of blocking for PER_COMMAND_TIMEOUT.
+                if before.elapsed() < Duration::from_millis(50) {
                     fast_fails += 1;
                 }
             }
@@ -373,21 +383,60 @@ mod repro_tests {
         let elapsed = started.elapsed();
         println!("[budget] {commands} commands, {fast_fails} fast-failed, elapsed={elapsed:?}");
 
-        // Total stall is bounded by the budget plus one in-flight command, NOT
-        // commands × PER_COMMAND_TIMEOUT (which would be 60s here).
+        // Only the first MAX_CONSECUTIVE_TIMEOUTS commands actually block; the
+        // rest fail fast. Total stall ~= MAX_CONSECUTIVE_TIMEOUTS × 2s, NOT
+        // 50 × 2s = 100s.
         assert!(
-            elapsed < budget * 3,
-            "reload budget must cap the total stall, got {elapsed:?}"
+            elapsed < PER_COMMAND_TIMEOUT * (MAX_CONSECUTIVE_TIMEOUTS + 2),
+            "stall must be bounded by the timeout streak, got {elapsed:?}"
         );
         assert!(
-            fast_fails > 0,
-            "commands after the budget is spent must fail fast"
+            fast_fails >= (commands - MAX_CONSECUTIVE_TIMEOUTS as usize - 1),
+            "most commands must fail fast after the worker is given up on, got {fast_fails}"
         );
     }
 
-    /// Without a reload budget active (a standalone command), `send_to_worker`
-    /// keeps its original full per-command deadline — the budget only applies
-    /// inside `with_reload_budget`, so non-reload callers are unaffected.
+    /// Regression guard for the prod incident this fix *caused* on first attempt:
+    /// a large but HEALTHY reload (worker acks every command, even slowly) must
+    /// NOT be short-circuited. Every ack resets the streak, so the counter never
+    /// reaches MAX_CONSECUTIVE_TIMEOUTS and all commands go through.
+    #[test]
+    fn healthy_reload_is_never_short_circuited_however_large() {
+        let (mut command, mut proxy) =
+            Channel::<WorkerRequest, WorkerResponse>::generate(1000, 10000)
+                .expect("generate channel pair");
+        proxy.blocking().expect("set proxy side blocking");
+
+        let commands = 200;
+        let mut ok = 0;
+        with_reload_budget(|| {
+            for i in 0..commands {
+                let id = format!("cmd-{i}");
+                // Worker acks promptly before we send (pre-queued reply with the
+                // matching id), so send_to_worker always succeeds.
+                proxy
+                    .write_message(&WorkerResponse {
+                        id: id.clone(),
+                        status: ResponseStatus::Ok as i32,
+                        message: String::new(),
+                        content: None,
+                    })
+                    .expect("worker acks");
+                let r = send_to_worker(&mut command, id, RequestType::Status(Status {}));
+                assert!(r.is_ok(), "healthy ack must succeed at command {i}");
+                ok += 1;
+            }
+        });
+
+        assert_eq!(
+            ok, commands,
+            "every command in a healthy reload must go through"
+        );
+    }
+
+    /// Without a reload active (a standalone command), `send_to_worker` keeps its
+    /// full per-command deadline — the streak counter only applies inside
+    /// `with_reload_budget`, so non-reload callers are unaffected.
     #[test]
     fn standalone_command_keeps_full_per_command_timeout() {
         let (mut command, _proxy) = Channel::<WorkerRequest, WorkerResponse>::generate(1000, 10000)
@@ -402,8 +451,8 @@ mod repro_tests {
         let elapsed = started.elapsed();
 
         assert!(r.is_err(), "silent worker times out");
-        // No budget => full PER_COMMAND_TIMEOUT (2s). Confirm it waited, i.e. it
-        // did not inherit a leaked/zero budget from another test.
+        // No reload => full PER_COMMAND_TIMEOUT (2s). Confirm it waited, i.e. it
+        // did not inherit a leaked counter from another test.
         assert!(
             elapsed >= Duration::from_millis(1900),
             "standalone command should wait the full timeout, got {elapsed:?}"
