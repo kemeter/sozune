@@ -244,9 +244,10 @@ fn spawn_tcp_workers(
                     )
                 })?;
 
-        let (mut command, proxy_chan) = Channel::generate(1000, 10000).map_err(|e| {
-            anyhow::anyhow!("Could not create TCP channel for `{}`: {}", tcp_cfg.name, e)
-        })?;
+        let (mut command, proxy_chan) = Channel::generate(1000, config.command_buffer_max_bytes)
+            .map_err(|e| {
+                anyhow::anyhow!("Could not create TCP channel for `{}`: {}", tcp_cfg.name, e)
+            })?;
 
         let listener_name = tcp_cfg.name.clone();
         let handle = thread::spawn(move || {
@@ -314,9 +315,10 @@ fn spawn_udp_workers(
                     )
                 })?;
 
-        let (mut command, proxy_chan) = Channel::generate(1000, 10000).map_err(|e| {
-            anyhow::anyhow!("Could not create UDP channel for `{}`: {}", udp_cfg.name, e)
-        })?;
+        let (mut command, proxy_chan) = Channel::generate(1000, config.command_buffer_max_bytes)
+            .map_err(|e| {
+                anyhow::anyhow!("Could not create UDP channel for `{}`: {}", udp_cfg.name, e)
+            })?;
 
         let listener_name = udp_cfg.name.clone();
         let listener_port = udp_cfg.listen;
@@ -424,10 +426,12 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
 
     // Create communication channels
-    let (mut command_channel, proxy_channel) = Channel::generate(1000, 10000)
+    let command_buffer_max_bytes = config.command_buffer_max_bytes;
+    let (mut command_channel, proxy_channel) = Channel::generate(1000, command_buffer_max_bytes)
         .map_err(|e| anyhow::anyhow!("Could not create HTTP channel: {}", e))?;
-    let (mut command_channel_https, proxy_channel_https) = Channel::generate(1000, 10000)
-        .map_err(|e| anyhow::anyhow!("Could not create HTTPS channel: {}", e))?;
+    let (mut command_channel_https, proxy_channel_https) =
+        Channel::generate(1000, command_buffer_max_bytes)
+            .map_err(|e| anyhow::anyhow!("Could not create HTTPS channel: {}", e))?;
 
     let worker_http_handle = thread::spawn(move || {
         if let Err(e) =

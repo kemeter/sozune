@@ -105,7 +105,7 @@ mod repro_tests {
     //! cause before any fix is written.
 
     use super::*;
-    use crate::config::default_metrics_poll_timeout_ms;
+    use crate::config::{default_command_buffer_max_bytes, default_metrics_poll_timeout_ms};
     use std::time::Instant;
 
     /// (a) A reply larger than `max_buffer_size` (10000 bytes, the prod value)
@@ -195,5 +195,39 @@ mod repro_tests {
             elapsed < Duration::from_millis(800),
             "poll did not release the loop fast enough: {elapsed:?}"
         );
+    }
+
+    /// With the raised default ceiling, a reply that overflowed the old
+    /// 10000-byte buffer (the prod incident) now fits and round-trips cleanly.
+    /// Pairs with repro (a): same 12_000-byte payload, but written and read back
+    /// successfully instead of being rejected.
+    #[test]
+    fn raised_ceiling_lets_a_formerly_oversized_reply_round_trip() {
+        let max = default_command_buffer_max_bytes();
+        assert!(
+            max > 10_000,
+            "ceiling must exceed the old 10000-byte limit, got {max}"
+        );
+
+        let (mut command, mut proxy) =
+            Channel::<WorkerRequest, WorkerResponse>::generate(1000, max)
+                .expect("generate channel pair");
+        proxy.blocking().expect("set proxy side blocking");
+
+        let reply = WorkerResponse {
+            id: "HTTP-metrics-repro".to_string(),
+            status: ResponseStatus::Ok as i32,
+            message: "x".repeat(12_000),
+            content: None,
+        };
+        proxy
+            .write_message(&reply)
+            .expect("reply now fits under the raised ceiling");
+
+        let got = command
+            .read_message_blocking_timeout(Some(Duration::from_millis(500)))
+            .expect("reply round-trips under the raised ceiling");
+        assert_eq!(got.id, "HTTP-metrics-repro");
+        assert_eq!(got.message.len(), 12_000);
     }
 }

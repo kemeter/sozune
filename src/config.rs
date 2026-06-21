@@ -485,6 +485,18 @@ pub struct ProxyConfig {
         deserialize_with = "deserialize_metrics_poll_timeout_ms_with_env"
     )]
     pub metrics_poll_timeout_ms: u64,
+    /// Maximum size, in bytes, the Sōzu command channel back buffer may grow to.
+    /// The channel carries config commands and worker replies (including the
+    /// metrics reply); a single frame larger than this ceiling is rejected with
+    /// a "too large for back buffer capacity" error and never reaches the peer.
+    /// The production incident hit the old 10000-byte ceiling once the metrics
+    /// reply grew past it. Defaults to 65536, well above any realistic command
+    /// or metrics frame, while still bounding memory per channel.
+    #[serde(
+        default = "default_command_buffer_max_bytes",
+        deserialize_with = "deserialize_command_buffer_max_bytes_with_env"
+    )]
+    pub command_buffer_max_bytes: u64,
     /// CIDRs of reverse-proxies that sit in front of Sōzune and are trusted
     /// to set `X-Forwarded-For`. **Empty by default** — when no entry is
     /// configured, Sōzune ignores `X-Forwarded-For` entirely and treats the
@@ -779,6 +791,7 @@ impl Default for ProxyConfig {
             cluster_setup_delay_ms: default_cluster_setup_delay_ms(),
             reload_debounce_ms: default_reload_debounce_ms(),
             metrics_poll_timeout_ms: default_metrics_poll_timeout_ms(),
+            command_buffer_max_bytes: default_command_buffer_max_bytes(),
             trusted_proxies: Vec::new(),
         }
     }
@@ -806,6 +819,10 @@ fn default_reload_debounce_ms() -> u64 {
 
 pub(crate) fn default_metrics_poll_timeout_ms() -> u64 {
     200
+}
+
+pub(crate) fn default_command_buffer_max_bytes() -> u64 {
+    65536
 }
 
 fn default_api_listen_address() -> String {
@@ -1157,6 +1174,12 @@ deserialize_with_env!(
     "SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS",
     u64,
     default_metrics_poll_timeout_ms
+);
+deserialize_with_env!(
+    deserialize_command_buffer_max_bytes_with_env,
+    "SOZUNE_PROXY_COMMAND_BUFFER_MAX_BYTES",
+    u64,
+    default_command_buffer_max_bytes
 );
 
 deserialize_bool_with_env!(
@@ -1564,6 +1587,9 @@ impl ProxyConfig {
         if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS") {
             self.metrics_poll_timeout_ms = v;
         }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_COMMAND_BUFFER_MAX_BYTES") {
+            self.command_buffer_max_bytes = v;
+        }
     }
 }
 
@@ -1828,6 +1854,7 @@ acme:
         assert_eq!(default_cluster_setup_delay_ms(), 500);
         assert_eq!(default_reload_debounce_ms(), 500);
         assert_eq!(default_metrics_poll_timeout_ms(), 200);
+        assert_eq!(default_command_buffer_max_bytes(), 65536);
     }
 
     #[test]
@@ -1871,6 +1898,7 @@ acme:
                 "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS",
                 "SOZUNE_PROXY_RELOAD_DEBOUNCE_MS",
                 "SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS",
+                "SOZUNE_PROXY_COMMAND_BUFFER_MAX_BYTES",
             ] {
                 std::env::remove_var(k);
             }
@@ -1887,6 +1915,7 @@ startup_delay_ms: 2000
 cluster_setup_delay_ms: 1000
 reload_debounce_ms: 750
 metrics_poll_timeout_ms: 250
+command_buffer_max_bytes: 131072
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.http.listen_address, 9080);
@@ -1897,6 +1926,7 @@ metrics_poll_timeout_ms: 250
         assert_eq!(config.cluster_setup_delay_ms, 1000);
         assert_eq!(config.reload_debounce_ms, 750);
         assert_eq!(config.metrics_poll_timeout_ms, 250);
+        assert_eq!(config.command_buffer_max_bytes, 131072);
     }
 
     #[test]
@@ -2098,6 +2128,7 @@ https:
         assert_eq!(config.cluster_setup_delay_ms, 500);
         assert_eq!(config.reload_debounce_ms, 500);
         assert_eq!(config.metrics_poll_timeout_ms, 200);
+        assert_eq!(config.command_buffer_max_bytes, 65536);
     }
 
     #[test]
