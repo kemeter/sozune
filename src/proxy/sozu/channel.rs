@@ -8,8 +8,64 @@ use sozu_command_lib::{
         Request, ResponseStatus, Status, WorkerRequest, WorkerResponse, request::RequestType,
     },
 };
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
+
+/// Per-command deadline for a worker ack. Long enough that a healthy worker
+/// (which answers in single-digit ms) is never cut off, short enough that a
+/// single silent worker doesn't dominate the reload budget on its own.
+const PER_COMMAND_TIMEOUT: Duration = Duration::from_millis(2000);
+
+thread_local! {
+    /// Deadline for the whole reload currently in flight, set by
+    /// `with_reload_budget`. Every `send_to_worker` on this thread shortens its
+    /// own wait to never run past it. Once the budget is spent, further commands
+    /// fail fast instead of each blocking for `PER_COMMAND_TIMEOUT` — that linear
+    /// accumulation across a reload's ~30 commands is what froze proxying when a
+    /// worker went silent mid-reload (see issues/send-to-worker-blocking-stalls-reload.md).
+    static RELOAD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Run `f` under a reload budget: every `send_to_worker` it triggers shares a
+/// single deadline `budget` from now, so the total time the reload can block the
+/// event loop is bounded regardless of how many commands it issues. Restores any
+/// previous deadline on the way out (reloads never nest today, but this keeps the
+/// guard honest and panic-safe).
+pub(super) fn with_reload_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> T {
+    let deadline = Instant::now() + budget;
+    let previous = RELOAD_DEADLINE.replace(Some(deadline));
+    // Restore on unwind too, so a panic mid-reload can't leave a stale deadline
+    // pinned on the thread for the next reload.
+    let _restore = RestoreDeadline(previous);
+    f()
+}
+
+struct RestoreDeadline(Option<Instant>);
+
+impl Drop for RestoreDeadline {
+    fn drop(&mut self) {
+        RELOAD_DEADLINE.set(self.0);
+    }
+}
+
+/// Time left in the current reload budget, capped at `PER_COMMAND_TIMEOUT`.
+/// Returns `None` when the budget is already exhausted (caller must fail fast)
+/// and `Some(PER_COMMAND_TIMEOUT)` when no reload budget is active (standalone
+/// calls keep their original behaviour).
+fn command_timeout() -> Option<Duration> {
+    match RELOAD_DEADLINE.get() {
+        None => Some(PER_COMMAND_TIMEOUT),
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                None
+            } else {
+                Some(remaining.min(PER_COMMAND_TIMEOUT))
+            }
+        }
+    }
+}
 
 pub(super) fn wait_for_worker_ready(
     channel: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -56,13 +112,26 @@ pub(super) fn send_to_worker(
     // believing the worker accepted the command while it may have rejected,
     // queued, or never received it — that silent drift caused entrypoint
     // desync against the live worker in the past. Return the actual failure.
-    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    //
+    // The deadline is the lesser of `PER_COMMAND_TIMEOUT` and the time left in
+    // the current reload budget (see `with_reload_budget`). If the budget is
+    // already spent, fail immediately: a previous command in this reload has
+    // already shown the worker unresponsive, so re-waiting the full timeout for
+    // every remaining command is what froze the event loop.
+    let Some(initial) = command_timeout() else {
+        return Err(anyhow::anyhow!(
+            "Worker did not ack {}; reload budget exhausted (worker unresponsive)",
+            id
+        ));
+    };
+    let deadline = std::time::Instant::now() + initial;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(anyhow::anyhow!(
-                "Worker did not ack {} within 2s; configuration may be desynced",
-                id
+                "Worker did not ack {} within {:?}; configuration may be desynced",
+                id,
+                initial
             ));
         }
         match channel.read_message_blocking_timeout(Some(remaining)) {
@@ -229,5 +298,115 @@ mod repro_tests {
             .expect("reply round-trips under the raised ceiling");
         assert_eq!(got.id, "HTTP-metrics-repro");
         assert_eq!(got.message.len(), 12_000);
+    }
+
+    /// Reproduces the *cumulative* stall risk of config application. A reload
+    /// issues many `send_to_worker` commands back-to-back; each blocks up to its
+    /// deadline waiting for the worker ack. If the worker goes silent mid-reload,
+    /// the stalls add up: N commands × per-command deadline. This proves the
+    /// mechanism with a tiny deadline so it stays fast — at the real 2s deadline
+    /// the same 8 commands would freeze the reload loop for ~16s.
+    #[test]
+    fn sequential_commands_to_a_silent_worker_accumulate_stalls() {
+        let (mut command, _proxy) = Channel::<WorkerRequest, WorkerResponse>::generate(1000, 10000)
+            .expect("generate channel pair");
+        // _proxy never replies — every command will time out.
+
+        let per_command = Duration::from_millis(50);
+        let commands = 8;
+
+        let started = Instant::now();
+        let mut timeouts = 0;
+        for _ in 0..commands {
+            // Mirror send_to_worker's read: a bounded blocking wait for the ack.
+            if command
+                .read_message_blocking_timeout(Some(per_command))
+                .is_err()
+            {
+                timeouts += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        println!("[stall] {commands} commands, {timeouts} timeouts, elapsed={elapsed:?}");
+
+        assert_eq!(
+            timeouts, commands,
+            "a silent worker times out every command"
+        );
+        // The cost is N × per_command, NOT a single deadline — that linear
+        // accumulation is the bug a global reload budget must cap.
+        assert!(
+            elapsed >= per_command * commands,
+            "stalls must accumulate linearly, got {elapsed:?}"
+        );
+    }
+
+    /// The fix: under `with_reload_budget`, the same flood of commands to a
+    /// silent worker is bounded by the *single* budget, not N × per-command.
+    /// After the first command spends the budget, the rest fail fast, so the
+    /// total stall stays ~budget regardless of how many commands follow.
+    #[test]
+    fn reload_budget_caps_total_stall_on_a_silent_worker() {
+        let (mut command, _proxy) = Channel::<WorkerRequest, WorkerResponse>::generate(1000, 10000)
+            .expect("generate channel pair");
+
+        let budget = Duration::from_millis(200);
+        let commands = 30;
+
+        let started = Instant::now();
+        let mut fast_fails = 0;
+        with_reload_budget(budget, || {
+            for i in 0..commands {
+                let r = send_to_worker(
+                    &mut command,
+                    format!("probe-{i}"),
+                    RequestType::Status(Status {}),
+                );
+                assert!(r.is_err(), "silent worker must never ack");
+                // Once the budget is spent, command_timeout() returns None and
+                // send_to_worker fails immediately.
+                if started.elapsed() > budget {
+                    fast_fails += 1;
+                }
+            }
+        });
+        let elapsed = started.elapsed();
+        println!("[budget] {commands} commands, {fast_fails} fast-failed, elapsed={elapsed:?}");
+
+        // Total stall is bounded by the budget plus one in-flight command, NOT
+        // commands × PER_COMMAND_TIMEOUT (which would be 60s here).
+        assert!(
+            elapsed < budget * 3,
+            "reload budget must cap the total stall, got {elapsed:?}"
+        );
+        assert!(
+            fast_fails > 0,
+            "commands after the budget is spent must fail fast"
+        );
+    }
+
+    /// Without a reload budget active (a standalone command), `send_to_worker`
+    /// keeps its original full per-command deadline — the budget only applies
+    /// inside `with_reload_budget`, so non-reload callers are unaffected.
+    #[test]
+    fn standalone_command_keeps_full_per_command_timeout() {
+        let (mut command, _proxy) = Channel::<WorkerRequest, WorkerResponse>::generate(1000, 10000)
+            .expect("generate channel pair");
+
+        let started = Instant::now();
+        let r = send_to_worker(
+            &mut command,
+            "solo".to_string(),
+            RequestType::Status(Status {}),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(r.is_err(), "silent worker times out");
+        // No budget => full PER_COMMAND_TIMEOUT (2s). Confirm it waited, i.e. it
+        // did not inherit a leaked/zero budget from another test.
+        assert!(
+            elapsed >= Duration::from_millis(1900),
+            "standalone command should wait the full timeout, got {elapsed:?}"
+        );
     }
 }
