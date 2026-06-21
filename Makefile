@@ -2,6 +2,8 @@
 
 IMAGE ?= kemeter/sozune
 TAG ?= latest
+# Package version from Cargo.toml (first `version = "..."`, i.e. the [package] one).
+VERSION := $(shell grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
 
 all: build
 
@@ -12,7 +14,7 @@ build-dashboard:
 	cd dashboard && bun install && bun run build
 
 docker-build:
-	docker build -t $(IMAGE):$(TAG) .
+	docker build -t $(IMAGE):$(TAG) -t $(IMAGE):$(VERSION) .
 
 run: build-dashboard
 	cargo run

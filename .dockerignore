@@ -1,9 +1,10 @@
-# Build artifacts
-target/
-dashboard/node_modules/
+# Build artifacts (match nested target/ and node_modules/ in sub-projects too,
+# e.g. bench/*/target, tests/e2e/plugins/*/target — otherwise they bloat the
+# build context by hundreds of MB on every `docker build`).
+**/target/
+**/node_modules/
 dashboard/build/
 dashboard/.svelte-kit/
-node_modules/
 
 # VCS / tooling
 .git/
@@ -21,8 +22,9 @@ entrypoints.yaml
 middleware.md
 ROADMAP.md
 
-# E2E test infrastructure (not needed for the binary)
+# E2E test infrastructure and perf bench (not needed for the binary)
 tests/e2e/
+bench/
 
 # Logs / editor / OS
 *.log
