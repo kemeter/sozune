@@ -120,6 +120,7 @@ providers:
 | `proxy.cluster_setup_delay_ms` | `500` | Delay between cluster setup commands |
 | `proxy.reload_debounce_ms` | `500` | Debounce window, in ms, applied to reload signals. A reload runs only after this many ms of silence, coalescing bursts of container start/stop events into one reload |
 | `proxy.metrics_poll_timeout_ms` | `200` | Per-worker deadline, in ms, for a metrics poll round-trip. Keep it short: the poll shares the loop that accepts traffic and applies certificates, so a slow or silent worker must not be allowed to block proxying |
+| `proxy.command_buffer_max_bytes` | `65536` | Maximum size, in bytes, the Sōzu command channel back buffer may grow to. A single command or worker reply larger than this is rejected; raise it if you have a very large number of entrypoints |
 
 ## Middleware
 
@@ -145,6 +146,7 @@ Every field above can be overridden through an environment variable. The env var
 | `proxy.cluster_setup_delay_ms` | `SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS` |
 | `proxy.reload_debounce_ms` | `SOZUNE_PROXY_RELOAD_DEBOUNCE_MS` |
 | `proxy.metrics_poll_timeout_ms` | `SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS` |
+| `proxy.command_buffer_max_bytes` | `SOZUNE_PROXY_COMMAND_BUFFER_MAX_BYTES` |
 | `api.enabled` | `SOZUNE_API_ENABLED` |
 | `api.listen_address` | `SOZUNE_API_LISTEN_ADDRESS` |
 | `dashboard.enabled` | `SOZUNE_DASHBOARD_ENABLED` |
