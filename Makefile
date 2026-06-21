@@ -11,7 +11,7 @@ build: build-dashboard
 	cargo build --release
 
 build-dashboard:
-	cd dashboard && bun install && bun run build
+	cd dashboard && bun install --frozen-lockfile && bun run build
 
 docker-build:
 	docker build -t $(IMAGE):$(TAG) -t $(IMAGE):$(VERSION) .
