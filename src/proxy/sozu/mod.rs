@@ -744,13 +744,12 @@ fn handle_reload(
 
     let current_snapshot = snapshot_from_storage(&storage_read);
 
-    // Bound the total time this reload can spend blocking on worker acks. Every
-    // send_to_worker below shares this single deadline, so a worker that goes
-    // silent mid-reload can stall the event loop for at most RELOAD_BUDGET, not
-    // PER_COMMAND_TIMEOUT × (number of commands). A healthy reload of hundreds of
-    // entrypoints finishes in well under this; the budget only bites when a
-    // worker is genuinely unresponsive.
-    with_reload_budget(RELOAD_BUDGET, || {
+    // Run the reload under a shared consecutive-timeout counter. A worker that
+    // goes silent is given up on after a few failed acks, so it can't stall the
+    // event loop for PER_COMMAND_TIMEOUT × (number of commands). A healthy reload
+    // of hundreds of entrypoints is unaffected: every ack resets the counter, so
+    // only a genuinely unresponsive worker trips the short-circuit.
+    with_reload_budget(|| {
         apply_routing_diff(previous_snapshot, &current_snapshot, channels);
 
         // Update middleware route table
@@ -770,13 +769,6 @@ fn handle_reload(
 
     current_snapshot
 }
-
-/// Upper bound on the total time a single reload may block the event loop
-/// waiting on worker acks. Generous enough for a large healthy reload (each
-/// command answers in single-digit ms), but it caps the worst case when a worker
-/// goes silent: the loop is frozen for at most this long instead of growing with
-/// the number of commands. See `channel::with_reload_budget`.
-const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 
 /// Rebuild the middleware route table from current storage
 fn update_middleware_routes(
