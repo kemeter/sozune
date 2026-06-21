@@ -37,7 +37,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # save-if: only main writes the cache; PRs restore it. Keeps PR branches
+      # from filling the 10 GB per-repo cache quota (and evicting each other).
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Rust format
         run: cargo fmt -- --check
@@ -62,6 +66,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo test
         run: cargo test --bin sozune
@@ -83,6 +89,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo build (release)
         run: cargo build --release --locked
