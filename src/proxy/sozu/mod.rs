@@ -491,6 +491,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     let https_port = config.https.listen_address;
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
     let reload_debounce = Duration::from_millis(config.reload_debounce_ms);
+    let metrics_poll_timeout = Duration::from_millis(config.metrics_poll_timeout_ms);
 
     // Now that every worker is up and the static ACME cluster has been
     // registered, fold the three command channels into a single `Channels`
@@ -570,8 +571,22 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
 
                             let mut merged = std::collections::BTreeMap::new();
                             for (proxy_metrics, name) in [
-                                (poll_worker_metrics(&mut channels.http, "HTTP"), "HTTP"),
-                                (poll_worker_metrics(&mut channels.https, "HTTPS"), "HTTPS"),
+                                (
+                                    poll_worker_metrics(
+                                        &mut channels.http,
+                                        "HTTP",
+                                        metrics_poll_timeout,
+                                    ),
+                                    "HTTP",
+                                ),
+                                (
+                                    poll_worker_metrics(
+                                        &mut channels.https,
+                                        "HTTPS",
+                                        metrics_poll_timeout,
+                                    ),
+                                    "HTTPS",
+                                ),
                             ] {
                                 debug!("metrics: {} worker returned {} keys", name, proxy_metrics.len());
                                 for (k, v) in proxy_metrics {
@@ -1432,6 +1447,7 @@ fn remove_udp_entrypoint(udp_channels: &mut L4Channels, cluster_id: &str, entryp
 fn poll_worker_metrics(
     channel: &mut Channel<WorkerRequest, WorkerResponse>,
     name: &str,
+    timeout: Duration,
 ) -> std::collections::BTreeMap<String, sozu_command_lib::proto::command::FilteredMetrics> {
     let id = format!("{}-metrics-{}", name, metrics_snapshot::now_unix());
     let request = WorkerRequest {
@@ -1456,7 +1472,7 @@ fn poll_worker_metrics(
         return Default::default();
     }
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {

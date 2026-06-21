@@ -472,6 +472,19 @@ pub struct ProxyConfig {
         deserialize_with = "deserialize_reload_debounce_ms_with_env"
     )]
     pub reload_debounce_ms: u64,
+    /// Per-worker deadline, in milliseconds, for a metrics poll round-trip. The
+    /// poll runs inside the same loop that accepts traffic and applies
+    /// certificates, and reads the worker reply with a *blocking* wait — so this
+    /// deadline is the longest that one worker's metrics query can monopolize
+    /// that loop. A silent or overwhelmed worker (e.g. a metrics reply that
+    /// overflows the command channel's back buffer) would otherwise block here;
+    /// keep this short so a metrics hiccup can never freeze proxying. Defaults
+    /// to 200 ms (a healthy worker answers in single-digit ms).
+    #[serde(
+        default = "default_metrics_poll_timeout_ms",
+        deserialize_with = "deserialize_metrics_poll_timeout_ms_with_env"
+    )]
+    pub metrics_poll_timeout_ms: u64,
     /// CIDRs of reverse-proxies that sit in front of Sōzune and are trusted
     /// to set `X-Forwarded-For`. **Empty by default** — when no entry is
     /// configured, Sōzune ignores `X-Forwarded-For` entirely and treats the
@@ -765,6 +778,7 @@ impl Default for ProxyConfig {
             startup_delay_ms: default_startup_delay_ms(),
             cluster_setup_delay_ms: default_cluster_setup_delay_ms(),
             reload_debounce_ms: default_reload_debounce_ms(),
+            metrics_poll_timeout_ms: default_metrics_poll_timeout_ms(),
             trusted_proxies: Vec::new(),
         }
     }
@@ -788,6 +802,10 @@ fn default_cluster_setup_delay_ms() -> u64 {
 
 fn default_reload_debounce_ms() -> u64 {
     500
+}
+
+pub(crate) fn default_metrics_poll_timeout_ms() -> u64 {
+    200
 }
 
 fn default_api_listen_address() -> String {
@@ -1133,6 +1151,12 @@ deserialize_with_env!(
     "SOZUNE_PROXY_RELOAD_DEBOUNCE_MS",
     u64,
     default_reload_debounce_ms
+);
+deserialize_with_env!(
+    deserialize_metrics_poll_timeout_ms_with_env,
+    "SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS",
+    u64,
+    default_metrics_poll_timeout_ms
 );
 
 deserialize_bool_with_env!(
@@ -1537,6 +1561,9 @@ impl ProxyConfig {
         if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_RELOAD_DEBOUNCE_MS") {
             self.reload_debounce_ms = v;
         }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS") {
+            self.metrics_poll_timeout_ms = v;
+        }
     }
 }
 
@@ -1800,6 +1827,7 @@ acme:
         assert_eq!(default_startup_delay_ms(), 1000);
         assert_eq!(default_cluster_setup_delay_ms(), 500);
         assert_eq!(default_reload_debounce_ms(), 500);
+        assert_eq!(default_metrics_poll_timeout_ms(), 200);
     }
 
     #[test]
@@ -1842,6 +1870,7 @@ acme:
                 "SOZUNE_PROXY_STARTUP_DELAY_MS",
                 "SOZUNE_PROXY_CLUSTER_SETUP_DELAY_MS",
                 "SOZUNE_PROXY_RELOAD_DEBOUNCE_MS",
+                "SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS",
             ] {
                 std::env::remove_var(k);
             }
@@ -1857,6 +1886,7 @@ buffer_size: 32768
 startup_delay_ms: 2000
 cluster_setup_delay_ms: 1000
 reload_debounce_ms: 750
+metrics_poll_timeout_ms: 250
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.http.listen_address, 9080);
@@ -1866,6 +1896,7 @@ reload_debounce_ms: 750
         assert_eq!(config.startup_delay_ms, 2000);
         assert_eq!(config.cluster_setup_delay_ms, 1000);
         assert_eq!(config.reload_debounce_ms, 750);
+        assert_eq!(config.metrics_poll_timeout_ms, 250);
     }
 
     #[test]
@@ -2066,6 +2097,7 @@ https:
         assert_eq!(config.startup_delay_ms, 1000);
         assert_eq!(config.cluster_setup_delay_ms, 500);
         assert_eq!(config.reload_debounce_ms, 500);
+        assert_eq!(config.metrics_poll_timeout_ms, 200);
     }
 
     #[test]
