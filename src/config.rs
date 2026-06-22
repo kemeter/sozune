@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub middleware: MiddlewareConfig,
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Dedicated `/metrics` listener, independent of the API. Disabled by default.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Logging output configuration (text vs JSON).
     #[serde(default)]
     pub log: LogConfig,
@@ -593,6 +596,37 @@ impl Default for DashboardConfig {
 
 fn default_dashboard_listen_address() -> String {
     "127.0.0.1:3038".to_string()
+}
+
+/// Dedicated `/metrics` listener, independent of the API.
+///
+/// `/metrics` is also served by the API listener when the API is enabled, but
+/// that couples scraping to running (and exposing) the admin API. This lets an
+/// operator expose only Prometheus metrics — its own port, its own `enabled`
+/// flag — without turning on the rest of the API.
+#[derive(Deserialize, Debug, Clone)]
+pub struct MetricsConfig {
+    #[serde(default, deserialize_with = "deserialize_metrics_enabled_with_env")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_metrics_listen_address",
+        deserialize_with = "deserialize_metrics_listen_address_with_env"
+    )]
+    pub listen_address: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: default_metrics_listen_address(),
+        }
+    }
+}
+
+fn default_metrics_listen_address() -> String {
+    // 3035 API, 3036 ACME challenge, 3037 middleware, 3038 dashboard → 3039.
+    "127.0.0.1:3039".to_string()
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1209,6 +1243,16 @@ deserialize_string_with_env!(
     "SOZUNE_DASHBOARD_LISTEN_ADDRESS",
     default_dashboard_listen_address
 );
+deserialize_bool_with_env!(
+    deserialize_metrics_enabled_with_env,
+    "SOZUNE_METRICS_ENABLED",
+    false
+);
+deserialize_string_with_env!(
+    deserialize_metrics_listen_address_with_env,
+    "SOZUNE_METRICS_LISTEN_ADDRESS",
+    default_metrics_listen_address
+);
 
 fn env_bool(var: &str) -> Option<bool> {
     std::env::var(var)
@@ -1239,6 +1283,7 @@ impl AppConfig {
         self.proxy.apply_env_overrides();
         self.middleware.apply_env_overrides();
         self.dashboard.apply_env_overrides();
+        self.metrics.apply_env_overrides();
         self.log.apply_env_overrides();
         self.tracing.apply_env_overrides();
 
@@ -1593,6 +1638,17 @@ impl DashboardConfig {
     }
 }
 
+impl MetricsConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_bool("SOZUNE_METRICS_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_METRICS_LISTEN_ADDRESS") {
+            self.listen_address = v;
+        }
+    }
+}
+
 impl AcmeConfig {
     fn apply_env_overrides(&mut self) {
         if let Some(v) = env_bool("SOZUNE_ACME_ENABLED") {
@@ -1789,6 +1845,24 @@ acme:
         let acme = config.acme.expect("acme present in YAML");
         assert_eq!(acme.email, "override@example.com");
         assert!(acme.enabled, "yaml-only fields untouched");
+    }
+
+    #[test]
+    fn apply_env_overrides_enables_metrics_listener_without_yaml() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            ("SOZUNE_METRICS_ENABLED", "true"),
+            ("SOZUNE_METRICS_LISTEN_ADDRESS", "0.0.0.0:9100"),
+        ]);
+
+        // Env-only deployment: no config file, so `apply_env_overrides` is the
+        // only path that can turn the metrics listener on.
+        let mut config = AppConfig::default();
+        assert!(!config.metrics.enabled, "disabled by default");
+        config.apply_env_overrides();
+
+        assert!(config.metrics.enabled, "env enables the metrics listener");
+        assert_eq!(config.metrics.listen_address, "0.0.0.0:9100");
     }
 
     #[test]

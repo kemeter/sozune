@@ -54,6 +54,7 @@ middleware:
 | `acme` | Let's Encrypt provisioning. |
 | `proxy` | Sōzu listeners and runtime tuning. |
 | `middleware` | Internal middleware proxy port. |
+| `metrics` | Dedicated Prometheus `/metrics` listener, independent of the API. Off by default. See [Observability](../advanced/observability.md#the-metrics-endpoint). |
 | `log` | Log output format (`text` or `json`). |
 | `tracing` | OpenTelemetry distributed tracing (OTLP export). Off by default. See [Observability](../advanced/observability.md#distributed-tracing-opentelemetry). |
 
@@ -106,6 +107,17 @@ providers:
 | `api.listen_address` | `127.0.0.1:3035` | Bind address |
 | `api.users` | `[]` | List of API users. Each entry has `name`, `hash` (hex sha256 of the password) and `role` (`admin` or `read-only`). The API refuses to start if this list is empty when `api.enabled: true`. |
 | `api.cors_origins` | `[]` | Allowed origins for CORS |
+
+## Metrics
+
+Dedicated Prometheus `/metrics` listener, independent of the API — lets you
+scrape metrics without enabling the admin API. When the API is also enabled,
+`/metrics` is served on both listeners.
+
+| Field | Default | Description |
+|---|---|---|
+| `metrics.enabled` | `false` | Enables the dedicated `/metrics` listener (`SOZUNE_METRICS_ENABLED`) |
+| `metrics.listen_address` | `127.0.0.1:3039` | Bind address (`SOZUNE_METRICS_LISTEN_ADDRESS`); keep on loopback or restrict with an ACL |
 
 ## Proxy
 
