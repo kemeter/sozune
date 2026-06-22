@@ -37,6 +37,10 @@ All notable changes to this project will be documented in this file.
 
 - Optional auth header on outgoing fetches — `providers.http.auth.header` and `auth.value` send an arbitrary header (typically `Authorization: Bearer <token>`) with every poll. Useful when the upstream config service sits behind its own auth layer.
 
+### Observability
+
+- Dedicated `/metrics` listener — scrape Prometheus metrics without enabling (or exposing) the admin API. Enable with `metrics.enabled: true` (or `SOZUNE_METRICS_ENABLED=true`); binds `127.0.0.1:3039` by default (`metrics.listen_address` / `SOZUNE_METRICS_LISTEN_ADDRESS`). Off by default. When the API is also enabled, `/metrics` keeps being served there too, unchanged. See [Observability docs](documentation/advanced/observability.md#the-metrics-endpoint).
+
 ### Providers
 
 - Ring provider — discover entrypoints from a [Ring](https://github.com/kemeter/ring) cluster (a lightweight container / microVM orchestrator). Enable with `providers.ring` (`endpoint`, optional `token`, `poll_interval`, `expose_by_default`); Sōzune polls Ring's `GET /deployments` HTTP API, turns each deployment's `sozune.*` labels into routes, and fans a multi-replica deployment out to one backend per running instance. Discovery is interval-based and only triggers a reload when the Ring-sourced view changes. See [Ring provider docs](documentation/providers/ring.md).

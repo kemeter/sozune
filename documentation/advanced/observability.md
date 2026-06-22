@@ -4,10 +4,34 @@ Sōzune exposes a Prometheus-compatible `/metrics` endpoint so any Prometheus sc
 
 ## The `/metrics` endpoint
 
-- Path: `/metrics` on the API listener (default `:3035`)
-- Method: `GET`
+- Path: `/metrics`, method `GET`
 - Auth: **none** (Prometheus scrapers don't authenticate by default; protect the listener with TLS / network ACLs at the perimeter)
 - Re-computed on every scrape from authoritative state — no background aggregator, no stale cache
+
+`/metrics` is reachable on **two** listeners; enable whichever fits your setup:
+
+| Listener | Default address | Enable with | Use when |
+|---|---|---|---|
+| **Dedicated metrics listener** | `127.0.0.1:3039` | `metrics.enabled: true` (or `SOZUNE_METRICS_ENABLED=true`) | You want metrics **without** exposing the admin API. Independent port and flag. |
+| **API listener** | `127.0.0.1:3035` | `api.enabled: true` | The admin API is already running — `/metrics` is served there too, unchanged. |
+
+The two are independent: the dedicated listener lets you scrape Prometheus while
+keeping `api.enabled: false`. When both are on, `/metrics` is served on both
+(same handler, same values) — existing scrapers pointed at the API port keep
+working.
+
+### Configuring the dedicated metrics listener
+
+```yaml
+metrics:
+  enabled: true
+  listen_address: "127.0.0.1:3039"   # default; bind 0.0.0.0 only behind an ACL
+```
+
+Environment overrides (win over YAML): `SOZUNE_METRICS_ENABLED`,
+`SOZUNE_METRICS_LISTEN_ADDRESS`. Disabled by default. The address stays on
+loopback by default — like the API and dashboard — so nothing is exposed until
+you opt in.
 
 ### Output formats
 
@@ -151,7 +175,7 @@ docker compose -f compose.metrics.yaml up -d
 
 Then open:
 
-- Sōzune (assuming it's running on the host): `http://127.0.0.1:3035/metrics`
+- Sōzune (assuming it's running on the host): `http://127.0.0.1:3039/metrics` with the dedicated metrics listener (`metrics.enabled: true`), or `http://127.0.0.1:3035/metrics` when scraping through the API
 - Prometheus: `http://127.0.0.1:9090`
 - Grafana: `http://127.0.0.1:3000` — login `admin` / `admin`, dashboard "Sozune Overview" auto-loaded
 

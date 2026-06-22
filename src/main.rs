@@ -275,6 +275,20 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         request_metrics: Arc::clone(&request_metrics_store),
         config: Arc::new(config.clone()),
     };
+    // Dedicated `/metrics` listener — independent of the API, so metrics can be
+    // scraped without enabling/exposing the admin API. Reuses the same state and
+    // handler; clone the state before `api_task` moves the original.
+    let metrics_config = config.metrics.clone();
+    let metrics_state = api_state.clone();
+    let metrics_task = tokio::spawn(async move {
+        if metrics_config.enabled {
+            info!("Starting Metrics server");
+            api::metrics_server::serve(metrics_config, metrics_state).await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
     let api_task = tokio::spawn(async move {
         if api_config.enabled {
             info!("Starting API server");
@@ -382,6 +396,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let secondary_tasks_future = async {
         tokio::try_join!(
             api_task,
+            metrics_task,
             dashboard_task,
             provider_task,
             acme_task,
@@ -403,11 +418,16 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         },
         result = secondary_tasks_future => {
             signal_handle.close();
-            let (api_result, dashboard_result, provider_result, acme_result, middleware_result, health_result) = result?;
+            let (api_result, metrics_result, dashboard_result, provider_result, acme_result, middleware_result, health_result) = result?;
 
             match api_result {
                 Ok(_) => debug!("API task completed successfully"),
                 Err(e) => error!("API task failed: {}", e),
+            }
+
+            match metrics_result {
+                Ok(_) => debug!("Metrics task completed successfully"),
+                Err(e) => error!("Metrics task failed: {}", e),
             }
 
             match dashboard_result {
