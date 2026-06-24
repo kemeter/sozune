@@ -2297,6 +2297,7 @@ mod tests {
                 methods: Vec::new(),
                 acme: None,
                 plugins: Vec::new(),
+                plugin_config: std::collections::BTreeMap::new(),
                 error_pages: Default::default(),
                 ip_allow_list: Vec::new(),
                 match_headers: Vec::new(),

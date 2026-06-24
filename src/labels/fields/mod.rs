@@ -8,6 +8,7 @@ pub mod in_flight_req;
 pub mod ip_allow_list;
 pub mod methods;
 pub mod path;
+pub mod plugin_config;
 pub mod plugins;
 pub mod ratelimit;
 pub mod redirect;

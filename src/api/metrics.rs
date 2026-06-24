@@ -499,6 +499,7 @@ mod tests {
                 acme: None,
                 error_pages: std::collections::BTreeMap::new(),
                 plugins: Vec::new(),
+                plugin_config: std::collections::BTreeMap::new(),
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),

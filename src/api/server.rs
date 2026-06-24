@@ -89,6 +89,16 @@ fn entrypoint_payload(
 
     let mut value = serde_json::json!(entrypoint);
     if let Some(obj) = value.as_object_mut() {
+        // Per-route plugin config can hold tenant secrets (e.g. a CrowdSec
+        // `lapi_key`); never serialize the values. The key shape is kept so an
+        // operator can still see *which* plugins a route configures.
+        if let Some(plugin_config) = obj
+            .get_mut("config")
+            .and_then(|c| c.as_object_mut())
+            .and_then(|c| c.get_mut("plugin_config"))
+        {
+            redact_plugin_config(plugin_config);
+        }
         obj.insert(
             "unhealthy_backends".to_string(),
             serde_json::json!(unhealthy_for_ep),
@@ -96,6 +106,25 @@ fn entrypoint_payload(
         obj.insert("diagnostics".to_string(), serde_json::json!(diags_for_ep));
     }
     value
+}
+
+/// Replace every leaf value in a route's `plugin_config` with `"***"` while
+/// preserving the key structure, so the API never leaks tenant-supplied plugin
+/// secrets but still reports which keys a route sets.
+fn redact_plugin_config(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_plugin_config(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items.iter_mut() {
+                redact_plugin_config(v);
+            }
+        }
+        other => *other = serde_json::Value::String("***".to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -722,6 +751,24 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use sha2::Digest;
 
+    #[test]
+    fn redact_plugin_config_masks_all_leaf_values() {
+        // A per-route plugin secret must never survive serialization; only the
+        // key structure remains, every leaf becomes "***".
+        let mut value = serde_json::json!({
+            "crowdsec": { "lapi_key": "super-secret", "lapi_host": "crowdsec:8080" },
+            "umami": { "tracking": { "mode": "spa" }, "ids": ["a", "b"] },
+        });
+        redact_plugin_config(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "crowdsec": { "lapi_key": "***", "lapi_host": "***" },
+                "umami": { "tracking": { "mode": "***" }, "ids": ["***", "***"] },
+            })
+        );
+    }
+
     fn hash_password(password: &str) -> String {
         let digest = sha2::Sha256::digest(password.as_bytes());
         let mut out = String::with_capacity(64);
@@ -1059,6 +1106,7 @@ mod tests {
                         methods: Vec::new(),
                         acme: None,
                         plugins: Vec::new(),
+                        plugin_config: std::collections::BTreeMap::new(),
                         error_pages: std::collections::BTreeMap::new(),
                         match_headers: Vec::new(),
                         match_query: Vec::new(),
@@ -1536,6 +1584,7 @@ mod tests {
                         methods: Vec::new(),
                         acme: None,
                         plugins: Vec::new(),
+                        plugin_config: std::collections::BTreeMap::new(),
                         error_pages: std::collections::BTreeMap::new(),
                         match_headers: Vec::new(),
                         match_query: Vec::new(),
@@ -1645,6 +1694,7 @@ mod tests {
                         methods: Vec::new(),
                         acme: None,
                         plugins: Vec::new(),
+                        plugin_config: std::collections::BTreeMap::new(),
                         error_pages: std::collections::BTreeMap::new(),
                         match_headers: Vec::new(),
                         match_query: Vec::new(),
@@ -1717,6 +1767,7 @@ mod tests {
                 methods: Vec::new(),
                 acme: None,
                 plugins: Vec::new(),
+                plugin_config: std::collections::BTreeMap::new(),
                 error_pages: std::collections::BTreeMap::new(),
                 match_headers: Vec::new(),
                 match_query: Vec::new(),

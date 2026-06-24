@@ -48,9 +48,10 @@ const SERVICE_FIELDS: &[&str] = &[
     "ipAllowList",
 ];
 
-/// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`).
-/// Anything beginning with one of these is considered known.
-const SERVICE_FIELD_PREFIXES: &[&str] = &["headers.", "errorPages."];
+/// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`,
+/// `plugins.umami.websiteId`). Anything beginning with one of these is
+/// considered known.
+const SERVICE_FIELD_PREFIXES: &[&str] = &["headers.", "errorPages.", "plugins."];
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
