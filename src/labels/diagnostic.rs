@@ -55,6 +55,9 @@ pub enum DiagnosticCode {
     W023InvalidRetry,
     W024InvalidCircuitBreaker,
     W025InvalidInFlightReq,
+    /// A `plugins.<name>.<key>` label was malformed (missing sub-key or nested
+    /// past the depth limit) or set on a TCP/UDP route where plugins don't run.
+    W026InvalidPluginConfig,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -94,6 +97,7 @@ impl DiagnosticCode {
             DiagnosticCode::W023InvalidRetry => "W023",
             DiagnosticCode::W024InvalidCircuitBreaker => "W024",
             DiagnosticCode::W025InvalidInFlightReq => "W025",
+            DiagnosticCode::W026InvalidPluginConfig => "W026",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }

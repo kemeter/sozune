@@ -5,7 +5,7 @@ use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
     auth, core, error_pages, forward_auth, headers, host, in_flight_req, ip_allow_list, methods,
-    path, plugins, ratelimit, redirect, request_match,
+    path, plugin_config, plugins, ratelimit, redirect, request_match,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
@@ -204,6 +204,7 @@ fn build_entrypoint(
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
     let methods = methods::parse_methods(labels, &prefix, diagnostics);
     let plugins = plugins::parse_plugins(labels, &prefix);
+    let plugin_config = plugin_config::parse_plugin_config(labels, &prefix, diagnostics);
     let parsed_error_pages = error_pages::parse_error_pages(labels, &prefix, diagnostics);
     let match_headers = request_match::parse_match_headers(labels, &prefix);
     let match_query = request_match::parse_match_query(labels, &prefix);
@@ -255,6 +256,7 @@ fn build_entrypoint(
             methods,
             acme: None,
             plugins,
+            plugin_config,
             error_pages: parsed_error_pages,
             match_headers,
             match_query,
@@ -279,6 +281,27 @@ fn build_l4_entrypoint(
 ) -> Option<Entrypoint> {
     let prefix = format!("sozune.{proto}.{service_name}.");
     let entrypoint_key = format!("{prefix}entrypoint");
+
+    // WASM plugins only run on the HTTP path. A `plugins`/`plugins.*` label on a
+    // TCP/UDP route is silently dropped below, so warn once that it has no effect.
+    let plugins_prefix = format!("{prefix}plugins");
+    if let Some(stray) = labels
+        .keys()
+        .filter(|k| k.as_str() == plugins_prefix || k.starts_with(&format!("{plugins_prefix}.")))
+        .min()
+    {
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticCode::W026InvalidPluginConfig,
+                format!(
+                    "plugins are HTTP-only; '{stray}' on a {} route is ignored",
+                    proto.to_uppercase()
+                ),
+            )
+            .with_label(stray)
+            .with_hint("move the plugin to an HTTP entrypoint, or remove the label"),
+        );
+    }
 
     let entrypoint_ref = match labels.get(&entrypoint_key) {
         Some(value) if !value.trim().is_empty() => value.trim().to_string(),
@@ -360,6 +383,7 @@ fn build_l4_entrypoint(
             methods: Vec::new(),
             acme: None,
             plugins: Vec::new(),
+            plugin_config: std::collections::BTreeMap::new(),
             error_pages: std::collections::BTreeMap::new(),
             match_headers: Vec::new(),
             match_query: Vec::new(),

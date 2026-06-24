@@ -130,8 +130,11 @@ impl MiddlewareRoute {
 }
 
 /// Compiled WASM plugins keyed by their declared name. Each plugin is compiled
-/// once at startup and shared across every route that references it.
-pub type PluginRegistry = std::collections::HashMap<String, Arc<dyn Middleware>>;
+/// once at startup and shared across every route that references it. The value
+/// is the concrete [`wasm::WasmMiddleware`] (not a `dyn Middleware`) so a route
+/// can cheaply derive a copy with its own config via
+/// [`wasm::WasmMiddleware::with_route_config`].
+pub type PluginRegistry = std::collections::HashMap<String, Arc<wasm::WasmMiddleware>>;
 
 /// Compile every declared plugin into a shareable middleware. A plugin that
 /// fails to load (missing file, bad wasm) is logged and skipped, so one broken
@@ -150,17 +153,16 @@ pub fn build_plugin_registry(
                 continue;
             }
         };
-        let config_bytes = serde_json::to_vec(&cfg.config).unwrap_or_default();
         let limits = http_wasm_host::Limits::default();
 
         // A plugin with declared allowed_hosts opts into the outbound-HTTP
         // extension; otherwise it gets the standard sandbox with no network.
         let built = if cfg.allowed_hosts.is_empty() {
-            wasm::WasmMiddleware::from_bytes(&wasm, config_bytes, limits)
+            wasm::WasmMiddleware::from_bytes(&wasm, cfg.config.clone(), limits)
         } else {
             wasm::WasmMiddleware::from_bytes_with_network(
                 &wasm,
-                config_bytes,
+                cfg.config.clone(),
                 limits,
                 fetch_client.clone(),
                 handle.clone(),
@@ -288,10 +290,16 @@ pub fn build_middleware_route(
     }
 
     // WASM plugins run after the native request-phase middlewares, in the order
-    // the entrypoint lists them. An unknown name is logged and skipped.
+    // the entrypoint lists them. An unknown name is logged and skipped. When the
+    // route carries per-plugin config (`plugins.<name>.*` labels), the plugin is
+    // re-derived with that config merged over its global default; otherwise the
+    // shared global instance is used directly.
     for name in &config.plugins {
         match plugins.get(name) {
-            Some(mw) => middlewares.push(Arc::clone(mw)),
+            Some(mw) => match config.plugin_config.get(name) {
+                Some(overlay) => middlewares.push(Arc::new(mw.with_route_config(overlay))),
+                None => middlewares.push(Arc::clone(mw) as Arc<dyn Middleware>),
+            },
             None => warn!("entrypoint references unknown plugin '{}', skipping", name),
         }
     }

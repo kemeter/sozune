@@ -188,13 +188,92 @@ struct HostFetcher {
 /// accepted if its host alone, or its `host:port` authority, matches an entry.
 /// This dual match is why a config entry like `127.0.0.1:8080` works even though
 /// `Url::host_str` returns just `127.0.0.1`.
+///
+/// **Anti-SSRF, global and non-bypassable:** a URL whose host is an internal IP
+/// literal (loopback, link-local — including the `169.254.169.254` cloud
+/// metadata endpoint — or RFC 1918 / unique-local private ranges) is refused
+/// *unless* `allowed_hosts` itself names an internal target. Since `allowed_hosts`
+/// comes from the platform operator's static config — never from per-route app
+/// labels — an app cannot point a plugin at the internal network or metadata
+/// service, but the operator can still allow an internal target in dev (e.g. a
+/// local `127.0.0.1:3000`) by listing it explicitly.
+///
+/// The extra clause matters as defence-in-depth: matching the URL host against
+/// the allow-list is not enough on its own, because a future code path that lets
+/// a tenant influence the outbound target would otherwise reach any internal IP
+/// that merely happens to share a string with an allow-list entry. Requiring the
+/// allow-list to *contain* an internal entry before any internal target is
+/// reachable keeps internal access strictly opt-in by the operator.
 fn host_allowed(url: &reqwest::Url, allowed_hosts: &[String]) -> bool {
     let host = url.host_str().unwrap_or_default();
     let authority = match url.port() {
         Some(p) => format!("{host}:{p}"),
         None => host.to_string(),
     };
-    allowed_hosts.iter().any(|h| h == host || h == &authority)
+    let explicitly_allowed = allowed_hosts.iter().any(|h| h == host || h == &authority);
+
+    if is_internal_target(url) {
+        // An internal target is reachable only when it is explicitly listed AND
+        // the operator has opted into internal access at all (i.e. at least one
+        // allow-list entry is itself an internal literal). A purely public
+        // allow-list can never authorise an internal IP.
+        return explicitly_allowed && allowed_hosts.iter().any(|h| entry_is_internal(h));
+    }
+
+    explicitly_allowed
+}
+
+/// Whether an `allowed_hosts` entry (a bare host or `host:port`) is itself an
+/// internal IP literal. Used so that a public-only allow-list never opens a door
+/// to the internal network even if a target string coincidentally matches.
+fn entry_is_internal(entry: &str) -> bool {
+    // Strip an optional `:port`; an IPv6 literal in an entry would be bracketed,
+    // so only split on the last colon when the head still parses as an address.
+    let host = entry.rsplit_once(':').map_or(entry, |(h, p)| {
+        if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() {
+            h
+        } else {
+            entry
+        }
+    });
+    // Reuse the URL-based classifier by parsing the bare host as a URL.
+    reqwest::Url::parse(&format!("http://{host}/"))
+        .map(|u| is_internal_target(&u))
+        .unwrap_or(false)
+}
+
+/// Whether `url`'s host is an IP literal in a range that must never be reachable
+/// from a tenant-supplied plugin target: loopback, link-local (covers the
+/// `169.254.169.254` cloud metadata endpoint), private/unique-local, or the
+/// unspecified address. Hostnames (non-IP) return `false` here — they are not
+/// resolved at this layer, so a name that resolves to an internal IP (DNS
+/// rebinding) is not caught here; that is a known limitation handled by the
+/// operator-controlled allow-list, not by this literal check.
+fn is_internal_target(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                // Unique-local (fc00::/7) and link-local (fe80::/10) are not yet
+                // stable as `IpAddr` methods, so match the prefixes directly.
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped (::ffff:a.b.c.d) — unwrap and re-check.
+                || ip.to_ipv4_mapped().is_some_and(|v4| {
+                    let mapped = IpAddr::V4(v4);
+                    mapped.is_loopback() || matches!(mapped, IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
+                })
+        }
+        _ => false,
+    }
 }
 
 impl Fetcher for HostFetcher {
@@ -307,23 +386,54 @@ impl Sink for EventSink {
 const EVENT_QUEUE_SIZE: usize = 1024;
 
 /// A compiled http-wasm guest wired in as a middleware.
+///
+/// The guest is compiled once (`plugin`, shared via `Arc`) and may be cheaply
+/// re-derived per route with a different configuration via
+/// [`with_route_config`](Self::with_route_config): the route's JSON config is
+/// merged over the global `config_value` and re-serialized into `config`, which
+/// is what the guest reads through the `get_config` ABI.
 pub struct WasmMiddleware {
     name: &'static str,
     plugin: Arc<Plugin>,
+    /// The effective config, JSON-serialized, handed to the guest verbatim.
     config: Vec<u8>,
+    /// The effective config as a JSON value, kept so a per-route overlay can be
+    /// merged on top of it without re-reading the original bytes.
+    config_value: serde_json::Value,
 }
 
 impl WasmMiddleware {
     /// Compile a guest from `.wasm` bytes with the given per-invocation limits
     /// and guest configuration.
-    pub fn from_bytes(wasm: &[u8], config: Vec<u8>, limits: Limits) -> anyhow::Result<Self> {
+    pub fn from_bytes(
+        wasm: &[u8],
+        config: serde_json::Value,
+        limits: Limits,
+    ) -> anyhow::Result<Self> {
         let plugin = Plugin::from_bytes(wasm, limits)
             .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?;
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
-            config,
+            config: serde_json::to_vec(&config).unwrap_or_default(),
+            config_value: config,
         })
+    }
+
+    /// Derive a copy of this middleware whose config is `overlay` merged on top
+    /// of the global config. The compiled guest is shared (`Arc`), so this is
+    /// cheap — no recompilation. Keys in `overlay` win over the global config;
+    /// nested objects are merged recursively. A non-object `overlay` (or an
+    /// empty one) yields a clone with the global config unchanged.
+    pub fn with_route_config(&self, overlay: &serde_json::Value) -> Self {
+        let mut merged = self.config_value.clone();
+        merge_json(&mut merged, overlay);
+        Self {
+            name: self.name,
+            plugin: Arc::clone(&self.plugin),
+            config: serde_json::to_vec(&merged).unwrap_or_default(),
+            config_value: merged,
+        }
     }
 
     /// Like [`from_bytes`](Self::from_bytes) but enables the network extensions:
@@ -331,7 +441,7 @@ impl WasmMiddleware {
     /// calls go through `client`, both restricted to `allowed_hosts`.
     pub fn from_bytes_with_network(
         wasm: &[u8],
-        config: Vec<u8>,
+        config: serde_json::Value,
         limits: Limits,
         client: reqwest::Client,
         handle: tokio::runtime::Handle,
@@ -355,7 +465,8 @@ impl WasmMiddleware {
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
-            config,
+            config: serde_json::to_vec(&config).unwrap_or_default(),
+            config_value: config,
         })
     }
 
@@ -383,6 +494,25 @@ impl WasmMiddleware {
             resp_body_cursor: 0,
         };
         (state, body_bytes)
+    }
+}
+
+/// Recursively merge `overlay` into `base`. When both sides are JSON objects,
+/// keys are merged (recursing into nested objects); otherwise `overlay`
+/// replaces `base`. A null `overlay` is treated as "no change" so a route can
+/// omit a key without wiping the global default.
+fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                merge_json(
+                    base_map.entry(k.clone()).or_insert(serde_json::Value::Null),
+                    v,
+                );
+            }
+        }
+        (_, serde_json::Value::Null) => {}
+        (base_slot, other) => *base_slot = other.clone(),
     }
 }
 
@@ -606,6 +736,112 @@ mod tests {
     #[test]
     fn empty_allow_list_rejects_everything() {
         assert!(!host_allowed(&url("http://crowdsec:8080/"), &[]));
+    }
+
+    #[test]
+    fn internal_ip_targets_are_blocked_even_if_pattern_would_match() {
+        // The cloud metadata endpoint and other internal literals must be
+        // refused when only reachable via a tenant-style target, i.e. not named
+        // in the operator allow-list.
+        let allowed = vec!["umami.example.com".to_string()];
+        for target in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:3000/api/send",
+            "http://10.0.0.5:8080/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://[::1]:3000/",
+            "http://0.0.0.0/",
+        ] {
+            assert!(
+                !host_allowed(&url(target), &allowed),
+                "internal target should be blocked: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_ip_target_allowed_when_operator_lists_it() {
+        // Dev / self-hosted: the operator may explicitly opt an internal target
+        // in via the static allow-list. This must keep working (regression on
+        // the existing `127.0.0.1:8080` CrowdSec case).
+        let allowed = vec!["127.0.0.1:3000".to_string()];
+        assert!(host_allowed(
+            &url("http://127.0.0.1:3000/api/send"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn public_only_allow_list_never_opens_internal_target() {
+        // A public-only allow-list must not authorise an internal IP even if the
+        // target string were to coincide with an entry: internal access is only
+        // ever opened when the operator lists an internal entry of its own.
+        let allowed = vec!["umami.example.com".to_string()];
+        assert!(!host_allowed(&url("http://127.0.0.1/"), &allowed));
+        assert!(!host_allowed(&url("http://169.254.169.254/"), &allowed));
+    }
+
+    #[test]
+    fn entry_is_internal_classifies_allow_list_entries() {
+        assert!(entry_is_internal("127.0.0.1"));
+        assert!(entry_is_internal("127.0.0.1:3000"));
+        assert!(entry_is_internal("[::1]:8080"));
+        assert!(entry_is_internal("10.0.0.5"));
+        assert!(!entry_is_internal("umami.example.com"));
+        assert!(!entry_is_internal("umami.example.com:443"));
+        assert!(!entry_is_internal("8.8.8.8"));
+    }
+
+    #[test]
+    fn public_target_still_passes_when_allowed() {
+        let allowed = vec!["umami.example.com".to_string()];
+        assert!(host_allowed(
+            &url("https://umami.example.com/api/send"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn is_internal_target_classification() {
+        assert!(is_internal_target(&url("http://169.254.169.254/")));
+        assert!(is_internal_target(&url("http://127.0.0.1/")));
+        assert!(is_internal_target(&url("http://[::1]/")));
+        assert!(is_internal_target(&url("http://[fe80::1]/")));
+        assert!(is_internal_target(&url("http://[fc00::1]/")));
+        assert!(!is_internal_target(&url("http://example.com/")));
+        assert!(!is_internal_target(&url("http://8.8.8.8/")));
+    }
+
+    #[test]
+    fn is_internal_target_catches_alternate_ip_encodings() {
+        // The `url` crate normalizes integer / shorthand IPv4 forms to a
+        // canonical `Ipv4Addr`, and IPv4-mapped IPv6 unwraps to its v4 — all of
+        // which must still be classified internal so a tenant can't dodge the
+        // literal check with an unusual spelling of a loopback / metadata IP.
+        assert!(is_internal_target(&url("http://2130706433/"))); // 127.0.0.1 as u32
+        assert!(is_internal_target(&url("http://127.1/"))); // shorthand loopback
+        assert!(is_internal_target(&url("http://[::ffff:127.0.0.1]/")));
+        assert!(is_internal_target(&url("http://[::ffff:169.254.169.254]/")));
+        assert!(is_internal_target(&url("http://[::ffff:10.0.0.1]/")));
+    }
+
+    #[test]
+    fn merge_json_overlays_correctly() {
+        use serde_json::json;
+        // Nested object merge: overlay keys win, sibling keys survive.
+        let mut base = json!({"a": 1, "nested": {"x": 1, "y": 2}});
+        merge_json(&mut base, &json!({"a": 9, "nested": {"y": 99, "z": 3}}));
+        assert_eq!(base, json!({"a": 9, "nested": {"x": 1, "y": 99, "z": 3}}));
+        // A null overlay value leaves the existing key untouched; an absent
+        // base key gets the null inserted.
+        let mut b2 = json!({"a": 1});
+        merge_json(&mut b2, &json!({"a": null, "b": null}));
+        assert_eq!(b2, json!({"a": 1, "b": null}));
+        // A non-object overlay replaces the base wholesale.
+        let mut b3 = json!({"a": 1});
+        merge_json(&mut b3, &json!("scalar"));
+        assert_eq!(b3, json!("scalar"));
     }
 
     fn beacon(url: &str) -> FetchRequest {

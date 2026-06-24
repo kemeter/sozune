@@ -38,6 +38,7 @@ labels:
 | Label | Description |
 |---|---|
 | `plugins` | Comma-separated list of plugin names (declared in `config.yaml`) to run as middleware, in order. Unknown names are logged and skipped. |
+| `plugins.<name>.<key>` | Per-route config for plugin `<name>`, merged over its global `config`. `<key>` may be dotted to nest. See [Per-route config](#per-route-config). |
 
 ## Example
 
@@ -61,6 +62,42 @@ services:
 ```
 
 For `https://app.example.com/`, Sōzune runs the `geoblock` guest's `handle_request` before forwarding. The guest reads the client IP and headers, checks them against `allow_countries`, and either lets the request continue or short-circuits with a `403`.
+
+## Per-route config
+
+A plugin's `config` in `config.yaml` is its global default. A route can override
+or extend that config for itself with `plugins.<name>.<key>=<value>` labels —
+the route's config is merged over the global default before the guest reads it.
+This lets the same plugin run with different settings per app (an Umami
+`websiteId`, a CrowdSec `lapi_key`) without recompiling the guest.
+
+```yaml
+services:
+  blog:
+    image: my-blog
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.blog.host=blog.example.com"
+      - "sozune.http.blog.plugins=umami"
+      # route-specific config, merged over the global `umami` config:
+      - "sozune.http.blog.plugins.umami.websiteId=abc-123"
+      - "sozune.http.blog.plugins.umami.tracking.mode=spa"
+```
+
+`<key>` may be dotted to nest into the config object
+(`plugins.umami.tracking.mode=spa` → `{"tracking": {"mode": "spa"}}`). Values
+that are valid JSON keep their type (`true`, `42`, `["a","b"]`); everything else
+is a string. Keys are merged over the global config, so a route only needs to
+set what differs. Plugins run on HTTP routes only — `plugins.*` labels on a
+TCP/UDP route, or a `plugins.<name>` label with no sub-key, are ignored with a
+`W026` diagnostic.
+
+> **Secrets in labels.** Per-route plugin config is set from labels and stored
+> on the entrypoint. The API redacts plugin-config *values* (they show as `***`
+> in `GET /entrypoints`), but labels themselves are visible to anyone who can
+> read the container/orchestrator config. Prefer the operator-controlled global
+> `config` in `config.yaml` for shared secrets, and use per-route config for
+> non-secret, app-specific settings.
 
 ## Ordering
 
@@ -89,6 +126,17 @@ request path and query, but the host only performs (or enqueues) the call if the
 target host is on the list — this prevents a guest from reaching arbitrary
 internal addresses (SSRF). An empty or absent `allowed_hosts` means the plugin
 has no network access.
+
+`allowed_hosts` is operator-controlled static config (`config.yaml`) and can
+never be set from per-route labels, so a tenant cannot widen a plugin's reach.
+On top of the allow-list, a target whose host is an internal IP literal
+(loopback, RFC 1918 / unique-local private ranges, or link-local — including the
+`169.254.169.254` cloud metadata endpoint) is refused unless the operator's
+`allowed_hosts` itself names an internal target. A purely public allow-list can
+therefore never reach an internal IP, while an operator running a local service
+in dev can still opt in by listing it (e.g. `["127.0.0.1:3000"]`). Note this
+checks IP literals only; a hostname in `allowed_hosts` that resolves to an
+internal IP is trusted as the operator's choice.
 
 ```yaml
 plugins:

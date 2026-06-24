@@ -170,6 +170,7 @@ mod tests {
                 methods: Vec::new(),
                 acme: None,
                 plugins: Vec::new(),
+                plugin_config: std::collections::BTreeMap::new(),
                 error_pages: std::collections::BTreeMap::new(),
                 match_headers: Vec::new(),
                 match_query: Vec::new(),

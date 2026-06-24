@@ -278,6 +278,15 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.http.api.priority=10"),
     },
     Entry {
+        code: "W026",
+        title: "Invalid or ignored plugin config label",
+        severity: "warning",
+        cause: "A `sozune.<proto>.<svc>.plugins.<name>.<key>` label was malformed (no sub-key, or nested past the depth limit), or was set on a TCP/UDP route where plugins do not run.",
+        effect: "The plugin-config label is dropped. The plugin runs with its global config (or not at all on L4), which can silently differ from what was intended.",
+        fix: "Give the label a sub-key (`plugins.<name>.<key>=<value>`), keep nesting shallow, and only set plugin config on HTTP routes.",
+        example: Some("sozune.http.web.plugins.umami.websiteId=abc-123"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         severity: "info",

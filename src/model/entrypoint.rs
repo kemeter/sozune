@@ -147,6 +147,15 @@ pub struct EntrypointConfig {
     /// middleware on this entrypoint, in order.
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// Per-route configuration for the plugins listed in `plugins`, keyed by
+    /// plugin name. Each value is a JSON object merged on top of the plugin's
+    /// global `config` (from `AppConfig.plugins[name].config`) before being
+    /// handed to the guest, so the same plugin can be configured differently
+    /// per entrypoint (e.g. an Umami `websiteId` or a CrowdSec `lapi_key`).
+    /// Built from `plugins.<name>.<key>=<value>` labels. A `BTreeMap` keeps the
+    /// ordering deterministic so `PartialEq` (and thus the reload diff) is stable.
+    #[serde(default)]
+    pub plugin_config: BTreeMap<String, serde_json::Value>,
     /// Cluster-scoped custom HTTP answer templates, keyed by status code.
     /// Values may be inline bodies or `file://<path>` references when set
     /// from static YAML; when populated from provider labels, `file://` is
