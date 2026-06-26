@@ -31,6 +31,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# -- Pre-flight cleanup --
+# A previous run that was killed (timeout, Ctrl-C, crash) never fires its EXIT
+# trap, leaving orphaned containers and a stray sōzune behind. Those poison the
+# next run: the compose project name is reused, so stale backends linger and the
+# proxy routes to the wrong instance. Purge any leftovers up front so every run
+# starts from a clean slate, regardless of how the last one ended.
+log "Pre-flight cleanup of any leftovers from a previous run..."
+docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+# Also drop any container still carrying the functest compose-project label, in
+# case the compose file path changed since the orphaned run was started.
+_STALE=$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" 2>/dev/null || true)
+[[ -n "$_STALE" ]] && docker rm -f $_STALE >/dev/null 2>&1 || true
+# Kill a stray debug sōzune bound to the functest middleware/proxy ports.
+pkill -f "$PROJECT_DIR/target/debug/sozune" 2>/dev/null || true
+
 # -- Build --
 log "Building sozune..."
 cargo build --quiet --manifest-path "$PROJECT_DIR/Cargo.toml" 2>&1
