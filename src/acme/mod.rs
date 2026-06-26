@@ -1,4 +1,5 @@
 pub mod challenge_server;
+pub mod inventory;
 pub mod resolver;
 
 use std::collections::BTreeMap;
@@ -17,6 +18,13 @@ use crate::model::Entrypoint;
 
 use self::challenge_server::ChallengeState;
 use self::resolver::{Resolver, build_resolver};
+
+/// Upper bound, in days, on how early a certificate may be renewed before
+/// expiry. The renewal trigger is `min(total_lifetime / 3, RENEWAL_FLOOR_DAYS)`:
+/// the ratio adapts to short-lived certs, and this floor stops a long-lived cert
+/// from being reissued months ahead of time. Set to 30 so the common 90-day
+/// Let's Encrypt profile keeps renewing at the 30-days-left mark.
+const RENEWAL_FLOOR_DAYS: u32 = 30;
 
 /// Command sent from ACME manager to the proxy reload handler
 pub struct CertCommand {
@@ -169,7 +177,15 @@ impl AcmeManager {
         Ok(())
     }
 
-    /// Check if a hostname needs a new certificate (missing or expiring within 30 days)
+    /// Check if a hostname needs a new certificate (missing, or past the
+    /// lifetime-ratio renewal point).
+    ///
+    /// Renewal triggers once the remaining lifetime drops below one third of the
+    /// certificate's total lifetime, capped at [`RENEWAL_FLOOR_DAYS`] so a
+    /// long-lived cert isn't reissued months early. For Let's Encrypt's classic
+    /// 90-day profile this is the 30-days-left mark — identical to the previous
+    /// fixed threshold — while short-lived profiles (7-day, 45-day) no longer
+    /// renew on every poll the moment they're issued.
     async fn needs_certificate(&self, hostname: &str) -> bool {
         if Self::validate_hostname(hostname).is_err() {
             warn!("Skipping invalid hostname: {}", hostname);
@@ -182,13 +198,14 @@ impl AcmeManager {
 
         // Read and parse existing cert to check expiration
         match tokio::fs::read_to_string(&cert_path).await {
-            Ok(pem_data) => cheti::needs_renewal_checked(&pem_data, 30).unwrap_or_else(|e| {
-                warn!(
-                    "Could not parse certificate expiry, assuming renewal needed: {}",
-                    e
-                );
-                true
-            }),
+            Ok(pem_data) => cheti::needs_renewal_ratio_checked(&pem_data, RENEWAL_FLOOR_DAYS)
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "Could not parse certificate expiry, assuming renewal needed: {}",
+                        e
+                    );
+                    true
+                }),
             Err(_) => true,
         }
     }
