@@ -235,6 +235,7 @@ pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
         )
         .route("/diagnostics", get(list_diagnostics))
         .route("/providers", get(list_providers))
+        .route("/certificates", get(list_certificates))
         .route("/config", get(crate::api::config_view::config))
         .route_layer(axum_middleware::from_fn(require_admin));
 
@@ -534,6 +535,23 @@ async fn list_providers(State(state): State<AppState>) -> (StatusCode, Json<serd
         Json(serde_json::json!({
             "providers": items,
         })),
+    )
+}
+
+/// List the certificates Sōzune has on disk, with their identity (CN/SAN),
+/// validity window, and lifecycle status. Reads `acme.certs_dir`; returns an
+/// empty list when ACME isn't configured (no cert store to scan).
+async fn list_certificates(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let certs = match state.config.acme.as_ref() {
+        Some(acme) => {
+            crate::acme::inventory::scan_certificates(std::path::Path::new(&acme.certs_dir)).await
+        }
+        None => Vec::new(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "certificates": certs })),
     )
 }
 

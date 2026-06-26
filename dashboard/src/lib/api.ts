@@ -172,6 +172,34 @@ export interface ProvidersResponse {
   providers: Provider[];
 }
 
+/** Lifecycle bucket for a certificate. Mirrors `CertStatus` server-side, which
+ *  derives it from the same lifetime ratio the ACME renewal uses — so the
+ *  badge here and the renewal trigger never disagree. */
+export type CertStatus = 'valid' | 'expiring' | 'expired';
+
+export interface Certificate {
+  /** Hostname recovered from the cert store directory (wildcards restored). */
+  hostname: string;
+  /** Subject Common Name, if the certificate carries one. */
+  subject_cn: string | null;
+  /** DNS names from the Subject Alternative Name extension. */
+  sans: string[];
+  /** `notBefore` as Unix epoch seconds. */
+  not_before: number;
+  /** `notAfter` as Unix epoch seconds. */
+  not_after: number;
+  /** Full lifetime in whole days. */
+  total_days: number;
+  /** Whole days until expiry; negative once expired. */
+  remaining_days: number;
+  /** Lifecycle bucket derived from the lifetime ratio. */
+  status: CertStatus;
+}
+
+export interface CertificatesResponse {
+  certificates: Certificate[];
+}
+
 export function listEntrypoints(): Promise<Entrypoint[]> {
   return request<Entrypoint[]>('/entrypoints');
 }
@@ -182,6 +210,10 @@ export function listDiagnostics(): Promise<DiagnosticsResponse> {
 
 export function listProviders(): Promise<ProvidersResponse> {
   return request<ProvidersResponse>('/providers');
+}
+
+export function listCertificates(): Promise<CertificatesResponse> {
+  return request<CertificatesResponse>('/certificates');
 }
 
 export function getEntrypoint(id: string): Promise<Entrypoint> {

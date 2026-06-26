@@ -99,3 +99,31 @@ if [[ -n "$ep_id" ]]; then
 else
     fail "API create did not return an ID, skipping GET/PUT/DELETE tests"
 fi
+
+# --- GET /certificates ---------------------------------------------------
+# Auth is required, and the response is a JSON object with a `certificates`
+# array. With no ACME cert store on disk the array is empty — the shape is
+# what we lock down here; per-cert metadata is covered by Rust unit tests.
+certs_noauth_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    "$API_URL/certificates" 2>/dev/null || echo "000")
+if [[ "$certs_noauth_status" == "401" ]]; then
+    pass "API /certificates returns 401 without auth token"
+else
+    fail "API /certificates returned $certs_noauth_status instead of 401 without auth"
+fi
+
+certs_response=$(curl -s --max-time 2 \
+    -H "$AUTH_HEADER" "$API_URL/certificates" 2>/dev/null || echo "")
+certs_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "$AUTH_HEADER" "$API_URL/certificates" 2>/dev/null || echo "000")
+if [[ "$certs_status" == "200" ]]; then
+    pass "API /certificates returns 200 with auth"
+else
+    fail "API /certificates returned $certs_status instead of 200"
+fi
+
+if echo "$certs_response" | grep -q '"certificates"'; then
+    pass "API /certificates payload exposes a certificates array"
+else
+    fail "API /certificates payload is missing the certificates key (got: $certs_response)"
+fi

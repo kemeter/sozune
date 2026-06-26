@@ -234,6 +234,41 @@ curl -u admin:your-password http://localhost:3035/providers
 
 The list always contains every known provider, even when not configured, so the dashboard can render "configure me" rows next to inactive providers.
 
+### `GET /certificates`
+
+Lists the TLS certificates sōzune has on disk under `acme.certs_dir`, with the identity and expiry of each. Returns an empty list when ACME isn't configured (there is no cert store to scan). **Admin only.**
+
+```bash
+curl -u admin:your-password http://localhost:3035/certificates
+```
+
+```json
+{
+  "certificates": [
+    {
+      "hostname": "shop.example.com",
+      "subject_cn": "shop.example.com",
+      "sans": ["shop.example.com", "www.example.com"],
+      "not_before": 1750000000,
+      "not_after": 1757776000,
+      "total_days": 90,
+      "remaining_days": 47,
+      "status": "valid"
+    }
+  ]
+}
+```
+
+- `hostname`: the host the certificate is stored under (wildcards are restored from the on-disk directory name, e.g. `*.example.com`)
+- `subject_cn`: the certificate's subject Common Name, or `null` if it has none
+- `sans`: the `dNSName` entries from the Subject Alternative Name extension
+- `not_before` / `not_after`: validity window as Unix epoch seconds
+- `total_days`: the certificate's full lifetime in whole days
+- `remaining_days`: whole days until expiry; negative once expired
+- `status`: lifecycle bucket — `valid`, `expiring`, or `expired`
+
+The `status` is derived from the same lifetime-ratio rule that drives ACME renewal: a certificate is `expiring` once its remaining lifetime drops below one third of its total lifetime (capped at 30 days), so short-lived certificates (7-day, 45-day profiles) aren't flagged the moment they're issued, and the dashboard badge never disagrees with when sōzune actually renews.
+
 ### `GET /config`
 
 Read-only snapshot of the running configuration: listener ports, ACME settings, providers, the dashboard listener, and the API listener (without the user list). **Admin only.**

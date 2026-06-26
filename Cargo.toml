@@ -29,7 +29,7 @@ signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 futures-util = "0.3"
 notify = "8.2.0"
 instant-acme = "0.8"
-cheti = { git = "https://github.com/kemeter/cheti", rev = "39987633dd4f53d1399231ec3d83225df97683c5" }
+cheti = { git = "https://github.com/kemeter/cheti", rev = "dd798b850186c485d6da6a7e7a00b9e274219cb3" }
 http-wasm-host = { git = "https://github.com/kemeter/http-wasm", rev = "3f82f100b1e139890657ea6c333a0092dedc9871" }
 rcgen = { version = "0.14", features = ["pem"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
@@ -53,6 +53,10 @@ mime_guess = "2"
 kube = { version = "0.99", default-features = false, features = ["client", "runtime", "rustls-tls"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 gateway-api = "0.15"
+
+[dev-dependencies]
+tempfile = "3"
+time = "0.3"
 
 [profile.release]
 strip = true
