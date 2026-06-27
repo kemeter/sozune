@@ -144,7 +144,27 @@ pub enum ResolverConfig {
     #[serde(rename = "http-01")]
     Http01,
     #[serde(rename = "dns-01")]
-    Dns01 { provider: ProviderConfig },
+    Dns01 {
+        provider: ProviderConfig,
+        /// Hostnames the resolver provisions on its own, independently of any
+        /// entrypoint. This is how a wildcard (`*.example.com`) gets issued
+        /// without a placeholder route: the cert is then served by SNI for
+        /// every matching subdomain. Each entry is treated exactly like an
+        /// entrypoint hostname bound to this resolver.
+        #[serde(default)]
+        domains: Vec<String>,
+    },
+}
+
+impl ResolverConfig {
+    /// Hostnames this resolver provisions on its own (DNS-01 `domains`).
+    /// Empty for HTTP-01 or a DNS-01 resolver without `domains`.
+    pub fn managed_domains(&self) -> &[String] {
+        match self {
+            ResolverConfig::Dns01 { domains, .. } => domains,
+            ResolverConfig::Http01 => &[],
+        }
+    }
 }
 
 /// DNS-01 provider configuration. Credentials are referenced by env var name,
