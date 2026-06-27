@@ -142,7 +142,14 @@ pub struct AcmeConfig {
 #[serde(tag = "challenge", rename_all = "kebab-case")]
 pub enum ResolverConfig {
     #[serde(rename = "http-01")]
-    Http01,
+    Http01 {
+        /// ACME directory URL for this resolver (Traefik's `caServer`). When
+        /// set, it overrides the global `staging` flag, so a staging resolver
+        /// and a production resolver can coexist. Each distinct CA keeps its
+        /// own ACME account on disk. Defaults to the global staging/prod URL.
+        #[serde(default)]
+        ca_server: Option<String>,
+    },
     #[serde(rename = "dns-01")]
     Dns01 {
         provider: ProviderConfig,
@@ -153,6 +160,10 @@ pub enum ResolverConfig {
         /// entrypoint hostname bound to this resolver.
         #[serde(default)]
         domains: Vec<String>,
+        /// ACME directory URL for this resolver (Traefik's `caServer`). See
+        /// the `http-01` variant for semantics.
+        #[serde(default)]
+        ca_server: Option<String>,
     },
 }
 
@@ -162,7 +173,17 @@ impl ResolverConfig {
     pub fn managed_domains(&self) -> &[String] {
         match self {
             ResolverConfig::Dns01 { domains, .. } => domains,
-            ResolverConfig::Http01 => &[],
+            ResolverConfig::Http01 { .. } => &[],
+        }
+    }
+
+    /// Explicit ACME directory URL for this resolver, if any. `None` means
+    /// fall back to the global staging/prod URL.
+    pub fn ca_server(&self) -> Option<&str> {
+        match self {
+            ResolverConfig::Http01 { ca_server } | ResolverConfig::Dns01 { ca_server, .. } => {
+                ca_server.as_deref()
+            }
         }
     }
 }

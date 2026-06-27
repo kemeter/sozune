@@ -58,11 +58,14 @@ pub struct AcmeView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "challenge", rename_all = "kebab-case")]
 pub enum ResolverView {
-    Http01,
+    Http01 {
+        ca_server: Option<String>,
+    },
     Dns01 {
         provider: &'static str,
         required_env: Vec<&'static str>,
         domains: Vec<String>,
+        ca_server: Option<String>,
     },
 }
 
@@ -165,8 +168,14 @@ fn acme_view(acme: &AcmeConfig) -> AcmeView {
 fn resolver_view(r: &ResolverConfig) -> ResolverView {
     use crate::config::ProviderConfig::*;
     match r {
-        ResolverConfig::Http01 => ResolverView::Http01,
-        ResolverConfig::Dns01 { provider, domains } => {
+        ResolverConfig::Http01 { ca_server } => ResolverView::Http01 {
+            ca_server: ca_server.clone(),
+        },
+        ResolverConfig::Dns01 {
+            provider,
+            domains,
+            ca_server,
+        } => {
             let (name, required_env) = match provider {
                 Cloudflare { .. } => ("cloudflare", vec!["CLOUDFLARE_API_TOKEN (configurable)"]),
                 Ovh { .. } => (
@@ -184,6 +193,7 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
                 provider: name,
                 required_env,
                 domains: domains.clone(),
+                ca_server: ca_server.clone(),
             }
         }
     }

@@ -327,10 +327,16 @@ impl AcmeManager {
         // Ensure rustls has a crypto provider installed (needed by instant-acme/reqwest)
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let server_url = if self.config.staging {
-            "https://acme-staging-v02.api.letsencrypt.org/directory"
-        } else {
-            "https://acme-v02.api.letsencrypt.org/directory"
+        // A resolver may pin its own ACME directory URL (Traefik's `caServer`),
+        // which overrides the global staging/prod default — so a staging and a
+        // production resolver can coexist.
+        let resolver_ca = resolver_name
+            .and_then(|name| self.config.resolvers.get(name))
+            .and_then(|r| r.ca_server());
+        let server_url = match resolver_ca {
+            Some(url) => url,
+            None if self.config.staging => "https://acme-staging-v02.api.letsencrypt.org/directory",
+            None => "https://acme-v02.api.letsencrypt.org/directory",
         };
 
         let account = self.get_or_create_account(server_url).await?;
@@ -423,8 +429,14 @@ impl AcmeManager {
     }
 
     /// Get or create an ACME account, persisted via cheti's FileAccountStore.
+    ///
+    /// The account is keyed by the ACME directory URL: each CA (production,
+    /// staging, a third-party ACME) has its own credentials file, so switching
+    /// or mixing CAs never reuses an account that belongs to a different
+    /// server. The production Let's Encrypt URL keeps the historical filename
+    /// (`account_credentials.json`) for backwards compatibility.
     async fn get_or_create_account(&self, server_url: &str) -> anyhow::Result<Account> {
-        let store = FileAccountStore::new(self.certs_dir.join("account_credentials.json"));
+        let store = FileAccountStore::new(self.certs_dir.join(account_file_for(server_url)));
 
         match store.load() {
             Ok(Some(credentials)) => {
@@ -584,8 +596,9 @@ impl AcmeManager {
                 None => continue,
             };
 
-            // Skip account credentials file
-            if dir_name == "account_credentials.json" {
+            // Skip ACME account credential files (one per CA directory URL:
+            // `account_credentials.json` plus any `account_<slug>.json`).
+            if dir_name.starts_with("account_") && dir_name.ends_with(".json") {
                 continue;
             }
 
@@ -698,6 +711,18 @@ fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
         .collect();
 
     (leaf, chain)
+}
+
+/// Credentials filename for an ACME account, derived from the directory URL so
+/// each CA (production, staging, a third-party ACME) gets its own account file
+/// and they never collide. The URL is reduced to a stable, filesystem-safe
+/// slug.
+fn account_file_for(server_url: &str) -> String {
+    let slug: String = server_url
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("account_{slug}.json")
 }
 
 /// Flatten the `domains` declared on each resolver into `(hostname, resolver)`
@@ -981,6 +1006,7 @@ mod tests {
                 personal_access_token_env: "X".to_string(),
             },
             domains: domains.iter().map(|s| s.to_string()).collect(),
+            ca_server: None,
         }
     }
 
@@ -1000,7 +1026,10 @@ mod tests {
     fn resolver_without_domains_contributes_nothing() {
         let mut resolvers = HashMap::new();
         resolvers.insert("gandi".to_string(), dns01(&[]));
-        resolvers.insert("legacy".to_string(), ResolverConfig::Http01);
+        resolvers.insert(
+            "legacy".to_string(),
+            ResolverConfig::Http01 { ca_server: None },
+        );
 
         assert!(collect_resolver_managed_domains(&resolvers).is_empty());
     }
@@ -1010,7 +1039,10 @@ mod tests {
         // Http01 has no `domains` field, so it can never manage a domain on its
         // own — managed_domains() is empty regardless.
         let mut resolvers = HashMap::new();
-        resolvers.insert("legacy".to_string(), ResolverConfig::Http01);
+        resolvers.insert(
+            "legacy".to_string(),
+            ResolverConfig::Http01 { ca_server: None },
+        );
 
         assert!(collect_resolver_managed_domains(&resolvers).is_empty());
     }
@@ -1040,5 +1072,46 @@ mod tests {
             .collect();
         hosts.sort();
         assert_eq!(hosts, vec!["*.example.com", "*.kemeter.app"]);
+    }
+
+    #[test]
+    fn account_file_is_distinct_per_ca() {
+        // Staging and prod must map to different account files so a switch or a
+        // mix of CAs never reuses an account that belongs to another server.
+        let prod = account_file_for("https://acme-v02.api.letsencrypt.org/directory");
+        let staging = account_file_for("https://acme-staging-v02.api.letsencrypt.org/directory");
+        assert_ne!(prod, staging);
+        // Same URL is stable across calls.
+        assert_eq!(
+            prod,
+            account_file_for("https://acme-v02.api.letsencrypt.org/directory")
+        );
+    }
+
+    #[test]
+    fn account_file_is_filesystem_safe() {
+        // No slashes, colons or other path-significant characters survive.
+        let name = account_file_for("https://acme-v02.api.letsencrypt.org/directory");
+        assert!(name.starts_with("account_"));
+        assert!(name.ends_with(".json"));
+        assert!(!name.contains('/'));
+        assert!(!name.contains(':'));
+    }
+
+    #[test]
+    fn ca_server_override_is_read_from_resolver() {
+        let staging = "https://acme-staging-v02.api.letsencrypt.org/directory";
+        let resolver = ResolverConfig::Dns01 {
+            provider: crate::config::ProviderConfig::Gandi {
+                personal_access_token_env: "X".to_string(),
+            },
+            domains: vec![],
+            ca_server: Some(staging.to_string()),
+        };
+        assert_eq!(resolver.ca_server(), Some(staging));
+
+        // Absent ca_server -> None (caller falls back to the global default).
+        assert_eq!(dns01(&[]).ca_server(), None);
+        assert_eq!(ResolverConfig::Http01 { ca_server: None }.ca_server(), None);
     }
 }
