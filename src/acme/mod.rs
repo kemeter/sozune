@@ -13,7 +13,7 @@ use rcgen::{CertificateParams, KeyPair};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::config::AcmeConfig;
+use crate::config::{AcmeConfig, ResolverConfig};
 use crate::model::Entrypoint;
 
 use self::challenge_server::ChallengeState;
@@ -228,7 +228,12 @@ impl AcmeManager {
             }
         };
 
-        let mut certs: Vec<(String, Option<String>)> = Vec::new();
+        // Resolver-managed domains first: a resolver can declare `domains`
+        // (e.g. a wildcard) it provisions on its own, with no entrypoint. They
+        // take precedence so that an entrypoint reusing the same hostname does
+        // not override the resolver binding for it.
+        let mut certs = collect_resolver_managed_domains(&self.config.resolvers);
+
         for entrypoint in storage.values() {
             if !entrypoint.config.tls {
                 continue;
@@ -695,6 +700,24 @@ fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
     (leaf, chain)
 }
 
+/// Flatten the `domains` declared on each resolver into `(hostname, resolver)`
+/// pairs, deduplicating by hostname (first resolver wins). These are the certs
+/// a resolver provisions on its own, with no entrypoint — typically a wildcard.
+fn collect_resolver_managed_domains(
+    resolvers: &HashMap<String, ResolverConfig>,
+) -> Vec<(String, Option<String>)> {
+    let mut certs: Vec<(String, Option<String>)> = Vec::new();
+    for (resolver_name, resolver) in resolvers {
+        for hostname in resolver.managed_domains() {
+            if certs.iter().any(|(h, _)| h == hostname) {
+                continue;
+            }
+            certs.push((hostname.clone(), Some(resolver_name.clone())));
+        }
+    }
+    certs
+}
+
 /// Extract the seconds remaining until the `retry after` instant carried by a
 /// Let's Encrypt `rateLimited` error message, e.g.
 /// `... retry after 2026-06-27 15:48:27 UTC: see ...`.
@@ -950,5 +973,72 @@ mod tests {
             remaining > BACKOFF_SCHEDULE[0],
             "retry-after must override the shorter schedule delay, got {remaining:?}"
         );
+    }
+
+    fn dns01(domains: &[&str]) -> ResolverConfig {
+        ResolverConfig::Dns01 {
+            provider: crate::config::ProviderConfig::Gandi {
+                personal_access_token_env: "X".to_string(),
+            },
+            domains: domains.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolver_domains_are_collected_with_their_resolver() {
+        let mut resolvers = HashMap::new();
+        resolvers.insert("gandi".to_string(), dns01(&["*.kemeter.app"]));
+
+        let certs = collect_resolver_managed_domains(&resolvers);
+        assert_eq!(
+            certs,
+            vec![("*.kemeter.app".to_string(), Some("gandi".to_string()))]
+        );
+    }
+
+    #[test]
+    fn resolver_without_domains_contributes_nothing() {
+        let mut resolvers = HashMap::new();
+        resolvers.insert("gandi".to_string(), dns01(&[]));
+        resolvers.insert("legacy".to_string(), ResolverConfig::Http01);
+
+        assert!(collect_resolver_managed_domains(&resolvers).is_empty());
+    }
+
+    #[test]
+    fn http01_resolver_domains_are_ignored() {
+        // Http01 has no `domains` field, so it can never manage a domain on its
+        // own — managed_domains() is empty regardless.
+        let mut resolvers = HashMap::new();
+        resolvers.insert("legacy".to_string(), ResolverConfig::Http01);
+
+        assert!(collect_resolver_managed_domains(&resolvers).is_empty());
+    }
+
+    #[test]
+    fn duplicate_domain_across_resolvers_keeps_one() {
+        // Same hostname declared on two resolvers: only one pairing is kept so
+        // we never open two competing ACME orders for it.
+        let mut resolvers = HashMap::new();
+        resolvers.insert("a".to_string(), dns01(&["*.kemeter.app"]));
+        resolvers.insert("b".to_string(), dns01(&["*.kemeter.app"]));
+
+        let certs = collect_resolver_managed_domains(&resolvers);
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].0, "*.kemeter.app");
+    }
+
+    #[test]
+    fn multiple_resolvers_each_contribute_their_domains() {
+        let mut resolvers = HashMap::new();
+        resolvers.insert("gandi".to_string(), dns01(&["*.kemeter.app"]));
+        resolvers.insert("cf".to_string(), dns01(&["*.example.com"]));
+
+        let mut hosts: Vec<String> = collect_resolver_managed_domains(&resolvers)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        hosts.sort();
+        assert_eq!(hosts, vec!["*.example.com", "*.kemeter.app"]);
     }
 }

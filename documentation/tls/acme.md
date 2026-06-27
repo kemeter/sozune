@@ -61,6 +61,29 @@ acme:
 
 Set `CF_API_TOKEN=...` in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
 
+### Wildcard without an entrypoint (`domains`)
+
+The example above ties the wildcard to an entrypoint. When you want a wildcard purely to *cover* every subdomain — and let each app keep its own exact-host route — declaring a placeholder entrypoint just to carry the cert is awkward. Instead, list the hostnames directly on the resolver with `domains`:
+
+```yaml
+# config.yaml
+acme:
+  enabled: true
+  email: ops@example.com
+  resolvers:
+    cloudflare-main:
+      challenge: dns-01
+      provider:
+        type: cloudflare
+        api_token_env: CF_API_TOKEN
+      domains:
+        - "*.example.com"
+```
+
+Sōzune provisions each entry in `domains` on its own — no entrypoint required — and Sōzu then serves the resulting cert by SNI for every matching subdomain. Apps keep their normal `app.example.com` routes (which win by longest-prefix match) and no longer need a per-host ACME order, so a busy domain stops piling up Let's Encrypt rate-limit usage.
+
+`domains` is only valid on a `dns-01` resolver (wildcards always need DNS-01). It composes with the per-entrypoint `acme.resolver` binding: a resolver can both manage its own `domains` and be referenced by entrypoints. If the same hostname is claimed by a resolver's `domains` and an entrypoint, the resolver binding wins and only one certificate is issued.
+
 **Supported providers:**
 
 | Provider | `type` value | Required env vars | Optional fields |

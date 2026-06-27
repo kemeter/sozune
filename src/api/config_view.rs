@@ -62,6 +62,7 @@ pub enum ResolverView {
     Dns01 {
         provider: &'static str,
         required_env: Vec<&'static str>,
+        domains: Vec<String>,
     },
 }
 
@@ -165,7 +166,7 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
     use crate::config::ProviderConfig::*;
     match r {
         ResolverConfig::Http01 => ResolverView::Http01,
-        ResolverConfig::Dns01 { provider } => {
+        ResolverConfig::Dns01 { provider, domains } => {
             let (name, required_env) = match provider {
                 Cloudflare { .. } => ("cloudflare", vec!["CLOUDFLARE_API_TOKEN (configurable)"]),
                 Ovh { .. } => (
@@ -182,6 +183,7 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
             ResolverView::Dns01 {
                 provider: name,
                 required_env,
+                domains: domains.clone(),
             }
         }
     }

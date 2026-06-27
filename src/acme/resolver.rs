@@ -27,7 +27,9 @@ pub fn build_resolver(name: Option<&str>, acme: &AcmeConfig) -> anyhow::Result<O
 
     match cfg {
         ResolverConfig::Http01 => Ok(Some(Resolver::Http01)),
-        ResolverConfig::Dns01 { provider } => Ok(Some(Resolver::Dns01(build_provider(provider)?))),
+        ResolverConfig::Dns01 { provider, .. } => {
+            Ok(Some(Resolver::Dns01(build_provider(provider)?)))
+        }
     }
 }
 
@@ -164,6 +166,7 @@ mod tests {
                 provider: ProviderConfig::Cloudflare {
                     api_token_env: "TEST_CF_TOKEN_MISSING".to_string(),
                 },
+                domains: vec![],
             },
         );
         let err = match build_resolver(Some("cf"), &acme) {
@@ -188,6 +191,7 @@ mod tests {
                 provider: ProviderConfig::Cloudflare {
                     api_token_env: "TEST_CF_TOKEN_PRESENT".to_string(),
                 },
+                domains: vec![],
             },
         );
         let resolver = build_resolver(Some("cf"), &acme).unwrap().unwrap();
