@@ -52,17 +52,47 @@ fn reason_phrase(code: &str) -> &'static str {
     }
 }
 
-/// Wrap a plain body into a full HTTP/1.1 response Sōzu can parse. Values
-/// that already start with `HTTP/` are assumed to be complete responses and
-/// passed through unchanged (`file://` paths flow through unchanged too —
-/// Sōzu will load and parse them as written).
+/// Wrap an error-page value into a full HTTP/1.1 response Sōzu can parse.
+///
+/// The value may be:
+/// * a `file://` reference — the file is read off disk and its contents are
+///   treated exactly like an inline value (wrapped unless they already are a
+///   full `HTTP/` response). This keeps a `file://` template authored as plain
+///   HTML working: Sōzu itself does not wrap file contents, so without this the
+///   raw HTML would reach the worker without a status line and the listener
+///   would fail to load. Only trusted static config reaches here; provider
+///   labels have their `file://` values stripped by
+///   [`sanitize_provider_error_pages`] beforehand.
+/// * an inline body already starting with `HTTP/` — passed through unchanged.
+/// * any other inline body — wrapped.
 ///
 /// The wrapped response carries `Content-Length`, `Content-Type: text/html`
 /// and `Connection: close` to match the shape of Sōzu's built-in templates.
+/// A `file://` whose path cannot be read falls back to wrapping the literal
+/// value, so a typo surfaces as a visible body rather than a panic.
 pub fn wrap_body_into_http_response(code: &str, value: &str) -> String {
-    if value.starts_with("HTTP/") || value.starts_with("file://") {
-        return value.to_string();
+    let body = match value.strip_prefix("file://") {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) => {
+                tracing::warn!("error_pages: failed to read '{path}' (code {code}): {e}");
+                value.to_string()
+            }
+        },
+        None => value.to_string(),
+    };
+
+    if body.starts_with("HTTP/") {
+        return body;
     }
+
+    // Sōzu re-parses the template and normalizes every line ending to CRLF
+    // (`\r\n` -> `\n` -> `\r\n`) before serving it. Normalize the body the same
+    // way here so the `Content-Length` we emit matches the byte count Sōzu will
+    // actually put on the wire. Counting the LF-form length instead would
+    // under-report by one byte per line and Sōzu would truncate the tail.
+    let body = body.replace("\r\n", "\n").replace('\n', "\r\n");
+
     let reason = reason_phrase(code);
     format!(
         "HTTP/1.1 {code} {reason}\r\n\
@@ -73,8 +103,8 @@ pub fn wrap_body_into_http_response(code: &str, value: &str) -> String {
          {body}",
         code = code,
         reason = reason,
-        len = value.len(),
-        body = value,
+        len = body.len(),
+        body = body,
     )
 }
 
@@ -170,6 +200,17 @@ mod tests {
     }
 
     #[test]
+    fn wrap_multiline_body_content_length_counts_crlf() {
+        // Sōzu normalizes LF -> CRLF before serving; Content-Length must count
+        // the CRLF form or the tail is truncated on the wire. A 3-line body
+        // (two LF) carries +2 bytes once normalized.
+        let body = "a\nb\nc"; // 5 bytes as LF, 7 bytes as CRLF
+        let wrapped = wrap_body_into_http_response("404", body);
+        assert!(wrapped.contains("Content-Length: 7\r\n"));
+        assert!(wrapped.ends_with("a\r\nb\r\nc"));
+    }
+
+    #[test]
     fn wrap_plain_body_produces_valid_http_response() {
         let wrapped = wrap_body_into_http_response("503", "<h1>Down</h1>");
         assert!(wrapped.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
@@ -187,9 +228,44 @@ mod tests {
     }
 
     #[test]
-    fn wrap_file_uri_passes_through_unchanged() {
-        let v = "file:///etc/sozune/templates/503.html";
-        assert_eq!(wrap_body_into_http_response("503", v), v);
+    fn wrap_file_uri_reads_and_wraps_plain_html() {
+        // A file:// template authored as plain HTML must be read and wrapped
+        // into a full HTTP/1.1 response (Sōzu does not wrap file contents).
+        let dir = std::env::temp_dir();
+        let path = dir.join("sozune_test_404_plain.html");
+        std::fs::write(&path, "<h1>Gone</h1>").unwrap();
+        let value = format!("file://{}", path.display());
+
+        let wrapped = wrap_body_into_http_response("404", &value);
+        assert!(wrapped.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(wrapped.contains("Content-Length: 13\r\n"));
+        assert!(wrapped.ends_with("<h1>Gone</h1>"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wrap_file_uri_passes_through_full_http_response() {
+        // A file:// template that already is a full HTTP response is served
+        // verbatim, no double-wrapping.
+        let dir = std::env::temp_dir();
+        let path = dir.join("sozune_test_404_full.http");
+        let raw = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        std::fs::write(&path, raw).unwrap();
+        let value = format!("file://{}", path.display());
+
+        assert_eq!(wrap_body_into_http_response("404", &value), raw);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wrap_file_uri_missing_path_falls_back_to_literal() {
+        // An unreadable path does not panic: the literal value is wrapped so
+        // the misconfiguration is visible rather than fatal.
+        let wrapped = wrap_body_into_http_response("404", "file:///nonexistent/sozune/never.html");
+        assert!(wrapped.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(wrapped.ends_with("file:///nonexistent/sozune/never.html"));
     }
 
     #[test]
