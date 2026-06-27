@@ -2,10 +2,10 @@ pub mod challenge_server;
 pub mod inventory;
 pub mod resolver;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cheti::{AccountStore, Dns01Solver, FileAccountStore};
 use instant_acme::{Account, ChallengeType, Identifier, NewAccount, NewOrder, Order, OrderStatus};
@@ -26,6 +26,76 @@ use self::resolver::{Resolver, build_resolver};
 /// Let's Encrypt profile keeps renewing at the 30-days-left mark.
 const RENEWAL_FLOOR_DAYS: u32 = 30;
 
+/// Per-hostname backoff schedule applied after a failed provisioning attempt,
+/// indexed by the count of consecutive failures (1st failure -> 60s, etc.).
+/// A permanently broken hostname (e.g. missing DNS) settles at the last value
+/// instead of being retried every cycle, which would otherwise pile up
+/// Let's Encrypt authorization failures and rate-limit the whole account.
+const BACKOFF_SCHEDULE: [Duration; 5] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+    Duration::from_secs(6 * 60 * 60),
+];
+
+/// Tracks when a hostname may next be attempted after one or more failures.
+struct BackoffState {
+    next_attempt_at: Instant,
+    consecutive_failures: u32,
+}
+
+/// Per-hostname backoff tracker. Keeps failing hostnames from being retried
+/// every cycle (which would pile up Let's Encrypt authorization failures and
+/// rate-limit the whole account) while letting healthy hostnames through.
+#[derive(Default)]
+struct Backoff {
+    failures: RwLock<HashMap<String, BackoffState>>,
+}
+
+impl Backoff {
+    /// Remaining backoff for a hostname, or `None` if it may be attempted now.
+    fn remaining(&self, hostname: &str) -> Option<Duration> {
+        let failures = self.failures.read().ok()?;
+        let state = failures.get(hostname)?;
+        state.next_attempt_at.checked_duration_since(Instant::now())
+    }
+
+    /// Clear any backoff state for a hostname after a successful provisioning.
+    fn record_success(&self, hostname: &str) {
+        if let Ok(mut failures) = self.failures.write() {
+            failures.remove(hostname);
+        }
+    }
+
+    /// Record a failed attempt and schedule the next one. When a `retry after`
+    /// instant is present (Let's Encrypt rate limiting), honor it: the next
+    /// attempt is deferred until at least that time, even if the backoff
+    /// schedule would have been shorter.
+    fn record_failure(&self, hostname: &str, retry_after_secs: Option<u64>) {
+        let Ok(mut failures) = self.failures.write() else {
+            return;
+        };
+        let now = Instant::now();
+        let entry = failures
+            .entry(hostname.to_string())
+            .or_insert(BackoffState {
+                next_attempt_at: now,
+                consecutive_failures: 0,
+            });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+
+        let idx = (entry.consecutive_failures as usize - 1).min(BACKOFF_SCHEDULE.len() - 1);
+        let mut delay = BACKOFF_SCHEDULE[idx];
+
+        if let Some(retry_after) = retry_after_secs {
+            delay = delay.max(Duration::from_secs(retry_after));
+        }
+
+        entry.next_attempt_at = now + delay;
+    }
+}
+
 /// Command sent from ACME manager to the proxy reload handler
 pub struct CertCommand {
     pub hostname: String,
@@ -41,6 +111,8 @@ pub struct AcmeManager {
     cert_tx: mpsc::Sender<CertCommand>,
     certs_dir: PathBuf,
     notify: Arc<Notify>,
+    /// Per-hostname backoff after failed provisioning attempts.
+    backoff: Backoff,
 }
 
 impl AcmeManager {
@@ -59,6 +131,7 @@ impl AcmeManager {
             cert_tx,
             certs_dir,
             notify,
+            backoff: Backoff::default(),
         }
     }
 
@@ -104,12 +177,30 @@ impl AcmeManager {
         for (hostname, resolver_name) in &certs {
             match self.needs_certificate(hostname).await {
                 true => {
+                    // A hostname that keeps failing (e.g. missing DNS) stays in
+                    // backoff so it is not retried every cycle — that would keep
+                    // the Let's Encrypt account rate-limited and starve healthy
+                    // hostnames of provisioning.
+                    if let Some(remaining) = self.backoff.remaining(hostname) {
+                        debug!(
+                            "Skipping {}: in backoff for another {}s after a prior failure",
+                            hostname,
+                            remaining.as_secs()
+                        );
+                        continue;
+                    }
+
                     info!("Requesting certificate for {}", hostname);
-                    if let Err(e) = self
+                    match self
                         .provision_certificate(hostname, resolver_name.as_deref())
                         .await
                     {
-                        error!("Failed to provision certificate for {}: {}", hostname, e);
+                        Ok(()) => self.backoff.record_success(hostname),
+                        Err(e) => {
+                            let retry_after = parse_retry_after_secs(&e.to_string());
+                            self.backoff.record_failure(hostname, retry_after);
+                            error!("Failed to provision certificate for {}: {}", hostname, e);
+                        }
                     }
                 }
                 false => {
@@ -604,6 +695,78 @@ fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
     (leaf, chain)
 }
 
+/// Extract the seconds remaining until the `retry after` instant carried by a
+/// Let's Encrypt `rateLimited` error message, e.g.
+/// `... retry after 2026-06-27 15:48:27 UTC: see ...`.
+/// Returns `None` when no such timestamp is present or it is already in the past.
+///
+/// The timestamp has a `YYYY-MM-DD HH:MM:SS UTC` shape, so it is parsed by hand
+/// to avoid pulling a date-parsing crate into the production build (`time` is a
+/// dev-dependency only, and without its `parsing` feature anyway).
+fn parse_retry_after_secs(message: &str) -> Option<u64> {
+    let after = message.split("retry after ").nth(1)?;
+    // The instant is followed by `: see <url>` in real messages. Cut at that
+    // separator instead of assuming a fixed offset, so a longer year, a missing
+    // suffix, or extra surrounding text doesn't silently truncate the stamp.
+    let stamp = after.split(": ").next()?.trim();
+    let retry_epoch = parse_utc_stamp_to_epoch(stamp)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+
+    let remaining = retry_epoch - now;
+    if remaining > 0 {
+        Some(remaining as u64)
+    } else {
+        None
+    }
+}
+
+/// Parse a `YYYY-MM-DD HH:MM:SS UTC` string into a Unix epoch (seconds).
+fn parse_utc_stamp_to_epoch(stamp: &str) -> Option<i64> {
+    let stamp = stamp.strip_suffix(" UTC")?;
+    let (date, time) = stamp.split_once(' ')?;
+
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    // Reject any trailing field, e.g. "2026-06-27-01".
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+
+    // Days since the Unix epoch via the civil-date algorithm (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +820,135 @@ mod tests {
         assert!(AcmeManager::validate_hostname("*.*.example.com").is_err());
         // Bare `*.` is also invalid (no apex).
         assert!(AcmeManager::validate_hostname("*.").is_err());
+    }
+
+    #[test]
+    fn parse_utc_stamp_matches_known_epochs() {
+        // Reference values cross-checked against the Unix epoch.
+        assert_eq!(parse_utc_stamp_to_epoch("1970-01-01 00:00:00 UTC"), Some(0));
+        assert_eq!(
+            parse_utc_stamp_to_epoch("2000-01-01 00:00:00 UTC"),
+            Some(946_684_800)
+        );
+        assert_eq!(
+            parse_utc_stamp_to_epoch("2026-06-27 15:48:27 UTC"),
+            Some(1_782_575_307)
+        );
+        // Leap second is accepted (60s).
+        assert_eq!(
+            parse_utc_stamp_to_epoch("2016-12-31 23:59:60 UTC"),
+            Some(1_483_228_800)
+        );
+        // Malformed input is rejected, not panicked on.
+        assert_eq!(parse_utc_stamp_to_epoch("not a date"), None);
+        assert_eq!(parse_utc_stamp_to_epoch("2026-13-01 00:00:00 UTC"), None);
+        // Out-of-range time fields are rejected.
+        assert_eq!(parse_utc_stamp_to_epoch("2026-06-27 24:00:00 UTC"), None);
+        assert_eq!(parse_utc_stamp_to_epoch("2026-06-27 15:60:00 UTC"), None);
+        // Extra trailing fields are rejected, not silently ignored.
+        assert_eq!(parse_utc_stamp_to_epoch("2026-06-27-01 15:48:27 UTC"), None);
+        assert_eq!(parse_utc_stamp_to_epoch("2026-06-27 15:48:27:99 UTC"), None);
+        // Missing UTC suffix is rejected.
+        assert_eq!(parse_utc_stamp_to_epoch("2026-06-27 15:48:27"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_is_robust_to_message_shape() {
+        // Five-digit year would overflow a fixed 23-char slice; the separator
+        // cut handles it (epoch far in the future -> large positive remaining).
+        let secs = parse_retry_after_secs("retry after 10000-01-01 00:00:00 UTC: see x")
+            .expect("five-digit year must still parse");
+        assert!(secs > 0);
+
+        // No trailing `: see ...`, just the stamp.
+        assert!(parse_retry_after_secs("retry after 2099-01-01 00:00:00 UTC").is_some());
+
+        // Surrounding whitespace around the stamp is tolerated.
+        assert!(parse_retry_after_secs("retry after  2099-01-01 00:00:00 UTC : see x").is_some());
+
+        // Garbage after the marker yields None, not a panic or bogus instant.
+        assert_eq!(parse_retry_after_secs("retry after soon-ish: see x"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_reads_letsencrypt_rate_limit_message() {
+        // A timestamp far in the future yields a large positive remaining.
+        let msg = "API error: too many failed authorizations (5) for \"x.example.com\" in the \
+             last 1h0m0s, retry after 2099-01-01 00:00:00 UTC: see \
+             https://letsencrypt.org/docs/rate-limits/";
+        let secs = parse_retry_after_secs(msg).expect("should parse a future retry-after");
+        assert!(secs > 0, "expected positive remaining, got {secs}");
+    }
+
+    #[test]
+    fn parse_retry_after_none_when_absent_or_past() {
+        assert_eq!(parse_retry_after_secs("Order became invalid"), None);
+        assert_eq!(
+            parse_retry_after_secs("retry after 2000-01-01 00:00:00 UTC: see ..."),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_schedule_progresses_and_caps() {
+        // The index used in record_failure: (consecutive_failures - 1) clamped.
+        let pick = |failures: u32| {
+            let idx = (failures as usize - 1).min(BACKOFF_SCHEDULE.len() - 1);
+            BACKOFF_SCHEDULE[idx]
+        };
+        assert_eq!(pick(1), Duration::from_secs(60));
+        assert_eq!(pick(2), Duration::from_secs(5 * 60));
+        assert_eq!(pick(5), Duration::from_secs(6 * 60 * 60));
+        // Beyond the schedule length it stays capped at the last value.
+        assert_eq!(pick(99), Duration::from_secs(6 * 60 * 60));
+    }
+
+    #[test]
+    fn backoff_isolates_hostnames_so_a_broken_one_does_not_starve_others() {
+        let backoff = Backoff::default();
+
+        // One hostname fails; it goes into backoff.
+        backoff.record_failure("broken.example.com", None);
+        assert!(
+            backoff.remaining("broken.example.com").is_some(),
+            "a failed hostname must be in backoff"
+        );
+
+        // A sibling hostname that never failed is not affected: it may be
+        // attempted right away, so it is still provisioned this cycle.
+        assert_eq!(
+            backoff.remaining("healthy.example.com"),
+            None,
+            "an unrelated hostname must not inherit a sibling's backoff"
+        );
+    }
+
+    #[test]
+    fn backoff_records_failure_then_clears_on_success() {
+        let backoff = Backoff::default();
+
+        backoff.record_failure("host.example.com", None);
+        assert!(backoff.remaining("host.example.com").is_some());
+
+        // A successful provisioning clears the backoff entry entirely.
+        backoff.record_success("host.example.com");
+        assert_eq!(backoff.remaining("host.example.com"), None);
+    }
+
+    #[test]
+    fn backoff_honors_retry_after_over_the_schedule() {
+        let backoff = Backoff::default();
+
+        // First failure would normally back off 60s; a far-future retry-after
+        // must win, deferring the next attempt well beyond the schedule value.
+        let one_day = 24 * 60 * 60;
+        backoff.record_failure("host.example.com", Some(one_day));
+        let remaining = backoff
+            .remaining("host.example.com")
+            .expect("host should be in backoff");
+        assert!(
+            remaining > BACKOFF_SCHEDULE[0],
+            "retry-after must override the shorter schedule delay, got {remaining:?}"
+        );
     }
 }
