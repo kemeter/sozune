@@ -99,6 +99,26 @@ Sōzune provisions each entry in `domains` on its own — no entrypoint required
 
 **Multiple entrypoints sharing a hostname with different resolvers:** Sōzune issues one certificate per hostname; the first resolver seen wins. A warning is logged for the others.
 
+### Per-resolver ACME server (`ca_server`)
+
+By default every resolver uses the global staging/prod Let's Encrypt directory (the `staging` flag / `SOZUNE_ACME_STAGING`). A resolver can pin its own ACME directory URL with `ca_server`, which overrides that default — so a staging resolver and a production resolver can run side by side:
+
+```yaml
+acme:
+  resolvers:
+    le-prod:
+      challenge: dns-01
+      provider: { type: gandi, personal_access_token_env: GANDI_PAT }
+      domains: ["*.example.com"]
+    le-staging:
+      challenge: dns-01
+      provider: { type: gandi, personal_access_token_env: GANDI_PAT }
+      ca_server: "https://acme-staging-v02.api.letsencrypt.org/directory"
+      domains: ["*.test.example.com"]
+```
+
+Each distinct `ca_server` keeps its own ACME account on disk (the account file is derived from the directory URL), so switching or mixing CAs never reuses an account that belongs to a different server. `ca_server` also accepts a non-Let's-Encrypt ACME directory (e.g. an internal CA).
+
 ## How it works
 
 When you declare a service with `tls=true`, Sōzune scans every TLS-enabled hostname and triggers an HTTP-01 challenge for each one that is missing a certificate or is expiring within 30 days.

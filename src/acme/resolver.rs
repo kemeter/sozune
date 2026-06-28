@@ -26,7 +26,7 @@ pub fn build_resolver(name: Option<&str>, acme: &AcmeConfig) -> anyhow::Result<O
     };
 
     match cfg {
-        ResolverConfig::Http01 => Ok(Some(Resolver::Http01)),
+        ResolverConfig::Http01 { .. } => Ok(Some(Resolver::Http01)),
         ResolverConfig::Dns01 { provider, .. } => {
             Ok(Some(Resolver::Dns01(build_provider(provider)?)))
         }
@@ -146,8 +146,10 @@ mod tests {
     #[test]
     fn http01_resolver_does_not_support_wildcard() {
         let mut acme = empty_acme();
-        acme.resolvers
-            .insert("legacy".to_string(), ResolverConfig::Http01);
+        acme.resolvers.insert(
+            "legacy".to_string(),
+            ResolverConfig::Http01 { ca_server: None },
+        );
         let resolver = build_resolver(Some("legacy"), &acme).unwrap().unwrap();
         assert!(!resolver.supports_wildcard());
         assert!(matches!(resolver, Resolver::Http01));
@@ -167,6 +169,7 @@ mod tests {
                     api_token_env: "TEST_CF_TOKEN_MISSING".to_string(),
                 },
                 domains: vec![],
+                ca_server: None,
             },
         );
         let err = match build_resolver(Some("cf"), &acme) {
@@ -192,6 +195,7 @@ mod tests {
                     api_token_env: "TEST_CF_TOKEN_PRESENT".to_string(),
                 },
                 domains: vec![],
+                ca_server: None,
             },
         );
         let resolver = build_resolver(Some("cf"), &acme).unwrap().unwrap();
