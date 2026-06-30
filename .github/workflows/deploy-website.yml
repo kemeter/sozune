@@ -40,14 +40,14 @@ jobs:
 
       - name: Copy documentation assets
         run: |
-          mkdir -p website/public/dist/documentation/assets
-          cp -r documentation/assets/. website/public/dist/documentation/assets/
+          mkdir -p website/dist/documentation/assets
+          cp -r documentation/assets/. website/dist/documentation/assets/
 
       - uses: actions/configure-pages@v6
 
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: website/public/dist
+          path: website/dist
 
   deploy:
     needs: build
