@@ -193,6 +193,7 @@ fn build_entrypoint(
     let health_check = core::parse_health_check(labels, &prefix, diagnostics);
     // HTTP has no flow key, so hrw/maglev are not honored here (W022).
     let load_balancer = core::parse_load_balancer(labels, &prefix, false, diagnostics);
+    let weight = core::parse_weight(labels, &prefix, diagnostics);
     let retry = core::parse_retry(labels, &prefix, diagnostics);
     let circuit_breaker = core::parse_circuit_breaker(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
@@ -218,9 +219,14 @@ fn build_entrypoint(
         _ => return None,
     };
 
+    let backend = match weight {
+        Some(weight) => Backend::new(backend_ip, port).with_weight(weight),
+        None => Backend::new(backend_ip, port),
+    };
+
     Some(Entrypoint {
         id: format!("{protocol}_{service_name}"),
-        backends: vec![Backend::new(backend_ip, port)],
+        backends: vec![backend],
         name: service_name.to_string(),
         protocol: protocol_enum,
         config: EntrypointConfig {
@@ -344,10 +350,16 @@ fn build_l4_entrypoint(
     let priority = core::parse_priority(labels, &prefix, diagnostics);
     // Flow-affine algorithms (hrw/maglev) are only honored for UDP.
     let load_balancer = core::parse_load_balancer(labels, &prefix, proto == "udp", diagnostics);
+    let weight = core::parse_weight(labels, &prefix, diagnostics);
+
+    let backend = match weight {
+        Some(weight) => Backend::new(backend_ip, port).with_weight(weight),
+        None => Backend::new(backend_ip, port),
+    };
 
     Some(Entrypoint {
         id: format!("{proto}_{service_name}"),
-        backends: vec![Backend::new(backend_ip, port)],
+        backends: vec![backend],
         name: service_name.to_string(),
         protocol,
         config: EntrypointConfig {
@@ -489,6 +501,60 @@ mod tests {
         let ep = r.entrypoints.get("http_web").unwrap();
         assert_eq!(ep.backends, vec![Backend::new("172.18.0.4", 8080)]);
         assert_eq!(ep.config.hostnames, vec!["example.com"]);
+    }
+
+    #[test]
+    fn weight_label_sets_backend_weight() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "example.com"),
+                ("sozune.http.web.port", "8080"),
+                ("sozune.http.web.weight", "90"),
+            ],
+            vec![net("bridge", "172.18.0.4")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_web").unwrap();
+        assert_eq!(
+            ep.backends,
+            vec![Backend::new("172.18.0.4", 8080).with_weight(90)]
+        );
+    }
+
+    #[test]
+    fn weight_zero_is_honoured() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "example.com"),
+                ("sozune.http.web.port", "8080"),
+                ("sozune.http.web.weight", "0"),
+            ],
+            vec![net("bridge", "172.18.0.4")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_web").unwrap();
+        assert_eq!(ep.backends[0].weight, 0);
+        assert!(!has_code(&r, DiagnosticCode::W027InvalidWeight));
+    }
+
+    #[test]
+    fn invalid_weight_falls_back_to_default_with_w027() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "example.com"),
+                ("sozune.http.web.port", "8080"),
+                ("sozune.http.web.weight", "-5"),
+            ],
+            vec![net("bridge", "172.18.0.4")],
+        );
+        let r = parse(&c);
+        let ep = r.entrypoints.get("http_web").unwrap();
+        // Falls back to the model default (no weight applied), still routes.
+        assert_eq!(ep.backends, vec![Backend::new("172.18.0.4", 8080)]);
+        assert!(has_code(&r, DiagnosticCode::W027InvalidWeight));
     }
 
     #[test]

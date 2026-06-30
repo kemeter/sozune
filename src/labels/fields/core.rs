@@ -253,6 +253,43 @@ pub fn parse_load_balancer(
     }
 }
 
+/// Parse the `<prefix>weight` label into a backend load-balancing weight.
+///
+/// The weight is a relative share of traffic among the backends of a service:
+/// a backend with weight `90` receives roughly nine times the traffic of one
+/// with weight `10`. It is only honoured by weight-aware balancers (`random`);
+/// `round_robin` and the load-based algorithms ignore it. A weight of `0` keeps
+/// the backend wired but excludes it from selection.
+///
+/// Absent or empty → `None` (the backend keeps its default weight). A negative
+/// or non-integer value emits `W027` and falls back to `None`.
+pub fn parse_weight(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<u32> {
+    let key = format!("{prefix}weight");
+    let raw = labels
+        .get(&key)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    match raw.parse::<u32>() {
+        Ok(weight) => Some(weight),
+        Err(_) => {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W027InvalidWeight,
+                    "weight is not a valid non-negative integer; backend keeps the default weight",
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint("expected a non-negative integer, e.g. 90"),
+            );
+            None
+        }
+    }
+}
+
 /// Parse the `<prefix>retry.attempts` label into a [`RetryConfig`]. The value
 /// is the total number of attempts (first try + retries). Absent, `<= 1`, or
 /// invalid → `None` (no retry); an invalid value emits `W023`.

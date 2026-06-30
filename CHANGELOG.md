@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Routing
+
+- Backend weight — a backend can now declare a load-balancing weight via `sozune.http.<svc>.weight` (also available for TCP/UDP services). The weight is a relative share of traffic among a service's backends and is honoured by the weight-aware `random` balancer (`round_robin` and the load-based algorithms ignore it). A weight of `0` keeps the backend wired but excludes it from selection; a negative or non-integer value emits `W027` and the backend keeps its default weight.
+
+### CLI
+
+- `sozune explain` now covers every diagnostic code. The new `W027` (invalid backend weight) plus the previously undocumented `W019`–`W025` (forwardAuth, error pages, healthCheck, loadBalancer, retry, circuitBreaker, inFlightReq) now resolve instead of reporting an unknown code.
+
 ## [0.14.0-dev]
 
 ### TLS / ACME
