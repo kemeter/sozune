@@ -78,7 +78,30 @@ Weights live on each backend via the `weight` field (default `100`). Higher weig
 }
 ```
 
-There is currently no Docker label to set per-backend weights.
+From Docker (or any label source), a backend sets its own weight with the `weight` label:
+
+```yaml
+services:
+  app-stable:
+    image: my-app:stable
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.app.host=app.example.com"
+      - "sozune.http.app.weight=90"
+      - "sozune.http.app.loadBalancer=random"
+
+  app-canary:
+    image: my-app:canary
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.app.host=app.example.com"
+      - "sozune.http.app.weight=10"
+      - "sozune.http.app.loadBalancer=random"
+```
+
+The two containers join the same `app` service, so `app.example.com` is split roughly 90% / 10% between them — a simple canary.
+
+> **Only `random` honours the weight.** `round_robin` (the default) and the load-based algorithms ignore it, so set `loadBalancer=random` on the service when you rely on weights. The split is statistical, not an exact ratio. A weight of `0` keeps the backend wired but excludes it from selection; a negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
 
 ## Sticky sessions
 
@@ -97,4 +120,4 @@ Sticky sessions are best-effort affinity, not absolute pinning.
 ## What's not supported
 
 - **Custom hashing** (consistent hashing, IP hash) — not exposed by Sōzu.
-- **Per-backend weights from Docker labels** — weights are settable via the REST/YAML payload only (see above).
+- **Deterministic weighted round-robin** — weights are honoured only by the `random` balancer, so the split is statistical, not an exact request-by-request ratio.

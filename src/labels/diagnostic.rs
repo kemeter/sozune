@@ -58,6 +58,9 @@ pub enum DiagnosticCode {
     /// A `plugins.<name>.<key>` label was malformed (missing sub-key or nested
     /// past the depth limit) or set on a TCP/UDP route where plugins don't run.
     W026InvalidPluginConfig,
+    /// A `weight` label was not a valid non-negative integer; the backend keeps
+    /// the default weight.
+    W027InvalidWeight,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -98,6 +101,7 @@ impl DiagnosticCode {
             DiagnosticCode::W024InvalidCircuitBreaker => "W024",
             DiagnosticCode::W025InvalidInFlightReq => "W025",
             DiagnosticCode::W026InvalidPluginConfig => "W026",
+            DiagnosticCode::W027InvalidWeight => "W027",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -109,6 +113,49 @@ impl DiagnosticCode {
             Some('W') => Severity::Warn,
             _ => Severity::Info,
         }
+    }
+
+    /// Every diagnostic code, in declaration order. Keep in sync with the enum
+    /// variants; used to assert exhaustive coverage (e.g. `sozune explain`).
+    #[cfg(test)]
+    pub fn all() -> &'static [DiagnosticCode] {
+        &[
+            DiagnosticCode::E001Disabled,
+            DiagnosticCode::E002MissingHost,
+            DiagnosticCode::E003InspectFailed,
+            DiagnosticCode::E004NoServices,
+            DiagnosticCode::E005MissingL4Entrypoint,
+            DiagnosticCode::E006MissingUdpPort,
+            DiagnosticCode::W001InvalidPort,
+            DiagnosticCode::W002InvalidPriority,
+            DiagnosticCode::W003InvalidTimeout,
+            DiagnosticCode::W004InvalidRateLimit,
+            DiagnosticCode::W005InvalidRedirectPolicy,
+            DiagnosticCode::W006InvalidRedirectScheme,
+            DiagnosticCode::W007MalformedBasicAuthEntry,
+            DiagnosticCode::W008BlockedHeader,
+            DiagnosticCode::W009NetworkNotFound,
+            DiagnosticCode::W010NoIpFellBackToLocalhost,
+            DiagnosticCode::W011EmptyBasicAuth,
+            DiagnosticCode::W012InvalidProtocol,
+            DiagnosticCode::W013UnknownLabel,
+            DiagnosticCode::W014InvalidMethod,
+            DiagnosticCode::W015AcmeWithoutTls,
+            DiagnosticCode::W016HttpsRedirectWithoutTls,
+            DiagnosticCode::W017RateLimitBurstBelowAverage,
+            DiagnosticCode::W018RouteCollision,
+            DiagnosticCode::W019InvalidForwardAuth,
+            DiagnosticCode::W020InvalidErrorPage,
+            DiagnosticCode::W021InvalidHealthCheck,
+            DiagnosticCode::W022InvalidLoadBalancer,
+            DiagnosticCode::W023InvalidRetry,
+            DiagnosticCode::W024InvalidCircuitBreaker,
+            DiagnosticCode::W025InvalidInFlightReq,
+            DiagnosticCode::W026InvalidPluginConfig,
+            DiagnosticCode::W027InvalidWeight,
+            DiagnosticCode::I001PathDefaulted,
+            DiagnosticCode::I002PortDefaulted,
+        ]
     }
 }
 
