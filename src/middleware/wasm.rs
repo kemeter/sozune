@@ -458,9 +458,22 @@ impl EventSink {
                 if !req.body.is_empty() {
                     builder = builder.body(req.body);
                 }
-                // Fire-and-forget: we don't surface the result, only log failures.
-                if let Err(e) = builder.send().await {
-                    warn!("wasm plugin event send failed: {e}");
+                // Fire-and-forget: we don't wait on the body, but we do surface
+                // failures. A transport error is an outright send failure; a
+                // non-2xx response means the sink reached the collector but it
+                // rejected the event (e.g. a bad website id, or an analytics
+                // backend that silently drops bot-looking traffic), which is
+                // otherwise invisible and looks like "nothing is being tracked".
+                let target = req.url.clone();
+                match builder.send().await {
+                    Ok(resp) if !resp.status().is_success() => {
+                        warn!(
+                            "wasm plugin event to {target} rejected with status {}",
+                            resp.status()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("wasm plugin event send to {target} failed: {e}"),
                 }
             }
         });
