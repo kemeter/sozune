@@ -227,16 +227,9 @@ fn host_allowed(url: &reqwest::Url, allowed_hosts: &[String]) -> bool {
 /// internal IP literal. Used so that a public-only allow-list never opens a door
 /// to the internal network even if a target string coincidentally matches.
 fn entry_is_internal(entry: &str) -> bool {
-    // Strip an optional `:port`; an IPv6 literal in an entry would be bracketed,
-    // so only split on the last colon when the head still parses as an address.
-    let host = entry.rsplit_once(':').map_or(entry, |(h, p)| {
-        if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() {
-            h
-        } else {
-            entry
-        }
-    });
-    // Reuse the URL-based classifier by parsing the bare host as a URL.
+    // Strip an optional `:port`, then reuse the URL-based classifier by parsing
+    // the bare host as a URL.
+    let host = bare_host(entry);
     reqwest::Url::parse(&format!("http://{host}/"))
         .map(|u| is_internal_target(&u))
         .unwrap_or(false)
@@ -245,34 +238,141 @@ fn entry_is_internal(entry: &str) -> bool {
 /// Whether `url`'s host is an IP literal in a range that must never be reachable
 /// from a tenant-supplied plugin target: loopback, link-local (covers the
 /// `169.254.169.254` cloud metadata endpoint), private/unique-local, or the
-/// unspecified address. Hostnames (non-IP) return `false` here — they are not
-/// resolved at this layer, so a name that resolves to an internal IP (DNS
-/// rebinding) is not caught here; that is a known limitation handled by the
-/// operator-controlled allow-list, not by this literal check.
+/// unspecified address. Hostnames (non-IP) return `false` here — this is the
+/// *literal* check only, run before any DNS lookup. A name that resolves to an
+/// internal IP (DNS rebinding) is caught later by [`GuardedResolver`], which
+/// re-applies [`ip_is_internal`] to every address the name resolves to.
 fn is_internal_target(url: &reqwest::Url) -> bool {
-    use std::net::IpAddr;
     match url.host() {
-        Some(url::Host::Ipv4(ip)) => {
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                // Unique-local (fc00::/7) and link-local (fe80::/10) are not yet
-                // stable as `IpAddr` methods, so match the prefixes directly.
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:a.b.c.d) — unwrap and re-check.
-                || ip.to_ipv4_mapped().is_some_and(|v4| {
-                    let mapped = IpAddr::V4(v4);
-                    mapped.is_loopback() || matches!(mapped, IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
-                })
-        }
+        Some(url::Host::Ipv4(ip)) => ipv4_is_internal(&ip),
+        Some(url::Host::Ipv6(ip)) => ipv6_is_internal(&ip),
         _ => false,
+    }
+}
+
+/// Whether a resolved [`IpAddr`] falls in a range a tenant-supplied plugin
+/// target must never reach. Shared by the URL-literal check
+/// ([`is_internal_target`]) and the post-resolution check ([`GuardedResolver`]),
+/// so a literal IP and a hostname that resolves to that IP are classified
+/// identically.
+fn ip_is_internal(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_is_internal(v4),
+        std::net::IpAddr::V6(v6) => ipv6_is_internal(v6),
+    }
+}
+
+fn ipv4_is_internal(ip: &std::net::Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+}
+
+fn ipv6_is_internal(ip: &std::net::Ipv6Addr) -> bool {
+    use std::net::IpAddr;
+    ip.is_loopback()
+        || ip.is_unspecified()
+        // Unique-local (fc00::/7) and link-local (fe80::/10) are not yet
+        // stable as `IpAddr` methods, so match the prefixes directly.
+        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        || (ip.segments()[0] & 0xffc0) == 0xfe80
+        // IPv4-mapped (::ffff:a.b.c.d) — unwrap and re-check.
+        || ip.to_ipv4_mapped().is_some_and(|v4| {
+            let mapped = IpAddr::V4(v4);
+            mapped.is_loopback() || matches!(mapped, IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
+        })
+}
+
+/// A custom [`reqwest::dns::Resolve`] that closes the DNS-rebinding hole for
+/// tenant-supplied outbound hosts.
+///
+/// The outbound client is built once and shared, so it sees every host a plugin
+/// targets — both operator hosts (from static `allowed_hosts`) and tenant hosts
+/// (derived per route from `outbound_host_keys`). This resolver hardens the
+/// tenant ones without touching the operator ones:
+///
+/// - **Operator hosts** (name present in `operator_hosts`) resolve with the
+///   default behaviour. The operator is trusted and may deliberately point a
+///   plugin at an internal service, so we don't second-guess its list.
+/// - **Every other host** (i.e. anything derived from tenant config) is resolved
+///   and then *every* returned address is checked with [`ip_is_internal`]. If a
+///   single address is internal — including one entry of a mixed A-record set —
+///   the whole resolution is refused. Because reqwest connects to exactly the
+///   addresses this resolver returns (no second lookup), a name that flips to an
+///   internal IP between check and connect (rebinding / TOCTOU) cannot slip
+///   through. Resolution failure is fail-closed: no addresses, no connection.
+struct GuardedResolver {
+    /// Bare hostnames (no port) from the operator's static `allowed_hosts`,
+    /// exempt from the internal-address check. This is the union across all
+    /// plugins (the outbound client is shared), which is safe: every operator
+    /// host is trusted regardless of which plugin declared it.
+    operator_hosts: Arc<Vec<String>>,
+}
+
+/// Strip an optional `:port` from an allow-list entry, returning the bare host.
+/// An IPv6 literal is bracketed (`[::1]:8080`), so only split on the last colon
+/// when the tail is all digits and the head still looks like a host.
+pub fn bare_host(entry: &str) -> String {
+    match entry.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h.to_string(),
+        _ => entry.to_string(),
+    }
+}
+
+/// Build the shared outbound client for WASM plugins: no redirect following
+/// (a redirect could bounce an allowed public host to an internal one), a short
+/// timeout, and a [`GuardedResolver`] that hardens every non-operator host
+/// against DNS rebinding. `operator_hosts` are bare hostnames exempt from the
+/// internal-address check (the operator is trusted to target internal services).
+pub fn build_outbound_client(operator_hosts: Vec<String>) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            super::forward_auth::TIMEOUT_SECS,
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(GuardedResolver {
+            operator_hosts: Arc::new(operator_hosts),
+        }))
+        .build()
+        .expect("reqwest outbound client builds with default config")
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let operator_hosts = Arc::clone(&self.operator_hosts);
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // Resolve via the system resolver. reqwest strips the port before
+            // handing us the name, so pair with :0 and drop it from the result.
+            let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+
+            // Fail-closed: a name we could not resolve is never dialed.
+            if resolved.is_empty() {
+                return Err(format!("no addresses resolved for '{host}'").into());
+            }
+
+            let operator_trusted = operator_hosts.iter().any(|h| h == &host);
+            if !operator_trusted {
+                // Tenant host: refuse if ANY resolved address is internal, so a
+                // mixed A-record (one public, one internal) can't smuggle a
+                // rebinding target past the check.
+                if let Some(bad) = resolved.iter().find(|a| ip_is_internal(&a.ip())) {
+                    warn!(
+                        "wasm plugin outbound host '{host}' resolves to internal address {}, refused",
+                        bad.ip()
+                    );
+                    return Err(format!("host '{host}' resolves to an internal address").into());
+                }
+            }
+
+            let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
+            Ok(addrs)
+        })
     }
 }
 
@@ -385,13 +485,39 @@ impl Sink for EventSink {
 /// Bounded queue size for a plugin's outbound events.
 const EVENT_QUEUE_SIZE: usize = 1024;
 
+/// Ingredients kept by a network-enabled [`WasmMiddleware`] so a per-route
+/// derivation can rebuild its fetcher/sink with an allow-list extended by the
+/// route's own outbound hosts. Held only by plugins that opted into the network
+/// extension; a plain (no-network) plugin has `None` and shares its compiled
+/// guest across routes.
+#[derive(Clone)]
+struct NetIngredients {
+    /// The compiled `.wasm` bytes, kept so a per-route derivation can rebuild a
+    /// guest bound to an extended allow-list. Shared (`Arc`) to keep clones cheap.
+    wasm: Arc<Vec<u8>>,
+    limits: Limits,
+    /// The outbound client, already wired with the [`GuardedResolver`].
+    client: reqwest::Client,
+    handle: tokio::runtime::Handle,
+    /// Operator-declared hosts (trusted, may name internal targets). Every
+    /// derived instance starts from this list.
+    operator_hosts: Vec<String>,
+    /// Config keys whose merged value is a per-route outbound URL to add to the
+    /// effective allow-list (e.g. `["umami_host"]`).
+    outbound_host_keys: Vec<String>,
+}
+
 /// A compiled http-wasm guest wired in as a middleware.
 ///
-/// The guest is compiled once (`plugin`, shared via `Arc`) and may be cheaply
-/// re-derived per route with a different configuration via
+/// The guest is compiled once (`plugin`, shared via `Arc`) and re-derived per
+/// route with a different configuration via
 /// [`with_route_config`](Self::with_route_config): the route's JSON config is
 /// merged over the global `config_value` and re-serialized into `config`, which
-/// is what the guest reads through the `get_config` ABI.
+/// is what the guest reads through the `get_config` ABI. A plugin with no
+/// network extension shares its compiled guest across routes (cheap `Arc`
+/// clone); a network-enabled plugin whose route declares outbound hosts rebuilds
+/// its guest so the fetcher/sink see the extended allow-list — this happens on a
+/// route reload, never on the request path.
 pub struct WasmMiddleware {
     name: &'static str,
     plugin: Arc<Plugin>,
@@ -400,6 +526,9 @@ pub struct WasmMiddleware {
     /// The effective config as a JSON value, kept so a per-route overlay can be
     /// merged on top of it without re-reading the original bytes.
     config_value: serde_json::Value,
+    /// Present only for network-enabled plugins; drives per-route allow-list
+    /// extension in [`with_route_config`](Self::with_route_config).
+    net: Option<NetIngredients>,
 }
 
 impl WasmMiddleware {
@@ -417,56 +546,96 @@ impl WasmMiddleware {
             plugin: Arc::new(plugin),
             config: serde_json::to_vec(&config).unwrap_or_default(),
             config_value: config,
+            net: None,
         })
     }
 
     /// Derive a copy of this middleware whose config is `overlay` merged on top
-    /// of the global config. The compiled guest is shared (`Arc`), so this is
-    /// cheap — no recompilation. Keys in `overlay` win over the global config;
-    /// nested objects are merged recursively. A non-object `overlay` (or an
-    /// empty one) yields a clone with the global config unchanged.
+    /// of the global config. Keys in `overlay` win over the global config; nested
+    /// objects are merged recursively. A non-object `overlay` (or an empty one)
+    /// yields a clone with the global config unchanged.
+    ///
+    /// For a plugin without the network extension the compiled guest is shared
+    /// (`Arc`), so this is cheap. For a network-enabled plugin declaring
+    /// `outbound_host_keys`, the merged config is scanned for those keys and each
+    /// value's host is added to this route's effective allow-list, then the guest
+    /// is rebuilt so its fetcher/sink enforce the extended list. A tenant host
+    /// that is an internal IP literal is refused here (before any DNS), and a
+    /// host that resolves to an internal address is refused at connect time by
+    /// the [`GuardedResolver`]; a tenant value can never reach the internal
+    /// network. If rebuilding fails, the shared guest is kept as a safe fallback.
     pub fn with_route_config(&self, overlay: &serde_json::Value) -> Self {
         let mut merged = self.config_value.clone();
         merge_json(&mut merged, overlay);
+
+        if let Some(net) = &self.net {
+            let allowed = derive_route_allow_list(
+                self.name,
+                &net.operator_hosts,
+                &net.outbound_host_keys,
+                &merged,
+            );
+
+            match build_network_plugin(&net.wasm, net.limits, &net.client, &net.handle, allowed) {
+                Ok(plugin) => {
+                    return Self {
+                        name: self.name,
+                        plugin: Arc::new(plugin),
+                        config: serde_json::to_vec(&merged).unwrap_or_default(),
+                        config_value: merged,
+                        net: self.net.clone(),
+                    };
+                }
+                Err(e) => {
+                    // Fail safe: fall back to the shared guest (operator hosts
+                    // only). The route just doesn't get its tenant host, rather
+                    // than losing the plugin entirely.
+                    error!(
+                        "wasm plugin '{}': failed to rebuild for per-route hosts, keeping global allow-list: {e}",
+                        self.name
+                    );
+                }
+            }
+        }
+
         Self {
             name: self.name,
             plugin: Arc::clone(&self.plugin),
             config: serde_json::to_vec(&merged).unwrap_or_default(),
             config_value: merged,
+            net: self.net.clone(),
         }
     }
 
     /// Like [`from_bytes`](Self::from_bytes) but enables the network extensions:
     /// the guest's `http_fetch` (blocking) and `http_send` (fire-and-forget)
-    /// calls go through `client`, both restricted to `allowed_hosts`.
+    /// calls go through `client`, both restricted to the effective allow-list.
+    /// `operator_hosts` is the operator's static, trusted list; `client` must be
+    /// built with a [`GuardedResolver`] so tenant hosts added per route cannot be
+    /// rebound to an internal address.
     pub fn from_bytes_with_network(
         wasm: &[u8],
         config: serde_json::Value,
         limits: Limits,
         client: reqwest::Client,
         handle: tokio::runtime::Handle,
-        allowed_hosts: Vec<String>,
+        operator_hosts: Vec<String>,
+        outbound_host_keys: Vec<String>,
     ) -> anyhow::Result<Self> {
-        let fetcher = Arc::new(HostFetcher {
-            client: client.clone(),
-            handle: handle.clone(),
-            allowed_hosts: allowed_hosts.clone(),
-        });
-        let sink = Arc::new(EventSink::new(
-            client,
-            &handle,
-            allowed_hosts,
-            EVENT_QUEUE_SIZE,
-        ));
-        let plugin = Plugin::from_bytes(wasm, limits)
-            .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?
-            .with_fetcher(fetcher)
-            .with_sink(sink);
+        let plugin = build_network_plugin(wasm, limits, &client, &handle, operator_hosts.clone())?;
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
             config: serde_json::to_vec(&config).unwrap_or_default(),
             config_value: config,
+            net: Some(NetIngredients {
+                wasm: Arc::new(wasm.to_vec()),
+                limits,
+                client,
+                handle,
+                operator_hosts,
+                outbound_host_keys,
+            }),
         })
     }
 
@@ -502,6 +671,72 @@ impl WasmMiddleware {
         };
         (state, oversize_body)
     }
+}
+
+/// Compute a route's effective outbound allow-list: the operator's trusted hosts
+/// plus, for each declared `outbound_host_keys` entry present in `merged` config,
+/// the host of that value's URL. A tenant value that is not a URL is ignored, and
+/// one that is an internal IP literal is refused here (before any DNS) — so a
+/// tenant can never add an internal target. The DNS-rebinding case (a name that
+/// resolves to an internal IP) is caught later at connect time by
+/// [`GuardedResolver`]. `plugin_name` is only for log context.
+fn derive_route_allow_list(
+    plugin_name: &str,
+    operator_hosts: &[String],
+    outbound_host_keys: &[String],
+    merged: &serde_json::Value,
+) -> Vec<String> {
+    let mut allowed = operator_hosts.to_vec();
+    for key in outbound_host_keys {
+        let Some(value) = merged.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(url) = reqwest::Url::parse(value) else {
+            warn!("wasm plugin '{plugin_name}': outbound host key '{key}' is not a URL, ignored");
+            continue;
+        };
+        if is_internal_target(&url) {
+            warn!(
+                "wasm plugin '{plugin_name}': tenant outbound host '{value}' is an internal address, refused"
+            );
+            continue;
+        }
+        if let Some(host) = url.host_str() {
+            let authority = match url.port() {
+                Some(p) => format!("{host}:{p}"),
+                None => host.to_string(),
+            };
+            allowed.push(authority);
+        }
+    }
+    allowed
+}
+
+/// Compile a guest and wire its `http_fetch`/`http_send` extensions to a
+/// fetcher/sink bound to `allowed_hosts`. Used both for the shared global
+/// instance and for a per-route rebuild with an extended allow-list.
+fn build_network_plugin(
+    wasm: &[u8],
+    limits: Limits,
+    client: &reqwest::Client,
+    handle: &tokio::runtime::Handle,
+    allowed_hosts: Vec<String>,
+) -> anyhow::Result<Plugin> {
+    let fetcher = Arc::new(HostFetcher {
+        client: client.clone(),
+        handle: handle.clone(),
+        allowed_hosts: allowed_hosts.clone(),
+    });
+    let sink = Arc::new(EventSink::new(
+        client.clone(),
+        handle,
+        allowed_hosts,
+        EVENT_QUEUE_SIZE,
+    ));
+    Ok(Plugin::from_bytes(wasm, limits)
+        .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?
+        .with_fetcher(fetcher)
+        .with_sink(sink))
 }
 
 /// Recursively merge `overlay` into `base`. When both sides are JSON objects,
@@ -1008,5 +1243,150 @@ mod tests {
             }
         }
         assert!(full_seen, "expected the bounded queue to report QueueFull");
+    }
+
+    // --- per-route tenant outbound hosts (derive_route_allow_list) ---
+
+    fn derive(operator: &[&str], keys: &[&str], cfg: serde_json::Value) -> Vec<String> {
+        let operator: Vec<String> = operator.iter().map(|s| s.to_string()).collect();
+        let keys: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
+        derive_route_allow_list("test", &operator, &keys, &cfg)
+    }
+
+    #[test]
+    fn route_config_adds_public_tenant_host() {
+        let hosts = derive(
+            &[],
+            &["umami_host"],
+            serde_json::json!({"umami_host": "https://umami.alpacode.io"}),
+        );
+        assert_eq!(hosts, vec!["umami.alpacode.io".to_string()]);
+    }
+
+    #[test]
+    fn route_config_keeps_port_from_tenant_host() {
+        let hosts = derive(
+            &[],
+            &["umami_host"],
+            serde_json::json!({"umami_host": "https://umami.alpacode.io:8443/x"}),
+        );
+        assert_eq!(hosts, vec!["umami.alpacode.io:8443".to_string()]);
+    }
+
+    #[test]
+    fn route_config_refuses_internal_ip_literal_tenant_host() {
+        for bad in [
+            "http://169.254.169.254/api",
+            "http://127.0.0.1:3000/api",
+            "http://10.0.0.5/api",
+            "http://[::1]/api",
+            "http://2130706433/api", // 127.0.0.1 as u32
+        ] {
+            let hosts = derive(
+                &[],
+                &["umami_host"],
+                serde_json::json!({ "umami_host": bad }),
+            );
+            assert!(
+                hosts.is_empty(),
+                "internal literal must not be added: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_config_ignores_non_url_and_missing_keys() {
+        assert!(derive(&[], &["umami_host"], serde_json::json!({})).is_empty());
+        assert!(
+            derive(
+                &[],
+                &["umami_host"],
+                serde_json::json!({"umami_host": "not a url"})
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn route_config_isolates_hosts_per_route() {
+        let a = derive(
+            &[],
+            &["umami_host"],
+            serde_json::json!({"umami_host": "https://a.example.com"}),
+        );
+        let b = derive(
+            &[],
+            &["umami_host"],
+            serde_json::json!({"umami_host": "https://b.example.com"}),
+        );
+        assert_eq!(a, vec!["a.example.com".to_string()]);
+        assert_eq!(b, vec!["b.example.com".to_string()]);
+        // Route A's list never contains route B's host: isolation holds.
+        assert!(!a.contains(&"b.example.com".to_string()));
+    }
+
+    #[test]
+    fn route_config_keeps_operator_hosts() {
+        let hosts = derive(
+            &["crowdsec:8080"],
+            &["umami_host"],
+            serde_json::json!({"umami_host": "https://pub.example.com"}),
+        );
+        assert!(hosts.contains(&"crowdsec:8080".to_string()));
+        assert!(hosts.contains(&"pub.example.com".to_string()));
+    }
+
+    // --- GuardedResolver DNS hardening ---
+
+    fn resolver(operator_hosts: Vec<String>) -> GuardedResolver {
+        GuardedResolver {
+            operator_hosts: Arc::new(operator_hosts),
+        }
+    }
+
+    async fn resolve(r: &GuardedResolver, host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+        use reqwest::dns::Resolve;
+        let name: reqwest::dns::Name = host.parse().map_err(|_| "bad name".to_string())?;
+        r.resolve(name)
+            .await
+            .map(|it| it.collect())
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolver_refuses_name_resolving_to_internal_ip() {
+        // An IP literal resolves to itself offline, exercising the post-resolution
+        // internal-address check deterministically (this is the rebinding guard).
+        let r = resolver(vec![]);
+        for internal in ["127.0.0.1", "169.254.169.254", "10.0.0.1"] {
+            assert!(
+                resolve(&r, internal).await.is_err(),
+                "tenant host resolving to internal must be refused: {internal}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolver_allows_operator_host_even_if_internal() {
+        // The operator is trusted: a host it declared is exempt from the check.
+        let r = resolver(vec!["127.0.0.1".to_string()]);
+        assert!(
+            resolve(&r, "127.0.0.1").await.is_ok(),
+            "operator-listed internal host must resolve"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolver_allows_public_ip() {
+        let r = resolver(vec![]);
+        assert!(resolve(&r, "8.8.8.8").await.is_ok());
+    }
+
+    #[test]
+    fn bare_host_strips_port_only() {
+        assert_eq!(bare_host("umami.example.com:443"), "umami.example.com");
+        assert_eq!(bare_host("umami.example.com"), "umami.example.com");
+        assert_eq!(bare_host("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(bare_host("[::1]:8080"), "[::1]");
     }
 }

@@ -128,6 +128,10 @@ if [[ -f "$WASM_PLUGIN_FILE" ]]; then
 plugins:
   headerguest:
     path: $WASM_PLUGIN_FILE
+    # Declares a per-tenant outbound key so the route below exercises the
+    # network-extension activation and the per-route allow-list rebuild path
+    # (with_route_config) without needing a guest that actually calls out.
+    outbound_host_keys: ["umami_host"]
 EOF
 fi
 
@@ -218,6 +222,9 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcwasm.host=$HOST_WASM"
       - "sozune.http.svcwasm.plugins=headerguest"
+      # Per-tenant outbound host: a public URL that must be accepted and merged
+      # into this route's effective allow-list without breaking routing.
+      - "sozune.http.svcwasm.plugins.headerguest.umami_host=https://umami.alpacode.io"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-headers-response:
