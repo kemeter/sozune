@@ -1689,7 +1689,7 @@ dependencies = [
 [[package]]
 name = "http-wasm-host"
 version = "0.1.0"
-source = "git+https://github.com/kemeter/http-wasm?rev=3f82f100b1e139890657ea6c333a0092dedc9871#3f82f100b1e139890657ea6c333a0092dedc9871"
+source = "git+https://github.com/kemeter/http-wasm?rev=f70a710d686e9029eac1fe75df625057f30303ed#f70a710d686e9029eac1fe75df625057f30303ed"
 dependencies = [
  "log",
  "wasmtime",
