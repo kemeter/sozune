@@ -134,9 +134,12 @@ On top of the allow-list, a target whose host is an internal IP literal
 `169.254.169.254` cloud metadata endpoint) is refused unless the operator's
 `allowed_hosts` itself names an internal target. A purely public allow-list can
 therefore never reach an internal IP, while an operator running a local service
-in dev can still opt in by listing it (e.g. `["127.0.0.1:3000"]`). Note this
-checks IP literals only; a hostname in `allowed_hosts` that resolves to an
-internal IP is trusted as the operator's choice.
+in dev can still opt in by listing it (e.g. `["127.0.0.1:3000"]`). For an
+operator host this checks IP literals only; a hostname in `allowed_hosts` that
+resolves to an internal IP is trusted as the operator's choice. Tenant hosts
+(see [`outbound_host_keys`](#per-tenant-outbound-hosts-outbound_host_keys)) are
+additionally checked after DNS resolution, so they can never reach an internal
+address even via a name.
 
 ```yaml
 plugins:
@@ -150,6 +153,53 @@ plugins:
 
 A list entry may be a bare host (`crowdsec`) or include a port
 (`crowdsec:8080`); both forms match.
+
+### Per-tenant outbound hosts (`outbound_host_keys`)
+
+Some plugins call an endpoint that differs per app, configured through per-route
+labels rather than the static `config.yaml` — e.g. an analytics feeder that posts
+to each app's own Umami instance. Listing every tenant's host in `allowed_hosts`
+does not scale. Instead, declare which **config keys** hold an outbound URL:
+
+```yaml
+plugins:
+  umami:
+    path: /plugins/sozune_umami.wasm
+    outbound_host_keys: ["umami_host"]   # keys, never hosts
+```
+
+```yaml
+# labels on a service
+- "sozune.http.blog.plugins=umami"
+- "sozune.http.blog.plugins.umami.umami_host=https://umami.alpacode.io"
+- "sozune.http.blog.plugins.umami.websiteId=abc-123"
+```
+
+For each key in `outbound_host_keys`, Sōzune reads the value from that route's
+merged config, takes its URL host, and adds it to **that route's** effective
+allow-list. So a plugin reaches its tenant-configured endpoint with no
+operator-maintained host list, and declaring `outbound_host_keys` alone (empty
+`allowed_hosts`) is enough to enable the outbound extension.
+
+These hosts are **tenant-controlled**, so they are locked to the public internet
+and can never reach the internal network, whatever a tenant sets:
+
+- A value that is an internal IP literal (loopback, RFC 1918 / unique-local,
+  link-local including `169.254.169.254`) is refused and never added.
+- A value that is a hostname resolving to an internal IP is refused **at connect
+  time**: Sōzune resolves it, rejects it if any resolved address is internal, and
+  connects only to the addresses it verified — closing the DNS-rebinding hole (a
+  name that flips to an internal IP between check and connect cannot slip
+  through). Resolution failure is fail-closed: no address, no call.
+- Each route only ever reaches its own configured host (per-route isolation);
+  route A cannot reach route B's endpoint.
+- Redirects are never followed, so an allowed public host cannot bounce the call
+  to an internal one.
+
+The internal-target opt-in described above applies to **operator** `allowed_hosts`
+only. A tenant value is never eligible for internal access, and the DNS
+rebinding hardening applies only to tenant hosts — an operator host (which the
+operator may deliberately point at an internal service) resolves normally.
 
 > A guest using `http_fetch` or `http_send` is no longer portable to a vanilla
 > http-wasm host (the extensions are Sōzune-specific).

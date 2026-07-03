@@ -141,12 +141,23 @@ pub type PluginRegistry = std::collections::HashMap<String, Arc<wasm::WasmMiddle
 /// plugin doesn't take down routing.
 pub fn build_plugin_registry(
     declared: &std::collections::HashMap<String, crate::config::PluginConfig>,
-    fetch_client: &reqwest::Client,
     handle: &tokio::runtime::Handle,
 ) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
+
+    // The outbound client for plugins is built lazily on first network plugin,
+    // wired with a DNS-rebinding guard that exempts every operator-declared host
+    // (across all plugins) and hardens everything else (i.e. tenant hosts added
+    // per route). Forward-auth keeps its own `fetch_client`, unchanged.
+    let outbound_client = std::cell::OnceCell::new();
+    let operator_hosts: Vec<String> = declared
+        .values()
+        .flat_map(|c| c.allowed_hosts.iter())
+        .map(|h| wasm::bare_host(h))
+        .collect();
+
     for (name, cfg) in declared {
-        let wasm = match std::fs::read(&cfg.path) {
+        let wasm_bytes = match std::fs::read(&cfg.path) {
             Ok(w) => w,
             Err(e) => {
                 error!("Cannot read WASM plugin '{}' at {}: {}", name, cfg.path, e);
@@ -155,19 +166,24 @@ pub fn build_plugin_registry(
         };
         let limits = http_wasm_host::Limits::default();
 
-        // A plugin with declared allowed_hosts opts into the outbound-HTTP
-        // extension; otherwise it gets the standard sandbox with no network.
-        let built = if cfg.allowed_hosts.is_empty() {
-            wasm::WasmMiddleware::from_bytes(&wasm, cfg.config.clone(), limits)
-        } else {
+        // A plugin opts into the outbound-HTTP extension when it declares
+        // operator `allowed_hosts` OR `outbound_host_keys` (per-route tenant
+        // hosts); otherwise it gets the standard sandbox with no network.
+        let needs_network = !cfg.allowed_hosts.is_empty() || !cfg.outbound_host_keys.is_empty();
+        let built = if needs_network {
+            let client =
+                outbound_client.get_or_init(|| wasm::build_outbound_client(operator_hosts.clone()));
             wasm::WasmMiddleware::from_bytes_with_network(
-                &wasm,
+                &wasm_bytes,
                 cfg.config.clone(),
                 limits,
-                fetch_client.clone(),
+                client.clone(),
                 handle.clone(),
                 cfg.allowed_hosts.clone(),
+                cfg.outbound_host_keys.clone(),
             )
+        } else {
+            wasm::WasmMiddleware::from_bytes(&wasm_bytes, cfg.config.clone(), limits)
         };
 
         match built {

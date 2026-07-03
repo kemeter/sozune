@@ -12,7 +12,11 @@ if [[ ! -f "${WASM_PLUGIN_FILE:-}" ]]; then
     return 0 2>/dev/null || true
 fi
 
-# 1. The guest adds `x-wasm-plugin: ran` to the response.
+# 1. The guest adds `x-wasm-plugin: ran` to the response. This route also carries
+#    a per-tenant outbound host (`plugins.headerguest.umami_host`) plus the
+#    plugin's `outbound_host_keys`, so a 200 here also proves the network-
+#    extension activation and the per-route allow-list rebuild
+#    (with_route_config) load cleanly without breaking routing.
 if wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_WASM" "200"; then
     headers=$(curl -s -D - -o /dev/null --max-time 2 \
         -H "Host: $HOST_WASM" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
@@ -22,7 +26,7 @@ if wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_WASM" "200"; then
         fail "wasm plugin response header x-wasm-plugin NOT found"
     fi
 else
-    fail "wasm plugin route did not return 200"
+    fail "wasm plugin route (with per-tenant outbound host) did not return 200"
 fi
 
 # 2. The guest short-circuits with 403 when x-wasm-block: yes is present.

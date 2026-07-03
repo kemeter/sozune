@@ -107,9 +107,22 @@ pub struct PluginConfig {
     pub config: serde_json::Value,
     /// Hosts the plugin is allowed to reach via the outbound-HTTP extension
     /// (`http_fetch`). Empty disables network access for the plugin. Listing
-    /// hosts opts the plugin into the non-standard fetch extension.
+    /// hosts opts the plugin into the non-standard fetch extension. These come
+    /// from the operator's static config and are trusted: an operator entry may
+    /// name an internal target (opt-in), and is exempt from the tenant DNS
+    /// hardening applied to per-route hosts.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Config keys whose value is an outbound URL the plugin calls per route
+    /// (e.g. `["umami_host"]`). The host of each such value, read from a route's
+    /// merged config, is added to that route's effective allow-list so a plugin
+    /// can target a tenant-configured endpoint without the operator listing every
+    /// host. These are tenant-controlled, so their hosts are always subject to
+    /// the internal-target guard and DNS rebinding hardening — a tenant value can
+    /// never reach the internal network, whatever it points at. Listing keys here
+    /// also opts the plugin into the outbound-HTTP extension.
+    #[serde(default)]
+    pub outbound_host_keys: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

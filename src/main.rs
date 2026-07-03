@@ -200,8 +200,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let proxy_config = config.proxy.clone();
     let handle = tokio::runtime::Handle::current();
-    let plugin_fetch_client = middleware::build_forward_auth_client();
-    let plugins = middleware::build_plugin_registry(&config.plugins, &plugin_fetch_client, &handle);
+    let plugins = middleware::build_plugin_registry(&config.plugins, &handle);
     let metrics_store_proxy = Arc::clone(&metrics_store);
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
