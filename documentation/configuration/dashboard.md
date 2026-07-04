@@ -14,6 +14,13 @@ dashboard:
 
 Restart sozune to pick up the change.
 
+## Pages
+
+- **Overview** — a landing page summarising entrypoints, backends, and diagnostics at a glance, so you can spot the health of the whole proxy in one screen.
+- **Entrypoints** — the full route list with drill-down filters (by host, provider, diagnostic) to go from the summary straight to a single route.
+- **Diagnostics** — every active warning/error, filterable, each linking back to the entrypoint that raised it.
+- **Config** — a read-only view of the effective running configuration, backed by the `GET /config` endpoint, with secrets masked. Use it to confirm what Sōzune actually loaded (environment overrides, provider merges) without exposing credentials.
+
 ## Authentication
 
 The dashboard talks to the [REST API](/documentation/configuration/api) and uses the same credentials. Configure at least one user under `api.users` and log in from the dashboard's `/login` page.

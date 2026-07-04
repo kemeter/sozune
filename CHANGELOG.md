@@ -4,15 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Routing
-
-- Backend weight — a backend can now declare a load-balancing weight via `sozune.http.<svc>.weight` (also available for TCP/UDP services). The weight is a relative share of traffic among a service's backends and is honoured by the weight-aware `random` balancer (`round_robin` and the load-based algorithms ignore it). A weight of `0` keeps the backend wired but excludes it from selection; a negative or non-integer value emits `W027` and the backend keeps its default weight.
-
-### CLI
-
-- `sozune explain` now covers every diagnostic code. The new `W027` (invalid backend weight) plus the previously undocumented `W019`–`W025` (forwardAuth, error pages, healthCheck, loadBalancer, retry, circuitBreaker, inFlightReq) now resolve instead of reporting an unknown code.
-
-## [0.14.0-dev]
+## [0.14.0] - 2026-07-04
 
 ### TLS / ACME
 
@@ -22,12 +14,15 @@ All notable changes to this project will be documented in this file.
 - Per-resolver `ca_server` — a resolver can pin its own ACME directory URL, overriding the global staging/prod default, so a staging and a production resolver can coexist (also accepts a non-Let's-Encrypt ACME directory). Each distinct CA keeps its own account file on disk (derived from the directory URL), so switching or mixing CAs never reuses another server's account.
 - Entrypoints with `tls: true` but no `acme.resolver` keep the existing HTTP-01 behaviour on `challenge_port` — no migration needed.
 - ACME account persistence and certificate renewal checks now use cheti (`FileAccountStore`, `needs_renewal`), replacing the in-tree X.509 parser. Storage layout is unchanged (`certs_dir/account_credentials.json`).
+- `GET /certificates` endpoint — inspect every certificate Sōzune manages (domains, issuer, validity window, renewal state) over the REST API. Renewal is now driven by a lifetime ratio: a cert is renewed once it has consumed a configurable fraction of its validity, rather than a fixed day threshold, so short- and long-lived certs are handled uniformly. See [API docs](documentation/configuration/api.md).
 - HTTP/2 listener tuning — `proxy.https.http2.alpn_protocols` and `http2.disable_http11` let you control ALPN on the TLS listener (force HTTP/1.1-only, or h2-only). Both default to unset, keeping the existing behaviour (ALPN `["h2", "http/1.1"]`, HTTP/2 negotiated by default).
 
 ### Routing
 
+- Backend weight — a backend can now declare a load-balancing weight via `sozune.http.<svc>.weight` (also available for TCP/UDP services). The weight is a relative share of traffic among a service's backends and is honoured by the weight-aware `random` balancer (`round_robin` and the load-based algorithms ignore it). A weight of `0` keeps the backend wired but excludes it from selection; a negative or non-integer value emits `W027` and the backend keeps its default weight.
 - `addPrefix` middleware — prepend a fixed path prefix to incoming requests before forwarding to the backend. Counterpart of `stripPrefix`, useful for serving a sub-path of an existing app under a dedicated subdomain (e.g. `expats.example.com` → backend receives `/foo`). Available via Docker/Swarm/Podman/Nomad labels (`sozune.http.<svc>.addPrefix=/foo`), the HTTP provider, the YAML config file, and the REST API.
 - UDP load balancing — UDP listeners now load-balance datagrams across backends with flow affinity: datagrams from the same source IP form a virtual flow pinned to one backend. Two flow-affine algorithms are available, set per service via `sozune.udp.<svc>.loadBalancer`: `hrw` (Highest-Random-Weight / rendezvous hashing, stable under backend churn, recommended) and `maglev` (consistent hashing with O(1) lookup, for large backend sets). `round_robin`, `random`, `power_of_two`, and `least_connections` are also accepted. Requesting `hrw`/`maglev` on an HTTP or TCP service emits `W022` and falls back to round-robin. See [UDP routing docs](documentation/routing/udp.md#load-balancing).
+- Load-balancing algorithm selection — pick how an HTTP service spreads traffic across its backends with `sozune.http.<svc>.loadBalancer`: `round_robin` (default), `least_connections`, `power_of_two`, or `random`. Applies per service and composes with backend weights (weight-aware `random`). See [Load balancing docs](documentation/routing/load-balancing.md).
 - Source-IP allow-list on TCP listeners — restrict which source IPs may connect to a TCP listener with `ip_allow_list` (CIDRs or bare IPs), checked at `accept()` on the public port. Empty (default) allows all. See [TCP routing docs](documentation/routing/tcp.md#source-ip-allow-list).
 - Per-source connection-rate anti-flood on TCP listeners — cap how fast a single source IP may open new connections with `rate_limit` (`max_conns` per `per_seconds`) on a `proxy.tcp` listener; excess connections are dropped before `accept()`. See [TCP routing docs](documentation/routing/tcp.md#anti-flood-per-source-connection-rate).
 - Header & query matching — scope a route to requests carrying specific headers or query parameters, on top of host/path. `sozune.http.<svc>.matchHeaders=<key>:<value>,…` and `matchQuery=<key>:<value>,…`; every listed condition must hold, and a bare key (no `:`) matches on presence alone. A non-matching request gets `404` (the route simply doesn't apply). See [Header & query matching docs](documentation/routing/header-query-matching.md).
@@ -53,12 +48,22 @@ All notable changes to this project will be documented in this file.
 
 - Optional auth header on outgoing fetches — `providers.http.auth.header` and `auth.value` send an arbitrary header (typically `Authorization: Bearer <token>`) with every poll. Useful when the upstream config service sits behind its own auth layer.
 
+### Health checks
+
+- Active HTTP health checks — probe each backend with a real HTTP request and gate routing on the result, configured per service with `sozune.http.<svc>.healthCheck.path`, `.status` (expected code), and `.timeout`. Unhealthy backends are pulled out of the pool and restored when they recover. See [Health checks docs](documentation/advanced/health-checks.md).
+- Health-check failure reason surfaced — when a backend is marked unhealthy, the reason (timeout, wrong status, connection error) is now exposed in the REST API and the dashboard, so an operator can tell *why* a backend dropped out instead of just seeing it gone.
+
 ### Observability
 
 - Prometheus `/metrics` endpoint — exposes Sōzune metrics in Prometheus text format, including Sōzu proxy series bridged from `QueryMetrics` (`sozune_proxy_*`), a middleware request-latency histogram, and per-HTTP-status-class response counters. Content negotiation: send `Accept: application/json` for a JSON rendering instead of the Prometheus text format. A ready-to-use Grafana + Prometheus stack ships under `tests/observability/`. See [Observability docs](documentation/advanced/observability.md).
 - Dedicated `/metrics` listener — scrape Prometheus metrics without enabling (or exposing) the admin API. Enable with `metrics.enabled: true` (or `SOZUNE_METRICS_ENABLED=true`); binds `127.0.0.1:3039` by default (`metrics.listen_address` / `SOZUNE_METRICS_LISTEN_ADDRESS`). Off by default. When the API is also enabled, `/metrics` keeps being served there too, unchanged. See [Observability docs](documentation/advanced/observability.md#the-metrics-endpoint).
 - Distributed tracing (OpenTelemetry) — emit one span per proxied request and export it over OTLP/gRPC to a collector (Jaeger, Grafana Tempo, Zipkin via OTel). Enable with `tracing.endpoint`; `tracing.service_name` and `tracing.sampler` (`parent_based_always_on` default, plus `always_on`/`always_off`/`ratio:<0..1>`) tune it. W3C `traceparent` is honoured inbound and injected toward the backend, and each access-log line carries the `trace_id`. Disabled by default — zero overhead when off. See [Distributed tracing docs](documentation/advanced/observability.md#distributed-tracing-opentelemetry).
 - JSON log format — set `log.format: json` to emit every log line (including the per-request access log) as one structured JSON object per line, no regex parsing needed downstream; defaults to human-readable `text`. Access-log events carry `client_ip`, `method`, `host`, `path`, `status`, `duration_ms`, `phase`, and `trace_id`. See [Access logs docs](documentation/advanced/access-logs.md).
+
+### Dashboard
+
+- Dashboard overhaul — a new overview page summarising entrypoints, backends, and diagnostics at a glance, plus drill-down filters on the entrypoints and diagnostics views to go from the summary to a single route. See [Dashboard docs](documentation/configuration/dashboard.md).
+- `GET /config` endpoint — a read-only view of the effective running configuration, with secrets masked, so you can confirm what Sōzune actually loaded (env overrides, provider merges) without exposing credentials.
 
 ### Providers
 
@@ -82,6 +87,10 @@ All notable changes to this project will be documented in this file.
 - HTTPRoute `urlRewrite` filter — transparent path and hostname rewriting via `ReplaceFullPath`, `ReplacePrefixMatch` (suffix preserved) and `hostname`, mapped onto Sōzu's native frontend rewrite (no redirect). `requestMirror` and `extensionRef` remain unsupported; combining `urlRewrite` with `requestRedirect` on one rule is rejected.
 - Status conditions — sōzune writes the standard `Accepted` and `ResolvedRefs` conditions to `status.parents[]` for every parentRef it owns, so users see `Accepted=True` / `ResolvedRefs=BackendNotFound` / `Accepted=False reason=UnsupportedValue` directly in `kubectl describe httproute`. Other controllers' entries are preserved untouched. Requires the new `httproutes/status` `update;patch` RBAC.
 - Listener-driven port binding, `parentRef.sectionName`/`port`, the `requestMirror`/`extensionRef` HTTPRoute filters, and GRPCRoute/TCPRoute are not yet implemented — see [Kubernetes provider docs](documentation/providers/kubernetes.md#gateway-api-httproute) for the full support matrix.
+
+### CLI
+
+- `sozune explain` now covers every diagnostic code. The new `W027` (invalid backend weight) plus the previously undocumented `W019`–`W025` (forwardAuth, error pages, healthCheck, loadBalancer, retry, circuitBreaker, inFlightReq) now resolve instead of reporting an unknown code.
 
 ## [0.13.0] - 2026-05-04
 
