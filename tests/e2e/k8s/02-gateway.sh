@@ -386,10 +386,117 @@ else
     fail "urlRewrite route status wrong (reason='$rewrite_reason', expected Accepted)"
 fi
 
+# ----------------------------------------------------------------------
+# Cross-namespace backendRef + ReferenceGrant. An HTTPRoute in one
+# namespace targeting a Service in another must be REFUSED until a
+# ReferenceGrant in the *target* (Service) namespace trusts the route's
+# namespace. Without enforcement, any route author could reach any Service
+# cluster-wide (privilege escalation).
+#
+# Topology note: this sozune watches Services/EndpointSlices only in
+# `sozune-test` (providers.kubernetes.namespace), so the referenced Service
+# must live there to be resolvable. The HTTPRoute/Gateway watchers are
+# cluster-wide, so the *route* can live elsewhere. We therefore put the
+# route in `gw-frontend` and the Service (svcb, already deployed) in
+# `sozune-test`, with the grant in `sozune-test`.
+# ----------------------------------------------------------------------
+log "[02] Gateway: cross-namespace backendRef without a ReferenceGrant is refused"
+
+kubectl create namespace gw-frontend >/dev/null 2>&1 || true
+# A Gateway in gw-frontend (owned by our GatewayClass) plus a route that
+# targets svcb back in sozune-test across the namespace boundary.
+kubectl apply -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: xns-gw
+  namespace: gw-frontend
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: xns-route
+  namespace: gw-frontend
+spec:
+  parentRefs:
+    - name: xns-gw
+  hostnames:
+    - gw-xns.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: svcb
+          namespace: sozune-test
+          port: 80
+YAML
+sleep 4
+
+xns_denied_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: gw-xns.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+xns_denied_status=${xns_denied_status:-000}
+if [[ "$xns_denied_status" == "404" ]]; then
+    pass "cross-namespace backend without a ReferenceGrant is not served (got 404)"
+else
+    fail "cross-namespace backend served without a grant (got $xns_denied_status, expected 404)"
+fi
+
+log "[02] Gateway: applying a ReferenceGrant authorises the cross-namespace backend"
+
+kubectl apply -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gw-frontend
+  namespace: sozune-test
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: gw-frontend
+  to:
+    - group: ""
+      kind: Service
+YAML
+sleep 4
+
+if wait_for_status "http://127.0.0.1:$HTTP_PORT/" "gw-xns.k8s-test.localhost" "200"; then
+    pass "cross-namespace backend is served once a ReferenceGrant authorises it"
+else
+    fail "cross-namespace backend NOT served after ReferenceGrant applied (timeout)"
+fi
+
+log "[02] Gateway: deleting the ReferenceGrant revokes the cross-namespace backend"
+
+kubectl delete referencegrant allow-gw-frontend -n sozune-test >/dev/null 2>&1 || true
+sleep 4
+xns_revoked_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: gw-xns.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+xns_revoked_status=${xns_revoked_status:-000}
+if [[ "$xns_revoked_status" == "404" ]]; then
+    pass "deleting the ReferenceGrant stops serving the cross-namespace backend (got 404)"
+else
+    fail "cross-namespace backend still served after grant deletion (got $xns_revoked_status, expected 404)"
+fi
+
 # Cleanup of the dynamically-applied resources to leave the cluster
 # tidy if the suite is re-run.
 kubectl delete httproute filtered-route foreign-route header-route rewrite-route -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gateway foreign-gw -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gatewayclass foreign >/dev/null 2>&1 || true
+kubectl delete namespace gw-frontend >/dev/null 2>&1 || true
 
 set -e

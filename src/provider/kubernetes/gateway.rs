@@ -39,6 +39,7 @@ use gateway_api::apis::standard::httproutes::{
     HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
     HTTPRouteStatusParentsParentRef,
 };
+use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{Patch, PatchParams};
 use kube::runtime::watcher::{self, Event};
@@ -97,6 +98,13 @@ pub struct ScopeState {
     /// accepted iff `spec.gatewayClassName` is in `gateway_classes`. We
     /// don't yet read the listener list — that's a post-merge concern.
     gateways: HashSet<(String, String)>,
+    /// Cross-namespace backendRef authorisations, keyed by
+    /// `(from_namespace, to_namespace)`: the namespace of the referencing
+    /// HTTPRoute and the namespace of the referenced Service. A pair is
+    /// present iff a `ReferenceGrant` in `to_namespace` permits an
+    /// `HTTPRoute` from `from_namespace` to reach a `Service`. Same-namespace
+    /// refs never need a grant and are not stored here.
+    reference_grants: HashSet<(String, String)>,
 }
 
 /// Thread-safe handle to the [`ScopeState`] paired with a notifier the
@@ -282,6 +290,152 @@ impl GatewayScope {
         drop(g);
         self.fire_if(removed)
     }
+
+    /// True iff an HTTPRoute in `from_ns` may reference a `Service` in
+    /// `to_ns`. Same-namespace references are always allowed and never
+    /// consult the grant set. A cross-namespace reference is allowed only
+    /// when a `ReferenceGrant` in `to_ns` trusts `from_ns` — without one it
+    /// is refused, per the Gateway API spec (a namespace must opt in to
+    /// being referenced).
+    pub fn allows_backend_ref(&self, from_ns: &str, to_ns: &str) -> bool {
+        if from_ns == to_ns {
+            return true;
+        }
+        match self.state.read() {
+            Ok(g) => g
+                .reference_grants
+                .contains(&(from_ns.to_string(), to_ns.to_string())),
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                // Fail closed: a poisoned lock must not widen access.
+                false
+            }
+        }
+    }
+
+    /// Mutates the scope on a ReferenceGrant apply. The grant lives in the
+    /// referenced (`to`) namespace and lists the `from` namespaces/kinds it
+    /// trusts. We only care about grants that let an `HTTPRoute` reach a
+    /// `Service`; every such `from.namespace` is authorised to reference
+    /// this grant's namespace. Returns true iff the authorised set changed.
+    pub fn upsert_reference_grant(&self, grant: &ReferenceGrant) -> bool {
+        let Some(to_ns) = grant.metadata.namespace.as_deref() else {
+            return false;
+        };
+        let froms = trusted_route_from_namespaces(grant);
+
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return false;
+            }
+        };
+        // Recompute this grant's contribution from scratch: drop every pair
+        // targeting `to_ns` that this grant could have added, then re-insert
+        // the current `from` set. A single grant per (from,to) pair is the
+        // common case; on the rare overlap of two grants trusting the same
+        // pair, a delete of one still leaves the pair authorised only if the
+        // survivor re-adds it — which it does on its own next apply/relist.
+        let before: HashSet<(String, String)> = g
+            .reference_grants
+            .iter()
+            .filter(|(_, t)| t == to_ns)
+            .cloned()
+            .collect();
+        let after: HashSet<(String, String)> = froms
+            .iter()
+            .map(|f| (f.clone(), to_ns.to_string()))
+            .collect();
+        if before == after {
+            return false;
+        }
+        for pair in &before {
+            g.reference_grants.remove(pair);
+        }
+        for pair in after {
+            g.reference_grants.insert(pair);
+        }
+        drop(g);
+        self.fire_if(true)
+    }
+
+    /// Mutates the scope on a ReferenceGrant delete: drop every authorised
+    /// pair this grant contributed (all pairs targeting its namespace and
+    /// listing one of its trusted `from` namespaces).
+    pub fn remove_reference_grant(&self, grant: &ReferenceGrant) -> bool {
+        let Some(to_ns) = grant.metadata.namespace.as_deref() else {
+            return false;
+        };
+        let froms = trusted_route_from_namespaces(grant);
+        if froms.is_empty() {
+            return false;
+        }
+
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return false;
+            }
+        };
+        let mut changed = false;
+        for f in froms {
+            changed |= g.reference_grants.remove(&(f, to_ns.to_string()));
+        }
+        drop(g);
+        self.fire_if(changed)
+    }
+}
+
+/// Extract the namespaces of `HTTPRoute` `from` entries in a ReferenceGrant
+/// that grants access `to` a `Service`. Only these (route → service)
+/// grants are relevant to backendRef resolution; grants for other
+/// kind pairs (e.g. Secret references) are ignored.
+/// Decides whether a cross-namespace backendRef is authorised. Abstracted
+/// behind a trait so `route_to_entrypoints` stays testable without a live
+/// [`GatewayScope`]: production passes the scope (grant-aware), tests can
+/// pass a stub.
+pub trait BackendRefAuthorizer {
+    /// True iff an HTTPRoute in `from_ns` may reference a Service in `to_ns`.
+    fn allows(&self, from_ns: &str, to_ns: &str) -> bool;
+}
+
+impl BackendRefAuthorizer for GatewayScope {
+    fn allows(&self, from_ns: &str, to_ns: &str) -> bool {
+        self.allows_backend_ref(from_ns, to_ns)
+    }
+}
+
+/// A [`BackendRefAuthorizer`] that permits every cross-namespace reference.
+/// Same-namespace refs never consult an authorizer, so this only matters
+/// for the cross-namespace paths in tests that predate grant enforcement.
+#[cfg(test)]
+pub struct AllowAllBackendRefs;
+
+#[cfg(test)]
+impl BackendRefAuthorizer for AllowAllBackendRefs {
+    fn allows(&self, _from_ns: &str, _to_ns: &str) -> bool {
+        true
+    }
+}
+
+fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
+    let grants_to_service = grant.spec.to.iter().any(|t| {
+        let group_ok = t.group.is_empty();
+        let kind_ok = t.kind == "Service";
+        group_ok && kind_ok
+    });
+    if !grants_to_service {
+        return HashSet::new();
+    }
+    grant
+        .spec
+        .from
+        .iter()
+        .filter(|f| f.group == GATEWAY_API_GROUP && f.kind == "HTTPRoute")
+        .map(|f| f.namespace.clone())
+        .collect()
 }
 
 /// Kick off a HTTPRoute watch on the given client. On every Apply we
@@ -414,6 +568,55 @@ pub async fn run_gatewayclass_watcher(client: Client, scope: GatewayScope) -> an
     }
 
     warn!("Gateway API: GatewayClass watcher stream ended unexpectedly");
+    Ok(())
+}
+
+/// Watch ReferenceGrants cluster-wide and keep the cross-namespace
+/// backendRef authorisations in [`GatewayScope`] in sync. A grant lives in
+/// the referenced namespace and lists the namespaces/kinds it trusts;
+/// mutating the authorised set notifies the HTTPRoute watcher (via the
+/// shared `changed` notifier) so a grant appearing or disappearing
+/// re-resolves affected routes immediately instead of waiting for the
+/// periodic tick.
+///
+/// On stream errors we log and let the driver reconnect; the relist on
+/// reconnect rebuilds the authorised set correctly.
+pub async fn run_referencegrant_watcher(client: Client, scope: GatewayScope) -> anyhow::Result<()> {
+    let api: Api<ReferenceGrant> = Api::all(client);
+    let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    info!("Gateway API: ReferenceGrant watcher started");
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(Event::Apply(grant)) | Ok(Event::InitApply(grant)) => {
+                let name = grant.metadata.name.as_deref().unwrap_or("<no-name>");
+                let ns = grant
+                    .metadata
+                    .namespace
+                    .as_deref()
+                    .unwrap_or("<no-namespace>");
+                if scope.upsert_reference_grant(&grant) {
+                    info!("Gateway API: ReferenceGrant {}/{} applied", ns, name);
+                }
+            }
+            Ok(Event::Delete(grant)) => {
+                let name = grant.metadata.name.as_deref().unwrap_or("<no-name>");
+                let ns = grant
+                    .metadata
+                    .namespace
+                    .as_deref()
+                    .unwrap_or("<no-namespace>");
+                if scope.remove_reference_grant(&grant) {
+                    info!("Gateway API: ReferenceGrant {}/{} removed", ns, name);
+                }
+            }
+            Ok(Event::Init) => debug!("Gateway API: ReferenceGrant init"),
+            Ok(Event::InitDone) => debug!("Gateway API: ReferenceGrant init done"),
+            Err(e) => error!("Gateway API: ReferenceGrant watcher error: {}", e),
+        }
+    }
+
+    warn!("Gateway API: ReferenceGrant watcher stream ended unexpectedly");
     Ok(())
 }
 
@@ -555,7 +758,7 @@ fn apply_route(
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
     } else {
-        let eps = route_to_entrypoints(route, resolver);
+        let eps = route_to_entrypoints(route, resolver, scope);
         let outcome = if eps.is_empty() {
             RouteOutcome::NoResolvableBackends
         } else {
@@ -749,7 +952,11 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
 /// - rules with backends that resolve to zero pod IPs
 /// - matches that aren't `Path` (header/query/method-only matches)
 /// - `RegularExpression` path type — not yet supported by the routing layer
-pub fn route_to_entrypoints(route: &HTTPRoute, resolver: &dyn ServiceResolver) -> Vec<Entrypoint> {
+pub fn route_to_entrypoints(
+    route: &HTTPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Vec<Entrypoint> {
     let ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let route_name = match route.metadata.name.as_deref() {
         Some(n) => n,
@@ -766,7 +973,7 @@ pub fn route_to_entrypoints(route: &HTTPRoute, resolver: &dyn ServiceResolver) -
         .iter()
         .enumerate()
         .flat_map(|(idx, rule)| {
-            rule_to_entrypoints(ns, route_name, idx, &hostnames, rule, resolver)
+            rule_to_entrypoints(ns, route_name, idx, &hostnames, rule, resolver, grants)
         })
         .collect()
 }
@@ -983,6 +1190,7 @@ fn rule_to_entrypoints(
     hostnames: &[String],
     rule: &HTTPRouteRules,
     resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
 ) -> Vec<Entrypoint> {
     // Gateway API: each entry in `filters` is meant to mutate the
     // request/response before/after it reaches the backend. We honour the
@@ -1032,6 +1240,18 @@ fn rule_to_entrypoints(
                 return Vec::new();
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+            // Cross-namespace backendRefs require a ReferenceGrant in the
+            // target namespace trusting this route's namespace. Without one
+            // the ref is dropped (not routed), per the Gateway API spec:
+            // a namespace must opt in to being referenced. Same-namespace
+            // refs are always allowed and never consult the grant set.
+            if !grants.allows(namespace, target_ns) {
+                warn!(
+                    "Gateway API: HTTPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
+                    namespace, route_name, target_ns, b.name
+                );
+                return Vec::new();
+            }
             let weight = b.weight.unwrap_or(100).max(0) as u32;
             resolver
                 .pod_ips(target_ns, &b.name)
@@ -1326,7 +1546,7 @@ mod tests {
             spec: HTTPRouteSpec::default(),
             status: Default::default(),
         };
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1339,7 +1559,7 @@ mod tests {
             },
             status: Default::default(),
         };
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1351,7 +1571,7 @@ mod tests {
             }],
             vec!["app.example.com".into()],
         );
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1359,7 +1579,7 @@ mod tests {
         let mut b = backend("svc", 0);
         b.port = None;
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1368,7 +1588,7 @@ mod tests {
             vec![rule(None, vec![backend("api", 8080)])],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         let ep = &eps[0];
         assert_eq!(ep.id, "k8s-gateway-default-web-0");
@@ -1388,7 +1608,7 @@ mod tests {
         );
         // Empty resolver: Service has no ready endpoints yet — we drop the
         // route rather than register a frontend that would 502.
-        assert!(route_to_entrypoints(&r, &r0()).is_empty());
+        assert!(route_to_entrypoints(&r, &r0(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1398,7 +1618,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         let resolver = StubResolver(vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
-        let eps = route_to_entrypoints(&r, &resolver);
+        let eps = route_to_entrypoints(&r, &resolver, &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].backends.len(), 3);
         let addresses: Vec<&str> = eps[0].backends.iter().map(|b| b.address.as_str()).collect();
@@ -1416,7 +1636,7 @@ mod tests {
             ],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 2);
         assert!(eps[0].id.ends_with("-0"));
         assert!(eps[1].id.ends_with("-1"));
@@ -1439,8 +1659,126 @@ mod tests {
         let mut b = backend("api", 80);
         b.namespace = Some("other".into());
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
-        let eps = route_to_entrypoints(&r, &CrossNsResolver);
+        let eps = route_to_entrypoints(&r, &CrossNsResolver, &AllowAllBackendRefs);
         assert_eq!(eps[0].backends[0].address, "10.1.0.1");
+    }
+
+    // A ReferenceGrant in `to_ns` trusting `HTTPRoute` from `from_ns`.
+    fn reference_grant(to_ns: &str, from_ns: &str) -> ReferenceGrant {
+        use gateway_api::apis::standard::referencegrants::{
+            ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+        };
+        ReferenceGrant {
+            metadata: ObjectMeta {
+                namespace: Some(to_ns.into()),
+                name: Some("grant".into()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: GATEWAY_API_GROUP.into(),
+                    kind: "HTTPRoute".into(),
+                    namespace: from_ns.into(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: String::new(),
+                    kind: "Service".into(),
+                    name: None,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn cross_namespace_backend_without_grant_is_dropped() {
+        struct CrossNsResolver;
+        impl ServiceResolver for CrossNsResolver {
+            fn pod_ips(&self, namespace: &str, service: &str) -> Vec<String> {
+                if namespace == "other" && service == "api" {
+                    vec!["10.1.0.1".into()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        let mut b = backend("api", 80);
+        b.namespace = Some("other".into());
+        let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
+        // Empty scope: no ReferenceGrant, so the cross-namespace ref is
+        // refused and the route resolves to zero entrypoints.
+        let scope = GatewayScope::new();
+        assert!(route_to_entrypoints(&r, &CrossNsResolver, &scope).is_empty());
+    }
+
+    #[test]
+    fn cross_namespace_backend_with_grant_resolves() {
+        struct CrossNsResolver;
+        impl ServiceResolver for CrossNsResolver {
+            fn pod_ips(&self, namespace: &str, service: &str) -> Vec<String> {
+                if namespace == "other" && service == "api" {
+                    vec!["10.1.0.1".into()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        let mut b = backend("api", 80);
+        b.namespace = Some("other".into());
+        // Route lives in the default namespace; a grant in "other" trusts it.
+        let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
+        let scope = GatewayScope::new();
+        assert!(scope.upsert_reference_grant(&reference_grant("other", "default")));
+        let eps = route_to_entrypoints(&r, &CrossNsResolver, &scope);
+        assert_eq!(eps[0].backends[0].address, "10.1.0.1");
+    }
+
+    #[test]
+    fn reference_grant_removal_revokes_access() {
+        let scope = GatewayScope::new();
+        let grant = reference_grant("other", "default");
+        assert!(scope.upsert_reference_grant(&grant));
+        assert!(scope.allows_backend_ref("default", "other"));
+        assert!(scope.remove_reference_grant(&grant));
+        assert!(!scope.allows_backend_ref("default", "other"));
+    }
+
+    #[test]
+    fn same_namespace_backend_never_needs_grant() {
+        let scope = GatewayScope::new();
+        // No grant at all, yet same-namespace is always allowed.
+        assert!(scope.allows_backend_ref("app", "app"));
+    }
+
+    #[test]
+    fn grant_to_secret_does_not_authorise_service_ref() {
+        use gateway_api::apis::standard::referencegrants::{
+            ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+        };
+        let grant = ReferenceGrant {
+            metadata: ObjectMeta {
+                namespace: Some("other".into()),
+                name: Some("grant".into()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: GATEWAY_API_GROUP.into(),
+                    kind: "HTTPRoute".into(),
+                    namespace: "default".into(),
+                }],
+                // Grants access to a Secret, not a Service — irrelevant to
+                // backendRef resolution.
+                to: vec![ReferenceGrantTo {
+                    group: String::new(),
+                    kind: "Secret".into(),
+                    name: None,
+                }],
+            },
+        };
+        let scope = GatewayScope::new();
+        // Nothing changed: the grant doesn't authorise any Service ref.
+        assert!(!scope.upsert_reference_grant(&grant));
+        assert!(!scope.allows_backend_ref("default", "other"));
     }
 
     #[test]
@@ -1455,7 +1793,7 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         let p = eps[0].config.path.as_ref().expect("path config present");
         assert_eq!(p.value, "/api");
         assert!(matches!(p.rule_type, PathRuleType::Prefix));
@@ -1473,7 +1811,7 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         let p = eps[0].config.path.as_ref().unwrap();
         assert!(matches!(p.rule_type, PathRuleType::Exact));
         assert_eq!(p.value, "/health");
@@ -1491,7 +1829,7 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         // Backend still produces an entrypoint, but without a path config.
         assert_eq!(eps.len(), 1);
         assert!(eps[0].config.path.is_none());
@@ -1502,7 +1840,7 @@ mod tests {
         let mut b = backend("svc", 80);
         b.kind = Some("CustomResource".into());
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     fn route_with_uid(uid: &str, rules: Vec<HTTPRouteRules>, hostnames: Vec<String>) -> HTTPRoute {
@@ -1705,7 +2043,7 @@ mod tests {
         let mut b = backend("api", 80);
         b.weight = Some(42);
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps[0].backends[0].weight, 42);
     }
 
@@ -1747,7 +2085,7 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
         assert!(route_has_unsupported_filters(&r));
     }
 
@@ -1767,7 +2105,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
         assert_eq!(
@@ -1793,7 +2131,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].config.headers.len(), 1);
         assert_eq!(eps[0].config.headers[0].name, "X-Env");
@@ -1818,7 +2156,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps[0].config.headers.len(), 1);
         assert_eq!(
             eps[0].config.headers[0].direction,
@@ -1847,7 +2185,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
         assert_eq!(eps[0].config.headers.len(), 1);
@@ -1864,7 +2202,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(route_has_unsupported_filters(&r));
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1885,7 +2223,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         let rw = eps[0].config.rewrite.as_ref().unwrap();
         assert_eq!(rw.path, Some(PathRewrite::ReplacePrefixMatch("/v2".into())));
@@ -1906,7 +2244,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         let rw = eps[0].config.rewrite.as_ref().unwrap();
         assert_eq!(rw.hostname.as_deref(), Some("internal.svc"));
         assert_eq!(rw.path, None);
@@ -1938,7 +2276,7 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(route_has_unsupported_filters(&r));
-        assert!(route_to_entrypoints(&r, &r1()).is_empty());
+        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
     #[test]
@@ -1950,7 +2288,10 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(!route_has_unsupported_filters(&r));
-        assert_eq!(route_to_entrypoints(&r, &r1()).len(), 1);
+        assert_eq!(
+            route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).len(),
+            1
+        );
     }
 
     #[test]
@@ -1968,7 +2309,7 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 3, "one entrypoint per match");
         let paths: Vec<&str> = eps
             .iter()
@@ -2002,7 +2343,7 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].id, "k8s-gateway-default-web-0");
     }
@@ -2015,7 +2356,7 @@ mod tests {
             vec![rule(None, vec![backend("api", 80)])],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert!(eps[0].config.path.is_none());
     }
