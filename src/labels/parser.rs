@@ -8,7 +8,7 @@ use crate::labels::fields::{
     path, plugin_config, plugins, ratelimit, redirect, request_match,
 };
 use crate::labels::network;
-use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol};
+use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol, RedirectPolicy};
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
@@ -219,14 +219,29 @@ fn build_entrypoint(
         _ => return None,
     };
 
-    let backend = match weight {
-        Some(weight) => Backend::new(backend_ip, port).with_weight(weight),
-        None => Backend::new(backend_ip, port),
+    // A permanent/unauthorized redirect answers at the frontend and never reaches
+    // a backend (see proxy::sozu — "a permanent redirect never [reaches the]
+    // backend"). Attaching one anyway registers a phantom backend that the health
+    // checker probes forever (e.g. an alias host with no `.port` falls back to
+    // `:80`, which nothing listens on) and pollutes the cluster's backend set.
+    // Forwarding redirects still proxy, so they keep their backend.
+    let is_pure_redirect = matches!(
+        redirect,
+        Some(RedirectPolicy::Permanent | RedirectPolicy::Unauthorized)
+    );
+    let backends = if is_pure_redirect {
+        Vec::new()
+    } else {
+        let backend = match weight {
+            Some(weight) => Backend::new(backend_ip, port).with_weight(weight),
+            None => Backend::new(backend_ip, port),
+        };
+        vec![backend]
     };
 
     Some(Entrypoint {
         id: format!("{protocol}_{service_name}"),
-        backends: vec![backend],
+        backends,
         name: service_name.to_string(),
         protocol: protocol_enum,
         config: EntrypointConfig {
