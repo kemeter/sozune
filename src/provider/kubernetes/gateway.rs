@@ -28,6 +28,7 @@
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gateway/>
 
 use super::gateway_filters;
+use super::gateway_matches;
 use crate::model::{
     Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
 };
@@ -1034,6 +1035,14 @@ fn apply_route(
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
+    } else if route_has_unsupported_matches(route) {
+        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+        warn!(
+            "Gateway API: HTTPRoute {}/{} declares a RegularExpression header/query match sōzune cannot represent (Exact and presence-only header/query matches, and all method matches, are supported) — dropping the route",
+            ns, name
+        );
+        (RouteOutcome::UnsupportedFilters, Vec::new())
     } else {
         let eps = route_to_entrypoints(route, resolver, scope);
         let outcome = if eps.is_empty() {
@@ -1276,6 +1285,24 @@ pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
             }
             _ => false,
         })
+}
+
+/// True iff any match in the route declares a condition sōzune can't
+/// represent — a `type: RegularExpression` header or query match. Treated
+/// like an unsupported filter: the route is rejected (logged, and reflected
+/// as `ResolvedRefs=False reason=UnsupportedValue`) rather than served with
+/// the regex condition silently dropped, which would route more traffic
+/// than the author asked for. Exact and presence-only header/query matches,
+/// and all method matches, are supported and don't trip this.
+pub fn route_has_unsupported_matches(route: &HTTPRoute) -> bool {
+    route
+        .spec
+        .rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|rule| rule.matches.as_deref().unwrap_or_default())
+        .any(gateway_matches::match_has_unsupported_conditions)
 }
 
 // Gateway API standard condition types and reasons. Values are the
@@ -1572,6 +1599,17 @@ fn rule_to_entrypoints(
                 Some(PathConfig { rule_type, value })
             });
 
+            // Header / query-param / method conditions, ANDed with the path
+            // (and with each other) inside this single match. A match with
+            // none of them constrains on path alone. Unrepresentable regex
+            // header/query matches never reach here — the route is rejected
+            // upstream (see `route_has_unsupported_matches`).
+            let match_headers = m
+                .map(gateway_matches::match_headers_from)
+                .unwrap_or_default();
+            let match_query = m.map(gateway_matches::match_query_from).unwrap_or_default();
+            let methods = m.map(gateway_matches::methods_from).unwrap_or_default();
+
             // Stable IDs: keep the existing `…-{rule_index}` shape when a
             // rule has exactly one match (the universal case until now,
             // and what the storage / dashboard expects), and append
@@ -1623,13 +1661,13 @@ fn rule_to_entrypoints(
                     sticky_session: false,
                     compress: false,
                     entrypoint: None,
-                    methods: Vec::new(),
+                    methods,
                     acme: None,
                     plugins: Vec::new(),
                     plugin_config: std::collections::BTreeMap::new(),
                     error_pages: std::collections::BTreeMap::new(),
-                    match_headers: Vec::new(),
-                    match_query: Vec::new(),
+                    match_headers,
+                    match_query,
                     match_client_ip: Vec::new(),
                     ip_allow_list: Vec::new(),
                 },
@@ -1668,7 +1706,9 @@ mod tests {
     use gateway_api::apis::standard::httproutes::{
         HTTPRouteRulesBackendRefs, HTTPRouteRulesFiltersRequestRedirect,
         HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesMatches,
-        HTTPRouteRulesMatchesPath, HTTPRouteSpec,
+        HTTPRouteRulesMatchesHeaders, HTTPRouteRulesMatchesHeadersType,
+        HTTPRouteRulesMatchesMethod, HTTPRouteRulesMatchesPath, HTTPRouteRulesMatchesQueryParams,
+        HTTPRouteRulesMatchesQueryParamsType, HTTPRouteSpec,
     };
     use kube::api::ObjectMeta;
 
@@ -1811,6 +1851,43 @@ mod tests {
                 r#type: Some(ty),
                 value: Some(value.into()),
             }),
+            ..Default::default()
+        }
+    }
+
+    fn header_match(
+        name: &str,
+        value: &str,
+        ty: HTTPRouteRulesMatchesHeadersType,
+    ) -> HTTPRouteRulesMatches {
+        HTTPRouteRulesMatches {
+            headers: Some(vec![HTTPRouteRulesMatchesHeaders {
+                name: name.into(),
+                value: value.into(),
+                r#type: Some(ty),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn query_match(
+        name: &str,
+        value: &str,
+        ty: HTTPRouteRulesMatchesQueryParamsType,
+    ) -> HTTPRouteRulesMatches {
+        HTTPRouteRulesMatches {
+            query_params: Some(vec![HTTPRouteRulesMatchesQueryParams {
+                name: name.into(),
+                value: value.into(),
+                r#type: Some(ty),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn method_match(method: HTTPRouteRulesMatchesMethod) -> HTTPRouteRulesMatches {
+        HTTPRouteRulesMatches {
+            method: Some(method),
             ..Default::default()
         }
     }
@@ -2112,6 +2189,127 @@ mod tests {
         // Backend still produces an entrypoint, but without a path config.
         assert_eq!(eps.len(), 1);
         assert!(eps[0].config.path.is_none());
+    }
+
+    #[test]
+    fn exact_header_match_becomes_a_match_condition() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![header_match(
+                    "X-Canary",
+                    "yes",
+                    HTTPRouteRulesMatchesHeadersType::Exact,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.match_headers.len(), 1);
+        assert_eq!(eps[0].config.match_headers[0].key, "X-Canary");
+        assert_eq!(eps[0].config.match_headers[0].value, "yes");
+    }
+
+    #[test]
+    fn exact_query_match_becomes_a_match_condition() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![query_match(
+                    "debug",
+                    "1",
+                    HTTPRouteRulesMatchesQueryParamsType::Exact,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.match_query.len(), 1);
+        assert_eq!(eps[0].config.match_query[0].key, "debug");
+        assert_eq!(eps[0].config.match_query[0].value, "1");
+    }
+
+    #[test]
+    fn method_match_becomes_an_uppercase_verb() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![method_match(HTTPRouteRulesMatchesMethod::Post)]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.methods, vec!["POST".to_string()]);
+    }
+
+    #[test]
+    fn header_query_and_method_are_anded_on_one_match() {
+        let mut m = header_match("X-Canary", "yes", HTTPRouteRulesMatchesHeadersType::Exact);
+        m.query_params = Some(vec![HTTPRouteRulesMatchesQueryParams {
+            name: "debug".into(),
+            value: "1".into(),
+            r#type: Some(HTTPRouteRulesMatchesQueryParamsType::Exact),
+        }]);
+        m.method = Some(HTTPRouteRulesMatchesMethod::Get);
+        let r = route_with(
+            vec![rule(Some(vec![m]), vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].config.match_headers.len(), 1);
+        assert_eq!(eps[0].config.match_query.len(), 1);
+        assert_eq!(eps[0].config.methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
+    fn regex_header_match_is_reported_unsupported() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![header_match(
+                    "X-Canary",
+                    "^v[0-9]+$",
+                    HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_has_unsupported_matches(&r));
+    }
+
+    #[test]
+    fn regex_query_match_is_reported_unsupported() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![query_match(
+                    "v",
+                    "^[0-9]+$",
+                    HTTPRouteRulesMatchesQueryParamsType::RegularExpression,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_has_unsupported_matches(&r));
+    }
+
+    #[test]
+    fn exact_matches_are_not_reported_unsupported() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![
+                    header_match("X-A", "1", HTTPRouteRulesMatchesHeadersType::Exact),
+                    method_match(HTTPRouteRulesMatchesMethod::Delete),
+                ]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_matches(&r));
     }
 
     #[test]

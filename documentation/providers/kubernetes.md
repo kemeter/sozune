@@ -234,6 +234,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
 - `spec.hostnames` — matched against the `Host` header of incoming requests.
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
+- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other); a request that fails any condition gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below).
 - `backendRef.weight` — propagated to the load balancer.

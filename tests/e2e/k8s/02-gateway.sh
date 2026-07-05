@@ -64,6 +64,78 @@ else
     fail "/b NOT reachable on split host (timeout)"
 fi
 
+# ----------------------------------------------------------------------
+# Header + method matching: match-gw serves only a GET carrying
+# `X-Canary: yes`. A GET with the header is 200; a GET without it, and a
+# POST with it, are both 404 (the match doesn't apply).
+# ----------------------------------------------------------------------
+GW_HOST_MATCH="gw-match.k8s-test.localhost"
+
+log "[02] Gateway: header+method match serves only the matching request"
+
+# wait_for_status can't send a custom header, so poll with an explicit curl
+# until the matching route is live (routes propagate a moment after apply).
+match_hit="000"
+for _ in $(seq 1 30); do
+    match_hit=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "Host: $GW_HOST_MATCH" -H "X-Canary: yes" \
+        "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+    [[ "$match_hit" == "200" ]] && break
+    sleep 0.5
+done
+if [[ "$match_hit" == "200" ]]; then
+    pass "GET with X-Canary:yes is served (200)"
+else
+    fail "GET with X-Canary:yes not served (got $match_hit)"
+fi
+
+match_no_header=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $GW_HOST_MATCH" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+match_no_header=${match_no_header:-000}
+if [[ "$match_no_header" == "404" ]]; then
+    pass "GET without the header is 404 (header condition enforced)"
+else
+    fail "GET without the header got $match_no_header, expected 404"
+fi
+
+match_wrong_method=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 -X POST \
+    -H "Host: $GW_HOST_MATCH" -H "X-Canary: yes" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+match_wrong_method=${match_wrong_method:-000}
+if [[ "$match_wrong_method" == "404" ]]; then
+    pass "POST with the header is 404 (method condition enforced)"
+else
+    fail "POST with the header got $match_wrong_method, expected 404"
+fi
+
+# ----------------------------------------------------------------------
+# Query-param matching: query-gw serves only a request carrying `?debug=1`.
+# ----------------------------------------------------------------------
+GW_HOST_QUERY="gw-query.k8s-test.localhost"
+
+log "[02] Gateway: query-param match serves only the matching request"
+
+query_hit=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $GW_HOST_QUERY" \
+    "http://127.0.0.1:$HTTP_PORT/?debug=1" 2>/dev/null)
+query_hit=${query_hit:-000}
+if [[ "$query_hit" == "200" ]]; then
+    pass "request with ?debug=1 is served (200)"
+else
+    fail "request with ?debug=1 not served (got $query_hit)"
+fi
+
+query_miss=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $GW_HOST_QUERY" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+query_miss=${query_miss:-000}
+if [[ "$query_miss" == "404" ]]; then
+    pass "request without the query param is 404 (query condition enforced)"
+else
+    fail "request without ?debug=1 got $query_miss, expected 404"
+fi
+
 log "[02] Gateway: unknown host returns 404"
 
 unknown_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \

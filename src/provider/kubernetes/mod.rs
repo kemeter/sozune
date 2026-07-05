@@ -1,5 +1,6 @@
 pub mod gateway;
 pub mod gateway_filters;
+pub mod gateway_matches;
 
 use crate::config::KubernetesConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
