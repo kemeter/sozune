@@ -144,3 +144,47 @@ spec:
       backendRefs:
         - name: svcb
           port: 80
+---
+# parentRef.sectionName selecting the Gateway's `http` listener by name.
+# Served, because gw declares a listener named `http`.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: section-ok-gw
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+      sectionName: http
+  hostnames:
+    - gw-section-ok.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: svca
+          port: 80
+---
+# parentRef.sectionName naming a listener that does not exist on gw.
+# Refused: the route is out of scope, so it 404s.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: section-ghost-gw
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+      sectionName: ghost
+  hostnames:
+    - gw-section-ghost.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: svcb
+          port: 80

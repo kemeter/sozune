@@ -89,16 +89,36 @@ const SOURCE_TAG: &str = "k8s-gateway";
 /// Keeping it as an explicit struct (rather than two free-standing
 /// `RwLock`s) lets us atomically answer "is this route in scope?" in
 /// constant time without partial views during concurrent updates.
+/// The slice of a Gateway `spec.listeners[]` entry sōzune needs to bind a
+/// route to a specific listener. Protocol/TLS/port-binding are out of scope
+/// (HTTP serving stays on the configured listener); what matters here is
+/// resolving a `parentRef`'s `sectionName`/`port` to a listener and
+/// intersecting the listener `hostname` with the route's hostnames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerInfo {
+    /// Listener `name`, unique within the Gateway. Matched against a
+    /// `parentRef.sectionName`.
+    pub name: String,
+    /// Listener `port`. Matched against a `parentRef.port`.
+    pub port: i32,
+    /// Optional listener `hostname`. When set, a route attached to this
+    /// listener only serves hostnames that match it.
+    pub hostname: Option<String>,
+}
+
 #[derive(Default, Debug)]
 pub struct ScopeState {
     /// Names of GatewayClasses whose `spec.controllerName` matches
     /// [`SOZUNE_CONTROLLER_NAME`]. Cluster-scoped, so a flat set is
     /// enough.
     gateway_classes: HashSet<String>,
-    /// Gateways we accept, keyed by `(namespace, name)`. A Gateway is
-    /// accepted iff `spec.gatewayClassName` is in `gateway_classes`. We
-    /// don't yet read the listener list — that's a post-merge concern.
-    gateways: HashSet<(String, String)>,
+    /// Gateways we accept, keyed by `(namespace, name)`, mapping to the
+    /// listeners each one declares. A Gateway is accepted iff
+    /// `spec.gatewayClassName` is in `gateway_classes`. The listener list
+    /// lets a route's `parentRef` bind to a specific listener via
+    /// `sectionName`/`port`, and lets a listener's `hostname` narrow which
+    /// route hostnames it serves.
+    gateways: HashMap<(String, String), Vec<ListenerInfo>>,
     /// Cross-namespace backendRef authorisations, keyed by
     /// `(from_namespace, to_namespace)`: the namespace of the referencing
     /// HTTPRoute and the namespace of the referenced Service. A pair is
@@ -141,6 +161,12 @@ impl GatewayScope {
     /// defaults to `Gateway`, missing `group` defaults to
     /// `gateway.networking.k8s.io`. A `parentRef` to a `Service` (mesh
     /// profile) is explicitly out of scope here.
+    ///
+    /// When the `parentRef` names a specific listener — via `sectionName`
+    /// (matched against a listener `name`) or `port` — the Gateway must
+    /// have a listener that matches, otherwise the ref is refused. Per
+    /// spec, an unset `sectionName`/`port` binds to the whole Gateway (any
+    /// listener), which is the existing behaviour.
     fn accepts_parent_ref(&self, route_namespace: &str, parent_ref: &HTTPRouteParentRefs) -> bool {
         let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
         if kind != "Gateway" {
@@ -155,11 +181,87 @@ impl GatewayScope {
         let ns = parent_ref.namespace.as_deref().unwrap_or(route_namespace);
         let key = (ns.to_string(), parent_ref.name.clone());
         match self.state.read() {
-            Ok(g) => g.gateways.contains(&key),
+            Ok(g) => match g.gateways.get(&key) {
+                Some(listeners) => parent_ref_selects_listener(parent_ref, listeners),
+                None => false,
+            },
             Err(e) => {
                 error!("Gateway API: scope lock poisoned: {}", e);
                 false
             }
+        }
+    }
+
+    /// Returns the listeners of an accepted Gateway named by `(ns, name)`,
+    /// or `None` if sōzune doesn't own it. Used to intersect a listener's
+    /// `hostname` with a route's hostnames.
+    fn gateway_listeners(&self, ns: &str, name: &str) -> Option<Vec<ListenerInfo>> {
+        match self.state.read() {
+            Ok(g) => g.gateways.get(&(ns.to_string(), name.to_string())).cloned(),
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                None
+            }
+        }
+    }
+
+    /// The hostnames a route's entrypoints should serve, after narrowing
+    /// the route's declared hostnames by each bound listener's `hostname`.
+    /// Unions the per-parentRef intersections: a route attached to two
+    /// listeners serves the union of what each listener admits.
+    ///
+    /// Returns `Some(hostnames)` (deduplicated, order-stable; an empty vec
+    /// means "all hosts", exactly like an empty `spec.hostnames`), or `None`
+    /// when every bound listener constrains hostnames and none of them
+    /// overlaps the route — the route resolves to nothing on this Gateway.
+    /// Falls back to the route's own hostnames when no bound listener
+    /// constrains hostnames.
+    fn effective_hostnames_for_route(&self, route: &HTTPRoute) -> Option<Vec<String>> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return Some(route_hostnames);
+        };
+
+        let mut out: Vec<String> = Vec::new();
+        let mut any_listener = false;
+        let mut any_overlap = false;
+        for p in refs.iter().filter(|p| self.accepts_parent_ref(route_ns, p)) {
+            let ns = p.namespace.as_deref().unwrap_or(route_ns);
+            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+                continue;
+            };
+            // Restrict to the listener(s) this parentRef selects, so a
+            // sectionName/port ref only inherits its own listener's hostname.
+            let selected: Vec<ListenerInfo> = if p.section_name.is_none() && p.port.is_none() {
+                listeners
+            } else {
+                listeners
+                    .into_iter()
+                    .filter(|l| {
+                        let name_ok = p.section_name.as_deref().is_none_or(|s| s == l.name);
+                        let port_ok = p.port.is_none_or(|port| port == l.port);
+                        name_ok && port_ok
+                    })
+                    .collect()
+            };
+            any_listener = true;
+            if let Some(hs) = intersect_hostnames(&route_hostnames, &selected) {
+                any_overlap = true;
+                for h in hs {
+                    if !out.contains(&h) {
+                        out.push(h);
+                    }
+                }
+            }
+        }
+
+        if !any_listener {
+            Some(route_hostnames)
+        } else if any_overlap {
+            Some(out)
+        } else {
+            None
         }
     }
 
@@ -238,8 +340,10 @@ impl GatewayScope {
         self.fire_if(removed)
     }
 
-    /// Mutates the scope on a Gateway apply. Returns true iff the
-    /// accepted set actually changed.
+    /// Mutates the scope on a Gateway apply. Returns true iff the accepted
+    /// set changed — either the Gateway flipped in/out of scope, or (while
+    /// accepted) its listener set changed, since a route's binding depends
+    /// on the listeners.
     pub fn upsert_gateway(&self, gateway: &Gateway) -> bool {
         let Some(name) = gateway.metadata.name.as_deref() else {
             return false;
@@ -251,6 +355,7 @@ impl GatewayScope {
             .unwrap_or("default")
             .to_string();
         let class = gateway.spec.gateway_class_name.as_str();
+        let listeners = listeners_of(gateway);
 
         let mut g = match self.state.write() {
             Ok(g) => g,
@@ -261,17 +366,21 @@ impl GatewayScope {
         };
         let key = (ns, name.to_string());
         let accepted = g.gateway_classes.contains(class);
-        let was = g.gateways.contains(&key);
-        let changed = match (accepted, was) {
-            (true, false) => {
-                g.gateways.insert(key);
+        let changed = match (accepted, g.gateways.get(&key)) {
+            (true, None) => {
+                g.gateways.insert(key, listeners);
                 true
             }
-            (false, true) => {
+            (true, Some(existing)) if *existing != listeners => {
+                g.gateways.insert(key, listeners);
+                true
+            }
+            (true, Some(_)) => false,
+            (false, Some(_)) => {
                 g.gateways.remove(&key);
                 true
             }
-            _ => false,
+            (false, None) => false,
         };
         drop(g);
         self.fire_if(changed)
@@ -301,7 +410,8 @@ impl GatewayScope {
         };
         let removed = g
             .gateways
-            .remove(&(namespace.to_string(), name.to_string()));
+            .remove(&(namespace.to_string(), name.to_string()))
+            .is_some();
         drop(g);
         self.fire_if(removed)
     }
@@ -451,6 +561,90 @@ fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
         .filter(|f| f.group == GATEWAY_API_GROUP && f.kind == "HTTPRoute")
         .map(|f| f.namespace.clone())
         .collect()
+}
+
+/// Extract the [`ListenerInfo`] slice sōzune tracks from a Gateway's
+/// `spec.listeners[]`. Only `name`, `port` and `hostname` are kept — the
+/// data needed for `parentRef` listener selection and hostname narrowing.
+fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
+    gateway
+        .spec
+        .listeners
+        .iter()
+        .map(|l| ListenerInfo {
+            name: l.name.clone(),
+            port: l.port,
+            hostname: l.hostname.clone(),
+        })
+        .collect()
+}
+
+/// True iff a `parentRef` selects at least one of `listeners`. An unset
+/// `sectionName` and unset `port` bind to the whole Gateway (every
+/// listener). When `sectionName` is set it must equal a listener `name`;
+/// when `port` is set it must equal a listener `port`; when both are set
+/// the same listener must satisfy both. A Gateway with no listeners at all
+/// is only selected by a ref that names neither.
+fn parent_ref_selects_listener(
+    parent_ref: &HTTPRouteParentRefs,
+    listeners: &[ListenerInfo],
+) -> bool {
+    let section = parent_ref.section_name.as_deref();
+    let port = parent_ref.port;
+    if section.is_none() && port.is_none() {
+        return true;
+    }
+    listeners.iter().any(|l| {
+        let name_ok = section.is_none_or(|s| s == l.name);
+        let port_ok = port.is_none_or(|p| p == l.port);
+        name_ok && port_ok
+    })
+}
+
+/// Intersect a route's `hostnames` with the listener hostnames it binds to.
+/// Per the Gateway API spec, a listener with a `hostname` only serves route
+/// hostnames that match it (exact or a shared suffix for wildcard forms);
+/// a listener with no `hostname` serves them all. A route with no
+/// hostnames inherits the listener hostnames. Returns the effective
+/// hostname set the entrypoints should use, or `None` when the
+/// intersection is empty (the route doesn't apply to this listener).
+fn intersect_hostnames(
+    route_hostnames: &[String],
+    listeners: &[ListenerInfo],
+) -> Option<Vec<String>> {
+    let listener_hosts: Vec<&str> = listeners
+        .iter()
+        .filter_map(|l| l.hostname.as_deref())
+        .collect();
+    // No listener constrains hostnames → route hostnames pass through
+    // unchanged (including an empty list, meaning "all hosts").
+    if listener_hosts.len() != listeners.len() || listeners.is_empty() {
+        return Some(route_hostnames.to_vec());
+    }
+    // Every listener has a hostname. A route with no hostnames inherits them.
+    if route_hostnames.is_empty() {
+        return Some(listener_hosts.iter().map(|h| h.to_string()).collect());
+    }
+    // Keep each route hostname that matches at least one listener hostname.
+    let kept: Vec<String> = route_hostnames
+        .iter()
+        .filter(|rh| listener_hosts.iter().any(|lh| hostnames_compatible(rh, lh)))
+        .cloned()
+        .collect();
+    if kept.is_empty() { None } else { Some(kept) }
+}
+
+/// Two Gateway API hostnames are compatible if one matches the other,
+/// honouring a single leading `*.` wildcard on either side (e.g.
+/// `*.example.com` matches `api.example.com`). No wildcard → exact match.
+fn hostnames_compatible(a: &str, b: &str) -> bool {
+    fn matches(pattern: &str, host: &str) -> bool {
+        match pattern.strip_prefix("*.") {
+            Some(suffix) => host.strip_suffix(suffix).is_some_and(|p| p.ends_with('.')),
+            None => pattern == host,
+        }
+    }
+    a == b || matches(a, b) || matches(b, a)
 }
 
 /// Kick off a HTTPRoute watch on the given client. On every Apply we
@@ -1044,13 +1238,27 @@ fn apply_route(
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
     } else {
-        let eps = route_to_entrypoints(route, resolver, scope);
-        let outcome = if eps.is_empty() {
-            RouteOutcome::NoResolvableBackends
-        } else {
-            RouteOutcome::Accepted
-        };
-        (outcome, eps)
+        // Narrow the route's hostnames by the listener(s) it binds to: a
+        // listener with a `hostname` only serves matching route hostnames.
+        // `None` means no bound listener admits any of the route's
+        // hostnames, so the route produces nothing here.
+        match scope.effective_hostnames_for_route(route) {
+            Some(effective_hostnames) => {
+                let eps = route_to_entrypoints_with_hostnames(
+                    route,
+                    resolver,
+                    scope,
+                    &effective_hostnames,
+                );
+                let outcome = if eps.is_empty() {
+                    RouteOutcome::NoResolvableBackends
+                } else {
+                    RouteOutcome::Accepted
+                };
+                (outcome, eps)
+            }
+            None => (RouteOutcome::NoResolvableBackends, Vec::new()),
+        }
     };
 
     // Best-effort status notification. We send the route (cloned —
@@ -1213,7 +1421,25 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
     }
 }
 
-/// Convert a HTTPRoute into one or more Sozune `Entrypoint`s. Each rule
+/// Convenience wrapper that serves the route's own `spec.hostnames`. The
+/// live path goes through [`route_to_entrypoints_with_hostnames`] with the
+/// listener-narrowed hostnames instead; this form (no listener narrowing)
+/// is used by the unit tests.
+#[cfg(test)]
+pub fn route_to_entrypoints(
+    route: &HTTPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Vec<Entrypoint> {
+    let hostnames = route.spec.hostnames.clone().unwrap_or_default();
+    route_to_entrypoints_with_hostnames(route, resolver, grants, &hostnames)
+}
+
+/// Convert a HTTPRoute into one or more Sozune `Entrypoint`s, serving
+/// `hostnames` (the caller passes the hostnames left after intersecting the
+/// route with its bound listeners' hostnames — see
+/// [`GatewayScope::effective_hostnames_for_route`]; an empty slice means
+/// "all hosts" exactly as an empty `spec.hostnames` does). Each rule
 /// expands to one entrypoint per `match` it declares (Gateway API
 /// semantics: matches inside a rule are OR'd together). A rule with no
 /// matches is treated as match-all, producing exactly one entrypoint
@@ -1238,18 +1464,17 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
 /// - rules with backends that resolve to zero pod IPs
 /// - matches that aren't `Path` (header/query/method-only matches)
 /// - `RegularExpression` path type — not yet supported by the routing layer
-pub fn route_to_entrypoints(
+pub fn route_to_entrypoints_with_hostnames(
     route: &HTTPRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
+    hostnames: &[String],
 ) -> Vec<Entrypoint> {
     let ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let route_name = match route.metadata.name.as_deref() {
         Some(n) => n,
         None => return Vec::new(),
     };
-
-    let hostnames = route.spec.hostnames.clone().unwrap_or_default();
 
     let Some(rules) = route.spec.rules.as_ref() else {
         return Vec::new();
@@ -1259,7 +1484,7 @@ pub fn route_to_entrypoints(
         .iter()
         .enumerate()
         .flat_map(|(idx, rule)| {
-            rule_to_entrypoints(ns, route_name, idx, &hostnames, rule, resolver, grants)
+            rule_to_entrypoints(ns, route_name, idx, hostnames, rule, resolver, grants)
         })
         .collect()
 }
@@ -1702,7 +1927,7 @@ mod tests {
     use super::*;
     use crate::model::entrypoint::{RedirectPolicy, RedirectScheme};
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
-    use gateway_api::apis::standard::gateways::GatewaySpec;
+    use gateway_api::apis::standard::gateways::{GatewayListeners, GatewaySpec};
     use gateway_api::apis::standard::httproutes::{
         HTTPRouteRulesBackendRefs, HTTPRouteRulesFiltersRequestRedirect,
         HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesMatches,
@@ -3229,6 +3454,147 @@ mod tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    fn li(name: &str, port: i32, hostname: Option<&str>) -> ListenerInfo {
+        ListenerInfo {
+            name: name.into(),
+            port,
+            hostname: hostname.map(Into::into),
+        }
+    }
+
+    // ---------- Listener selection / hostname intersection ----------
+
+    #[test]
+    fn unset_section_and_port_selects_any_listener() {
+        let listeners = vec![li("web", 80, None), li("admin", 8080, None)];
+        assert!(parent_ref_selects_listener(&parent("gw"), &listeners));
+    }
+
+    #[test]
+    fn section_name_must_match_a_listener() {
+        let listeners = vec![li("web", 80, None)];
+        let mut p = parent("gw");
+        p.section_name = Some("web".into());
+        assert!(parent_ref_selects_listener(&p, &listeners));
+        p.section_name = Some("nope".into());
+        assert!(!parent_ref_selects_listener(&p, &listeners));
+    }
+
+    #[test]
+    fn port_must_match_a_listener() {
+        let listeners = vec![li("web", 80, None)];
+        let mut p = parent("gw");
+        p.port = Some(80);
+        assert!(parent_ref_selects_listener(&p, &listeners));
+        p.port = Some(8080);
+        assert!(!parent_ref_selects_listener(&p, &listeners));
+    }
+
+    #[test]
+    fn section_and_port_must_be_satisfied_by_the_same_listener() {
+        let listeners = vec![li("web", 80, None), li("admin", 8080, None)];
+        let mut p = parent("gw");
+        p.section_name = Some("web".into());
+        p.port = Some(8080); // web is 80, admin is 8080 — no single listener matches
+        assert!(!parent_ref_selects_listener(&p, &listeners));
+        p.port = Some(80);
+        assert!(parent_ref_selects_listener(&p, &listeners));
+    }
+
+    #[test]
+    fn listener_without_hostname_passes_route_hostnames_through() {
+        let listeners = vec![li("web", 80, None)];
+        let got = intersect_hostnames(&["a.example.com".into()], &listeners);
+        assert_eq!(got, Some(vec!["a.example.com".to_string()]));
+    }
+
+    #[test]
+    fn listener_hostname_narrows_route_hostnames() {
+        let listeners = vec![li("web", 80, Some("*.example.com"))];
+        let got = intersect_hostnames(&["a.example.com".into(), "b.other.com".into()], &listeners);
+        assert_eq!(got, Some(vec!["a.example.com".to_string()]));
+    }
+
+    #[test]
+    fn no_hostname_overlap_yields_none() {
+        let listeners = vec![li("web", 80, Some("example.com"))];
+        let got = intersect_hostnames(&["a.other.com".into()], &listeners);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn route_without_hostnames_inherits_listener_hostname() {
+        let listeners = vec![li("web", 80, Some("example.com"))];
+        let got = intersect_hostnames(&[], &listeners);
+        assert_eq!(got, Some(vec!["example.com".to_string()]));
+    }
+
+    #[test]
+    fn wildcard_hostname_compatibility() {
+        assert!(hostnames_compatible("*.example.com", "api.example.com"));
+        assert!(hostnames_compatible("api.example.com", "*.example.com"));
+        assert!(!hostnames_compatible("*.example.com", "example.com"));
+        assert!(!hostnames_compatible("*.example.com", "api.other.com"));
+        assert!(hostnames_compatible("a.example.com", "a.example.com"));
+    }
+
+    #[test]
+    fn scope_rejects_parent_ref_naming_an_unknown_listener() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![GatewayListeners {
+            name: "web".into(),
+            port: 80,
+            protocol: "HTTP".into(),
+            ..Default::default()
+        }];
+        scope.upsert_gateway(&gw);
+
+        let mut good = parent("gw");
+        good.section_name = Some("web".into());
+        let mut bad = parent("gw");
+        bad.section_name = Some("admin".into());
+
+        let r_good = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![good],
+        );
+        let r_bad = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![bad],
+        );
+        assert!(scope.accepts_route(&r_good));
+        assert!(!scope.accepts_route(&r_bad));
+    }
+
+    #[test]
+    fn scope_notifies_when_listeners_change() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![GatewayListeners {
+            name: "web".into(),
+            port: 80,
+            protocol: "HTTP".into(),
+            ..Default::default()
+        }];
+        assert!(scope.upsert_gateway(&gw), "first apply is a change");
+        assert!(!scope.upsert_gateway(&gw), "same listeners is a no-op");
+        gw.spec.listeners.push(GatewayListeners {
+            name: "admin".into(),
+            port: 8080,
+            protocol: "HTTP".into(),
+            ..Default::default()
+        });
+        assert!(
+            scope.upsert_gateway(&gw),
+            "adding a listener must be seen as a change"
+        );
     }
 
     #[test]
