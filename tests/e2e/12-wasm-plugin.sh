@@ -29,6 +29,17 @@ else
     fail "wasm plugin route (with per-tenant outbound host) did not return 200"
 fi
 
+# 1b. skip_paths: a request to a `*.js` path bypasses the plugin entirely, so
+#     the guest's `x-wasm-plugin: ran` header must be ABSENT (while `/` above
+#     carries it). Proves the plugin is skipped, not just that it did nothing.
+js_headers=$(curl -s -D - -o /dev/null --max-time 2 \
+    -H "Host: $HOST_WASM" "http://127.0.0.1:$HTTP_PORT/app.js" 2>/dev/null || echo "")
+if echo "$js_headers" | grep -qi "x-wasm-plugin: ran"; then
+    fail "skip_paths did not skip the plugin on *.js (header still present)"
+else
+    pass "skip_paths bypassed the plugin on *.js (no x-wasm-plugin header)"
+fi
+
 # 2. The guest short-circuits with 403 when x-wasm-block: yes is present.
 block_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
     -H "Host: $HOST_WASM" -H "x-wasm-block: yes" \

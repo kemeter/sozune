@@ -132,6 +132,9 @@ plugins:
     # network-extension activation and the per-route allow-list rebuild path
     # (with_route_config) without needing a guest that actually calls out.
     outbound_host_keys: ["umami_host"]
+    # Skip the plugin for JS assets: a request to *.js must not carry the
+    # guest's response header, proving the plugin is bypassed entirely.
+    skip_paths: ["*.js"]
 EOF
 fi
 

@@ -542,6 +542,82 @@ pub struct WasmMiddleware {
     /// Present only for network-enabled plugins; drives per-route allow-list
     /// extension in [`with_route_config`](Self::with_route_config).
     net: Option<NetIngredients>,
+    /// Operator-set execution policy: which requests to skip, and whether a
+    /// guest error breaks the request. Independent of the guest config.
+    policy: Arc<PluginPolicy>,
+}
+
+/// Operator-controlled policy for when and how a plugin runs. Wrapped in an
+/// `Arc` so the cheap per-route derivations in
+/// [`with_route_config`](WasmMiddleware::with_route_config) share it. All
+/// fields come from the plugin's static config, never from a tenant route.
+#[derive(Debug, Default)]
+pub struct PluginPolicy {
+    /// Request-path globs the plugin is skipped for (both phases). Lowercased
+    /// at build time; matched case-insensitively against the request path.
+    skip_paths: Vec<String>,
+    /// HTTP methods the plugin is skipped for. Uppercased at build time.
+    skip_methods: Vec<String>,
+    /// `true` (default): a guest error lets the request continue untouched.
+    /// `false`: a guest error returns `502` and the request is short-circuited.
+    fail_open: bool,
+}
+
+impl PluginPolicy {
+    /// Build a policy from the operator's plugin config, normalising patterns
+    /// for case-insensitive matching.
+    pub fn new(skip_paths: &[String], skip_methods: &[String], fail_open: bool) -> Self {
+        Self {
+            skip_paths: skip_paths.iter().map(|p| p.to_ascii_lowercase()).collect(),
+            skip_methods: skip_methods
+                .iter()
+                .map(|m| m.to_ascii_uppercase())
+                .collect(),
+            fail_open,
+        }
+    }
+
+    /// True iff the plugin must be skipped for this request. Checked in the
+    /// request phase (before any body buffering or guest call) and remembered
+    /// for the response phase so both stay consistent.
+    fn skips(&self, method: &axum::http::Method, path: &str) -> bool {
+        if self.skip_methods.iter().any(|m| m == method.as_str()) {
+            return true;
+        }
+        let path_lc = path.to_ascii_lowercase();
+        self.skip_paths.iter().any(|pat| glob_match(pat, &path_lc))
+    }
+}
+
+/// Minimal shell-style glob match: `*` matches any run of characters
+/// (including `/`), everything else is literal. No `?` or character classes —
+/// path exclusion doesn't need them, and keeping it tiny avoids a regex dep.
+/// Both `pattern` and `text` are expected pre-lowercased by the caller.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // Classic two-pointer wildcard match with backtracking.
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 impl WasmMiddleware {
@@ -560,7 +636,18 @@ impl WasmMiddleware {
             config: serde_json::to_vec(&config).unwrap_or_default(),
             config_value: config,
             net: None,
+            policy: Arc::new(PluginPolicy {
+                fail_open: true,
+                ..Default::default()
+            }),
         })
+    }
+
+    /// Attach an operator execution policy (skip rules + fail-open behaviour),
+    /// replacing the permissive default. Chainable after a constructor.
+    pub fn with_policy(mut self, policy: PluginPolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
     }
 
     /// Derive a copy of this middleware whose config is `overlay` merged on top
@@ -597,6 +684,7 @@ impl WasmMiddleware {
                         config: serde_json::to_vec(&merged).unwrap_or_default(),
                         config_value: merged,
                         net: self.net.clone(),
+                        policy: Arc::clone(&self.policy),
                     };
                 }
                 Err(e) => {
@@ -617,6 +705,7 @@ impl WasmMiddleware {
             config: serde_json::to_vec(&merged).unwrap_or_default(),
             config_value: merged,
             net: self.net.clone(),
+            policy: Arc::clone(&self.policy),
         }
     }
 
@@ -648,6 +737,10 @@ impl WasmMiddleware {
                 handle,
                 operator_hosts,
                 outbound_host_keys,
+            }),
+            policy: Arc::new(PluginPolicy {
+                fail_open: true,
+                ..Default::default()
             }),
         })
     }
@@ -855,6 +948,15 @@ impl Middleware for WasmMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
+        // Operator skip rules: a matching request never touches the guest and,
+        // crucially, its body is never buffered — the whole point for a plugin
+        // kept off large static assets (e.g. an analytics plugin on `*.js`).
+        // Checked from `ctx` (not `req`) so the response phase sees the same
+        // decision without re-reading the request.
+        if self.policy.skips(&ctx.method, &ctx.path) {
+            return Flow::Continue;
+        }
+
         // Take ownership of the body, leaving an empty one behind. `snapshot_request`
         // buffers it for the guest if it fits; otherwise it hands back a streaming
         // body that forwards the full payload untouched (guest sees no body).
@@ -888,6 +990,18 @@ impl Middleware for WasmMiddleware {
             }
             Err(e) => {
                 error!("wasm middleware '{}' request phase failed: {e}", self.name);
+                // fail_open (default): a guest crash must not break traffic — an
+                // observability plugin failing to reach its collector should
+                // never turn a page into a 502. Restore the untouched body and
+                // continue to the backend. fail_open=false is for a security
+                // plugin (WAF/bouncer) that must fail closed.
+                if self.policy.fail_open {
+                    *req.body_mut() = match oversize_body {
+                        Some(body) => body,
+                        None => Body::from(state.req_body.clone()),
+                    };
+                    return Flow::Continue;
+                }
                 Flow::ShortCircuit(
                     Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
@@ -899,6 +1013,12 @@ impl Middleware for WasmMiddleware {
     }
 
     async fn on_response(&self, ctx: &RequestCtx, resp: Response<Body>) -> Response<Body> {
+        // Same skip decision as the request phase, so a plugin kept off a path
+        // doesn't touch its response either (and doesn't buffer the body).
+        if self.policy.skips(&ctx.method, &ctx.path) {
+            return resp;
+        }
+
         let (parts, body) = resp.into_parts();
         let (body_bytes, oversize_body) = buffer_or_stream(body).await;
 
@@ -967,6 +1087,49 @@ impl Middleware for WasmMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_matches_extensions_and_prefixes() {
+        assert!(glob_match("*.js", "/bundles/vendors.c9efe9df.js"));
+        assert!(glob_match("*.css", "/theme.css"));
+        assert!(glob_match("/assets/*", "/assets/img/logo.png"));
+        assert!(glob_match("*", "/anything/at/all"));
+        assert!(glob_match("/exact", "/exact"));
+        // Non-matches.
+        assert!(!glob_match("*.js", "/app.css"));
+        assert!(!glob_match("/assets/*", "/static/logo.png"));
+        assert!(!glob_match("/exact", "/exact/more"));
+        // `*` spans slashes (a whole-path glob).
+        assert!(glob_match("/a/*/z", "/a/b/c/z"));
+    }
+
+    #[test]
+    fn policy_skips_by_path_and_method() {
+        let p = PluginPolicy::new(&["*.js".into(), "*.css".into()], &["OPTIONS".into()], true);
+        assert!(p.skips(&axum::http::Method::GET, "/vendors.abc.js"));
+        assert!(p.skips(&axum::http::Method::GET, "/theme.CSS")); // case-insensitive
+        assert!(p.skips(&axum::http::Method::OPTIONS, "/index.html")); // method
+        assert!(!p.skips(&axum::http::Method::GET, "/index.html"));
+        assert!(!p.skips(&axum::http::Method::POST, "/api/track"));
+    }
+
+    #[test]
+    fn empty_policy_never_skips() {
+        let p = PluginPolicy::new(&[], &[], true);
+        assert!(!p.skips(&axum::http::Method::GET, "/anything.js"));
+        assert!(!p.skips(&axum::http::Method::OPTIONS, "/"));
+    }
+
+    #[test]
+    fn config_driven_policy_carries_fail_open() {
+        // The operator-facing default (PluginConfig.fail_open) is true and the
+        // middleware constructors set it explicitly. `PluginPolicy::default()`
+        // (only used via `..Default::default()` where fail_open is overridden)
+        // leaves the raw bool at false — never a plugin's effective value.
+        assert!(!PluginPolicy::default().fail_open);
+        assert!(PluginPolicy::new(&[], &[], true).fail_open);
+        assert!(!PluginPolicy::new(&[], &[], false).fail_open);
+    }
 
     fn state() -> HttpState {
         HttpState {

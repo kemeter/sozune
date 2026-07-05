@@ -188,8 +188,17 @@ pub fn build_plugin_registry(
 
         match built {
             Ok(mw) => {
-                info!("Loaded WASM plugin '{}' from {}", name, cfg.path);
-                registry.insert(name.clone(), Arc::new(mw));
+                let policy =
+                    wasm::PluginPolicy::new(&cfg.skip_paths, &cfg.skip_methods, cfg.fail_open);
+                info!(
+                    "Loaded WASM plugin '{}' from {} (fail_open={}, skip_paths={}, skip_methods={})",
+                    name,
+                    cfg.path,
+                    cfg.fail_open,
+                    cfg.skip_paths.len(),
+                    cfg.skip_methods.len(),
+                );
+                registry.insert(name.clone(), Arc::new(mw.with_policy(policy)));
             }
             Err(e) => error!("Failed to load WASM plugin '{}': {}", name, e),
         }
