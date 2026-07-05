@@ -128,7 +128,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Optional: only needed if you want HTTPRoute support.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes", "gateways", "gatewayclasses"]
+    resources: ["httproutes", "gateways", "gatewayclasses", "referencegrants"]
     verbs: ["get", "list", "watch"]
   # Optional: only needed for HTTPRoute status reporting (kubectl
   # describe httproute will show Accepted/ResolvedRefs from sōzune).
@@ -151,7 +151,7 @@ Useful for local development. Sōzune uses the current context from `$KUBECONFIG
 
 ## Gateway API (HTTPRoute)
 
-Sōzune watches `gateway.networking.k8s.io/v1` resources alongside Ingress. Three watchers run side by side: `GatewayClass`, `Gateway`, and `HTTPRoute`. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required.
+Sōzune watches `gateway.networking.k8s.io/v1` resources alongside Ingress. Four watchers run side by side: `GatewayClass`, `Gateway`, `ReferenceGrant`, and `HTTPRoute`. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required.
 
 ### Prerequisites
 
@@ -234,7 +234,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `spec.hostnames` — matched against the `Host` header of incoming requests.
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
-- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` honour `backendRef.namespace`.
+- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below).
 - `backendRef.weight` — propagated to the load balancer.
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
@@ -252,12 +252,36 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
 
+### Cross-namespace backends (ReferenceGrant)
+
+An `HTTPRoute` may reference a `Service` in another namespace via `backendRef.namespace`. Per the Gateway API spec, the *target* namespace must opt in with a `ReferenceGrant`: without one, the reference is a potential privilege escalation (any route author could route traffic to any Service cluster-wide), so Sōzune **drops** the backend and logs a `WARN`. Same-namespace references never need a grant.
+
+The grant lives in the namespace that owns the `Service` and names the route's namespace as trusted:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-frontend-routes
+  namespace: backend        # the Service's namespace
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: frontend   # the HTTPRoute's namespace
+  to:
+    - group: ""
+      kind: Service
+```
+
+With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` once the backend is dropped). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs.
+
 ### What's not supported (yet)
 
 - Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
 - `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
-- `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, `ReferenceGrant`.
+- `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`.
 
 ### HTTPRoute filters
 
@@ -383,8 +407,8 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
-- **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute does support cross-namespace `backendRefs`.)
-- **Gateway API: HTTPRoute only.** `Gateway`, `GatewayClass`, `GRPCRoute`, `TCPRoute`, `ReferenceGrant`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented. `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters are supported. See the Gateway API section above for details.
+- **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
+- **Gateway API: `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
 
 ## Environment variables
 

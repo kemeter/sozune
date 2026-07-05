@@ -205,13 +205,15 @@ pub async fn start_services(
         // Ingress provider. If the cluster does not have the CRDs
         // installed we log and move on — Ingress alone is enough.
         //
-        // Three watchers run side by side, sharing a single
+        // Four watchers run side by side, sharing a single
         // `GatewayScope`:
-        //   - GatewayClass watcher — accepts classes whose
+        //   - GatewayClass watcher    — accepts classes whose
         //     controllerName matches sōzune's identity
-        //   - Gateway watcher     — accepts Gateways whose class is owned
-        //   - HTTPRoute watcher   — accepts routes whose parentRefs
-        //                            point to an accepted Gateway
+        //   - Gateway watcher         — accepts Gateways whose class is owned
+        //   - ReferenceGrant watcher  — tracks cross-namespace backendRef
+        //                               authorisations
+        //   - HTTPRoute watcher       — accepts routes whose parentRefs
+        //                               point to an accepted Gateway
         // Mutations to the scope notify the HTTPRoute watcher, which
         // re-resolves every tracked route so changes propagate without
         // waiting for the periodic tick.
@@ -247,6 +249,14 @@ pub async fn start_services(
             tokio::spawn(async move {
                 if let Err(e) = gateway::run_gateway_watcher(gw_client, gw_scope).await {
                     error!("Gateway API: Gateway watcher failed: {}", e);
+                }
+            });
+
+            let rg_client = client.clone();
+            let rg_scope = scope.clone();
+            tokio::spawn(async move {
+                if let Err(e) = gateway::run_referencegrant_watcher(rg_client, rg_scope).await {
+                    error!("Gateway API: ReferenceGrant watcher failed: {}", e);
                 }
             });
 

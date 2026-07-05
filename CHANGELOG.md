@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - WASM plugin execution policy — three operator-set fields on a plugin declaration in `config.yaml` control when it runs and how it fails. `skip_paths` (path globs like `*.js`, `*.css`, `/assets/*`) and `skip_methods` skip the plugin entirely for matching requests — no body buffering, no guest call — so an analytics plugin no longer buffers a multi-megabyte JS bundle on every hit just to ignore it. `fail_open` (default `true`) means a guest that errors lets the request continue to the backend untouched instead of returning `502`; set it `false` for a security plugin (WAF / bouncer) that must fail closed. Previously any guest error in the request phase returned `502`, so a plugin failing to reach its collector could take a site down. See [WASM plugins docs](documentation/middleware/wasm-plugins.md#execution-policy-skip_paths-skip_methods-fail_open).
 
+### Kubernetes Gateway API
+
+- ReferenceGrant enforcement — cross-namespace `backendRefs` on an HTTPRoute now require a `ReferenceGrant` in the target namespace trusting the route's namespace, per the Gateway API spec. Without a grant the backend is dropped (logged, and reflected as `ResolvedRefs=False`) instead of being routed. Previously a cross-namespace ref was honoured unconditionally, which let any route author reach any Service cluster-wide. Same-namespace refs are unaffected. Needs the `referencegrants` read verb in RBAC. See [Cross-namespace backends](documentation/providers/kubernetes.md#cross-namespace-backends-referencegrant).
+
 ## [0.14.0] - 2026-07-04
 
 ### TLS / ACME
