@@ -13,6 +13,11 @@ pub struct RequestCtx {
     pub host: String,
     pub client_addr: Option<SocketAddr>,
     pub is_tls: bool,
+    /// Request method and path, captured before the request phase so the
+    /// response phase (which no longer holds the request) can still make
+    /// path/method-based decisions — e.g. a WASM plugin that skips assets.
+    pub method: axum::http::Method,
+    pub path: String,
     /// Encoding negotiated from the request, consumed by the compression
     /// middleware on the response side. `None` if the client accepts nothing
     /// we support.

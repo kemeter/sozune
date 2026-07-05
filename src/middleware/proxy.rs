@@ -115,6 +115,8 @@ pub async fn handle_proxy(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.eq_ignore_ascii_case("https"))
                 .unwrap_or(false),
+            method: req.method().clone(),
+            path: path.clone(),
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),

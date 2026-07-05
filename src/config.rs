@@ -97,7 +97,7 @@ pub enum LogFormat {
 
 /// Declaration of one WASM plugin artifact. The `config` blob is opaque to
 /// Sōzune and handed to the guest verbatim via the http-wasm `get_config` ABI.
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct PluginConfig {
     /// Filesystem path to the http-wasm guest `.wasm`.
     pub path: String,
@@ -123,6 +123,31 @@ pub struct PluginConfig {
     /// also opts the plugin into the outbound-HTTP extension.
     #[serde(default)]
     pub outbound_host_keys: Vec<String>,
+    /// Request-path globs the plugin is NOT run for. A request whose path
+    /// matches any pattern skips the plugin entirely — no body buffering, no
+    /// guest invocation, on both the request and the response phase. Use it to
+    /// keep an analytics plugin off static assets (`["*.js", "*.css", "*.map",
+    /// "/assets/*"]`). Patterns are shell-style globs (`*` matches any run of
+    /// characters, including `/`); matching is case-insensitive on the path only
+    /// (query string excluded). Empty (default) runs the plugin for every path.
+    #[serde(default)]
+    pub skip_paths: Vec<String>,
+    /// HTTP methods the plugin is NOT run for (e.g. `["OPTIONS", "HEAD"]`).
+    /// Case-insensitive. Empty (default) runs the plugin for every method.
+    #[serde(default)]
+    pub skip_methods: Vec<String>,
+    /// When the plugin's guest fails (a request- or response-phase error),
+    /// `true` (the default) lets the request continue to the backend untouched
+    /// — the failure is logged but never breaks traffic, which is what an
+    /// observability plugin (analytics) wants. Set `false` for a security
+    /// plugin (e.g. a WAF / CrowdSec bouncer) that must fail closed: a guest
+    /// error then returns `502` and the request never reaches the backend.
+    #[serde(default = "default_plugin_fail_open")]
+    pub fail_open: bool,
+}
+
+fn default_plugin_fail_open() -> bool {
+    true
 }
 
 #[derive(Deserialize, Debug, Clone)]

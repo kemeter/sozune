@@ -197,6 +197,8 @@ mod tests {
             host: "example.com".to_string(),
             client_addr: peer.map(|p| SocketAddr::new(IpAddr::from_str(p).unwrap(), 12345)),
             is_tls: false,
+            method: axum::http::Method::GET,
+            path: "/".to_string(),
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),

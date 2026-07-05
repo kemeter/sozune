@@ -107,6 +107,35 @@ WASM plugins run after the native request-phase middlewares (forward-auth, rate-
 
 Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched.
 
+## Execution policy (`skip_paths`, `skip_methods`, `fail_open`)
+
+Three operator-set fields on a plugin declaration control *when* it runs and *what happens if it fails*. They live in `config.yaml` (operator-controlled, never overridable per route).
+
+```yaml
+plugins:
+  umami:
+    path: /plugins/umami.wasm
+    # Don't run the plugin for these request paths — no body buffering,
+    # no guest call, on both the request and the response phase.
+    skip_paths:
+      - "*.js"
+      - "*.css"
+      - "*.map"
+      - "/assets/*"
+    # Don't run it for these methods either.
+    skip_methods: ["OPTIONS", "HEAD"]
+    # Best-effort: if the guest fails, let the request through (default).
+    fail_open: true
+```
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `skip_paths` | `[]` | Request-path globs the plugin is skipped for. A match means the guest is never invoked and the body is never buffered — the point for keeping an analytics plugin off large static assets (a 1.4 MiB JS bundle otherwise gets buffered up to the 1 MiB limit on every hit for nothing). `*` matches any run of characters including `/`; matching is case-insensitive and ignores the query string. |
+| `skip_methods` | `[]` | HTTP methods the plugin is skipped for (case-insensitive), e.g. `OPTIONS`, `HEAD`. |
+| `fail_open` | `true` | When the guest errors: `true` logs the failure and lets the request continue to the backend untouched — an observability plugin that can't reach its collector must never turn a page into a `502`. Set `false` for a **security** plugin (a WAF / bouncer) that must fail closed: a guest error then returns `502` and the request never reaches the backend. |
+
+> **Why `skip_paths` and not a content-type filter?** The path is known at request time, so `skip_paths` can prevent the body being buffered at all. A response content-type is only known after the backend replies — too late to avoid the request-phase cost — so it isn't offered.
+
 ## Outbound HTTP (`allowed_hosts`)
 
 The http-wasm spec has no way for a guest to make a network call. Sōzune adds
