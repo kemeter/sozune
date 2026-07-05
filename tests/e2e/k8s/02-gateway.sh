@@ -256,6 +256,48 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# GatewayClass status: the class sōzune owns (controllerName kemeter.io/sozune)
+# must carry Accepted=True in status.conditions[]. Poll a few times: the
+# watcher writes status on apply, which may land just after routing.
+# ----------------------------------------------------------------------
+log "[02] Gateway: owned GatewayClass has Accepted=True in status"
+
+gc_accepted=""
+for _ in $(seq 1 30); do
+    gc_accepted=$(kubectl get gatewayclass sozune \
+        -o jsonpath="{.status.conditions[?(@.type=='Accepted')].status}" 2>/dev/null)
+    [[ "$gc_accepted" == "True" ]] && break
+    sleep 0.5
+done
+if [[ "$gc_accepted" == "True" ]]; then
+    pass "GatewayClass sozune status: Accepted=True"
+else
+    fail "GatewayClass status wrong (Accepted='$gc_accepted')"
+fi
+
+# ----------------------------------------------------------------------
+# Gateway status: a Gateway whose class sōzune owns must carry both
+# Accepted=True and Programmed=True in status.conditions[].
+# ----------------------------------------------------------------------
+log "[02] Gateway: accepted Gateway has Accepted=True / Programmed=True in status"
+
+gw_accepted=""
+gw_programmed=""
+for _ in $(seq 1 30); do
+    gw_accepted=$(kubectl get gateway gw -n sozune-test \
+        -o jsonpath="{.status.conditions[?(@.type=='Accepted')].status}" 2>/dev/null)
+    gw_programmed=$(kubectl get gateway gw -n sozune-test \
+        -o jsonpath="{.status.conditions[?(@.type=='Programmed')].status}" 2>/dev/null)
+    [[ "$gw_accepted" == "True" ]] && [[ "$gw_programmed" == "True" ]] && break
+    sleep 0.5
+done
+if [[ "$gw_accepted" == "True" ]] && [[ "$gw_programmed" == "True" ]]; then
+    pass "Gateway gw status: Accepted=True, Programmed=True"
+else
+    fail "Gateway status wrong (Accepted='$gw_accepted', Programmed='$gw_programmed')"
+fi
+
+# ----------------------------------------------------------------------
 # requestHeaderModifier filter: a route declaring it is SERVED (not dropped)
 # and the header is injected before the request reaches the backend. The
 # backend (traefik/whoami) echoes received request headers in its body, so

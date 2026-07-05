@@ -276,6 +276,20 @@ impl GatewayScope {
         self.fire_if(changed)
     }
 
+    /// True iff a Gateway with this `spec.gatewayClassName` would be
+    /// accepted, i.e. its class is one sōzune owns. Used by the Gateway
+    /// watcher to decide the `Accepted`/`Programmed` status it writes back,
+    /// independently of whether the accepted *set* changed on this event.
+    pub fn owns_gateway_class(&self, class_name: &str) -> bool {
+        match self.state.read() {
+            Ok(g) => g.gateway_classes.contains(class_name),
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                false
+            }
+        }
+    }
+
     pub fn remove_gateway(&self, namespace: &str, name: &str) -> bool {
         let mut g = match self.state.write() {
             Ok(g) => g,
@@ -535,8 +549,12 @@ pub async fn run_httproute_watcher(
 /// reconnect — its built-in backoff is enough for transient apiserver
 /// hiccups, and the relist on reconnect rebuilds the accepted set
 /// correctly even if we missed events while disconnected.
-pub async fn run_gatewayclass_watcher(client: Client, scope: GatewayScope) -> anyhow::Result<()> {
-    let api: Api<GatewayClass> = Api::all(client);
+pub async fn run_gatewayclass_watcher(
+    client: Client,
+    scope: GatewayScope,
+    status_tx: mpsc::Sender<StatusWrite>,
+) -> anyhow::Result<()> {
+    let api: Api<GatewayClass> = Api::all(client.clone());
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     info!("Gateway API: GatewayClass watcher started");
 
@@ -551,6 +569,24 @@ pub async fn run_gatewayclass_watcher(client: Client, scope: GatewayScope) -> an
                         name,
                         if accepted { "accepted" } else { "rejected" },
                         class.spec.controller_name
+                    );
+                    // A class flipping into (or out of) scope changes which
+                    // Gateways are accepted, but the Gateway watcher won't
+                    // see a fresh event for Gateways that already exist and
+                    // didn't themselves change. Re-list Gateways here and
+                    // re-run them through the scope so a Gateway created
+                    // before its class was accepted activates immediately
+                    // — otherwise its routes stay dark until the Gateway is
+                    // next edited. Best-effort: a list failure just defers
+                    // the fix to the next event.
+                    reconcile_gateways_for_class(&client, &scope, &status_tx).await;
+                }
+                // Report Accepted status only on classes we own; a class
+                // pointing at another controller is not ours to annotate.
+                if accepted {
+                    queue_status_write(
+                        Some(&status_tx),
+                        StatusWrite::GatewayClass(Box::new(class.clone())),
                     );
                 }
             }
@@ -569,6 +605,39 @@ pub async fn run_gatewayclass_watcher(client: Client, scope: GatewayScope) -> an
 
     warn!("Gateway API: GatewayClass watcher stream ended unexpectedly");
     Ok(())
+}
+
+/// Re-list every Gateway and re-run it through the scope. Called after a
+/// GatewayClass acceptance changes, so Gateways that already existed
+/// before their class came into scope get re-evaluated (and their status
+/// re-written) without waiting for an unrelated edit to trigger a fresh
+/// Gateway event. Best-effort: a list failure is logged and dropped.
+async fn reconcile_gateways_for_class(
+    client: &Client,
+    scope: &GatewayScope,
+    status_tx: &mpsc::Sender<StatusWrite>,
+) {
+    let api: Api<Gateway> = Api::all(client.clone());
+    let list = match api.list(&Default::default()).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Gateway API: failed to re-list Gateways after class change: {e}");
+            return;
+        }
+    };
+    for gw in list {
+        let ns = gw.metadata.namespace.as_deref().unwrap_or("<no-namespace>");
+        let name = gw.metadata.name.as_deref().unwrap_or("<no-name>");
+        if scope.upsert_gateway(&gw) {
+            info!(
+                "Gateway API: Gateway {}/{} re-evaluated after class change (gatewayClassName={})",
+                ns, name, gw.spec.gateway_class_name
+            );
+        }
+        if scope.owns_gateway_class(&gw.spec.gateway_class_name) {
+            queue_status_write(Some(status_tx), StatusWrite::Gateway(Box::new(gw)));
+        }
+    }
 }
 
 /// Watch ReferenceGrants cluster-wide and keep the cross-namespace
@@ -624,8 +693,12 @@ pub async fn run_referencegrant_watcher(client: Client, scope: GatewayScope) -> 
 /// Gateway is accepted iff its `spec.gatewayClassName` matches one of the
 /// GatewayClasses sōzune already accepted; the scope stitches the two
 /// together transparently.
-pub async fn run_gateway_watcher(client: Client, scope: GatewayScope) -> anyhow::Result<()> {
-    let api: Api<Gateway> = Api::all(client);
+pub async fn run_gateway_watcher(
+    client: Client,
+    scope: GatewayScope,
+    status_tx: mpsc::Sender<StatusWrite>,
+) -> anyhow::Result<()> {
+    let api: Api<Gateway> = Api::all(client.clone());
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     info!("Gateway API: Gateway watcher started");
 
@@ -640,6 +713,13 @@ pub async fn run_gateway_watcher(client: Client, scope: GatewayScope) -> anyhow:
                         "Gateway API: Gateway {}/{} accepted (gatewayClassName={})",
                         ns, name, class
                     );
+                }
+                // Report Accepted/Programmed on every Gateway whose class
+                // we own; a Gateway pointing at another controller's class
+                // is left untouched. The status reflects the current
+                // ownership decision, not whether the set changed here.
+                if scope.owns_gateway_class(&class) {
+                    queue_status_write(Some(&status_tx), StatusWrite::Gateway(Box::new(gw)));
                 }
             }
             Ok(Event::Delete(gw)) => {
@@ -711,6 +791,203 @@ async fn run_status_writer(
         }
     }
     info!("Gateway API: HTTPRoute status writer stopped");
+}
+
+/// Build the `conditions[]` sōzune owns on a Gateway's status.
+///
+/// A Gateway is `Accepted=True` once sōzune owns its GatewayClass, and
+/// `Programmed=True` once the routing config derived from it is live —
+/// which, for sōzune, is the same instant: acceptance and programming are
+/// not staged, so both flip together. `observedGeneration` pins each
+/// condition to the spec revision it reflects, so a stale status is
+/// visible in `kubectl get`.
+fn build_gateway_conditions(gateway: &Gateway, accepted: bool) -> Vec<Condition> {
+    let now = Time(k8s_openapi::chrono::Utc::now());
+    let generation = gateway.metadata.generation;
+    let (status, accepted_msg, programmed_msg) = if accepted {
+        (
+            "True",
+            "Gateway accepted by sōzune".to_string(),
+            "Gateway configuration is live".to_string(),
+        )
+    } else {
+        (
+            "False",
+            "Gateway references a GatewayClass sōzune does not own".to_string(),
+            "Gateway is not programmed because it was not accepted".to_string(),
+        )
+    };
+    vec![
+        Condition {
+            type_: CONDITION_TYPE_ACCEPTED.to_string(),
+            status: status.to_string(),
+            reason: REASON_ACCEPTED.to_string(),
+            message: accepted_msg,
+            last_transition_time: now.clone(),
+            observed_generation: generation,
+        },
+        Condition {
+            type_: CONDITION_TYPE_PROGRAMMED.to_string(),
+            status: status.to_string(),
+            reason: REASON_PROGRAMMED.to_string(),
+            message: programmed_msg,
+            last_transition_time: now,
+            observed_generation: generation,
+        },
+    ]
+}
+
+/// Build the single `Accepted` condition sōzune owns on a GatewayClass's
+/// status. Only ever called for a class sōzune owns (controllerName
+/// matches), so the condition is always `Accepted=True`.
+fn build_gatewayclass_conditions(class: &GatewayClass) -> Vec<Condition> {
+    vec![Condition {
+        type_: CONDITION_TYPE_ACCEPTED.to_string(),
+        status: "True".to_string(),
+        reason: REASON_ACCEPTED.to_string(),
+        message: "GatewayClass accepted by sōzune".to_string(),
+        last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+        observed_generation: class.metadata.generation,
+    }]
+}
+
+/// Merge sōzune's conditions into an existing `conditions[]`, keyed by
+/// condition `type`. Conditions of a type sōzune sets are replaced; every
+/// other type is preserved (a Gateway's status may carry conditions from
+/// address allocation or listener programming that another actor owns).
+/// Returns the merged list and whether it differs from what was on the
+/// object, ignoring `last_transition_time` — that field is regenerated on
+/// every call and would otherwise force a write on every event.
+fn merge_conditions(
+    existing: Option<&[Condition]>,
+    ours: Vec<Condition>,
+) -> (Vec<Condition>, bool) {
+    let existing = existing.unwrap_or_default();
+    let our_types: HashSet<&str> = ours.iter().map(|c| c.type_.as_str()).collect();
+
+    let mut merged: Vec<Condition> = existing
+        .iter()
+        .filter(|c| !our_types.contains(c.type_.as_str()))
+        .cloned()
+        .collect();
+    merged.extend(ours.iter().cloned());
+
+    // Compare only the slice we own: a change to a foreign condition is not
+    // ours to react to. For each of our types, find the matching existing
+    // condition and compare the meaningful fields.
+    let changed = ours
+        .iter()
+        .any(|our| match existing.iter().find(|c| c.type_ == our.type_) {
+            Some(prev) => {
+                prev.status != our.status
+                    || prev.reason != our.reason
+                    || prev.message != our.message
+                    || prev.observed_generation != our.observed_generation
+            }
+            None => true,
+        });
+
+    (merged, changed)
+}
+
+/// A pending status write, drained off the watcher hot-path by
+/// [`run_gateway_status_writer`]. Patching status means a network round-trip
+/// to the apiserver; doing it inline in a watcher's event loop would stall
+/// the loop (and every Gateway/GatewayClass behind the current one) until
+/// the PATCH returns. So watchers only ever `try_send` one of these; the
+/// writer task owns the round-trip.
+#[derive(Clone, Debug)]
+pub enum StatusWrite {
+    Gateway(Box<Gateway>),
+    GatewayClass(Box<GatewayClass>),
+}
+
+/// Drains [`StatusWrite`]s and patches the `status.conditions[]` sōzune owns
+/// onto the target resource, preserving conditions owned by other actors and
+/// skipping the write when nothing sōzune cares about changed. Non-fatal:
+/// failures are logged at `warn` and dropped, mirroring [`run_status_writer`]
+/// — routing works without status, and the next event re-attempts the write.
+pub async fn run_gateway_status_writer(client: Client, mut rx: mpsc::Receiver<StatusWrite>) {
+    info!("Gateway API: Gateway/GatewayClass status writer started");
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            StatusWrite::Gateway(gw) => patch_gateway_status(&client, &gw).await,
+            StatusWrite::GatewayClass(class) => patch_gatewayclass_status(&client, &class).await,
+        }
+    }
+    info!("Gateway API: Gateway/GatewayClass status writer stopped");
+}
+
+/// Best-effort hand-off of a status write to the writer task. Never blocks
+/// the caller: a full or closed channel just drops the write (status is
+/// observability, not routing), and the next event re-attempts it.
+fn queue_status_write(tx: Option<&mpsc::Sender<StatusWrite>>, msg: StatusWrite) {
+    if let Some(tx) = tx
+        && let Err(e) = tx.try_send(msg)
+    {
+        debug!("Gateway API: status channel full or closed: {}", e);
+    }
+}
+
+/// Patch the `conditions[]` sōzune owns onto a Gateway's status. A Gateway
+/// reaches the writer only when sōzune owns its class, so the conditions are
+/// always `Accepted=True`/`Programmed=True`.
+async fn patch_gateway_status(client: &Client, gateway: &Gateway) {
+    let Some(name) = gateway.metadata.name.as_deref() else {
+        return;
+    };
+    let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+    let ours = build_gateway_conditions(gateway, true);
+    let existing = gateway
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref());
+    let (merged, changed) = merge_conditions(existing, ours);
+    if !changed {
+        return;
+    }
+    let patch = serde_json::json!({
+        "status": { "conditions": merged }
+    });
+    let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
+    let pp = PatchParams::default();
+    if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
+        warn!(
+            "Gateway API: failed to patch status on Gateway {}/{}: {}",
+            ns, name, e
+        );
+    } else {
+        debug!("Gateway API: status patched on Gateway {}/{}", ns, name);
+    }
+}
+
+/// Patch the `Accepted` condition onto a GatewayClass's status. A class
+/// reaches the writer only when sōzune owns it (controllerName matches); a
+/// class pointing at another controller is never queued, as Gateway API
+/// requires.
+async fn patch_gatewayclass_status(client: &Client, class: &GatewayClass) {
+    let Some(name) = class.metadata.name.as_deref() else {
+        return;
+    };
+    let ours = build_gatewayclass_conditions(class);
+    let existing = class.status.as_ref().and_then(|s| s.conditions.as_deref());
+    let (merged, changed) = merge_conditions(existing, ours);
+    if !changed {
+        return;
+    }
+    let patch = serde_json::json!({
+        "status": { "conditions": merged }
+    });
+    let api: Api<GatewayClass> = Api::all(client.clone());
+    let pp = PatchParams::default();
+    if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
+        warn!(
+            "Gateway API: failed to patch status on GatewayClass {}: {}",
+            name, e
+        );
+    } else {
+        debug!("Gateway API: status patched on GatewayClass {}", name);
+    }
 }
 
 /// Returns true if storage was modified. Replaces any previous state for
@@ -1006,8 +1283,10 @@ pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
 // don't paraphrase them.
 const CONDITION_TYPE_ACCEPTED: &str = "Accepted";
 const CONDITION_TYPE_RESOLVED_REFS: &str = "ResolvedRefs";
+const CONDITION_TYPE_PROGRAMMED: &str = "Programmed";
 const REASON_ACCEPTED: &str = "Accepted";
 const REASON_RESOLVED_REFS: &str = "ResolvedRefs";
+const REASON_PROGRAMMED: &str = "Programmed";
 const REASON_UNSUPPORTED_VALUE: &str = "UnsupportedValue";
 const REASON_BACKEND_NOT_FOUND: &str = "BackendNotFound";
 
@@ -2596,6 +2875,118 @@ mod tests {
             condition(&merged, 0, CONDITION_TYPE_ACCEPTED).status,
             "False",
             "our slice should now reflect the new outcome"
+        );
+    }
+
+    // ---------- Gateway / GatewayClass status tests ----------
+    //
+    // Same contract as the route status tests: the pure builders and the
+    // condition merge encode which conditions sōzune owns and how they
+    // slot into a status that may carry conditions owned by other actors.
+    // The patch writers themselves are apiserver-bound and covered by e2e.
+
+    fn find_condition(conds: &[Condition], ty: &str) -> Condition {
+        conds
+            .iter()
+            .find(|c| c.type_ == ty)
+            .expect("expected condition not found")
+            .clone()
+    }
+
+    #[test]
+    fn build_gateway_conditions_accepted_flips_both_true() {
+        let gw = gateway("default", "gw", "sozune");
+        let conds = build_gateway_conditions(&gw, true);
+        assert_eq!(conds.len(), 2);
+        assert_eq!(
+            find_condition(&conds, CONDITION_TYPE_ACCEPTED).status,
+            "True"
+        );
+        assert_eq!(
+            find_condition(&conds, CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+    }
+
+    #[test]
+    fn build_gateway_conditions_not_accepted_flips_both_false() {
+        let gw = gateway("default", "gw", "foreign");
+        let conds = build_gateway_conditions(&gw, false);
+        assert_eq!(
+            find_condition(&conds, CONDITION_TYPE_ACCEPTED).status,
+            "False"
+        );
+        assert_eq!(
+            find_condition(&conds, CONDITION_TYPE_PROGRAMMED).status,
+            "False"
+        );
+    }
+
+    #[test]
+    fn build_gateway_conditions_carry_observed_generation() {
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.metadata.generation = Some(7);
+        let conds = build_gateway_conditions(&gw, true);
+        assert!(
+            conds.iter().all(|c| c.observed_generation == Some(7)),
+            "every condition must pin the observed generation"
+        );
+    }
+
+    #[test]
+    fn build_gatewayclass_conditions_is_a_single_accepted_true() {
+        let c = class("sozune", SOZUNE_CONTROLLER_NAME);
+        let conds = build_gatewayclass_conditions(&c);
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].type_, CONDITION_TYPE_ACCEPTED);
+        assert_eq!(conds[0].status, "True");
+    }
+
+    #[test]
+    fn merge_conditions_preserves_foreign_types() {
+        let existing = vec![Condition {
+            type_: "Programmed".into(),
+            status: "True".into(),
+            reason: "Programmed".into(),
+            message: "set by another actor".into(),
+            last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+            observed_generation: Some(1),
+        }];
+        // Ours only sets Accepted; the foreign Programmed must survive.
+        let ours = build_gatewayclass_conditions(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let (merged, changed) = merge_conditions(Some(&existing), ours);
+        assert!(changed, "adding a new Accepted type is a change");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            find_condition(&merged, "Programmed").message,
+            "set by another actor"
+        );
+        assert_eq!(find_condition(&merged, "Accepted").status, "True");
+    }
+
+    #[test]
+    fn merge_conditions_skips_when_only_timestamp_differs() {
+        let gw = gateway("default", "gw", "sozune");
+        let first = build_gateway_conditions(&gw, true);
+        // Rebuild — same outcome, only last_transition_time differs.
+        let second = build_gateway_conditions(&gw, true);
+        let (_, changed) = merge_conditions(Some(&first), second);
+        assert!(
+            !changed,
+            "a differing timestamp alone must not trigger a write"
+        );
+    }
+
+    #[test]
+    fn merge_conditions_detects_status_flip() {
+        let gw = gateway("default", "gw", "sozune");
+        let accepted = build_gateway_conditions(&gw, true);
+        let rejected = build_gateway_conditions(&gw, false);
+        let (merged, changed) = merge_conditions(Some(&accepted), rejected);
+        assert!(changed);
+        assert_eq!(
+            find_condition(&merged, CONDITION_TYPE_ACCEPTED).status,
+            "False"
         );
     }
 

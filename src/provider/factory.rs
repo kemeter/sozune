@@ -236,18 +236,34 @@ pub async fn start_services(
             let resolver: Arc<dyn gateway::ServiceResolver> =
                 kubernetes_provider_for_gateway.clone();
 
+            // Status writes for Gateway/GatewayClass go through a dedicated
+            // task so the watchers never block their event loop on an
+            // apiserver PATCH round-trip. Buffer sized like the HTTPRoute
+            // status channel.
+            let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
+            let status_client = client.clone();
+            tokio::spawn(async move {
+                gateway::run_gateway_status_writer(status_client, status_rx).await;
+            });
+
             let gc_client = client.clone();
             let gc_scope = scope.clone();
+            let gc_status_tx = status_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = gateway::run_gatewayclass_watcher(gc_client, gc_scope).await {
+                if let Err(e) =
+                    gateway::run_gatewayclass_watcher(gc_client, gc_scope, gc_status_tx).await
+                {
                     error!("Gateway API: GatewayClass watcher failed: {}", e);
                 }
             });
 
             let gw_client = client.clone();
             let gw_scope = scope.clone();
+            let gw_status_tx = status_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = gateway::run_gateway_watcher(gw_client, gw_scope).await {
+                if let Err(e) =
+                    gateway::run_gateway_watcher(gw_client, gw_scope, gw_status_tx).await
+                {
                     error!("Gateway API: Gateway watcher failed: {}", e);
                 }
             });
