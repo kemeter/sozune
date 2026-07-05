@@ -95,3 +95,52 @@ spec:
       backendRefs:
         - name: svcb
           port: 80
+---
+# Header + method matching on a single hostname. Only a GET carrying
+# `X-Canary: yes` matches; anything else (wrong header, wrong method) gets
+# 404. Exercises matches[].headers and matches[].method together (ANDed).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: match-gw
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-match.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+          method: GET
+          headers:
+            - name: X-Canary
+              value: "yes"
+      backendRefs:
+        - name: svca
+          port: 80
+---
+# Query-param matching. Only a request carrying `?debug=1` matches.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: query-gw
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-query.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+          queryParams:
+            - name: debug
+              value: "1"
+      backendRefs:
+        - name: svcb
+          port: 80
