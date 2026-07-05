@@ -130,10 +130,11 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes", "gateways", "gatewayclasses", "referencegrants"]
     verbs: ["get", "list", "watch"]
-  # Optional: only needed for HTTPRoute status reporting (kubectl
-  # describe httproute will show Accepted/ResolvedRefs from sōzune).
+  # Optional: only needed for Gateway API status reporting (kubectl
+  # describe will show sōzune's conditions: Accepted/ResolvedRefs on
+  # HTTPRoutes, Accepted/Programmed on Gateways, Accepted on GatewayClasses).
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes/status"]
+    resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]
     verbs: ["update", "patch"]
 ```
 
@@ -238,9 +239,14 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `backendRef.weight` — propagated to the load balancer.
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
-- Status reporting — for every `parentRef` Sōzune owns, the route's `status.parents[]` is updated with the standard `Accepted` and `ResolvedRefs` conditions (`controllerName: kemeter.io/sozune`). Visible via `kubectl describe httproute <name>`. Other controllers' entries are preserved untouched.
+- Status reporting — Sōzune writes standard conditions back onto the resources it owns, visible via `kubectl describe` / `kubectl get`:
+  - `HTTPRoute` — for every `parentRef` Sōzune owns, `status.parents[]` carries `Accepted` and `ResolvedRefs` (`controllerName: kemeter.io/sozune`). Other controllers' entries are preserved untouched.
+  - `Gateway` — `status.conditions[]` carries `Accepted` and `Programmed`, both reflecting whether Sōzune owns the Gateway's `GatewayClass`.
+  - `GatewayClass` — `status.conditions[]` carries `Accepted` on classes whose `controllerName` is `kemeter.io/sozune`.
 
 ### Status conditions
+
+**HTTPRoute** (`status.parents[].conditions[]`):
 
 | Condition | Status | Reason | When |
 |---|---|---|---|
@@ -251,6 +257,21 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 | `ResolvedRefs` | `False` (`UnsupportedValue`) | Route was rejected because of unsupported filters |
 
 Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
+
+**Gateway** (`status.conditions[]`):
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `True` (`Accepted`) | Gateway's `gatewayClassName` points at a class sōzune owns |
+| `Programmed` | `True` (`Programmed`) | Same instant as acceptance — sōzune does not stage programming |
+
+**GatewayClass** (`status.conditions[]`):
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `True` (`Accepted`) | `spec.controllerName` is `kemeter.io/sozune` |
+
+Gateways and GatewayClasses that belong to another controller receive **no status entry** from sōzune.
 
 ### Cross-namespace backends (ReferenceGrant)
 
