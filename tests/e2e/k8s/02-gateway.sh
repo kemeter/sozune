@@ -136,6 +136,29 @@ else
     fail "request without ?debug=1 got $query_miss, expected 404"
 fi
 
+# ----------------------------------------------------------------------
+# parentRef.sectionName listener selection: a route whose parentRef names
+# an existing listener (`http`) is served; one naming a listener the
+# Gateway doesn't have (`ghost`) is refused (404, out of scope).
+# ----------------------------------------------------------------------
+log "[02] Gateway: parentRef.sectionName selects a Gateway listener"
+
+if wait_for_status "http://127.0.0.1:$HTTP_PORT/" "gw-section-ok.k8s-test.localhost" "200"; then
+    pass "route with sectionName=http (existing listener) is served (200)"
+else
+    fail "route with sectionName=http not served (timeout)"
+fi
+
+section_ghost=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: gw-section-ghost.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+section_ghost=${section_ghost:-000}
+if [[ "$section_ghost" == "404" ]]; then
+    pass "route with sectionName=ghost (unknown listener) is refused (404)"
+else
+    fail "route with sectionName=ghost got $section_ghost, expected 404"
+fi
+
 log "[02] Gateway: unknown host returns 404"
 
 unknown_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \

@@ -193,7 +193,7 @@ spec:
       protocol: HTTP
 ```
 
-> The listener block is required by the Gateway API schema, but Sōzune currently ignores it: real listening ports stay declared via `proxy.http.listen_address` / `proxy.https.listen_address` in `config.yaml`. Wiring listeners to live ports is a planned post-MVP enhancement.
+> The listener block is honoured for route selection and hostname narrowing, but not for the actual listening port: real listening ports stay declared via `proxy.http.listen_address` / `proxy.https.listen_address` in `config.yaml`. A `parentRef` can target a specific listener with `sectionName` (matched against a listener `name`) or `port`, and a listener's `hostname` narrows which of a route's hostnames it serves. Binding traffic on the listener's own `port` (multiple live HTTP ports from one Gateway) is a separate, planned enhancement.
 
 Finally, the `HTTPRoute` references the `Gateway` via `parentRefs`:
 
@@ -232,7 +232,8 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 - Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
-- `spec.hostnames` — matched against the `Host` header of incoming requests.
+- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix).
+- `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
 - `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other); a request that fails any condition gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
@@ -300,8 +301,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 ### What's not supported (yet)
 
-- Listener-driven port binding — the `listeners` block on `Gateway` is parsed but ignored; ports are still configured via `proxy.http.listen_address` / `proxy.https.listen_address`.
-- `parentRef.sectionName` and `parentRef.port` — the route binds to the whole `Gateway`, not a specific listener.
+- Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`.
 
