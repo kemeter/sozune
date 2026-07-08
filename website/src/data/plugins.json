@@ -44,6 +44,21 @@
           "app.example.com": "<website-id>"
         }
       }
+    },
+    {
+      "name": "redirectionio",
+      "version": "0.1.0",
+      "summary": "A redirection.io redirect engine that matches rules locally, with no agent.",
+      "author": "kemeter",
+      "tags": ["redirect", "routing"],
+      "abi": "http-wasm",
+      "repo": "https://github.com/kemeter/sozune-redirectionio",
+      "wasm": "https://github.com/kemeter/sozune-redirectionio/releases/latest/download/sozune_redirectionio.wasm",
+      "example": {
+        "rules": [
+          { "id": "r1", "source": { "path": "/old" }, "rank": 0, "target": "/new", "status_code": 301 }
+        ]
+      }
     }
   ]
 }
