@@ -44,6 +44,11 @@ kind load docker-image "$SOZUNE_IMAGE_REF" --name "$CLUSTER_NAME" >/dev/null 2>&
 log "Installing Gateway API CRDs (standard v1.2.0)..."
 kubectl apply -f "$K8S_DIR/gateway-api-crds-v1.2.0.yaml" >/dev/null
 
+# TLSRoute is v1alpha2 and lives in the experimental channel, so it is not in
+# the bundle above. Vendored on its own — see the file header.
+log "Installing TLSRoute CRD (experimental v1.2.0)..."
+kubectl apply -f "$K8S_DIR/tlsroute-crd-v1.2.0.yaml" >/dev/null
+
 # -- Workload manifests (must come before the sozune Pod so the namespace
 # and ingresses already exist when sozune starts watching).
 log "Applying workload manifests..."

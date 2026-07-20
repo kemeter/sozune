@@ -126,9 +126,12 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
-  # Optional: only needed if you want HTTPRoute support.
+  # Optional: only needed if you want Gateway API support. `tlsroutes` is
+  # only consulted when the (experimental) CRD is installed; without the
+  # permission Sōzune logs a warning and skips that watcher.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes", "gateways", "gatewayclasses", "referencegrants"]
+    resources:
+      ["httproutes", "tlsroutes", "gateways", "gatewayclasses", "referencegrants"]
     verbs: ["get", "list", "watch"]
   # Optional: only needed for Gateway API status reporting (kubectl
   # describe will show sōzune's conditions: Accepted/ResolvedRefs on
@@ -152,7 +155,7 @@ Useful for local development. Sōzune uses the current context from `$KUBECONFIG
 
 ## Gateway API (HTTPRoute)
 
-Sōzune watches `gateway.networking.k8s.io/v1` resources alongside Ingress. Four watchers run side by side: `GatewayClass`, `Gateway`, `ReferenceGrant`, and `HTTPRoute`. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required.
+Sōzune watches `gateway.networking.k8s.io` resources alongside Ingress. Five watchers run side by side: `GatewayClass`, `Gateway`, `ReferenceGrant`, `HTTPRoute`, and `TLSRoute` (see [Gateway API (TLSRoute)](#gateway-api-tlsroute)). They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required. The `TLSRoute` watcher exits quietly when its CRD — experimental-channel only — is absent.
 
 ### Prerequisites
 
@@ -414,6 +417,69 @@ rules:
 
 When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready pod IPs from the matching Service's `EndpointSlice`s. Sōzu requires `IpAddr` backends and refuses cluster-DNS hostnames, so a route that targets a Service with no ready endpoints registers no entrypoint and is retried every 2 seconds until the endpoints appear. Once at least one ready endpoint exists the route becomes live without any user intervention.
 
+## Gateway API (TLSRoute)
+
+`TLSRoute` routes TLS connections to different backends by the server name in the ClientHello, **without decrypting**. The client's handshake completes with the backend, against the backend's own certificate. Use it when the backend must own its certificates: end-to-end encryption to the service, a tenant terminating its own TLS, or a protocol Sōzune does not speak.
+
+`TLSRoute` is `v1alpha2` and ships only in the Gateway API **experimental** channel. Sōzune probes for the CRD at startup and skips the watcher when it is absent, so a cluster with only the standard bundle installed is unaffected.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tlsgw
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: passthrough
+      protocol: TLS
+      port: 8443
+      tls:
+        mode: Passthrough
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: my-passthrough
+spec:
+  parentRefs:
+    - name: tlsgw
+      sectionName: passthrough
+  hostnames:
+    - app.example.com
+  rules:
+    - backendRefs:
+        - name: my-service
+          port: 8443
+```
+
+### The port must already be declared
+
+Sōzune binds TCP ports at startup from `config.yaml` and never opens one from a Gateway alone — the same rule that applies to Docker labels, kept so startup state stays predictable. A Gateway listener on port `8443` is therefore served only if a `proxy.tcp` entry already listens there:
+
+```yaml
+proxy:
+  tcp:
+    - name: tlsgw
+      listen: 8443
+```
+
+A `TLSRoute` whose listener port has no matching entry is tracked but not served, and Sōzune logs which port it wanted. Declare the listener and the route goes live on the next reload, with no need to re-apply it.
+
+### What is supported
+
+| Aspect | Behaviour |
+|---|---|
+| `tls.mode` | `Passthrough` only. `Terminate` means the Gateway decrypts, which is what HTTPS entrypoints do — such a listener is ignored here. |
+| `hostnames` | Each becomes one SNI route. Exact names and a single leading `*.` wildcard label, per spec. A route with no hostname serves nothing: there is no name to match a ClientHello against. |
+| Listener `hostname` | Intersected with the route's hostnames, exactly as for HTTPRoute. |
+| `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is honoured. |
+| `parentRefs` | `sectionName` and `port` select a listener, as for HTTPRoute. A route may bind listeners on several ports; each serves only the names its own `hostname` admits. |
+| Invalid hostnames | A name Sōzu could not route (a wildcard beyond one leading `*.` label, `/`, an empty label, non-ASCII) is dropped with a warning; the route's other names still serve. |
+| Unmatched SNI | Dropped. Once a listener carries SNI routes there is no catch-all — declare a route for every name you serve. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough). |
+
+`TLSRoute` has no matches, filters or paths — the SNI is the whole routing decision — so none of the HTTPRoute filter machinery applies.
+
 ## ACME / Let's Encrypt
 
 When a Service is annotated with `sozune.http.<svc>.tls=true`, or an Ingress declares `spec.tls[].hosts`, Sōzune provisions a certificate for the declared hostnames. The HTTP-01 challenge responder runs inside the Sōzune pod, so:
@@ -430,7 +496,8 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
-- **Gateway API: `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
+- **Gateway API: `GRPCRoute`, `TCPRoute`, `UDPRoute`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
+- **TLSRoute serves `Passthrough` only, on a pre-declared port.** `tls.mode: Terminate` is out of scope — that is what HTTPS entrypoints are for — and the listener's port must already be bound by a `proxy.tcp` entry. See [Gateway API (TLSRoute)](#gateway-api-tlsroute).
 
 ## Environment variables
 

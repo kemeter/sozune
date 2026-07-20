@@ -33,8 +33,9 @@ use crate::model::{
     Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
 };
 use futures_util::StreamExt;
+use gateway_api::apis::experimental::tlsroutes::{TLSRoute, TLSRouteParentRefs, TLSRouteRules};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
     HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
@@ -81,6 +82,12 @@ type RouteIndex = Arc<RwLock<HashMap<String, TrackedRoute>>>;
 
 const SOURCE_TAG: &str = "k8s-gateway";
 
+/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute and
+/// TLSRoute. Each scope mutation posts one permit per watcher so both
+/// re-resolve immediately instead of one waiting out its periodic tick.
+/// Bump this when adding another route watcher.
+const SCOPE_SUBSCRIBERS: usize = 2;
+
 /// In-memory snapshot of the Gateway API resources sōzune has decided to
 /// honour. The HTTPRoute watcher consults this on every apply to decide
 /// whether a route is in scope; the GatewayClass and Gateway watchers
@@ -94,7 +101,8 @@ const SOURCE_TAG: &str = "k8s-gateway";
 /// (HTTP serving stays on the configured listener); what matters here is
 /// resolving a `parentRef`'s `sectionName`/`port` to a listener and
 /// intersecting the listener `hostname` with the route's hostnames.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// No `Eq`: the upstream `GatewayListenersTlsMode` only derives `PartialEq`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ListenerInfo {
     /// Listener `name`, unique within the Gateway. Matched against a
     /// `parentRef.sectionName`.
@@ -104,7 +112,57 @@ pub struct ListenerInfo {
     /// Optional listener `hostname`. When set, a route attached to this
     /// listener only serves hostnames that match it.
     pub hostname: Option<String>,
+    /// Listener `protocol`, verbatim (`HTTP`, `HTTPS`, `TLS`, `TCP`, `UDP`).
+    /// HTTP serving ignores it — an HTTPRoute is served on the configured
+    /// listener whatever this says — but a TLSRoute only attaches to a `TLS`
+    /// listener, so the shape has to be visible here.
+    pub protocol: String,
+    /// `tls.mode` when the listener declares one. A TLSRoute requires
+    /// `Passthrough`: under `Terminate` the Gateway would decrypt, which is a
+    /// different feature (and one Sōzune serves through HTTPS entrypoints).
+    pub tls_mode: Option<GatewayListenersTlsMode>,
 }
+
+/// The parts of a `parentRef` scope resolution actually reads. HTTPRoute and
+/// TLSRoute each get their own generated `…ParentRefs` struct with identical
+/// fields, so the acceptance rules are shared through this rather than
+/// duplicated per route kind.
+pub trait ParentRef {
+    fn group(&self) -> Option<&str>;
+    fn kind(&self) -> Option<&str>;
+    fn name(&self) -> &str;
+    fn namespace(&self) -> Option<&str>;
+    fn section_name(&self) -> Option<&str>;
+    fn port(&self) -> Option<i32>;
+}
+
+macro_rules! impl_parent_ref {
+    ($t:ty) => {
+        impl ParentRef for $t {
+            fn group(&self) -> Option<&str> {
+                self.group.as_deref()
+            }
+            fn kind(&self) -> Option<&str> {
+                self.kind.as_deref()
+            }
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn namespace(&self) -> Option<&str> {
+                self.namespace.as_deref()
+            }
+            fn section_name(&self) -> Option<&str> {
+                self.section_name.as_deref()
+            }
+            fn port(&self) -> Option<i32> {
+                self.port
+            }
+        }
+    };
+}
+
+impl_parent_ref!(HTTPRouteParentRefs);
+impl_parent_ref!(TLSRouteParentRefs);
 
 #[derive(Default, Debug)]
 pub struct ScopeState {
@@ -167,22 +225,53 @@ impl GatewayScope {
     /// have a listener that matches, otherwise the ref is refused. Per
     /// spec, an unset `sectionName`/`port` binds to the whole Gateway (any
     /// listener), which is the existing behaviour.
-    fn accepts_parent_ref(&self, route_namespace: &str, parent_ref: &HTTPRouteParentRefs) -> bool {
-        let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
+    fn accepts_parent_ref<P: ParentRef>(&self, route_namespace: &str, parent_ref: &P) -> bool {
+        // No predicate: an HTTPRoute is served on the configured HTTP listener
+        // whatever the Gateway declares — including when it declares nothing.
+        self.accepts_parent_ref_where(
+            route_namespace,
+            parent_ref,
+            None::<fn(&ListenerInfo) -> bool>,
+        )
+    }
+
+    /// `accepts_parent_ref`, optionally narrowed to listeners satisfying
+    /// `listener_ok`. TLSRoute passes a predicate to require a
+    /// `TLS`/`Passthrough` listener; HTTPRoute passes `None`.
+    ///
+    /// The distinction matters for a Gateway declaring no listeners: per spec
+    /// it is still selected by a ref naming neither `sectionName` nor `port`,
+    /// which `None` preserves. A predicate instead demands that at least one
+    /// listener survive it — a TLSRoute with nowhere to attach cannot be
+    /// served, so accepting it would strand the route.
+    fn accepts_parent_ref_where<P: ParentRef>(
+        &self,
+        route_namespace: &str,
+        parent_ref: &P,
+        listener_ok: Option<impl Fn(&ListenerInfo) -> bool>,
+    ) -> bool {
+        let kind = parent_ref.kind().unwrap_or("Gateway");
         if kind != "Gateway" {
             return false;
         }
-        let group = parent_ref.group.as_deref().unwrap_or(GATEWAY_API_GROUP);
+        let group = parent_ref.group().unwrap_or(GATEWAY_API_GROUP);
         // Empty string is a deliberate signal in the API ("core group");
         // we accept it the same way kubectl does for HTTPRoute parents.
         if !group.is_empty() && group != GATEWAY_API_GROUP {
             return false;
         }
-        let ns = parent_ref.namespace.as_deref().unwrap_or(route_namespace);
-        let key = (ns.to_string(), parent_ref.name.clone());
+        let ns = parent_ref.namespace().unwrap_or(route_namespace);
+        let key = (ns.to_string(), parent_ref.name().to_string());
         match self.state.read() {
             Ok(g) => match g.gateways.get(&key) {
-                Some(listeners) => parent_ref_selects_listener(parent_ref, listeners),
+                Some(listeners) => match &listener_ok {
+                    None => parent_ref_selects_listener(parent_ref, listeners),
+                    Some(pred) => {
+                        let eligible: Vec<ListenerInfo> =
+                            listeners.iter().filter(|l| pred(l)).cloned().collect();
+                        !eligible.is_empty() && parent_ref_selects_listener(parent_ref, &eligible)
+                    }
+                },
                 None => false,
             },
             Err(e) => {
@@ -190,6 +279,101 @@ impl GatewayScope {
                 false
             }
         }
+    }
+
+    /// True iff this listener can carry a TLSRoute: protocol `TLS` with
+    /// `tls.mode: Passthrough`. `Terminate` is deliberately excluded — the
+    /// Gateway would decrypt, which is what HTTPS entrypoints are for.
+    fn listener_serves_tls_passthrough(l: &ListenerInfo) -> bool {
+        l.protocol.eq_ignore_ascii_case("TLS")
+            && matches!(l.tls_mode, Some(GatewayListenersTlsMode::Passthrough))
+    }
+
+    /// True iff `parent_ref` binds this TLSRoute to a `TLS`/`Passthrough`
+    /// listener on a Gateway we own.
+    fn accepts_tls_parent_ref(
+        &self,
+        route_namespace: &str,
+        parent_ref: &TLSRouteParentRefs,
+    ) -> bool {
+        self.accepts_parent_ref_where(
+            route_namespace,
+            parent_ref,
+            Some(Self::listener_serves_tls_passthrough),
+        )
+    }
+
+    /// True iff at least one `parentRef` binds this TLSRoute to a listener we
+    /// can serve.
+    pub fn accepts_tls_route(&self, route: &TLSRoute) -> bool {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return false;
+        };
+        refs.iter()
+            .any(|p| self.accepts_tls_parent_ref(route_ns, p))
+    }
+
+    /// The SNI names this TLSRoute should serve, and the Gateway listener port
+    /// they arrive on.
+    ///
+    /// Mirrors [`Self::effective_hostnames_for_route`] but over TLS listeners,
+    /// and additionally reports the port: unlike HTTP — where every route is
+    /// served on the one configured listener — a passthrough route needs a real
+    /// TCP listener, resolved from that port by the caller.
+    ///
+    /// `None` when the route binds to nothing we own, or when the intersection
+    /// with every bound listener's hostname is empty. A route with no
+    /// hostnames of its own inherits the listener's; if neither names anything,
+    /// there is no SNI to match on and the route is refused rather than
+    /// silently serving nothing.
+    fn effective_tls_hostnames_by_port(&self, route: &TLSRoute) -> BTreeMap<i32, Vec<String>> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
+        let mut by_port: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return by_port;
+        };
+
+        for p in refs
+            .iter()
+            .filter(|p| self.accepts_tls_parent_ref(route_ns, p))
+        {
+            let ns = p.namespace.as_deref().unwrap_or(route_ns);
+            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+                continue;
+            };
+            for listener in listeners
+                .into_iter()
+                .filter(Self::listener_serves_tls_passthrough)
+                .filter(|l| {
+                    let name_ok = p.section_name.as_deref().is_none_or(|s| s == l.name);
+                    let port_ok = p.port.is_none_or(|port| port == l.port);
+                    name_ok && port_ok
+                })
+            {
+                // Intersect per listener, not across all of them: a name is
+                // only served on a listener whose own hostname admits it.
+                // Unioning first and picking one port would expose a name on a
+                // listener that refused it, and strand it on the one that
+                // wanted it.
+                let port = listener.port;
+                let Some(hs) =
+                    intersect_hostnames(&route_hostnames, std::slice::from_ref(&listener))
+                else {
+                    continue;
+                };
+                let entry = by_port.entry(port).or_default();
+                for h in hs {
+                    if !entry.contains(&h) {
+                        entry.push(h);
+                    }
+                }
+            }
+        }
+
+        by_port.retain(|_, hs| !hs.is_empty());
+        by_port
     }
 
     /// Returns the listeners of an accepted Gateway named by `(ns, name)`,
@@ -226,7 +410,10 @@ impl GatewayScope {
         let mut out: Vec<String> = Vec::new();
         let mut any_listener = false;
         let mut any_overlap = false;
-        for p in refs.iter().filter(|p| self.accepts_parent_ref(route_ns, p)) {
+        for p in refs
+            .iter()
+            .filter(|p| self.accepts_parent_ref(route_ns, *p))
+        {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
             let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
                 continue;
@@ -278,9 +465,17 @@ impl GatewayScope {
 
     /// Notifies subscribers iff `changed` is true; returns the same bool
     /// for caller convenience.
+    ///
+    /// One `notify_one` per route watcher, not one overall: a single permit is
+    /// consumed by whichever watcher wakes first, leaving the other to wait out
+    /// its 2s tick before it learns the scope moved. `notify_waiters` would not
+    /// do either — it posts no permit, so a watcher not yet parked on
+    /// `notified()` misses the change entirely.
     fn fire_if(&self, changed: bool) -> bool {
         if changed {
-            self.changed.notify_one();
+            for _ in 0..SCOPE_SUBSCRIBERS {
+                self.changed.notify_one();
+            }
         }
         changed
     }
@@ -575,6 +770,8 @@ fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
             name: l.name.clone(),
             port: l.port,
             hostname: l.hostname.clone(),
+            protocol: l.protocol.clone(),
+            tls_mode: l.tls.as_ref().and_then(|t| t.mode.clone()),
         })
         .collect()
 }
@@ -585,12 +782,9 @@ fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
 /// when `port` is set it must equal a listener `port`; when both are set
 /// the same listener must satisfy both. A Gateway with no listeners at all
 /// is only selected by a ref that names neither.
-fn parent_ref_selects_listener(
-    parent_ref: &HTTPRouteParentRefs,
-    listeners: &[ListenerInfo],
-) -> bool {
-    let section = parent_ref.section_name.as_deref();
-    let port = parent_ref.port;
+fn parent_ref_selects_listener<P: ParentRef>(parent_ref: &P, listeners: &[ListenerInfo]) -> bool {
+    let section = parent_ref.section_name();
+    let port = parent_ref.port();
     if section.is_none() && port.is_none() {
         return true;
     }
@@ -1626,7 +1820,7 @@ fn build_route_status(
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .filter(|p| scope.accepts_parent_ref(route_ns, p))
+        .filter(|p| scope.accepts_parent_ref(route_ns, *p))
         .map(|p| HTTPRouteStatusParents {
             controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
             parent_ref: HTTPRouteStatusParentsParentRef {
@@ -1903,6 +2097,494 @@ fn rule_to_entrypoints(
         .collect()
 }
 
+struct TrackedTlsRoute {
+    route: TLSRoute,
+    entrypoint_ids: Vec<String>,
+}
+
+/// Indexed by Kubernetes UID, like [`RouteIndex`].
+type TlsRouteIndex = Arc<RwLock<HashMap<String, TrackedTlsRoute>>>;
+
+/// Resolve a TLSRoute to its entrypoints and swap them into storage. Returns
+/// true when storage changed. Mirrors [`apply_route`], minus filters and
+/// matches (a TLSRoute has neither), plus the listener-port resolution: a
+/// route whose Gateway port has no matching `proxy.tcp` listener cannot be
+/// served, so it is tracked with zero entrypoints and reported unresolvable.
+fn apply_tls_route(
+    route: &TLSRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &TlsRouteIndex,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    listener_ports: &TcpListenerPorts,
+) -> bool {
+    let uid = match route.metadata.uid.as_deref() {
+        Some(u) => u.to_string(),
+        None => {
+            warn!("Gateway API: TLSRoute without uid, skipping");
+            return false;
+        }
+    };
+
+    // Out-of-scope routes stay tracked with zero entrypoints so they activate
+    // as soon as a matching Gateway appears, and deactivate cleanly when one
+    // goes away — same contract as the HTTP path.
+    let new_entrypoints = if !scope.accepts_tls_route(route) {
+        Vec::new()
+    } else {
+        // A route can bind listeners on several ports; each gets its own
+        // entrypoint set, serving only the names that listener admits.
+        scope
+            .effective_tls_hostnames_by_port(route)
+            .into_iter()
+            .flat_map(|(port, hostnames)| match listener_ports.get(&port) {
+                Some(listener_name) => {
+                    tls_route_to_entrypoints(route, resolver, scope, &hostnames, listener_name, port)
+                }
+                None => {
+                    let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+                    let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+                    warn!(
+                        "Gateway API: TLSRoute {}/{} binds to a Gateway listener on port {} but no `proxy.tcp` listener is declared there — declare one in config.yaml, Sōzune does not open TCP ports on the fly",
+                        ns, name, port
+                    );
+                    Vec::new()
+                }
+            })
+            .collect()
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    if let Some(previous) = index_guard.get(&uid) {
+        for id in &previous.entrypoint_ids {
+            if storage_guard.remove(id).is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    let new_ids: Vec<String> = new_entrypoints.iter().map(|e| e.id.clone()).collect();
+    for ep in new_entrypoints {
+        storage_guard.insert(ep.id.clone(), ep);
+        changed = true;
+    }
+
+    index_guard.insert(
+        uid,
+        TrackedTlsRoute {
+            route: route.clone(),
+            entrypoint_ids: new_ids,
+        },
+    );
+
+    changed
+}
+
+fn delete_tls_route(
+    route: &TLSRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &TlsRouteIndex,
+) -> bool {
+    let Some(uid) = route.metadata.uid.as_deref() else {
+        return false;
+    };
+
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let Some(tracked) = index_guard.remove(uid) else {
+        return false;
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for id in tracked.entrypoint_ids {
+        if storage_guard.remove(&id).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Re-resolve every tracked TLSRoute. Driven by the same two signals as the
+/// HTTP path: a periodic tick (so EndpointSlice churn reaches Sōzu) and a
+/// scope change (so routes flip in/out the moment a Gateway appears).
+fn re_resolve_all_tls(
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &TlsRouteIndex,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    listener_ports: &TcpListenerPorts,
+) -> bool {
+    let tracked: Vec<TLSRoute> = match index.read() {
+        Ok(g) => g.values().map(|t| t.route.clone()).collect(),
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for route in &tracked {
+        if apply_tls_route(route, storage, index, resolver, scope, listener_ports) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Watch TLSRoutes and keep their entrypoints in sync.
+///
+/// TLSRoute is `v1alpha2` and ships in the Gateway API *experimental* bundle,
+/// so the CRD is often absent. The watcher probes for it first and exits
+/// quietly when missing rather than logging an error on every retry.
+pub async fn run_tlsroute_watcher(
+    client: Client,
+    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    reload_tx: mpsc::Sender<()>,
+    resolver: Arc<dyn ServiceResolver>,
+    scope: GatewayScope,
+    listener_ports: TcpListenerPorts,
+) -> anyhow::Result<()> {
+    let api: Api<TLSRoute> = Api::all(client);
+    // Distinguish "CRD absent" from "not allowed to list it": both stop the
+    // watcher, but only the first is routine. Reporting a 403 as a missing CRD
+    // would send an operator hunting for the wrong thing.
+    if let Err(e) = api.list(&Default::default()).await {
+        match &e {
+            kube::Error::Api(resp) if resp.code == 404 => {
+                info!(
+                    "Gateway API: TLSRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
+                );
+            }
+            kube::Error::Api(resp) if resp.code == 403 => {
+                warn!(
+                    "Gateway API: not allowed to list TLSRoutes, skipping watcher — grant `tlsroutes` (get/list/watch) in the gateway.networking.k8s.io group: {}",
+                    resp.message
+                );
+            }
+            other => {
+                warn!(
+                    "Gateway API: could not probe for TLSRoutes, skipping watcher: {}",
+                    other
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+    let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    resolve_ticker.tick().await;
+
+    info!("Gateway API: TLSRoute watcher started");
+
+    loop {
+        let changed = tokio::select! {
+            event = stream.next() => match event {
+                Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    log_tls_route("apply", &route);
+                    apply_tls_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                }
+                Some(Ok(Event::Delete(route))) => {
+                    log_tls_route("delete", &route);
+                    delete_tls_route(&route, &storage, &index)
+                }
+                Some(Ok(Event::Init)) => {
+                    debug!("Gateway API: TLSRoute init");
+                    false
+                }
+                Some(Ok(Event::InitDone)) => {
+                    debug!("Gateway API: TLSRoute init done");
+                    false
+                }
+                Some(Err(e)) => {
+                    error!("Gateway API: TLSRoute watcher error: {}", e);
+                    false
+                }
+                None => break,
+            },
+            _ = resolve_ticker.tick() => {
+                re_resolve_all_tls(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+            }
+            _ = scope.changed() => {
+                debug!("Gateway API: scope changed, re-resolving TLS routes");
+                re_resolve_all_tls(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+            }
+        };
+        if changed && let Err(e) = reload_tx.send(()).await {
+            error!("Gateway API: failed to send reload signal: {}", e);
+        }
+    }
+
+    warn!("Gateway API: TLSRoute watcher stream ended unexpectedly");
+    Ok(())
+}
+
+fn log_tls_route(action: &str, route: &TLSRoute) {
+    let ns = route
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or("<no-namespace>");
+    let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+    let hosts = route
+        .spec
+        .hostnames
+        .as_ref()
+        .map(|v| v.join(","))
+        .unwrap_or_default();
+    debug!(
+        "Gateway API: TLSRoute {} {}/{} [{}]",
+        action, ns, name, hosts
+    );
+}
+
+/// Maps a Gateway listener port onto the name of a statically declared
+/// `proxy.tcp` listener.
+///
+/// Sōzune binds TCP ports at startup from `config.yaml` and deliberately does
+/// not open them on the fly, so a Gateway declaring `port: 8443` is served only
+/// if some `proxy.tcp` entry already listens there. Built once at startup and
+/// read on every TLSRoute apply.
+pub type TcpListenerPorts = Arc<HashMap<i32, String>>;
+
+/// Build the port → listener-name table from the proxy config.
+pub fn tcp_listener_ports(tcp: &[crate::config::TcpListenerConfig]) -> TcpListenerPorts {
+    Arc::new(
+        tcp.iter()
+            .map(|l| (i32::from(l.listen), l.name.clone()))
+            .collect(),
+    )
+}
+
+/// Convert a TLSRoute into Sōzune `Entrypoint`s, one per (rule, hostname).
+///
+/// Much simpler than its HTTP counterpart: a TLSRoute has no matches, no
+/// filters and no paths — the SNI *is* the whole routing decision — so a rule
+/// fans out only over `hostnames`. Sōzu keys a TCP frontend on one SNI, so a
+/// route serving three names becomes three entrypoints sharing one backend set.
+///
+/// `hostnames` are the names left after intersecting the route with its bound
+/// listeners (see [`GatewayScope::effective_hostnames_for_tls_route`]). Unlike
+/// HTTP, an empty set yields nothing at all: a passthrough route with no name
+/// has nothing to match a ClientHello against, and Sōzu has no catch-all once
+/// a listener carries SNI routes.
+///
+/// `listener_name` is the `proxy.tcp` listener the Gateway's port resolved to;
+/// entrypoints carry it in `config.entrypoint`, exactly as a Docker-labelled
+/// TCP route does.
+pub fn tls_route_to_entrypoints(
+    route: &TLSRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+    hostnames: &[String],
+    listener_name: &str,
+    port: i32,
+) -> Vec<Entrypoint> {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    let Some(route_name) = route.metadata.name.as_deref() else {
+        return Vec::new();
+    };
+
+    // Validate here rather than trusting CRD schema validation: a pattern Sōzu
+    // refuses would be rejected over the command socket at `debug!` level, and
+    // the entrypoint would sit in the snapshot looking applied while never
+    // matching anything. Same rule as the Docker-label path.
+    let hostnames: Vec<String> = hostnames
+        .iter()
+        .filter_map(|h| match crate::model::validate_sni(h) {
+            Ok(normalized) => Some(normalized),
+            Err(_) => {
+                warn!(
+                    "Gateway API: TLSRoute {}/{} declares hostname `{}`, which is not a routable SNI pattern (expected an exact host or one leading `*.` label, ASCII only) — dropping that hostname",
+                    namespace, route_name, h
+                );
+                None
+            }
+        })
+        .collect();
+    if hostnames.is_empty() {
+        return Vec::new();
+    }
+    let hostnames = &hostnames;
+
+    route
+        .spec
+        .rules
+        .iter()
+        .enumerate()
+        .flat_map(|(rule_index, rule)| {
+            let backends = tls_rule_backends(rule, namespace, route_name, resolver, grants);
+            if backends.is_empty() {
+                return Vec::new();
+            }
+
+            hostnames
+                .iter()
+                .enumerate()
+                .map(|(host_index, hostname)| {
+                    // Keep the `…-{rule_index}` shape a single-hostname route
+                    // produces, and only disambiguate when a rule fans out —
+                    // same convention as the HTTP path.
+                    let suffix = if hostnames.len() == 1 {
+                        format!("{rule_index}")
+                    } else {
+                        format!("{rule_index}-h{host_index}")
+                    };
+                    Entrypoint {
+                        // `/` separates the parts: it cannot occur in a
+                        // namespace or object name, so the id is injective.
+                        // Joining with `-` would not be — `a-b/c` and `a/b-c`
+                        // would collide, and one route would silently evict
+                        // the other from the shared storage map.
+                        // The port is part of the id: one route can serve
+                        // several listeners, and their entrypoint sets must not
+                        // overwrite each other.
+                        id: format!("{SOURCE_TAG}-tls/{namespace}/{route_name}/{port}/{suffix}"),
+                        name: format!("{route_name}-{port}-{suffix}"),
+                        backends: backends.clone(),
+                        protocol: Protocol::Tcp,
+                        config: EntrypointConfig {
+                            // `hostnames` stays empty: on a TCP entrypoint the
+                            // routing name lives in `sni`, and leaving both set
+                            // would imply an HTTP Host match that never runs.
+                            hostnames: Vec::new(),
+                            sni: Some(hostname.clone()),
+                            entrypoint: Some(listener_name.to_string()),
+                            ..tls_entrypoint_defaults()
+                        },
+                        source: Some(format!("{SOURCE_TAG}-tls/{namespace}/{route_name}")),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Resolve a TLSRoute rule's `backendRefs` to concrete pod IPs. Mirrors the
+/// HTTP path's backend handling, including the ReferenceGrant check that makes
+/// a cross-namespace ref opt-in.
+fn tls_rule_backends(
+    rule: &TLSRouteRules,
+    namespace: &str,
+    route_name: &str,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Vec<Backend> {
+    let Some(backend_refs) = rule.backend_refs.as_ref() else {
+        return Vec::new();
+    };
+    backend_refs
+        .iter()
+        .flat_map(|b| {
+            let Some(port_i32) = b.port else {
+                return Vec::new();
+            };
+            let Ok(port) = u16::try_from(port_i32) else {
+                return Vec::new();
+            };
+            let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
+            let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
+            if !kind_ok || !group_ok {
+                return Vec::new();
+            }
+            let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+            if !grants.allows(namespace, target_ns) {
+                warn!(
+                    "Gateway API: TLSRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
+                    namespace, route_name, target_ns, b.name
+                );
+                return Vec::new();
+            }
+            let weight = b.weight.unwrap_or(100).max(0) as u32;
+            resolver
+                .pod_ips(target_ns, &b.name)
+                .into_iter()
+                .map(|address| Backend {
+                    address,
+                    port,
+                    weight,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `EntrypointConfig` defaults for a passthrough TCP entrypoint. Everything
+/// HTTP-shaped stays off: there is no request to inspect, rewrite or
+/// authenticate — only bytes to forward.
+fn tls_entrypoint_defaults() -> EntrypointConfig {
+    EntrypointConfig {
+        hostnames: Vec::new(),
+        path: None,
+        tls: false,
+        strip_prefix: false,
+        add_prefix: None,
+        https_redirect: false,
+        https_redirect_port: None,
+        redirect: None,
+        redirect_scheme: None,
+        redirect_template: None,
+        rewrite_host: None,
+        rewrite_path: None,
+        rewrite: None,
+        rewrite_port: None,
+        www_authenticate: None,
+        priority: 0,
+        auth: None,
+        forward_auth: None,
+        headers: Vec::new(),
+        backend_timeout: None,
+        health_check: None,
+        retry: None,
+        circuit_breaker: None,
+        rate_limit: None,
+        in_flight_req: None,
+        load_balancer: LoadBalancer::default(),
+        sticky_session: false,
+        compress: false,
+        entrypoint: None,
+        sni: None,
+        methods: Vec::new(),
+        acme: None,
+        plugins: Vec::new(),
+        plugin_config: std::collections::BTreeMap::new(),
+        error_pages: std::collections::BTreeMap::new(),
+        match_headers: Vec::new(),
+        match_query: Vec::new(),
+        match_client_ip: Vec::new(),
+        ip_allow_list: Vec::new(),
+    }
+}
+
 fn log_route(action: &str, route: &HTTPRoute) {
     let ns = route
         .metadata
@@ -1992,6 +2674,457 @@ mod tests {
         let r = HTTPRoute::default();
         let _: Option<Vec<String>> = r.spec.hostnames;
         let _: Option<Vec<HTTPRouteRules>> = r.spec.rules;
+    }
+
+    /// Same guard as `httproute_shape_matches_what_we_read`, for TLSRoute.
+    /// Note `spec.rules` is a bare `Vec` here, not an `Option<Vec>` — the two
+    /// generated types differ, and assuming otherwise would not compile.
+    #[test]
+    fn tlsroute_shape_matches_what_we_read() {
+        let r = TLSRoute::default();
+        let _: Option<Vec<String>> = r.spec.hostnames;
+        let _: Vec<TLSRouteRules> = r.spec.rules;
+        let _: Option<Vec<TLSRouteParentRefs>> = r.spec.parent_refs;
+    }
+
+    /// A Gateway carrying one `TLS`/`Passthrough` listener, which is what a
+    /// TLSRoute needs to attach to.
+    fn tls_scope(listener_hostname: Option<&str>, port: i32) -> GatewayScope {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&GatewayClass {
+            metadata: ObjectMeta {
+                name: Some("sozune".into()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: SOZUNE_CONTROLLER_NAME.into(),
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+        scope.upsert_gateway(&Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "sozune".into(),
+                listeners: vec![GatewayListeners {
+                    name: "tls".into(),
+                    port,
+                    protocol: "TLS".into(),
+                    hostname: listener_hostname.map(Into::into),
+                    tls: Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
+                        mode: Some(GatewayListenersTlsMode::Passthrough),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+        scope
+    }
+
+    fn tls_route(hostnames: Vec<&str>, backend_port: i32) -> TLSRoute {
+        TLSRoute {
+            metadata: ObjectMeta {
+                name: Some("passthrough".into()),
+                namespace: Some("default".into()),
+                uid: Some("uid-tls-1".into()),
+                ..Default::default()
+            },
+            spec: gateway_api::apis::experimental::tlsroutes::TLSRouteSpec {
+                hostnames: Some(hostnames.into_iter().map(Into::into).collect()),
+                parent_refs: Some(vec![TLSRouteParentRefs {
+                    name: "gw".into(),
+                    ..Default::default()
+                }]),
+                rules: vec![TLSRouteRules {
+                    backend_refs: Some(vec![
+                        gateway_api::apis::experimental::tlsroutes::TLSRouteRulesBackendRefs {
+                            name: "svc".into(),
+                            port: Some(backend_port),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }],
+            },
+            status: Default::default(),
+        }
+    }
+
+    fn ports_8443() -> TcpListenerPorts {
+        Arc::new([(8443, "tlsgw".to_string())].into_iter().collect())
+    }
+
+    #[test]
+    fn tls_route_produces_one_entrypoint_per_hostname() {
+        // Sōzu keys a TCP frontend on a single SNI, so a route serving two
+        // names becomes two entrypoints sharing the backend set.
+        let scope = tls_scope(None, 8443);
+        let route = tls_route(vec!["a.example.com", "b.example.com"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        let hostnames = by_port.get(&8443).expect("listener on 8443");
+
+        let eps = tls_route_to_entrypoints(&route, &r1(), &scope, hostnames, "tlsgw", 8443);
+        assert_eq!(eps.len(), 2);
+        let snis: Vec<_> = eps.iter().filter_map(|e| e.config.sni.clone()).collect();
+        assert!(snis.contains(&"a.example.com".to_string()));
+        assert!(snis.contains(&"b.example.com".to_string()));
+        for ep in &eps {
+            assert!(matches!(ep.protocol, Protocol::Tcp));
+            assert_eq!(ep.config.entrypoint.as_deref(), Some("tlsgw"));
+            // The routing name lives in `sni`; a Host match would never run.
+            assert!(ep.config.hostnames.is_empty());
+            assert_eq!(ep.backends.len(), 1);
+            assert_eq!(ep.backends[0].port, 8443);
+        }
+    }
+
+    #[test]
+    fn tls_route_lowercases_the_sni() {
+        let scope = tls_scope(None, 8443);
+        let route = tls_route(vec!["API.Example.COM"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        let eps = tls_route_to_entrypoints(
+            &route,
+            &r1(),
+            &scope,
+            by_port.get(&8443).unwrap(),
+            "tlsgw",
+            8443,
+        );
+        assert_eq!(eps[0].config.sni.as_deref(), Some("api.example.com"));
+    }
+
+    #[test]
+    fn tls_route_without_hostnames_produces_nothing() {
+        // No SNI means nothing to match a ClientHello against, and Sōzu has no
+        // catch-all once a listener carries SNI routes.
+        let scope = tls_scope(None, 8443);
+        let route = tls_route(vec![], 8443);
+        let eps = tls_route_to_entrypoints(&route, &r1(), &scope, &[], "tlsgw", 8443);
+        assert!(eps.is_empty());
+    }
+
+    #[test]
+    fn tls_route_with_unresolvable_backend_produces_nothing() {
+        let scope = tls_scope(None, 8443);
+        let route = tls_route(vec!["a.example.com"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        let eps = tls_route_to_entrypoints(
+            &route,
+            &r0(),
+            &scope,
+            by_port.get(&8443).unwrap(),
+            "tlsgw",
+            8443,
+        );
+        assert!(eps.is_empty());
+    }
+
+    #[test]
+    fn tls_route_needs_a_passthrough_listener() {
+        // A `Terminate` listener means the Gateway decrypts — a different
+        // feature, served by HTTPS entrypoints, so the route is not ours.
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&GatewayClass {
+            metadata: ObjectMeta {
+                name: Some("sozune".into()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: SOZUNE_CONTROLLER_NAME.into(),
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+        scope.upsert_gateway(&Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "sozune".into(),
+                listeners: vec![GatewayListeners {
+                    name: "tls".into(),
+                    port: 8443,
+                    protocol: "TLS".into(),
+                    tls: Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
+                        mode: Some(GatewayListenersTlsMode::Terminate),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+        assert!(!scope.accepts_tls_route(&tls_route(vec!["a.example.com"], 8443)));
+    }
+
+    #[test]
+    fn tls_route_ignores_a_plain_http_listener() {
+        let scope = default_scope(); // gw with no listeners at all
+        assert!(!scope.accepts_tls_route(&tls_route(vec!["a.example.com"], 8443)));
+    }
+
+    #[test]
+    fn tls_listener_hostname_narrows_the_route() {
+        // Spec: a listener hostname restricts which route hostnames it serves.
+        let scope = tls_scope(Some("*.example.com"), 8443);
+        let route = tls_route(vec!["a.example.com", "b.other.net"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        assert_eq!(by_port.get(&8443), Some(&vec!["a.example.com".to_string()]));
+    }
+
+    #[test]
+    fn tls_route_on_an_undeclared_port_is_not_served() {
+        // The Gateway asks for 9443; only 8443 is declared under `proxy.tcp`,
+        // and Sōzune does not open TCP ports on the fly.
+        let scope = tls_scope(None, 9443);
+        let route = tls_route(vec!["a.example.com"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        assert!(by_port.contains_key(&9443));
+        assert!(ports_8443().get(&9443).is_none());
+    }
+
+    #[test]
+    fn tls_apply_and_delete_round_trip_through_storage() {
+        let scope = tls_scope(None, 8443);
+        let storage: Arc<RwLock<BTreeMap<String, Entrypoint>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let route = tls_route(vec!["a.example.com"], 8443);
+
+        assert!(apply_tls_route(
+            &route,
+            &storage,
+            &index,
+            &r1(),
+            &scope,
+            &ports_8443()
+        ));
+        assert_eq!(storage.read().unwrap().len(), 1);
+
+        assert!(delete_tls_route(&route, &storage, &index));
+        assert!(storage.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tls_apply_on_undeclared_port_tracks_the_route_with_no_entrypoints() {
+        // Tracked but unserved: the route must reactivate on its own once a
+        // matching `proxy.tcp` listener exists, without the apiserver
+        // re-sending it.
+        let scope = tls_scope(None, 9443);
+        let storage: Arc<RwLock<BTreeMap<String, Entrypoint>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let route = tls_route(vec!["a.example.com"], 8443);
+
+        apply_tls_route(&route, &storage, &index, &r1(), &scope, &ports_8443());
+        assert!(storage.read().unwrap().is_empty());
+        assert_eq!(index.read().unwrap().len(), 1);
+
+        // Declare 9443 and re-resolve: the route now lands.
+        let ports = Arc::new([(9443, "tlsgw".to_string())].into_iter().collect());
+        assert!(re_resolve_all_tls(&storage, &index, &r1(), &scope, &ports));
+        assert_eq!(storage.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tls_entrypoint_ids_are_stable_and_disambiguated() {
+        let scope = tls_scope(None, 8443);
+        let one = tls_route(vec!["a.example.com"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&one);
+        let eps = tls_route_to_entrypoints(
+            &one,
+            &r1(),
+            &scope,
+            by_port.get(&8443).unwrap(),
+            "tlsgw",
+            8443,
+        );
+        // Single hostname keeps the plain `…/{rule}` shape.
+        assert_eq!(eps[0].id, "k8s-gateway-tls/default/passthrough/8443/0");
+
+        let two = tls_route(vec!["a.example.com", "b.example.com"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&two);
+        let eps = tls_route_to_entrypoints(
+            &two,
+            &r1(),
+            &scope,
+            by_port.get(&8443).unwrap(),
+            "tlsgw",
+            8443,
+        );
+        let ids: Vec<_> = eps.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"k8s-gateway-tls/default/passthrough/8443/0-h0"));
+        assert!(ids.contains(&"k8s-gateway-tls/default/passthrough/8443/0-h1"));
+    }
+
+    #[test]
+    fn tls_entrypoint_ids_cannot_collide_across_routes() {
+        // `-` as a separator would make `a-b/c` and `a/b-c` produce the same
+        // id, and one route would silently evict the other from storage.
+        let scope = tls_scope(None, 8443);
+
+        let mut first = tls_route(vec!["x.example.com"], 8443);
+        first.metadata.namespace = Some("a-b".into());
+        first.metadata.name = Some("c".into());
+
+        let mut second = tls_route(vec!["x.example.com"], 8443);
+        second.metadata.namespace = Some("a".into());
+        second.metadata.name = Some("b-c".into());
+
+        let hs = vec!["x.example.com".to_string()];
+        let a = tls_route_to_entrypoints(&first, &r1(), &scope, &hs, "tlsgw", 8443);
+        let b = tls_route_to_entrypoints(&second, &r1(), &scope, &hs, "tlsgw", 8443);
+        assert_ne!(a[0].id, b[0].id);
+    }
+
+    #[test]
+    fn tls_route_with_an_unroutable_hostname_drops_only_that_name() {
+        // CRD validation is not a guarantee we can rely on: a pattern Sōzu
+        // refuses must be caught here, where it is visible, not in the worker.
+        let scope = tls_scope(None, 8443);
+        let route = tls_route(vec!["ok.example.com", "*.*.bad.example.com"], 8443);
+        let eps = tls_route_to_entrypoints(
+            &route,
+            &r1(),
+            &scope,
+            &[
+                "ok.example.com".to_string(),
+                "*.*.bad.example.com".to_string(),
+            ],
+            "tlsgw",
+            8443,
+        );
+        let snis: Vec<_> = eps.iter().filter_map(|e| e.config.sni.clone()).collect();
+        assert_eq!(snis, vec!["ok.example.com".to_string()]);
+    }
+
+    #[test]
+    fn tls_route_across_two_ports_keeps_each_name_on_its_own_listener() {
+        // Two TLS listeners, each admitting a different name. Unioning the
+        // hostnames and serving them on one port would expose a name on a
+        // listener that refused it, and strand it on the one that wanted it.
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "sozune".into(),
+                listeners: vec![
+                    GatewayListeners {
+                        name: "a".into(),
+                        port: 8443,
+                        protocol: "TLS".into(),
+                        hostname: Some("a.example.com".into()),
+                        tls: Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
+                            mode: Some(GatewayListenersTlsMode::Passthrough),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    GatewayListeners {
+                        name: "b".into(),
+                        port: 9443,
+                        protocol: "TLS".into(),
+                        hostname: Some("b.example.com".into()),
+                        tls: Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
+                            mode: Some(GatewayListenersTlsMode::Passthrough),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+
+        let route = tls_route(vec!["a.example.com", "b.example.com"], 8443);
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        assert_eq!(by_port.get(&8443), Some(&vec!["a.example.com".to_string()]));
+        assert_eq!(by_port.get(&9443), Some(&vec!["b.example.com".to_string()]));
+    }
+
+    #[test]
+    fn only_tls_passthrough_listeners_carry_tls_routes() {
+        // Passthrough is the one shape we can serve: the bytes stay encrypted
+        // and we route on the name alone.
+        assert!(GatewayScope::listener_serves_tls_passthrough(&li_tls(
+            "tls",
+            8443,
+            None,
+            GatewayListenersTlsMode::Passthrough
+        )));
+        // Terminate would have the Gateway decrypt — that is an HTTPS
+        // entrypoint's job, not this path's.
+        assert!(!GatewayScope::listener_serves_tls_passthrough(&li_tls(
+            "tls",
+            8443,
+            None,
+            GatewayListenersTlsMode::Terminate
+        )));
+        // An HTTP listener has no ClientHello to preread.
+        assert!(!GatewayScope::listener_serves_tls_passthrough(&li(
+            "http", 80, None
+        )));
+    }
+
+    #[test]
+    fn tls_protocol_match_is_case_insensitive() {
+        // The Gateway API says `TLS`, but the field is a free-form string and
+        // manifests in the wild are not always consistent.
+        let mut lower = li_tls("tls", 8443, None, GatewayListenersTlsMode::Passthrough);
+        lower.protocol = "tls".into();
+        assert!(GatewayScope::listener_serves_tls_passthrough(&lower));
+    }
+
+    #[test]
+    fn a_tls_listener_without_a_mode_is_not_passthrough() {
+        // `tls.mode` defaults to Terminate per spec, so an unset mode must not
+        // be read as passthrough.
+        let mut no_mode = li_tls("tls", 8443, None, GatewayListenersTlsMode::Passthrough);
+        no_mode.tls_mode = None;
+        assert!(!GatewayScope::listener_serves_tls_passthrough(&no_mode));
+    }
+
+    #[test]
+    fn tcp_listener_ports_maps_port_to_name() {
+        let listeners = vec![
+            crate::config::TcpListenerConfig {
+                name: "tlsgw".into(),
+                listen: 8443,
+                ip_allow_list: Vec::new(),
+                rate_limit: None,
+                sni_preread_timeout: None,
+                sni_preread_max_bytes: None,
+            },
+            crate::config::TcpListenerConfig {
+                name: "pg".into(),
+                listen: 5432,
+                ip_allow_list: Vec::new(),
+                rate_limit: None,
+                sni_preread_timeout: None,
+                sni_preread_max_bytes: None,
+            },
+        ];
+        let ports = tcp_listener_ports(&listeners);
+        assert_eq!(ports.get(&8443).map(String::as_str), Some("tlsgw"));
+        assert_eq!(ports.get(&5432).map(String::as_str), Some("pg"));
+        assert!(ports.get(&443).is_none());
     }
 
     /// Resolver test double: returns the same canned IP for every Service
@@ -3462,6 +4595,24 @@ mod tests {
             name: name.into(),
             port,
             hostname: hostname.map(Into::into),
+            protocol: "HTTP".into(),
+            tls_mode: None,
+        }
+    }
+
+    /// A `TLS` listener in the given mode — what a TLSRoute needs to attach to.
+    fn li_tls(
+        name: &str,
+        port: i32,
+        hostname: Option<&str>,
+        mode: GatewayListenersTlsMode,
+    ) -> ListenerInfo {
+        ListenerInfo {
+            name: name.into(),
+            port,
+            hostname: hostname.map(Into::into),
+            protocol: "TLS".into(),
+            tls_mode: Some(mode),
         }
     }
 
