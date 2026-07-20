@@ -26,7 +26,8 @@ rules:
     resources: ["ingresses", "ingressclasses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes", "gateways", "gatewayclasses", "referencegrants"]
+    resources:
+      ["httproutes", "tlsroutes", "gateways", "gatewayclasses", "referencegrants"]
     verbs: ["get", "list", "watch"]
   # Status sub-resources — sōzune patches conditions on the resources it
   # owns: `status.parents[]` on HTTPRoutes (Accepted/ResolvedRefs) and
@@ -71,6 +72,12 @@ data:
         listen_address: 18180
       https:
         listen_address: 18443
+      # TLSRoute attaches here: a Gateway declaring a TLS listener on this port
+      # resolves to this named listener. Sōzune binds TCP ports at startup and
+      # never opens one from a Gateway alone.
+      tcp:
+        - name: tlspassthrough
+          listen: 18444
 
     middleware:
       port: 13180

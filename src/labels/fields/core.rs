@@ -1,5 +1,7 @@
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::model::{CircuitBreakerConfig, HealthCheckConfig, LoadBalancer, RetryConfig};
+use crate::model::{
+    CircuitBreakerConfig, HealthCheckConfig, LoadBalancer, RetryConfig, SniRejection,
+};
 use std::collections::HashMap;
 
 /// Parse a port label, falling back to the protocol default when absent or
@@ -294,12 +296,9 @@ pub fn parse_weight(
 /// Absent → `None` (the listener keeps its catch-all behaviour); an invalid
 /// pattern emits `W028` and also yields `None`.
 ///
-/// The accepted shape mirrors Sōzu's `validate_sni_pattern`, which we cannot
-/// call here because rejecting late (in the worker) would surface as a silent
-/// no-op instead of a diagnostic. Keep the two in sync: an exact hostname, or
-/// a single leading `*.` wildcard label. `/` is rejected because Sōzu's SNI
-/// route table is a pattern trie whose leftmost `/…/` label means "regex",
-/// which would silently widen routing.
+/// The accepted shape lives in [`crate::model::validate_sni`], shared with the
+/// Gateway API TLSRoute path so both reject a bad pattern where the operator
+/// can see it rather than letting Sōzu refuse it silently in the worker.
 pub fn parse_sni(
     labels: &HashMap<String, String>,
     prefix: &str,
@@ -311,53 +310,39 @@ pub fn parse_sni(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())?;
 
-    let reject = |diagnostics: &mut Vec<Diagnostic>, reason: &str, hint: &str| {
-        diagnostics.push(
-            Diagnostic::new(
-                DiagnosticCode::W028InvalidSni,
-                format!("sni {reason}; route falls back to the listener catch-all"),
-            )
-            .with_label(&key)
-            .with_value(raw)
-            .with_hint(hint.to_string()),
-        );
-        None
-    };
-
-    if !raw.is_ascii() {
-        // A non-ASCII pattern can never match the ASCII A-label on the wire,
-        // so it would load and then never route. Punycode is the user's job.
-        return reject(
-            diagnostics,
-            "is not ASCII",
-            "use the punycode A-label, e.g. xn--caf-dma.example.com",
-        );
+    match crate::model::validate_sni(raw) {
+        Ok(normalized) => Some(normalized),
+        Err(rejection) => {
+            let (reason, hint) = match rejection {
+                SniRejection::NonAscii => (
+                    "is not ASCII",
+                    "use the punycode A-label, e.g. xn--caf-dma.example.com",
+                ),
+                SniRejection::BadWildcard => (
+                    "carries a wildcard beyond a single leading `*.` label",
+                    "expected an exact host or one leading wildcard, e.g. *.example.com",
+                ),
+                SniRejection::Slash => (
+                    "contains `/`, which is not valid in a hostname",
+                    "expected a bare hostname, e.g. api.example.com",
+                ),
+                SniRejection::EmptyLabel => (
+                    "has an empty label (leading, trailing, or doubled dot)",
+                    "expected a well-formed hostname, e.g. api.example.com",
+                ),
+            };
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W028InvalidSni,
+                    format!("sni {reason}; route falls back to the listener catch-all"),
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint(hint.to_string()),
+            );
+            None
+        }
     }
-
-    let remainder = raw.strip_prefix("*.").unwrap_or(raw);
-    if remainder.is_empty() || remainder.contains('*') {
-        return reject(
-            diagnostics,
-            "carries a wildcard beyond a single leading `*.` label",
-            "expected an exact host or one leading wildcard, e.g. *.example.com",
-        );
-    }
-    if remainder.contains('/') {
-        return reject(
-            diagnostics,
-            "contains `/`, which is not valid in a hostname",
-            "expected a bare hostname, e.g. api.example.com",
-        );
-    }
-    if remainder.split('.').any(|label| label.is_empty()) {
-        return reject(
-            diagnostics,
-            "has an empty label (leading, trailing, or doubled dot)",
-            "expected a well-formed hostname, e.g. api.example.com",
-        );
-    }
-
-    Some(raw.to_ascii_lowercase())
 }
 
 /// Parse the `<prefix>retry.attempts` label into a [`RetryConfig`]. The value

@@ -205,7 +205,7 @@ pub async fn start_services(
         // Ingress provider. If the cluster does not have the CRDs
         // installed we log and move on — Ingress alone is enough.
         //
-        // Four watchers run side by side, sharing a single
+        // Five watchers run side by side, sharing a single
         // `GatewayScope`:
         //   - GatewayClass watcher    — accepts classes whose
         //     controllerName matches sōzune's identity
@@ -214,9 +214,13 @@ pub async fn start_services(
         //                               authorisations
         //   - HTTPRoute watcher       — accepts routes whose parentRefs
         //                               point to an accepted Gateway
-        // Mutations to the scope notify the HTTPRoute watcher, which
-        // re-resolves every tracked route so changes propagate without
+        //   - TLSRoute watcher        — same, for TLS passthrough; exits
+        //                               quietly when the (experimental) CRD
+        //                               is absent
+        // Mutations to the scope notify the route watchers, which
+        // re-resolve every tracked route so changes propagate without
         // waiting for the periodic tick.
+        let tcp_listeners_for_gateway = config.proxy.tcp.clone();
         tokio::spawn(async move {
             let client = match kubernetes_provider_for_gateway.build_client().await {
                 Ok(c) => c,
@@ -273,6 +277,30 @@ pub async fn start_services(
             tokio::spawn(async move {
                 if let Err(e) = gateway::run_referencegrant_watcher(rg_client, rg_scope).await {
                     error!("Gateway API: ReferenceGrant watcher failed: {}", e);
+                }
+            });
+
+            // TLSRoute serves passthrough on a real TCP listener, so it needs
+            // the port → `proxy.tcp` name table: Sōzune binds those ports at
+            // startup and will not open one from a Gateway alone.
+            let tls_client = client.clone();
+            let tls_storage = Arc::clone(&storage_for_gateway);
+            let tls_reload_tx = reload_tx_for_gateway.clone();
+            let tls_resolver = Arc::clone(&resolver);
+            let tls_scope = scope.clone();
+            let tls_listener_ports = gateway::tcp_listener_ports(&tcp_listeners_for_gateway);
+            tokio::spawn(async move {
+                if let Err(e) = gateway::run_tlsroute_watcher(
+                    tls_client,
+                    tls_storage,
+                    tls_reload_tx,
+                    tls_resolver,
+                    tls_scope,
+                    tls_listener_ports,
+                )
+                .await
+                {
+                    error!("Gateway API: TLSRoute watcher failed: {}", e);
                 }
             });
 

@@ -383,3 +383,41 @@ pub struct ForwardAuthConfig {
     #[serde(default)]
     pub trust_forward_header: bool,
 }
+
+/// Why an SNI pattern cannot be used for routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniRejection {
+    /// Non-ASCII: it could never match the A-label seen on the wire.
+    NonAscii,
+    /// A wildcard beyond a single leading `*.` label.
+    BadWildcard,
+    /// Contains `/`, which is not valid in a hostname — and which Sōzu's
+    /// pattern trie would read as a regex segment, silently widening routing.
+    Slash,
+    /// An empty label: a leading, trailing, or doubled dot.
+    EmptyLabel,
+}
+
+/// Validate an SNI routing pattern, returning it normalised (lowercased).
+///
+/// Mirrors Sōzu's `validate_sni_pattern`. Kept here rather than calling Sōzu's
+/// so both entry points — Docker labels and Gateway API TLSRoutes — reject a
+/// bad pattern where the operator can see it. Sōzu refuses one over the command
+/// socket, where the error surfaces only at `debug!` and the route silently
+/// never matches.
+pub fn validate_sni(raw: &str) -> Result<String, SniRejection> {
+    if !raw.is_ascii() {
+        return Err(SniRejection::NonAscii);
+    }
+    let remainder = raw.strip_prefix("*.").unwrap_or(raw);
+    if remainder.is_empty() || remainder.contains('*') {
+        return Err(SniRejection::BadWildcard);
+    }
+    if remainder.contains('/') {
+        return Err(SniRejection::Slash);
+    }
+    if remainder.split('.').any(|label| label.is_empty()) {
+        return Err(SniRejection::EmptyLabel);
+    }
+    Ok(raw.to_ascii_lowercase())
+}

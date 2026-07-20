@@ -15,3 +15,7 @@ nodes:
       - containerPort: 18181
         hostPort: 18181
         protocol: TCP
+      # TLS passthrough listener, for the TLSRoute suite.
+      - containerPort: 18444
+        hostPort: 18444
+        protocol: TCP

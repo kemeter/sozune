@@ -188,3 +188,99 @@ spec:
       backendRefs:
         - name: svcb
           port: 80
+---
+# --- TLS passthrough ------------------------------------------------------
+# A backend that terminates TLS itself with a self-signed cert, announcing
+# which one answered. Sōzune reads the SNI from the ClientHello and forwards
+# the encrypted bytes untouched.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tls-backend-entry
+  namespace: sozune-test
+data:
+  run.sh: |
+    #!/bin/sh
+    set -e
+    apk add --no-cache socat openssl >/dev/null 2>&1
+    openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem \
+      -days 1 -nodes -subj "/CN=passthrough.k8s-test.localhost" >/dev/null 2>&1
+    exec socat OPENSSL-LISTEN:8443,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr \
+      SYSTEM:"echo k8s-tls-passthrough-ok"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-tls
+  namespace: sozune-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svc-tls
+  template:
+    metadata:
+      labels:
+        app: svc-tls
+    spec:
+      containers:
+        - name: tls
+          image: alpine:latest
+          command: ["sh", "/entry/run.sh"]
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: entry
+              mountPath: /entry
+      volumes:
+        - name: entry
+          configMap:
+            name: tls-backend-entry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-tls
+  namespace: sozune-test
+spec:
+  selector:
+    app: svc-tls
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+# A Gateway whose TLS listener is in Passthrough mode. Its port must match a
+# `proxy.tcp` listener declared in sozune's config — Sōzune does not open TCP
+# ports on the fly.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tlsgw
+  namespace: sozune-test
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: passthrough
+      protocol: TLS
+      port: 18444
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: tls-passthrough
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: tlsgw
+      sectionName: passthrough
+  hostnames:
+    - passthrough.k8s-test.localhost
+  rules:
+    - backendRefs:
+        - name: svc-tls
+          port: 8443
