@@ -190,6 +190,16 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let active_acme = config.acme.as_ref().filter(|a| a.enabled);
     let acme_enabled = active_acme.is_some();
     let acme_challenge_port = active_acme.map(|a| a.challenge_port);
+    // The HTTPS listener only switches to the ALPN-aware gate when a
+    // tls-alpn-01 resolver is actually configured — otherwise 443 stays a
+    // direct Sōzu HTTPS listener, byte-for-byte the old path.
+    let tls_alpn_responder_port = active_acme
+        .filter(|a| {
+            a.resolvers
+                .values()
+                .any(|r| matches!(r, config::ResolverConfig::TlsAlpn01 { .. }))
+        })
+        .map(|a| a.tls_alpn_port);
 
     // Create middleware state shared between middleware server and proxy reload
     let middleware_state: middleware::MiddlewareState =
@@ -212,6 +222,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 metrics_poll_rx,
                 metrics_store: metrics_store_proxy,
                 acme_challenge_port,
+                tls_alpn_responder_port,
                 middleware_state: middleware_state_proxy,
                 middleware_port,
                 plugins,
@@ -427,8 +438,18 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             signal_handle.close();
             match result {
                 Ok(Ok(_)) => debug!("Proxy task completed successfully"),
-                Ok(Err(e)) => error!("Proxy task failed: {}", e),
-                Err(e) => error!("Proxy task panicked: {:?}", e),
+                // A proxy startup failure (e.g. the TLS-ALPN-01 gate can't bind
+                // 443) must fail the process, not just log: the HTTPS worker has
+                // already moved to loopback, so continuing would leave 443
+                // unserved while the process reports success.
+                Ok(Err(e)) => {
+                    error!("Proxy task failed: {}", e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    error!("Proxy task panicked: {:?}", e);
+                    return Err(anyhow::anyhow!("proxy task panicked: {e}"));
+                }
             }
         },
         result = secondary_tasks_future => {

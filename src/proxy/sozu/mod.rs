@@ -11,6 +11,7 @@ use crate::middleware::{self, MiddlewareState};
 use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::metrics_snapshot;
+use crate::proxy::tls_alpn_gate;
 use acme::{add_certificate, register_acme_challenge_cluster};
 use addr::{l4_backend_id, parse_backend_address};
 use builders::{
@@ -88,9 +89,24 @@ struct Channels {
     udp: L4Channels,
     http_port: u16,
     https_port: u16,
+    /// Octets of the IP the HTTPS worker listens on. `0.0.0.0` normally, but
+    /// `127.0.0.1` when the ALPN gate fronts 443 and the worker moved to
+    /// loopback. HTTPS frontends and certificates must attach to this exact
+    /// address, or Sōzu rejects them ("found no listener with address …").
+    https_ip: [u8; 4],
     /// Loopback port serving the ACME HTTP-01 challenge responder, when
     /// ACME is enabled. `None` disables every ACME-specific code path.
     acme_challenge_port: Option<u16>,
+}
+
+impl Channels {
+    /// The address the HTTPS worker's listener is bound to. HTTPS frontends and
+    /// certificates must attach here — using `0.0.0.0` when the worker is on
+    /// loopback (behind the ALPN gate) makes Sōzu reject them.
+    fn https_addr(&self) -> SocketAddress {
+        let [a, b, c, d] = self.https_ip;
+        SocketAddress::new_v4(a, b, c, d, self.https_port)
+    }
 }
 
 fn snapshot_from_storage(storage: &BTreeMap<String, Entrypoint>) -> RoutingSnapshot {
@@ -387,6 +403,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         mut metrics_poll_rx,
         metrics_store,
         acme_challenge_port,
+        tls_alpn_responder_port,
         middleware_state,
         middleware_port,
         plugins,
@@ -417,15 +434,31 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         .to_http(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
 
+    // With the ALPN gate active, the HTTPS worker steps off the public 443 onto
+    // loopback and the gate owns 443, prereading each connection's ALPN. Bound
+    // to 127.0.0.1 so nothing but the gate can reach it. Without the gate, the
+    // worker binds the public 443 directly — the unchanged default.
+    let (https_bind_ip, https_bind_port) = match tls_alpn_responder_port {
+        Some(_) => (Ipv4Addr::LOCALHOST, pick_loopback_port()?),
+        None => (Ipv4Addr::UNSPECIFIED, config.https.listen_address),
+    };
+    let https_bind = https_bind_ip.octets();
     let mut https_builder = ListenerBuilder::new_https(SocketAddress::new_v4(
-        0,
-        0,
-        0,
-        0,
-        config.https.listen_address,
+        https_bind[0],
+        https_bind[1],
+        https_bind[2],
+        https_bind[3],
+        https_bind_port,
     ));
     apply_listener_error_pages(&mut https_builder, &config.https.error_pages, "HTTPS");
     apply_listener_http2(&mut https_builder, &config.https.http2);
+    // Behind the gate the worker only ever sees loopback connections, losing the
+    // real client IP. So the gate prepends a PROXY-v2 header carrying the true
+    // peer, and the worker is told to expect it — otherwise client-IP matching,
+    // allow-lists and access logs would all read 127.0.0.1.
+    if tls_alpn_responder_port.is_some() {
+        https_builder.with_expect_proxy(true);
+    }
     let https_listener = https_builder
         .to_tls(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
@@ -481,10 +514,29 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         "Sōzu HTTP worker running on 0.0.0.0:{}",
         config.http.listen_address
     );
-    info!(
-        "Sōzu HTTPS worker running on 0.0.0.0:{}",
-        config.https.listen_address
-    );
+    match tls_alpn_responder_port {
+        Some(_) => info!(
+            "Sōzu HTTPS worker running on 127.0.0.1:{https_bind_port} (behind the TLS-ALPN-01 gate on :{})",
+            config.https.listen_address
+        ),
+        None => info!(
+            "Sōzu HTTPS worker running on 0.0.0.0:{}",
+            config.https.listen_address
+        ),
+    }
+
+    // Front 443 with the ALPN-aware gate when a tls-alpn-01 resolver exists:
+    // `acme-tls/1` handshakes go to the responder, everything else to the HTTPS
+    // worker now on `https_bind_port`. Bind synchronously so a taken 443 fails
+    // startup here — the worker has already moved to loopback, so a silent gate
+    // failure would leave 443 unserved.
+    if let Some(responder_port) = tls_alpn_responder_port {
+        let public_port = config.https.listen_address;
+        let listener = handle.block_on(tls_alpn_gate::bind(public_port))?;
+        handle.spawn(async move {
+            tls_alpn_gate::run(listener, public_port, https_bind_port, responder_port).await;
+        });
+    }
 
     // Register ACME challenge cluster if enabled (routes added per-hostname during reload)
     if let Some(challenge_port) = acme_challenge_port
@@ -497,7 +549,11 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     let storage_reload = Arc::clone(&storage);
     let trusted_proxies_reload = Arc::clone(&trusted_proxies);
     let http_port = config.http.listen_address;
-    let https_port = config.https.listen_address;
+    // The port the HTTPS worker actually listens on: the loopback port behind
+    // the gate, or the public 443. Certificates and HTTPS frontends attach to
+    // this listener, so they must use the worker's real port, not the public
+    // one the gate fronts.
+    let https_port = https_bind_port;
     let cluster_setup_delay_ms = config.cluster_setup_delay_ms;
     let reload_debounce = Duration::from_millis(config.reload_debounce_ms);
     let metrics_poll_timeout = Duration::from_millis(config.metrics_poll_timeout_ms);
@@ -513,6 +569,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         udp: udp_channels,
         http_port,
         https_port,
+        https_ip: https_bind_ip.octets(),
         acme_challenge_port,
     };
 
@@ -551,9 +608,10 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                         Some(cmd) => {
                             info!("Adding certificate for {}", cmd.hostname);
+                            let https_addr = channels.https_addr();
                             if let Err(e) = add_certificate(
                                 &mut channels.https,
-                                https_port,
+                                https_addr,
                                 &cmd.cert_pem,
                                 &cmd.chain,
                                 &cmd.key_pem,
@@ -651,9 +709,10 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                             cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                                 Some(cmd) => {
                                     info!("Adding certificate for {}", cmd.hostname);
+                                    let https_addr = channels.https_addr();
                                     if let Err(e) = add_certificate(
                                         &mut channels.https,
-                                        https_port,
+                                        https_addr,
                                         &cmd.cert_pem,
                                         &cmd.chain,
                                         &cmd.key_pem,
@@ -994,13 +1053,15 @@ fn configure_sozu_routing(
                     }
                 }
 
+                let https_addr = channels.https_addr();
+                let http_port = channels.http_port;
                 configure_http_entrypoint(
                     &mut channels.http,
                     &mut channels.https,
                     cluster_id,
                     entrypoint,
-                    channels.http_port,
-                    channels.https_port,
+                    http_port,
+                    https_addr,
                     middleware_port,
                 )?;
             }
@@ -1025,7 +1086,7 @@ fn configure_http_entrypoint(
     cluster_id: &str,
     entrypoint: &Entrypoint,
     http_port: u16,
-    https_port: u16,
+    https_addr: SocketAddress,
     middleware_port: u16,
 ) -> anyhow::Result<()> {
     // Add cluster for both HTTP and HTTPS
@@ -1149,7 +1210,7 @@ fn configure_http_entrypoint(
             if entrypoint.config.tls {
                 let https_front = RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
-                    address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                    address: https_addr,
                     hostname: hostname.clone(),
                     path: path_rule.clone(),
                     method: method.clone(),
@@ -1653,7 +1714,7 @@ fn remove_http_frontends(
     cluster_id: &str,
     entrypoint: &Entrypoint,
     http_port: u16,
-    https_port: u16,
+    https_addr: SocketAddress,
 ) {
     let (path_rule, _) = build_path_and_rewrite(
         entrypoint.config.path.as_ref(),
@@ -1694,7 +1755,7 @@ fn remove_http_frontends(
             if entrypoint.config.tls {
                 let https_front = RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
-                    address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+                    address: https_addr,
                     hostname: hostname.clone(),
                     path: path_rule.clone(),
                     method: method.clone(),
@@ -2116,13 +2177,15 @@ fn apply_routing_diff(
             info!("Removing stale cluster: {}", cluster_id);
             match old.protocol {
                 Protocol::Http => {
+                    let https_addr = channels.https_addr();
+                    let http_port = channels.http_port;
                     remove_http_frontends(
                         &mut channels.http,
                         &mut channels.https,
                         cluster_id,
                         old,
-                        channels.http_port,
-                        channels.https_port,
+                        http_port,
+                        https_addr,
                     );
                     remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
                     remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
@@ -2166,13 +2229,15 @@ fn apply_routing_diff(
             info!("Updating changed cluster: {}", cluster_id);
             match old.protocol {
                 Protocol::Http => {
+                    let https_addr = channels.https_addr();
+                    let http_port = channels.http_port;
                     remove_http_frontends(
                         &mut channels.http,
                         &mut channels.https,
                         cluster_id,
                         old,
-                        channels.http_port,
-                        channels.https_port,
+                        http_port,
+                        https_addr,
                     );
                     remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
 

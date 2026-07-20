@@ -19,6 +19,8 @@ acme:
       provider:
         type: cloudflare
         api_token_env: CF_API_TOKEN
+    edge:
+      challenge: tls-alpn-01
 ```
 
 | Field | Default | Description |
@@ -28,7 +30,8 @@ acme:
 | `certs_dir` | `/etc/sozune/certs` | Where certificates and the ACME account credentials are stored. |
 | `staging` | `true` | Use Let's Encrypt's staging environment (no rate limit, untrusted certs). **Switch to `false` for production.** |
 | `challenge_port` | `3036` | Port where Sōzune answers HTTP-01 challenges (loopback only). |
-| `resolvers` | `{}` | Named challenge resolvers (HTTP-01 or DNS-01 with a provider). Entrypoints reference one by name. |
+| `tls_alpn_port` | `3040` | Loopback port the TLS-ALPN-01 responder binds. Only used when a `tls-alpn-01` resolver is configured; never exposed directly. |
+| `resolvers` | `{}` | Named challenge resolvers (`http-01`, `dns-01` with a provider, or `tls-alpn-01`). Entrypoints reference one by name. |
 
 Top-level fields are overridable through `SOZUNE_ACME_*` environment variables. Provider credentials are always read from environment variables — never inlined in YAML.
 
@@ -118,6 +121,41 @@ acme:
 ```
 
 Each distinct `ca_server` keeps its own ACME account on disk (the account file is derived from the directory URL), so switching or mixing CAs never reuses an account that belongs to a different server. `ca_server` also accepts a non-Let's-Encrypt ACME directory (e.g. an internal CA).
+
+## TLS-ALPN-01 (no port 80, no DNS API)
+
+TLS-ALPN-01 ([RFC 8737](https://www.rfc-editor.org/rfc/rfc8737.html)) proves control of a hostname over the TLS handshake on port 443 itself — the CA connects with the ALPN protocol `acme-tls/1` and Sōzune answers with a challenge certificate. It needs **neither port 80** (unlike HTTP-01) **nor DNS API credentials** (unlike DNS-01), so it fits when 80 is closed and DNS-01 is not an option.
+
+```yaml
+acme:
+  enabled: true
+  email: ops@example.com
+  resolvers:
+    edge:
+      challenge: tls-alpn-01
+```
+
+```yaml
+# entrypoints, or Docker labels
+- "sozune.http.app.host=app.example.com"
+- "sozune.http.app.tls=true"
+- "sozune.http.app.acme.resolver=edge"
+```
+
+### How the listener changes
+
+Answering the challenge means intercepting the handshake on 443, which the HTTPS worker cannot do on its own. So **when — and only when — a `tls-alpn-01` resolver is configured**, Sōzune puts an ALPN-aware gate in front of 443:
+
+- the gate binds the public 443 and prereads each connection's ClientHello;
+- a handshake offering `acme-tls/1` is routed to the internal responder, which presents the challenge certificate;
+- every other connection is spliced, untouched, to the HTTPS worker (now on a loopback port).
+
+The preread neither decrypts nor consumes the connection: normal HTTPS reaches the worker exactly as before. **Without a `tls-alpn-01` resolver, none of this happens** — 443 stays a direct HTTPS listener.
+
+### Limitations
+
+- **Wildcards are not supported** (a TLS-ALPN-01 validator connects to a concrete name). Use DNS-01 for `*.example.com`.
+- All HTTPS traffic passes through the gate's preread hop while a `tls-alpn-01` resolver is active. It is a bounded, non-decrypting splice — the same mechanism as SNI-based TCP routing — but it is a hop the default HTTPS path does not have. The real client IP is preserved: the gate prepends a PROXY-v2 header the HTTPS worker consumes, so client-IP allow-lists, access logs and metrics stay accurate.
 
 ## How it works
 

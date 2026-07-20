@@ -62,14 +62,14 @@ pub(super) fn register_acme_challenge_cluster(
 /// Send an AddCertificate command to the HTTPS worker.
 pub(super) fn add_certificate(
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
-    https_port: u16,
+    https_addr: SocketAddress,
     cert_pem: &str,
     chain: &[String],
     key_pem: &str,
     names: &[String],
 ) -> anyhow::Result<()> {
     let cert = AddCertificate {
-        address: SocketAddress::new_v4(0, 0, 0, 0, https_port),
+        address: https_addr,
         certificate: CertificateAndKey {
             certificate: cert_pem.to_string(),
             certificate_chain: chain.to_vec(),

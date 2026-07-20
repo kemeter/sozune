@@ -111,7 +111,14 @@ pub async fn serve(port: u16, responder: TlsAlpnResponder) -> anyhow::Result<()>
     let resolver = Arc::new(ChallengeCertResolver {
         certs: responder.certs.clone(),
     });
-    let mut config = ServerConfig::builder()
+    // Name the crypto provider explicitly: `ServerConfig::builder()` panics
+    // when it can't infer one, and the dependency tree carries both aws-lc-rs
+    // (ours) and ring (via cheti), so inference fails. This also frees the
+    // responder from having to start after the global default is installed.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow::anyhow!("TLS-ALPN-01 responder crypto setup: {e}"))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     // Advertise only `acme-tls/1`: the CA offers exactly that, and a normal

@@ -45,7 +45,9 @@ services:
       SOZUNE_ACME_TEST_CA: /config/pebble-ca.pem
       RUST_LOG: sozune=debug
     volumes:
-      - "./config.acme.yaml:/config/config.yaml:ro"
+      # Which config to mount is chosen by the runner: config.acme.yaml for
+      # HTTP-01, config.alpn.yaml for TLS-ALPN-01.
+      - "./${SOZUNE_CONFIG:-config.acme.yaml}:/config/config.yaml:ro"
       - "./entrypoints.acme.yaml:/config/entrypoints.acme.yaml:ro"
       - "./pebble-ca.pem:/config/pebble-ca.pem:ro"
     networks:
