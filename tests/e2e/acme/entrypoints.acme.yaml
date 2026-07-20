@@ -1,0 +1,21 @@
+entrypoints:
+  - id: acme-site
+    name: ACME Site
+    protocol: Http
+    backends:
+      - address: "10.44.7.10"
+        port: 80
+    config:
+      hostnames:
+        - "acme.test"
+      path:
+        rule_type: Prefix
+        value: "/"
+      # tls:true routes this hostname onto the HTTPS worker and marks it for
+      # ACME; `acme.resolver` picks which resolver provisions the cert.
+      tls: true
+      acme:
+        resolver: pebble
+      strip_prefix: false
+      priority: 10
+      headers: []

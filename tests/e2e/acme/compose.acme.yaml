@@ -1,0 +1,65 @@
+# ACME e2e harness. Pebble (Let's Encrypt's test CA) issues a real certificate
+# to Sōzune over a real challenge, hermetically — no public ACME, no port 80 on
+# the host. Everything shares one Docker network so Pebble can resolve the test
+# domain to the Sōzune container by network alias and reach it for validation.
+services:
+  # The test CA. Serves its ACME directory on :14000 over HTTPS with a
+  # self-signed root; Sōzune trusts that root via SOZUNE_ACME_TEST_CA.
+  # httpPort/tlsPort are 80/443 (see pebble-config.json) so validation targets
+  # the same ports Sōzune actually listens on.
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "/test/config/pebble-config.json"]
+    volumes:
+      - "./pebble-config.json:/test/config/pebble-config.json:ro"
+    environment:
+      # Validate immediately instead of sleeping a random 0-15s per attempt.
+      PEBBLE_VA_NOSLEEP: "1"
+    networks:
+      default:
+    ports:
+      - "14000:14000" # ACME directory, for pulling the CA from the host
+
+  # A plain backend behind the routed hostname, so the entrypoint Sōzune
+  # provisions a cert for actually has something to serve.
+  backend:
+    image: traefik/whoami
+    networks:
+      default:
+        # Fixed IP: Sōzune's config_file backends must be IP literals (Sōzu
+        # rejects DNS-style addresses), so the entrypoint points here directly.
+        ipv4_address: 10.44.7.10
+
+  # Sōzune under test, built from the repo. Runs in the network so Pebble can
+  # reach it as `acme.test` (the alias below) on port 80 for the HTTP-01
+  # challenge.
+  sozune:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    depends_on:
+      - pebble
+      - backend
+    environment:
+      CONFIG_PATH: /config/config.yaml
+      SOZUNE_ACME_TEST_CA: /config/pebble-ca.pem
+      RUST_LOG: sozune=debug
+    volumes:
+      - "./config.acme.yaml:/config/config.yaml:ro"
+      - "./entrypoints.acme.yaml:/config/entrypoints.acme.yaml:ro"
+      - "./pebble-ca.pem:/config/pebble-ca.pem:ro"
+    networks:
+      default:
+        aliases:
+          # Pebble resolves the challenged hostname to this container.
+          - acme.test
+    ports:
+      - "18080:80"
+      - "18443:443"
+      - "18081:8081" # API, to assert the issued cert landed
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.44.7.0/24

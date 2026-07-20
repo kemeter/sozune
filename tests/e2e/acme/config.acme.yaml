@@ -1,0 +1,33 @@
+# Sōzune config for the ACME e2e harness. One HTTPS entrypoint for `acme.test`,
+# backed by the whoami container, provisioned through Pebble via HTTP-01.
+providers:
+  config_file:
+    enabled: true
+    path: /config/entrypoints.acme.yaml
+  docker:
+    enabled: false
+
+api:
+  enabled: true
+  listen_address: "0.0.0.0:8081"
+  users:
+    - name: admin
+      # sha256 of "admin"
+      hash: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+      role: admin
+
+proxy:
+  http:
+    listen_address: 80
+  https:
+    listen_address: 443
+
+acme:
+  enabled: true
+  email: "e2e@acme.test"
+  certs_dir: /tmp/acme-certs
+  resolvers:
+    pebble:
+      challenge: http-01
+      # Pebble's ACME directory. Trusted via SOZUNE_ACME_TEST_CA.
+      ca_server: "https://pebble:14000/dir"
