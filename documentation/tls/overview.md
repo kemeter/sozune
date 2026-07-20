@@ -48,6 +48,13 @@ Common setups:
 
 Sōzune supports SNI natively (inherited from Sōzu). Many domains, each with its own certificate, share the same listener.
 
+The name serves two distinct purposes, depending on the entrypoint:
+
+- **On an HTTPS entrypoint**, Sōzune terminates TLS and uses the name to pick which certificate to present. That is the case described above.
+- **On a TCP entrypoint**, TLS is never terminated. Sōzune reads the name to choose a backend and forwards the encrypted bytes untouched; the client's handshake completes with the backend, against the backend's certificate. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough).
+
+Use the first when Sōzune should own the certificates, the second when the backend must.
+
 ## HTTPS redirect
 
 Force HTTP traffic to HTTPS — see [Redirects](/documentation/middleware/redirects).

@@ -134,6 +134,14 @@ pub struct EntrypointConfig {
     pub compress: bool,
     #[serde(default)]
     pub entrypoint: Option<String>,
+    /// SNI hostname this TCP entrypoint matches, for TLS passthrough routing.
+    /// The proxy reads the name from the ClientHello and picks a backend
+    /// without terminating TLS. Accepts an exact host or a single leading
+    /// `*.` wildcard label; kept separate from `hostnames` because that is an
+    /// HTTP `Host` header match, a different layer with different semantics.
+    /// `None` keeps the listener's legacy catch-all behaviour.
+    #[serde(default)]
+    pub sni: Option<String>,
     /// HTTP methods this entrypoint matches. Empty means any method.
     /// Methods are uppercased and validated against the standard verbs
     /// (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE).

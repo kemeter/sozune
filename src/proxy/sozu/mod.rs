@@ -29,7 +29,7 @@ use sozu_command_lib::{
         response_content::ContentType,
     },
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -232,17 +232,22 @@ fn spawn_tcp_workers(
         // loopback port — stored as `L4ListenerChannel.port`, which
         // configure_tcp_entrypoint already uses to build the frontend address.
         let loopback_port = pick_loopback_port()?;
-        let listener_config =
-            ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, loopback_port))
-                .to_tcp(None)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Could not create TCP listener `{}` on 127.0.0.1:{}: {}",
-                        tcp_cfg.name,
-                        loopback_port,
-                        e
-                    )
-                })?;
+        let mut builder =
+            ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, loopback_port));
+        // Bounds on the SNI preread, only consulted once an SNI-scoped frontend
+        // targets this listener. Set directly: `ListenerBuilder` exposes these
+        // as public fields with no `with_…` methods. `None` leaves Sōzu's
+        // defaults (5s / 16 KiB) in place.
+        builder.sni_preread_timeout = tcp_cfg.sni_preread_timeout;
+        builder.sni_preread_max_bytes = tcp_cfg.sni_preread_max_bytes;
+        let listener_config = builder.to_tcp(None).map_err(|e| {
+            anyhow::anyhow!(
+                "Could not create TCP listener `{}` on 127.0.0.1:{}: {}",
+                tcp_cfg.name,
+                loopback_port,
+                e
+            )
+        })?;
 
         let (mut command, proxy_chan) = Channel::generate(1000, config.command_buffer_max_bytes)
             .map_err(|e| {
@@ -742,7 +747,7 @@ fn handle_reload(
         }
     };
 
-    let current_snapshot = snapshot_from_storage(&storage_read);
+    let mut current_snapshot = snapshot_from_storage(&storage_read);
 
     // Run the reload under a shared consecutive-timeout counter. A worker that
     // goes silent is given up on after a few failed acks, so it can't stall the
@@ -762,7 +767,16 @@ fn handle_reload(
             cluster_setup_delay_ms,
             middleware_port,
         ) {
-            Ok(()) => info!("Configuration reloaded successfully"),
+            Ok(skipped) => {
+                // Entrypoints we chose not to send must not be recorded as
+                // live, or the next reload would see them unchanged and never
+                // apply them — leaving the route dead even after the operator
+                // fixes what blocked it.
+                for cluster_id in &skipped {
+                    current_snapshot.remove(cluster_id);
+                }
+                info!("Configuration reloaded successfully");
+            }
             Err(e) => error!("Failed to reload configuration: {}", e),
         }
     });
@@ -815,17 +829,103 @@ fn update_middleware_routes(
     }
 }
 
+/// Names of TCP entrypoints Sōzu would reject, grouped per listener.
+///
+/// Sōzu forbids a TCP listener from carrying both SNI-scoped and catch-all
+/// frontends: the first shape wins and the rest are refused. It reports that
+/// over the command socket, where `configure_tcp_entrypoint` can only log it
+/// at `debug!` — invisible to the operator, who just sees a route that never
+/// matches. So we catch the clash here, while we still have every entrypoint
+/// in view, and name the offenders.
+///
+/// Returns, per listener, the entrypoints on the minority side — the ones to
+/// change — as `(cluster_id, name)` pairs. Ties break toward reporting the
+/// catch-all ones, since adding an `sni` label is the usual fix.
+///
+/// Callers must *skip* these entrypoints rather than merely warn: sending a
+/// frontend Sōzu will refuse, while still recording it as applied, leaves the
+/// route permanently unreachable — the next reload sees it unchanged against
+/// the snapshot and never retries it, even once the clash is resolved.
+fn tcp_sni_mode_clashes(
+    storage: &BTreeMap<String, Entrypoint>,
+) -> BTreeMap<String, Vec<(String, String)>> {
+    type Side<'a> = Vec<(&'a str, &'a str)>;
+    let mut per_listener: BTreeMap<&str, (Side, Side)> = BTreeMap::new();
+
+    for (cluster_id, entrypoint) in storage {
+        if !matches!(entrypoint.protocol, Protocol::Tcp) {
+            continue;
+        }
+        let Some(listener) = entrypoint.config.entrypoint.as_deref() else {
+            continue;
+        };
+        let (with_sni, without_sni) = per_listener.entry(listener).or_default();
+        let side = match entrypoint.config.sni {
+            Some(_) => with_sni,
+            None => without_sni,
+        };
+        side.push((cluster_id.as_str(), entrypoint.name.as_str()));
+    }
+
+    per_listener
+        .into_iter()
+        .filter(|(_, (with, without))| !with.is_empty() && !without.is_empty())
+        .map(|(listener, (with, without))| {
+            let minority = if with.len() < without.len() {
+                with
+            } else {
+                without
+            };
+            (
+                listener.to_string(),
+                minority
+                    .into_iter()
+                    .map(|(id, name)| (id.to_string(), name.to_string()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Cluster IDs to leave out of this reload because their listener mixes
+/// SNI-routed and catch-all frontends. Logs one line per affected listener.
+fn skipped_on_sni_clash(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<String> {
+    let mut skipped = BTreeSet::new();
+
+    for (listener, offenders) in tcp_sni_mode_clashes(storage) {
+        error!(
+            "TCP listener `{}` mixes SNI-routed and catch-all entrypoints, which Sōzu refuses. \
+             Skipping {} for now — give them an `sni` of their own, or move them to a \
+             separate listener, and they will be applied on the next reload.",
+            listener,
+            offenders
+                .iter()
+                .map(|(_, name)| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        skipped.extend(offenders.into_iter().map(|(id, _)| id));
+    }
+
+    skipped
+}
+
+/// Applies `storage` to the workers. Returns the cluster IDs deliberately left
+/// out, which the caller must also drop from the snapshot so they are retried
+/// once whatever blocks them is fixed.
 fn configure_sozu_routing(
     channels: &mut Channels,
     storage: &BTreeMap<String, Entrypoint>,
     previous: &RoutingSnapshot,
     cluster_setup_delay_ms: u64,
     middleware_port: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BTreeSet<String>> {
     info!(
         "Applying Sōzu configuration for {} entrypoints",
         storage.len()
     );
+
+    let skipped = skipped_on_sni_clash(storage);
 
     // Sort entrypoints by priority descending (higher priority first).
     // Since Sozu Pre rules are matched in insertion order, registering
@@ -834,6 +934,13 @@ fn configure_sozu_routing(
     sorted_entrypoints.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
 
     for (cluster_id, entrypoint) in sorted_entrypoints {
+        // Sending a frontend Sōzu is going to refuse would still mark it
+        // applied, and the snapshot would then hide it from every later
+        // reload. Leave it out entirely instead.
+        if skipped.contains(cluster_id) {
+            continue;
+        }
+
         // Skip entrypoints that are byte-for-byte identical to the previous
         // snapshot. apply_routing_diff() only removes stale/changed entries,
         // so anything still in `previous` is already live in the workers and
@@ -909,7 +1016,7 @@ fn configure_sozu_routing(
     }
 
     info!("Sōzu configuration applied successfully");
-    Ok(())
+    Ok(skipped)
 }
 
 fn configure_http_entrypoint(
@@ -1239,6 +1346,11 @@ fn configure_tcp_entrypoint(
         // pre-accept forwarder), so the frontend address must match: 127.0.0.1,
         // not 0.0.0.0. `listener_port` is the loopback port here.
         address: SocketAddress::new_v4(127, 0, 0, 1, listener_port),
+        // `None` keeps the legacy catch-all frontend. `Some` makes the worker
+        // preread the ClientHello and route on the name, without terminating
+        // TLS. Sōzu keys a frontend on `(address, sni, alpn)`, so removal must
+        // pass the identical value — see `remove_tcp_entrypoint`.
+        sni: entrypoint.config.sni.clone(),
         ..Default::default()
     };
 
@@ -2121,6 +2233,11 @@ fn remove_tcp_entrypoint(tcp_channels: &mut L4Channels, cluster_id: &str, entryp
         // pre-accept forwarder), so the frontend address must match: 127.0.0.1,
         // not 0.0.0.0. `listener_port` is the loopback port here.
         address: SocketAddress::new_v4(127, 0, 0, 1, listener_port),
+        // Must mirror what `configure_tcp_entrypoint` sent: Sōzu keys a
+        // frontend on `(address, sni, alpn)` and a removal whose tuple does
+        // not match is a silent no-op, which would leave a stale route behind
+        // on every reload.
+        sni: entrypoint.config.sni.clone(),
         ..Default::default()
     };
     if let Err(e) = send_to_worker(
@@ -2257,6 +2374,133 @@ mod tests {
         assert_eq!(cfg.alpn_protocols, vec!["h2".to_string()]);
     }
 
+    /// A TCP entrypoint on `listener`, SNI-routed when `sni` is `Some`.
+    fn tcp_ep(name: &str, listener: &str, sni: Option<&str>) -> Entrypoint {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 5432)]);
+        ep.id = name.into();
+        ep.name = name.into();
+        ep.protocol = Protocol::Tcp;
+        ep.config.hostnames = Vec::new();
+        ep.config.entrypoint = Some(listener.into());
+        ep.config.sni = sni.map(str::to_string);
+        ep
+    }
+
+    fn storage_of(entrypoints: Vec<Entrypoint>) -> BTreeMap<String, Entrypoint> {
+        entrypoints
+            .into_iter()
+            .map(|ep| (ep.id.clone(), ep))
+            .collect()
+    }
+
+    #[test]
+    fn all_sni_on_one_listener_is_not_a_clash() {
+        let storage = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("b", "gateway", Some("b.example.com")),
+        ]);
+        assert!(tcp_sni_mode_clashes(&storage).is_empty());
+    }
+
+    #[test]
+    fn all_catch_all_on_one_listener_is_not_a_clash() {
+        // The pre-2.2.0 shape: one listener, one cluster, no SNI anywhere.
+        let storage = storage_of(vec![tcp_ep("a", "gateway", None)]);
+        assert!(tcp_sni_mode_clashes(&storage).is_empty());
+    }
+
+    /// Just the names on the minority side, for readable assertions.
+    fn clash_names(storage: &BTreeMap<String, Entrypoint>, listener: &str) -> Vec<String> {
+        tcp_sni_mode_clashes(storage)
+            .get(listener)
+            .map(|offenders| offenders.iter().map(|(_, name)| name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn mixing_sni_and_catch_all_on_one_listener_is_reported() {
+        let storage = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("b", "gateway", Some("b.example.com")),
+            tcp_ep("legacy", "gateway", None),
+        ]);
+        // The lone catch-all is the minority, so it is what we name.
+        assert_eq!(clash_names(&storage, "gateway"), vec!["legacy".to_string()]);
+    }
+
+    #[test]
+    fn clash_names_the_smaller_side() {
+        let storage = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("x", "gateway", None),
+            tcp_ep("y", "gateway", None),
+        ]);
+        assert_eq!(clash_names(&storage, "gateway"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn clashing_entrypoints_are_skipped_by_cluster_id() {
+        // The skip list is keyed by cluster id, not name — that is what the
+        // reload loop and the snapshot are indexed on.
+        let storage = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("legacy", "gateway", None),
+        ]);
+        let skipped = skipped_on_sni_clash(&storage);
+        assert!(skipped.contains("legacy"));
+        assert!(!skipped.contains("a"));
+    }
+
+    #[test]
+    fn a_clean_listener_skips_nothing() {
+        let storage = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("b", "gateway", Some("b.example.com")),
+        ]);
+        assert!(skipped_on_sni_clash(&storage).is_empty());
+    }
+
+    #[test]
+    fn resolving_a_clash_lets_the_previously_skipped_route_through() {
+        // The regression this guards: a skipped entrypoint must stay out of the
+        // snapshot, so that once the clash is fixed it is applied instead of
+        // being judged "unchanged" and silently left dead forever.
+        let clashing = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("legacy", "gateway", None),
+        ]);
+        assert!(skipped_on_sni_clash(&clashing).contains("legacy"));
+
+        // Operator gives the catch-all an SNI of its own.
+        let fixed = storage_of(vec![
+            tcp_ep("a", "gateway", Some("a.example.com")),
+            tcp_ep("legacy", "gateway", Some("legacy.example.com")),
+        ]);
+        assert!(skipped_on_sni_clash(&fixed).is_empty());
+    }
+
+    #[test]
+    fn separate_listeners_never_clash() {
+        // Each listener is judged on its own — this is the documented fix for
+        // a clash, so it must not itself be reported.
+        let storage = storage_of(vec![
+            tcp_ep("a", "sni-gw", Some("a.example.com")),
+            tcp_ep("legacy", "raw-gw", None),
+        ]);
+        assert!(tcp_sni_mode_clashes(&storage).is_empty());
+    }
+
+    #[test]
+    fn non_tcp_entrypoints_are_ignored_by_the_clash_check() {
+        // An HTTP entrypoint has no TCP frontend and cannot clash, even when it
+        // carries hostnames that look SNI-ish.
+        let mut http = base_ep(vec![Backend::new("10.0.0.9", 80)]);
+        http.id = "web".into();
+        http.config.entrypoint = Some("gateway".into());
+        let storage = storage_of(vec![http, tcp_ep("a", "gateway", Some("a.example.com"))]);
+        assert!(tcp_sni_mode_clashes(&storage).is_empty());
+    }
+
     fn base_ep(backends: Vec<Backend>) -> Entrypoint {
         Entrypoint {
             id: "svc".into(),
@@ -2294,6 +2538,7 @@ mod tests {
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,
+                sni: None,
                 methods: Vec::new(),
                 acme: None,
                 plugins: Vec::new(),

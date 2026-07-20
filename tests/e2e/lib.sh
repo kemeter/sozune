@@ -19,6 +19,7 @@ UDP_ECHO_PORT=15557
 TCP_ALLOW_PORT=15558
 TCP_DENY_PORT=15559
 TCP_FLOOD_PORT=15560
+TCP_SNI_PORT=15561
 API_USER="admin"
 API_PASSWORD="test-secret-token"
 API_PASSWORD_HASH=$(printf '%s' "$API_PASSWORD" | sha256sum | cut -d' ' -f1)
@@ -111,6 +112,19 @@ wait_for_tcp_open() {
         i=$((i + 1))
     done
     return 1
+}
+
+# Open a TLS connection announcing `servername` and capture what the backend
+# sends back. Used for SNI passthrough: Sōzune never terminates TLS here, so the
+# handshake is with the backend and its self-signed cert — hence no verification.
+# Prints the backend's plaintext banner, or nothing if the connection was
+# refused (which is itself the expected outcome for an unmatched SNI).
+tls_sni_probe() {
+    local host="$1" port="$2" servername="$3"
+    # `-quiet` keeps the handshake chatter on stderr, so stdout carries only
+    # what the backend wrote. The self-signed warning is expected and ignored.
+    timeout 5 openssl s_client -connect "$host:$port" -servername "$servername" \
+        -quiet -verify_quiet </dev/null 2>/dev/null || true
 }
 
 # Send a UDP datagram and capture the reply. `nc -u -w 2` waits up to 2s for the

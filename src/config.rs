@@ -655,6 +655,17 @@ pub struct TcpListenerConfig {
     /// pre-accept forwarder. Absent = no limit.
     #[serde(default)]
     pub rate_limit: Option<TcpRateLimit>,
+    /// Seconds to wait for a complete TLS ClientHello before giving up on a
+    /// connection, when this listener carries SNI-routed entrypoints. Absent
+    /// leaves Sōzu's default (5s). Must not exceed the global `front_timeout`.
+    #[serde(default)]
+    pub sni_preread_timeout: Option<u32>,
+    /// Cap on the bytes buffered while looking for the ClientHello. Absent
+    /// leaves Sōzu's default (16384). This bounds the hello, not the
+    /// connection: whatever the client coalesced after it still reaches the
+    /// backend intact.
+    #[serde(default)]
+    pub sni_preread_max_bytes: Option<u32>,
 }
 
 /// Per-source connection-rate limit for a TCP listener. A token bucket: a burst

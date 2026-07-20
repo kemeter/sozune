@@ -169,6 +169,7 @@ mod tests {
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,
+                sni: None,
                 methods: Vec::new(),
                 acme: None,
                 plugins: Vec::new(),
