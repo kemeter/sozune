@@ -41,6 +41,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "forwardAuth.responseHeaders",
     "forwardAuth.trustForwardHeader",
     "entrypoint",
+    "sni",
     "methods",
     "plugins",
     "matchHeaders",

@@ -363,6 +363,15 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.http.app.weight=90\nsozune.http.app.loadBalancer=random"),
     },
     Entry {
+        code: "W028",
+        title: "Invalid SNI pattern",
+        severity: "warning",
+        cause: "An `sni` label was not a routable pattern — empty, non-ASCII, carrying a wildcard beyond a single leading `*.` label, containing `/`, or holding an empty label — or it was set on a UDP route, which has no TLS ClientHello to read.",
+        effect: "The SNI is dropped and the route falls back to the listener's catch-all behaviour, so it never matches the name you intended.",
+        fix: "Use an exact hostname or one leading wildcard label. Write internationalised names as punycode A-labels. On UDP, remove the label or move the route to a TCP entrypoint.",
+        example: Some("sozune.tcp.db.entrypoint=postgres\nsozune.tcp.db.sni=db.example.com"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         severity: "info",

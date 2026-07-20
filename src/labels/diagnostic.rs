@@ -61,6 +61,11 @@ pub enum DiagnosticCode {
     /// A `weight` label was not a valid non-negative integer; the backend keeps
     /// the default weight.
     W027InvalidWeight,
+    /// An `sni` label was not a routable pattern (empty, non-ASCII, or a
+    /// wildcard beyond a single leading `*.` label), or was set on a protocol
+    /// that does not read the ClientHello. The route falls back to the
+    /// listener's catch-all behaviour.
+    W028InvalidSni,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -102,6 +107,7 @@ impl DiagnosticCode {
             DiagnosticCode::W025InvalidInFlightReq => "W025",
             DiagnosticCode::W026InvalidPluginConfig => "W026",
             DiagnosticCode::W027InvalidWeight => "W027",
+            DiagnosticCode::W028InvalidSni => "W028",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -153,6 +159,7 @@ impl DiagnosticCode {
             DiagnosticCode::W025InvalidInFlightReq,
             DiagnosticCode::W026InvalidPluginConfig,
             DiagnosticCode::W027InvalidWeight,
+            DiagnosticCode::W028InvalidSni,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

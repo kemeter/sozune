@@ -489,6 +489,7 @@ mod tests {
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,
+                sni: None,
                 methods: Vec::new(),
                 add_prefix: None,
                 rewrite_host: None,

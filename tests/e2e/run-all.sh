@@ -108,6 +108,10 @@ proxy:
       rate_limit:
         max_conns: 2
         per_seconds: 60
+    - name: tcpsni
+      listen: $TCP_SNI_PORT
+      sni_preread_timeout: 5
+      sni_preread_max_bytes: 16384
   udp:
     - name: udpecho
       listen: $UDP_ECHO_PORT
@@ -518,6 +522,44 @@ services:
       - "sozune.enable=true"
       - "sozune.tcp.tcpflood.entrypoint=tcpflood"
       - "sozune.tcp.tcpflood.port=9000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  # SNI passthrough: both terminate TLS themselves with their own self-signed
+  # cert and announce which one answered. Sōzune only reads the ClientHello to
+  # pick between them — it never decrypts. Certs are built at boot so no key
+  # material is written to the repo.
+  svc-sni-alpha:
+    image: alpine
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache socat openssl >/dev/null 2>&1 &&
+         openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem
+           -days 1 -nodes -subj /CN=alpha.sni.test >/dev/null 2>&1 &&
+         exec socat OPENSSL-LISTEN:9000,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr
+           SYSTEM:'echo sni-backend-alpha'"
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.snialpha.entrypoint=tcpsni"
+      - "sozune.tcp.snialpha.port=9000"
+      - "sozune.tcp.snialpha.sni=alpha.sni.test"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-sni-beta:
+    image: alpine
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache socat openssl >/dev/null 2>&1 &&
+         openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem
+           -days 1 -nodes -subj /CN=beta.sni.test >/dev/null 2>&1 &&
+         exec socat OPENSSL-LISTEN:9000,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr
+           SYSTEM:'echo sni-backend-beta'"
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.snibeta.entrypoint=tcpsni"
+      - "sozune.tcp.snibeta.port=9000"
+      - "sozune.tcp.snibeta.sni=beta.sni.test"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 

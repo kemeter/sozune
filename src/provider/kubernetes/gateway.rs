@@ -1886,6 +1886,7 @@ fn rule_to_entrypoints(
                     sticky_session: false,
                     compress: false,
                     entrypoint: None,
+                    sni: None,
                     methods,
                     acme: None,
                     plugins: Vec::new(),

@@ -274,6 +274,7 @@ fn build_entrypoint(
             sticky_session,
             compress,
             entrypoint: None,
+            sni: None,
             methods,
             acme: None,
             plugins,
@@ -361,6 +362,26 @@ fn build_l4_entrypoint(
         }
     }
 
+    // SNI routing reads the TLS ClientHello, which only exists on a stream.
+    // Warn rather than silently drop, so a misplaced label is visible.
+    let sni = match proto {
+        "udp" => {
+            let sni_key = format!("{prefix}sni");
+            if labels.contains_key(&sni_key) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::W028InvalidSni,
+                        "sni is TCP-only; UDP carries no TLS ClientHello to read",
+                    )
+                    .with_label(&sni_key)
+                    .with_hint("move the route to a TCP entrypoint, or remove the label"),
+                );
+            }
+            None
+        }
+        _ => core::parse_sni(labels, &prefix, diagnostics),
+    };
+
     let port = core::parse_port(labels, &prefix, proto, diagnostics);
     let priority = core::parse_priority(labels, &prefix, diagnostics);
     // Flow-affine algorithms (hrw/maglev) are only honored for UDP.
@@ -407,6 +428,7 @@ fn build_l4_entrypoint(
             sticky_session: false,
             compress: false,
             entrypoint: Some(entrypoint_ref),
+            sni,
             methods: Vec::new(),
             acme: None,
             plugins: Vec::new(),
@@ -659,6 +681,103 @@ mod tests {
         assert!(matches!(tcp.protocol, Protocol::Tcp));
         assert_eq!(tcp.config.entrypoint.as_deref(), Some("postgres"));
         assert_eq!(tcp.backends[0].port, 5432);
+    }
+
+    #[test]
+    fn tcp_sni_label_is_parsed_and_lowercased() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.tcp.db.entrypoint", "postgres"),
+                ("sozune.tcp.db.port", "5432"),
+                ("sozune.tcp.db.sni", "DB.Example.COM"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let tcp = r.entrypoints.get("tcp_db").unwrap();
+        // Lowercased to match the wire, which is what Sōzu keys the route on.
+        assert_eq!(tcp.config.sni.as_deref(), Some("db.example.com"));
+        assert!(!has_code(&r, DiagnosticCode::W028InvalidSni));
+    }
+
+    #[test]
+    fn tcp_sni_accepts_single_leading_wildcard() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.tcp.db.entrypoint", "postgres"),
+                ("sozune.tcp.db.sni", "*.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let tcp = r.entrypoints.get("tcp_db").unwrap();
+        assert_eq!(tcp.config.sni.as_deref(), Some("*.example.com"));
+        assert!(!has_code(&r, DiagnosticCode::W028InvalidSni));
+    }
+
+    #[test]
+    fn tcp_sni_rejects_unroutable_patterns_with_w028() {
+        // Each of these would either be refused by Sōzu or load and never
+        // match, so they must be caught here where the operator can see it.
+        for bad in [
+            "*.*.example.com",   // wildcard beyond one leading label
+            "foo.*.example.com", // wildcard not leading
+            "*",                 // bare wildcard, no remainder
+            "/regex/.example",   // `/` is a trie regex marker in Sōzu
+            ".example.com",      // empty leading label
+            "example..com",      // doubled dot
+            "café.example.com",  // non-ASCII never matches the A-label
+        ] {
+            let c = candidate(
+                &[
+                    ("sozune.enable", "true"),
+                    ("sozune.tcp.db.entrypoint", "postgres"),
+                    ("sozune.tcp.db.sni", bad),
+                ],
+                vec![net("bridge", "10.0.0.1")],
+            );
+            let r = parse(&c);
+            let tcp = r.entrypoints.get("tcp_db").unwrap();
+            assert_eq!(tcp.config.sni, None, "`{bad}` should not yield an SNI");
+            assert!(
+                has_code(&r, DiagnosticCode::W028InvalidSni),
+                "`{bad}` should emit W028"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_sni_label_is_rejected_with_w028() {
+        // Datagrams carry no ClientHello, so an `sni` there is always a mistake.
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.udp.dns.entrypoint", "dnslistener"),
+                ("sozune.udp.dns.port", "53"),
+                ("sozune.udp.dns.sni", "dns.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.7")],
+        );
+        let r = parse(&c);
+        let udp = r.entrypoints.get("udp_dns").unwrap();
+        assert_eq!(udp.config.sni, None);
+        assert!(has_code(&r, DiagnosticCode::W028InvalidSni));
+    }
+
+    #[test]
+    fn tcp_without_sni_label_keeps_catch_all() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.tcp.db.entrypoint", "postgres"),
+                ("sozune.tcp.db.port", "5432"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        assert_eq!(r.entrypoints.get("tcp_db").unwrap().config.sni, None);
     }
 
     #[test]
