@@ -68,6 +68,30 @@ impl Backoff {
         }
     }
 
+    /// Drop backoff state for any hostname not in `live`. Called each cycle so
+    /// an entry whose hostname left the config cannot keep the renewal loop
+    /// waking on an overdue, unactionable deadline.
+    fn retain_hostnames(&self, live: &std::collections::HashSet<&str>) {
+        if let Ok(mut failures) = self.failures.write() {
+            failures.retain(|hostname, _| live.contains(hostname.as_str()));
+        }
+    }
+
+    /// Shortest remaining backoff across all failing hostnames, or `None` when
+    /// none is waiting. The renewal loop uses this to wake up exactly when the
+    /// soonest retry is due instead of sleeping the full 12h cycle — without
+    /// it, a transient first-attempt failure (e.g. the challenge route not yet
+    /// in place at cold start) would strand a hostname for 12h even though its
+    /// backoff said 60s.
+    fn soonest_retry(&self) -> Option<Duration> {
+        let failures = self.failures.read().ok()?;
+        let now = Instant::now();
+        failures
+            .values()
+            .map(|state| state.next_attempt_at.saturating_duration_since(now))
+            .min()
+    }
+
     /// Record a failed attempt and schedule the next one. When a `retry after`
     /// instant is present (Let's Encrypt rate limiting), honor it: the next
     /// attempt is deferred until at least that time, even if the backoff
@@ -145,9 +169,17 @@ impl AcmeManager {
             error!("Initial ACME provisioning failed: {}", e);
         }
 
-        // Renewal loop: check every 12 hours OR when notified of new entrypoints
+        // Renewal loop: check every 12 hours, when notified of new entrypoints,
+        // or as soon as a failing hostname's backoff is due — otherwise a
+        // transient failure would wait out the full 12h before its 60s retry.
         let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
         loop {
+            // A far-future default so the branch is inert when nothing is
+            // backing off; `sleep` needs a concrete duration to await.
+            let until_retry = self
+                .backoff
+                .soonest_retry()
+                .unwrap_or(Duration::from_secs(12 * 3600));
             tokio::select! {
                 _ = interval.tick() => {
                     info!("Running ACME renewal check");
@@ -156,6 +188,9 @@ impl AcmeManager {
                     // Small delay to let storage settle
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     info!("Running ACME check after storage update");
+                }
+                _ = tokio::time::sleep(until_retry) => {
+                    info!("Retrying ACME provisioning after backoff");
                 }
             }
             if let Err(e) = self.provision_all().await {
@@ -204,10 +239,20 @@ impl AcmeManager {
                     }
                 }
                 false => {
+                    // No longer needs a cert (already valid, or one appeared on
+                    // disk since the last failure). Clear any stale backoff, or
+                    // the renewal loop would wake on its overdue deadline every
+                    // pass with nothing to do — a busy spin.
+                    self.backoff.record_success(hostname);
                     debug!("Certificate for {} is still valid, skipping", hostname);
                 }
             }
         }
+
+        // Drop backoff entries for hostnames no longer in the config at all, so
+        // a removed-then-failed hostname can't hold the loop awake forever.
+        let live: std::collections::HashSet<&str> = certs.iter().map(|(h, _)| h.as_str()).collect();
+        self.backoff.retain_hostnames(&live);
 
         Ok(())
     }
@@ -439,15 +484,16 @@ impl AcmeManager {
         let store = FileAccountStore::new(self.certs_dir.join(account_file_for(server_url)));
 
         match store.load() {
-            Ok(Some(credentials)) => {
-                match Account::builder()?.from_credentials(credentials).await {
-                    Ok(account) => {
-                        info!("Loaded existing ACME account");
-                        return Ok(account);
-                    }
-                    Err(e) => warn!("Failed to restore ACME account, creating new one: {}", e),
+            Ok(Some(credentials)) => match account_builder(server_url)?
+                .from_credentials(credentials)
+                .await
+            {
+                Ok(account) => {
+                    info!("Loaded existing ACME account");
+                    return Ok(account);
                 }
-            }
+                Err(e) => warn!("Failed to restore ACME account, creating new one: {}", e),
+            },
             Ok(None) => {}
             Err(e) => warn!(
                 "Failed to load account credentials, creating new one: {}",
@@ -461,7 +507,7 @@ impl AcmeManager {
             vec![format!("mailto:{}", self.config.email)]
         };
 
-        let (account, credentials) = Account::builder()?
+        let (account, credentials) = account_builder(server_url)?
             .create(
                 &NewAccount {
                     contact: &contact.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -711,6 +757,42 @@ fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
         .collect();
 
     (leaf, chain)
+}
+
+/// Build an ACME account builder for `server_url`, trusting a test CA when
+/// `SOZUNE_ACME_TEST_CA` points to a PEM root.
+///
+/// Public ACME directories (Let's Encrypt) are reached through the default
+/// client, which trusts the system roots. A test CA (Pebble) serves its
+/// directory over HTTPS with a self-signed root the system does not know, so
+/// e2e runs set `SOZUNE_ACME_TEST_CA` to that root's PEM and every ACME call
+/// goes through `builder_with_root`. Unset — which is always the case in
+/// production — nothing changes.
+///
+/// `builder_with_root` *replaces* the whole trust store with the given root, so
+/// the variable is refused against a public Let's Encrypt directory: an env var
+/// leaked from a test environment must never be able to weaken trust for a real
+/// CA. It only takes effect for a non-Let's-Encrypt (test) directory.
+fn account_builder(server_url: &str) -> anyhow::Result<instant_acme::AccountBuilder> {
+    match std::env::var("SOZUNE_ACME_TEST_CA") {
+        Ok(path) if !path.is_empty() => {
+            if server_url.contains("acme-v02.api.letsencrypt.org")
+                || server_url.contains("acme-staging-v02.api.letsencrypt.org")
+            {
+                anyhow::bail!(
+                    "SOZUNE_ACME_TEST_CA is set but the directory is a public Let's Encrypt \
+                     endpoint ({server_url}) — refusing to replace the trust store for a real CA. \
+                     Unset the variable, or point the resolver at a test directory."
+                );
+            }
+            let builder = Account::builder_with_root(&path).map_err(|e| {
+                anyhow::anyhow!("SOZUNE_ACME_TEST_CA `{path}` is not a usable PEM root: {e}")
+            })?;
+            warn!("ACME: trusting test CA from SOZUNE_ACME_TEST_CA=`{path}` — not for production");
+            Ok(builder)
+        }
+        _ => Ok(Account::builder()?),
+    }
 }
 
 /// Credentials filename for an ACME account, derived from the directory URL so
@@ -968,6 +1050,55 @@ mod tests {
             backoff.remaining("healthy.example.com"),
             None,
             "an unrelated hostname must not inherit a sibling's backoff"
+        );
+    }
+
+    #[test]
+    fn soonest_retry_reports_the_nearest_pending_backoff() {
+        let backoff = Backoff::default();
+        // Nothing failing → nothing to wake up for.
+        assert_eq!(backoff.soonest_retry(), None);
+
+        // One failure: the soonest retry is that hostname's first backoff step.
+        backoff.record_failure("a.example.com", None);
+        let one = backoff.soonest_retry().expect("a retry should be pending");
+        assert!(
+            one <= BACKOFF_SCHEDULE[0],
+            "first retry is bounded by the 60s step"
+        );
+
+        // A second hostname fails twice, so it backs off further; the soonest
+        // retry across both must still be the nearer (first) one.
+        backoff.record_failure("b.example.com", None);
+        backoff.record_failure("b.example.com", None);
+        let soonest = backoff.soonest_retry().expect("a retry should be pending");
+        assert!(
+            soonest <= BACKOFF_SCHEDULE[0],
+            "the loop must wake for the nearest retry, not the furthest"
+        );
+
+        // Clearing every failing hostname leaves nothing to wake for.
+        backoff.record_success("a.example.com");
+        backoff.record_success("b.example.com");
+        assert_eq!(backoff.soonest_retry(), None);
+    }
+
+    #[test]
+    fn retain_hostnames_drops_entries_no_longer_in_config() {
+        // A hostname that failed, then left the config, must not keep an
+        // overdue backoff entry alive — that would spin the renewal loop.
+        let backoff = Backoff::default();
+        backoff.record_failure("gone.example.com", None);
+        backoff.record_failure("still.example.com", None);
+
+        let live: std::collections::HashSet<&str> = ["still.example.com"].into_iter().collect();
+        backoff.retain_hostnames(&live);
+
+        assert!(backoff.remaining("still.example.com").is_some());
+        assert_eq!(
+            backoff.remaining("gone.example.com"),
+            None,
+            "a hostname dropped from config must lose its backoff entry"
         );
     }
 

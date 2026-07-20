@@ -6,3 +6,6 @@ ROADMAP.md
 .prd/
 .gstack/
 .issues/
+
+# ACME e2e: the Pebble test CA is fetched at runtime, never committed
+tests/e2e/acme/pebble-ca.pem
