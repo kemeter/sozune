@@ -11,6 +11,10 @@ use crate::config::{AcmeConfig, ProviderConfig, ResolverConfig};
 pub enum Resolver {
     Http01,
     Dns01(Box<dyn DnsProvider>),
+    /// TLS-ALPN-01 (RFC 8737): answered over the TLS handshake on 443. The
+    /// challenge certificate is served by the shared responder the ACME
+    /// manager holds, so this variant carries no state of its own.
+    TlsAlpn01,
 }
 
 /// Resolve a resolver name from `AcmeConfig.resolvers` and build it.
@@ -30,6 +34,7 @@ pub fn build_resolver(name: Option<&str>, acme: &AcmeConfig) -> anyhow::Result<O
         ResolverConfig::Dns01 { provider, .. } => {
             Ok(Some(Resolver::Dns01(build_provider(provider)?)))
         }
+        ResolverConfig::TlsAlpn01 { .. } => Ok(Some(Resolver::TlsAlpn01)),
     }
 }
 
@@ -123,6 +128,7 @@ mod tests {
             certs_dir: String::from("/tmp"),
             staging: true,
             challenge_port: 80,
+            tls_alpn_port: 3038,
             resolvers: HashMap::new(),
         }
     }

@@ -1,13 +1,14 @@
 pub mod challenge_server;
 pub mod inventory;
 pub mod resolver;
+pub mod tls_alpn_responder;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use cheti::{AccountStore, Dns01Solver, FileAccountStore};
+use cheti::{AccountStore, Dns01Solver, FileAccountStore, TlsAlpn01Solver};
 use instant_acme::{Account, ChallengeType, Identifier, NewAccount, NewOrder, Order, OrderStatus};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::sync::{Notify, mpsc};
@@ -18,6 +19,7 @@ use crate::model::Entrypoint;
 
 use self::challenge_server::ChallengeState;
 use self::resolver::{Resolver, build_resolver};
+use self::tls_alpn_responder::TlsAlpnResponder;
 
 /// Upper bound, in days, on how early a certificate may be renewed before
 /// expiry. The renewal trigger is `min(total_lifetime / 3, RENEWAL_FLOOR_DAYS)`:
@@ -131,6 +133,10 @@ pub struct CertCommand {
 pub struct AcmeManager {
     config: AcmeConfig,
     challenges: ChallengeState,
+    /// Shared store the TLS-ALPN-01 challenge certificates are presented
+    /// through, read by the loopback responder. Cloned from what the responder
+    /// task serves, so `present`/`cleanup` here reach that listener.
+    tls_alpn: TlsAlpnResponder,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     cert_tx: mpsc::Sender<CertCommand>,
     certs_dir: PathBuf,
@@ -143,6 +149,7 @@ impl AcmeManager {
     pub fn new(
         config: AcmeConfig,
         challenges: ChallengeState,
+        tls_alpn: TlsAlpnResponder,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         cert_tx: mpsc::Sender<CertCommand>,
         notify: Arc<Notify>,
@@ -151,6 +158,7 @@ impl AcmeManager {
         Self {
             config,
             challenges,
+            tls_alpn,
             storage,
             cert_tx,
             certs_dir,
@@ -390,6 +398,7 @@ impl AcmeManager {
 
         let (cert_chain_pem, key_pem) = match resolver {
             Some(Resolver::Dns01(provider)) => self.solve_dns01(order, provider).await?,
+            Some(Resolver::TlsAlpn01) => self.solve_tls_alpn01(order).await?,
             Some(Resolver::Http01) | None => self.solve_http01(order, hostname).await?,
         };
 
@@ -471,6 +480,18 @@ impl AcmeManager {
             .solve_and_finalize(order)
             .await
             .map_err(|e| anyhow::anyhow!("DNS-01 challenge failed: {e}"))
+    }
+
+    /// TLS-ALPN-01 challenge flow: hand the order off to cheti, which builds
+    /// the challenge certificate and presents it through the shared responder;
+    /// the loopback responder task serves it on `acme-tls/1`. The responder is
+    /// cloned (a shared handle), so the certificate cheti presents here is the
+    /// one that listener answers with.
+    async fn solve_tls_alpn01(&self, order: Order) -> anyhow::Result<(String, String)> {
+        TlsAlpn01Solver::new(self.tls_alpn.clone())
+            .solve_and_finalize(order)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS-ALPN-01 challenge failed: {e}"))
     }
 
     /// Get or create an ACME account, persisted via cheti's FileAccountStore.

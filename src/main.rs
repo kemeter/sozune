@@ -190,6 +190,16 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let active_acme = config.acme.as_ref().filter(|a| a.enabled);
     let acme_enabled = active_acme.is_some();
     let acme_challenge_port = active_acme.map(|a| a.challenge_port);
+    // The HTTPS listener only switches to the ALPN-aware gate when a
+    // tls-alpn-01 resolver is actually configured — otherwise 443 stays a
+    // direct Sōzu HTTPS listener, byte-for-byte the old path.
+    let tls_alpn_responder_port = active_acme
+        .filter(|a| {
+            a.resolvers
+                .values()
+                .any(|r| matches!(r, config::ResolverConfig::TlsAlpn01 { .. }))
+        })
+        .map(|a| a.tls_alpn_port);
 
     // Create middleware state shared between middleware server and proxy reload
     let middleware_state: middleware::MiddlewareState =
@@ -212,6 +222,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 metrics_poll_rx,
                 metrics_store: metrics_store_proxy,
                 acme_challenge_port,
+                tls_alpn_responder_port,
                 middleware_state: middleware_state_proxy,
                 middleware_port,
                 plugins,
@@ -340,7 +351,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
                 let challenges = Arc::new(RwLock::new(HashMap::new()));
 
-                // Start the challenge server
+                // Start the HTTP-01 challenge server
                 let challenge_port = acme_config.challenge_port;
                 let challenges_server = Arc::clone(&challenges);
                 tokio::spawn(async move {
@@ -351,10 +362,26 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                     }
                 });
 
+                // Start the TLS-ALPN-01 responder on a loopback port. It always
+                // runs when ACME is enabled; nothing routes `acme-tls/1` to it
+                // until a tls-alpn-01 resolver flips the HTTPS listener into
+                // preread mode (that wiring lives in the proxy layer).
+                let tls_alpn = acme::tls_alpn_responder::TlsAlpnResponder::new();
+                let tls_alpn_port = acme_config.tls_alpn_port;
+                let tls_alpn_server = tls_alpn.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        acme::tls_alpn_responder::serve(tls_alpn_port, tls_alpn_server).await
+                    {
+                        error!("TLS-ALPN-01 responder failed: {}", e);
+                    }
+                });
+
                 // Run the ACME manager
                 let manager = acme::AcmeManager::new(
                     acme_config,
                     challenges,
+                    tls_alpn,
                     storage_acme,
                     cert_tx,
                     Arc::clone(&acme_notify),
@@ -411,8 +438,18 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             signal_handle.close();
             match result {
                 Ok(Ok(_)) => debug!("Proxy task completed successfully"),
-                Ok(Err(e)) => error!("Proxy task failed: {}", e),
-                Err(e) => error!("Proxy task panicked: {:?}", e),
+                // A proxy startup failure (e.g. the TLS-ALPN-01 gate can't bind
+                // 443) must fail the process, not just log: the HTTPS worker has
+                // already moved to loopback, so continuing would leave 443
+                // unserved while the process reports success.
+                Ok(Err(e)) => {
+                    error!("Proxy task failed: {}", e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    error!("Proxy task panicked: {:?}", e);
+                    return Err(anyhow::anyhow!("proxy task panicked: {e}"));
+                }
             }
         },
         result = secondary_tasks_future => {
