@@ -289,11 +289,11 @@ fn redirect_from_redirect_filter(
 
     let path = match rr.path.as_ref() {
         // A full-path replacement is a literal target — maps directly.
-        Some(p) => match p.replace_full_path.as_deref() {
-            Some(full) => Some(full.to_string()),
+        Some(p) => {
             // replacePrefixMatch (or an empty path block) can't be honoured.
-            None => return None,
-        },
+            let full = p.replace_full_path.as_deref()?;
+            Some(full.to_string())
+        }
         None => None,
     };
 
