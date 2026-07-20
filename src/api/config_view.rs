@@ -67,6 +67,9 @@ pub enum ResolverView {
         domains: Vec<String>,
         ca_server: Option<String>,
     },
+    TlsAlpn01 {
+        ca_server: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -196,6 +199,9 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
                 ca_server: ca_server.clone(),
             }
         }
+        ResolverConfig::TlsAlpn01 { ca_server } => ResolverView::TlsAlpn01 {
+            ca_server: ca_server.clone(),
+        },
     }
 }
 
@@ -284,6 +290,7 @@ mod tests {
             certs_dir: "/var/lib/sozune/certs".into(),
             staging: true,
             challenge_port: 8080,
+            tls_alpn_port: 8443,
             resolvers: HashMap::new(),
         });
         cfg.dashboard.enabled = true;

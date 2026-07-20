@@ -340,7 +340,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
                 let challenges = Arc::new(RwLock::new(HashMap::new()));
 
-                // Start the challenge server
+                // Start the HTTP-01 challenge server
                 let challenge_port = acme_config.challenge_port;
                 let challenges_server = Arc::clone(&challenges);
                 tokio::spawn(async move {
@@ -351,10 +351,26 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                     }
                 });
 
+                // Start the TLS-ALPN-01 responder on a loopback port. It always
+                // runs when ACME is enabled; nothing routes `acme-tls/1` to it
+                // until a tls-alpn-01 resolver flips the HTTPS listener into
+                // preread mode (that wiring lives in the proxy layer).
+                let tls_alpn = acme::tls_alpn_responder::TlsAlpnResponder::new();
+                let tls_alpn_port = acme_config.tls_alpn_port;
+                let tls_alpn_server = tls_alpn.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        acme::tls_alpn_responder::serve(tls_alpn_port, tls_alpn_server).await
+                    {
+                        error!("TLS-ALPN-01 responder failed: {}", e);
+                    }
+                });
+
                 // Run the ACME manager
                 let manager = acme::AcmeManager::new(
                     acme_config,
                     challenges,
+                    tls_alpn,
                     storage_acme,
                     cert_tx,
                     Arc::clone(&acme_notify),

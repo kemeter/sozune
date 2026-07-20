@@ -4001,6 +4001,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tracing",

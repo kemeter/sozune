@@ -37,6 +37,8 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 http-body-util = "0.1"
 base64 = "0.22"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+# Terminates the TLS-ALPN-01 challenge handshake on the loopback responder.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 flate2 = "1"

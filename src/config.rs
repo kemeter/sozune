@@ -171,6 +171,11 @@ pub struct AcmeConfig {
         deserialize_with = "deserialize_acme_challenge_port_with_env"
     )]
     pub challenge_port: u16,
+    /// Loopback port the TLS-ALPN-01 responder binds. The public 443 routes
+    /// `acme-tls/1` handshakes here when a tls-alpn-01 resolver is configured;
+    /// it is never exposed directly.
+    #[serde(default = "default_acme_tls_alpn_port")]
+    pub tls_alpn_port: u16,
     #[serde(default)]
     pub resolvers: HashMap<String, ResolverConfig>,
 }
@@ -203,6 +208,21 @@ pub enum ResolverConfig {
         #[serde(default)]
         ca_server: Option<String>,
     },
+    /// TLS passthrough challenge (RFC 8737): the CA validates over a TLS
+    /// handshake on 443 with ALPN `acme-tls/1`, so it needs neither port 80
+    /// (unlike `http-01`) nor DNS API credentials (unlike `dns-01`).
+    ///
+    /// Declaring a `tls-alpn-01` resolver switches the HTTPS listener to an
+    /// ALPN-aware mode so the challenge can be answered without disturbing
+    /// normal traffic — see the TLS docs. No listener change happens unless a
+    /// resolver of this kind exists.
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01 {
+        /// ACME directory URL for this resolver (Traefik's `caServer`). See
+        /// the `http-01` variant for semantics.
+        #[serde(default)]
+        ca_server: Option<String>,
+    },
 }
 
 impl ResolverConfig {
@@ -211,7 +231,7 @@ impl ResolverConfig {
     pub fn managed_domains(&self) -> &[String] {
         match self {
             ResolverConfig::Dns01 { domains, .. } => domains,
-            ResolverConfig::Http01 { .. } => &[],
+            ResolverConfig::Http01 { .. } | ResolverConfig::TlsAlpn01 { .. } => &[],
         }
     }
 
@@ -219,9 +239,9 @@ impl ResolverConfig {
     /// fall back to the global staging/prod URL.
     pub fn ca_server(&self) -> Option<&str> {
         match self {
-            ResolverConfig::Http01 { ca_server } | ResolverConfig::Dns01 { ca_server, .. } => {
-                ca_server.as_deref()
-            }
+            ResolverConfig::Http01 { ca_server }
+            | ResolverConfig::Dns01 { ca_server, .. }
+            | ResolverConfig::TlsAlpn01 { ca_server } => ca_server.as_deref(),
         }
     }
 }
@@ -965,6 +985,12 @@ fn default_acme_challenge_port() -> u16 {
     3036
 }
 
+fn default_acme_tls_alpn_port() -> u16 {
+    // 3035 API, 3036 ACME challenge, 3037 middleware, 3038 dashboard, 3039 …,
+    // 3040 TLS-ALPN-01 responder.
+    3040
+}
+
 fn default_middleware_port() -> u16 {
     3037
 }
@@ -1436,6 +1462,7 @@ impl AppConfig {
                 certs_dir: default_acme_certs_dir(),
                 staging: default_acme_staging(),
                 challenge_port: default_acme_challenge_port(),
+                tls_alpn_port: default_acme_tls_alpn_port(),
                 resolvers: HashMap::new(),
             });
             acme.apply_env_overrides();
