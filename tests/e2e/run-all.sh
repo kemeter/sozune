@@ -92,6 +92,8 @@ proxy:
       "404": "<html><body><h1>sozune custom 404</h1></body></html>"
   https:
     listen_address: $HTTPS_PORT
+    tls:
+      min_version: "1.3"
   tcp:
     - name: tcpecho
       listen: $TCP_ECHO_PORT
