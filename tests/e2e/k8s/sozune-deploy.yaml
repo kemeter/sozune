@@ -27,7 +27,14 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["httproutes", "tlsroutes", "gateways", "gatewayclasses", "referencegrants"]
+      [
+        "httproutes",
+        "tlsroutes",
+        "tcproutes",
+        "gateways",
+        "gatewayclasses",
+        "referencegrants",
+      ]
     verbs: ["get", "list", "watch"]
   # Status sub-resources — sōzune patches conditions on the resources it
   # owns: `status.parents[]` on HTTPRoutes (Accepted/ResolvedRefs) and
@@ -78,6 +85,10 @@ data:
       tcp:
         - name: tlspassthrough
           listen: 18444
+        # TCPRoute attaches here: a Gateway TCP listener on this port resolves
+        # to this named listener.
+        - name: tcpraw
+          listen: 18445
 
     middleware:
       port: 13180

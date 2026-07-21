@@ -306,7 +306,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 - Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
-- `GRPCRoute`, `TCPRoute`, `UDPRoute`, `TLSRoute`.
+- `GRPCRoute`, `UDPRoute`.
 
 ### HTTPRoute filters
 
@@ -480,6 +480,58 @@ A `TLSRoute` whose listener port has no matching entry is tracked but not served
 
 `TLSRoute` has no matches, filters or paths — the SNI is the whole routing decision — so none of the HTTPRoute filter machinery applies.
 
+## Gateway API (TCPRoute)
+
+`TCPRoute` forwards a whole listener port to its backends — plain TCP, no SNI, no TLS, no matching. It is the raw-TCP counterpart to TLSRoute: where TLSRoute routes by the name in the ClientHello, TCPRoute routes nothing and hands the entire connection to its backend.
+
+`TCPRoute` is `v1alpha2` and ships only in the Gateway API **experimental** channel; the watcher probes for the CRD and skips quietly when it is absent.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tcpgw
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: raw
+      protocol: TCP
+      port: 5432
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: my-db
+spec:
+  parentRefs:
+    - name: tcpgw
+      sectionName: raw
+  rules:
+    - backendRefs:
+        - name: postgres
+          port: 5432
+```
+
+### The port must already be declared
+
+Exactly as for TLSRoute: the Gateway's `TCP` listener port must match a `proxy.tcp` entry in `config.yaml`. Sōzune binds TCP ports at startup and never opens one from a Gateway alone. A route on an undeclared port is tracked but not served, and goes live on the next reload once the listener is declared.
+
+```yaml
+proxy:
+  tcp:
+    - name: tcpgw
+      listen: 5432
+```
+
+### What is supported
+
+| Aspect | Behaviour |
+|---|---|
+| Listener | `protocol: TCP` only. A `TLS` or `HTTP` listener is ignored by TCPRoutes. |
+| Routing | None — the whole port goes to the backend. One rule → one entrypoint. No hostnames, matches, or filters (a TCPRoute has none). |
+| `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is honoured. |
+| `parentRefs` | `sectionName` and `port` select a listener. A route may bind listeners on several ports; each gets its own entrypoint. |
+
 ## ACME / Let's Encrypt
 
 When a Service is annotated with `sozune.http.<svc>.tls=true`, or an Ingress declares `spec.tls[].hosts`, Sōzune provisions a certificate for the declared hostnames. The HTTP-01 challenge responder runs inside the Sōzune pod, so:
@@ -496,8 +548,8 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
-- **Gateway API: `GRPCRoute`, `TCPRoute`, `UDPRoute`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
-- **TLSRoute serves `Passthrough` only, on a pre-declared port.** `tls.mode: Terminate` is out of scope — that is what HTTPS entrypoints are for — and the listener's port must already be bound by a `proxy.tcp` entry. See [Gateway API (TLSRoute)](#gateway-api-tlsroute).
+- **Gateway API: `GRPCRoute`, `UDPRoute`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
+- **TLSRoute and TCPRoute serve on a pre-declared port.** The listener's port must already be bound by a `proxy.tcp` entry — Sōzune does not open TCP ports from a Gateway alone. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what HTTPS entrypoints are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables
 

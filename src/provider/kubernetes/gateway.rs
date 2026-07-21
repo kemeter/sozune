@@ -33,6 +33,7 @@ use crate::model::{
     Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
 };
 use futures_util::StreamExt;
+use gateway_api::apis::experimental::tcproutes::{TCPRoute, TCPRouteParentRefs, TCPRouteRules};
 use gateway_api::apis::experimental::tlsroutes::{TLSRoute, TLSRouteParentRefs, TLSRouteRules};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
@@ -82,11 +83,11 @@ type RouteIndex = Arc<RwLock<HashMap<String, TrackedRoute>>>;
 
 const SOURCE_TAG: &str = "k8s-gateway";
 
-/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute and
-/// TLSRoute. Each scope mutation posts one permit per watcher so both
+/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute, TLSRoute
+/// and TCPRoute. Each scope mutation posts one permit per watcher so all
 /// re-resolve immediately instead of one waiting out its periodic tick.
 /// Bump this when adding another route watcher.
-const SCOPE_SUBSCRIBERS: usize = 2;
+const SCOPE_SUBSCRIBERS: usize = 3;
 
 /// In-memory snapshot of the Gateway API resources sōzune has decided to
 /// honour. The HTTPRoute watcher consults this on every apply to decide
@@ -163,6 +164,7 @@ macro_rules! impl_parent_ref {
 
 impl_parent_ref!(HTTPRouteParentRefs);
 impl_parent_ref!(TLSRouteParentRefs);
+impl_parent_ref!(TCPRouteParentRefs);
 
 #[derive(Default, Debug)]
 pub struct ScopeState {
@@ -312,6 +314,65 @@ impl GatewayScope {
         };
         refs.iter()
             .any(|p| self.accepts_tls_parent_ref(route_ns, p))
+    }
+
+    /// True iff this listener can carry a TCPRoute: protocol `TCP`. Raw TCP has
+    /// no TLS to reason about, so unlike a TLSRoute listener there is no `mode`
+    /// to check.
+    fn listener_serves_tcp(l: &ListenerInfo) -> bool {
+        l.protocol.eq_ignore_ascii_case("TCP")
+    }
+
+    /// True iff `parent_ref` binds this TCPRoute to a `TCP` listener we own.
+    fn accepts_tcp_parent_ref(
+        &self,
+        route_namespace: &str,
+        parent_ref: &TCPRouteParentRefs,
+    ) -> bool {
+        self.accepts_parent_ref_where(route_namespace, parent_ref, Some(Self::listener_serves_tcp))
+    }
+
+    /// True iff at least one `parentRef` binds this TCPRoute to a listener we
+    /// can serve.
+    pub fn accepts_tcp_route(&self, route: &TCPRoute) -> bool {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return false;
+        };
+        refs.iter()
+            .any(|p| self.accepts_tcp_parent_ref(route_ns, p))
+    }
+
+    /// The Gateway listener ports this TCPRoute binds to. Unlike a TLSRoute
+    /// there are no hostnames to intersect — raw TCP forwards the whole port —
+    /// so this yields just the set of ports, resolved to `proxy.tcp` listeners
+    /// by the caller. A route may bind several listeners on different ports;
+    /// each gets its own entrypoint.
+    fn effective_tcp_ports(&self, route: &TCPRoute) -> std::collections::BTreeSet<i32> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let mut ports = std::collections::BTreeSet::new();
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return ports;
+        };
+        for p in refs
+            .iter()
+            .filter(|p| self.accepts_tcp_parent_ref(route_ns, p))
+        {
+            let ns = p.namespace.as_deref().unwrap_or(route_ns);
+            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+                continue;
+            };
+            for listener in listeners.into_iter().filter(Self::listener_serves_tcp) {
+                // Honour a parentRef that pins a sectionName/port, exactly as
+                // the TLS path does.
+                let name_ok = p.section_name.as_deref().is_none_or(|s| s == listener.name);
+                let port_ok = p.port.is_none_or(|port| port == listener.port);
+                if name_ok && port_ok {
+                    ports.insert(listener.port);
+                }
+            }
+        }
+        ports
     }
 
     /// The SNI names this TLSRoute should serve, and the Gateway listener port
@@ -618,6 +679,11 @@ impl GatewayScope {
     /// is refused, per the Gateway API spec (a namespace must opt in to
     /// being referenced).
     pub fn allows_backend_ref(&self, from_ns: &str, to_ns: &str) -> bool {
+        // Grants are keyed by `(from_ns, to_ns)`, not by route kind, so a grant
+        // authorising e.g. HTTPRoute→Service also lets a TLSRoute/TCPRoute in
+        // the same namespace reach that target. This is slightly more permissive
+        // than the spec (a grant names one `from.kind`); tightening it to a
+        // per-kind key is a separate hardening step.
         if from_ns == to_ns {
             return true;
         }
@@ -749,11 +815,18 @@ fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
     if !grants_to_service {
         return HashSet::new();
     }
+    // A ReferenceGrant's `from` names the route kind it authorises. Recognise
+    // every route kind Sōzune serves, not just HTTPRoute — otherwise a
+    // TLSRoute or TCPRoute could never reach a cross-namespace backend even
+    // with a valid grant in place.
     grant
         .spec
         .from
         .iter()
-        .filter(|f| f.group == GATEWAY_API_GROUP && f.kind == "HTTPRoute")
+        .filter(|f| {
+            f.group == GATEWAY_API_GROUP
+                && matches!(f.kind.as_str(), "HTTPRoute" | "TLSRoute" | "TCPRoute")
+        })
         .map(|f| f.namespace.clone())
         .collect()
 }
@@ -2367,6 +2440,334 @@ fn log_tls_route(action: &str, route: &TLSRoute) {
     );
 }
 
+// ---------- TCPRoute ----------
+//
+// A TCPRoute forwards the whole of a listener port to its backends — no SNI, no
+// hostnames, no filters. It is the TLSRoute path with the name-routing removed:
+// one catch-all TCP entrypoint per (route, port), `sni: None`.
+
+struct TrackedTcpRoute {
+    route: TCPRoute,
+    entrypoint_ids: Vec<String>,
+}
+
+type TcpRouteIndex = Arc<RwLock<HashMap<String, TrackedTcpRoute>>>;
+
+/// Convert a TCPRoute into Sōzune `Entrypoint`s, one catch-all per rule on the
+/// resolved listener. `sni` is `None`: raw TCP does not route by name, so the
+/// entrypoint takes the whole port — exactly a Docker `sozune.tcp.*` route with
+/// no `sni` label.
+pub fn tcp_route_to_entrypoints(
+    route: &TCPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+    listener_name: &str,
+    port: i32,
+) -> Vec<Entrypoint> {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    let Some(route_name) = route.metadata.name.as_deref() else {
+        return Vec::new();
+    };
+
+    route
+        .spec
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(rule_index, rule)| {
+            let backends = tcp_rule_backends(rule, namespace, route_name, resolver, grants);
+            if backends.is_empty() {
+                return None;
+            }
+            Some(Entrypoint {
+                // `/`-joined and port-scoped for the same injectivity reasons as
+                // the TLS path (see `tls_route_to_entrypoints`).
+                id: format!("{SOURCE_TAG}-tcp/{namespace}/{route_name}/{port}/{rule_index}"),
+                name: format!("{route_name}-{port}-{rule_index}"),
+                backends,
+                protocol: Protocol::Tcp,
+                config: EntrypointConfig {
+                    // No `sni`: the listener forwards everything to this backend
+                    // set, the raw-TCP catch-all.
+                    entrypoint: Some(listener_name.to_string()),
+                    ..tls_entrypoint_defaults()
+                },
+                source: Some(format!("{SOURCE_TAG}-tcp/{namespace}/{route_name}")),
+            })
+        })
+        .collect()
+}
+
+/// Resolve a TCPRoute rule's `backendRefs` to pod IPs. Same handling as the TLS
+/// path (Service-typed, ReferenceGrant-gated cross-namespace, weight honoured);
+/// duplicated rather than shared because `TCPRouteRules` and `TLSRouteRules` are
+/// distinct generated types.
+fn tcp_rule_backends(
+    rule: &TCPRouteRules,
+    namespace: &str,
+    route_name: &str,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Vec<Backend> {
+    let Some(backend_refs) = rule.backend_refs.as_ref() else {
+        return Vec::new();
+    };
+    backend_refs
+        .iter()
+        .flat_map(|b| {
+            let Some(port_i32) = b.port else {
+                return Vec::new();
+            };
+            let Ok(port) = u16::try_from(port_i32) else {
+                return Vec::new();
+            };
+            let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
+            let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
+            if !kind_ok || !group_ok {
+                return Vec::new();
+            }
+            let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+            if !grants.allows(namespace, target_ns) {
+                warn!(
+                    "Gateway API: TCPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
+                    namespace, route_name, target_ns, b.name
+                );
+                return Vec::new();
+            }
+            let weight = b.weight.unwrap_or(100).max(0) as u32;
+            resolver
+                .pod_ips(target_ns, &b.name)
+                .into_iter()
+                .map(|address| Backend {
+                    address,
+                    port,
+                    weight,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Resolve a TCPRoute to its entrypoints and swap them into storage. Mirrors
+/// [`apply_tls_route`], minus hostnames.
+fn apply_tcp_route(
+    route: &TCPRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &TcpRouteIndex,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    listener_ports: &TcpListenerPorts,
+) -> bool {
+    let uid = match route.metadata.uid.as_deref() {
+        Some(u) => u.to_string(),
+        None => {
+            warn!("Gateway API: TCPRoute without uid, skipping");
+            return false;
+        }
+    };
+
+    let new_entrypoints = if !scope.accepts_tcp_route(route) {
+        Vec::new()
+    } else {
+        scope
+            .effective_tcp_ports(route)
+            .into_iter()
+            .flat_map(|port| match listener_ports.get(&port) {
+                Some(listener_name) => {
+                    tcp_route_to_entrypoints(route, resolver, scope, listener_name, port)
+                }
+                None => {
+                    let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+                    let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+                    warn!(
+                        "Gateway API: TCPRoute {}/{} binds to a Gateway listener on port {} but no `proxy.tcp` listener is declared there — declare one in config.yaml, Sōzune does not open TCP ports on the fly",
+                        ns, name, port
+                    );
+                    Vec::new()
+                }
+            })
+            .collect()
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    if let Some(previous) = index_guard.get(&uid) {
+        for id in &previous.entrypoint_ids {
+            if storage_guard.remove(id).is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    let new_ids: Vec<String> = new_entrypoints.iter().map(|e| e.id.clone()).collect();
+    for ep in new_entrypoints {
+        storage_guard.insert(ep.id.clone(), ep);
+        changed = true;
+    }
+
+    index_guard.insert(
+        uid,
+        TrackedTcpRoute {
+            route: route.clone(),
+            entrypoint_ids: new_ids,
+        },
+    );
+
+    changed
+}
+
+fn delete_tcp_route(
+    route: &TCPRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &TcpRouteIndex,
+) -> bool {
+    let Some(uid) = route.metadata.uid.as_deref() else {
+        return false;
+    };
+
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let Some(tracked) = index_guard.remove(uid) else {
+        return false;
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for id in tracked.entrypoint_ids {
+        if storage_guard.remove(&id).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn re_resolve_all_tcp(
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &TcpRouteIndex,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    listener_ports: &TcpListenerPorts,
+) -> bool {
+    let tracked: Vec<TCPRoute> = match index.read() {
+        Ok(g) => g.values().map(|t| t.route.clone()).collect(),
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for route in &tracked {
+        if apply_tcp_route(route, storage, index, resolver, scope, listener_ports) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Watch TCPRoutes and keep their entrypoints in sync. `v1alpha2`/experimental
+/// like TLSRoute, so the CRD is probed and the watcher exits quietly if absent.
+pub async fn run_tcproute_watcher(
+    client: Client,
+    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    reload_tx: mpsc::Sender<()>,
+    resolver: Arc<dyn ServiceResolver>,
+    scope: GatewayScope,
+    listener_ports: TcpListenerPorts,
+) -> anyhow::Result<()> {
+    let api: Api<TCPRoute> = Api::all(client);
+    if api.list(&Default::default()).await.is_err() {
+        info!(
+            "Gateway API: TCPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
+        );
+        return Ok(());
+    }
+
+    let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    let index: TcpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+    let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    resolve_ticker.tick().await;
+
+    info!("Gateway API: TCPRoute watcher started");
+
+    loop {
+        let changed = tokio::select! {
+            event = stream.next() => match event {
+                Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    log_tcp_route("apply", &route);
+                    apply_tcp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                }
+                Some(Ok(Event::Delete(route))) => {
+                    log_tcp_route("delete", &route);
+                    delete_tcp_route(&route, &storage, &index)
+                }
+                Some(Ok(Event::Init)) => {
+                    debug!("Gateway API: TCPRoute init");
+                    false
+                }
+                Some(Ok(Event::InitDone)) => {
+                    debug!("Gateway API: TCPRoute init done");
+                    false
+                }
+                Some(Err(e)) => {
+                    error!("Gateway API: TCPRoute watcher error: {}", e);
+                    false
+                }
+                None => break,
+            },
+            _ = resolve_ticker.tick() => {
+                re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+            }
+            _ = scope.changed() => {
+                debug!("Gateway API: scope changed, re-resolving TCP routes");
+                re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+            }
+        };
+        if changed && let Err(e) = reload_tx.send(()).await {
+            error!("Gateway API: failed to send reload signal: {}", e);
+        }
+    }
+
+    warn!("Gateway API: TCPRoute watcher stream ended unexpectedly");
+    Ok(())
+}
+
+fn log_tcp_route(action: &str, route: &TCPRoute) {
+    let ns = route
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or("<no-namespace>");
+    let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+    debug!("Gateway API: TCPRoute {} {}/{}", action, ns, name);
+}
+
 /// Maps a Gateway listener port onto the name of a statically declared
 /// `proxy.tcp` listener.
 ///
@@ -3127,6 +3528,155 @@ mod tests {
         assert!(ports.get(&443).is_none());
     }
 
+    // ---------- TCPRoute ----------
+
+    /// A Gateway with one `TCP` listener on `port`.
+    fn tcp_scope(port: i32) -> GatewayScope {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "sozune".into(),
+                listeners: vec![GatewayListeners {
+                    name: "tcp".into(),
+                    port,
+                    protocol: "TCP".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+        scope
+    }
+
+    fn tcp_route(backend_port: i32) -> TCPRoute {
+        TCPRoute {
+            metadata: ObjectMeta {
+                name: Some("raw".into()),
+                namespace: Some("default".into()),
+                uid: Some("uid-tcp-1".into()),
+                ..Default::default()
+            },
+            spec: gateway_api::apis::experimental::tcproutes::TCPRouteSpec {
+                parent_refs: Some(vec![TCPRouteParentRefs {
+                    name: "gw".into(),
+                    ..Default::default()
+                }]),
+                rules: vec![TCPRouteRules {
+                    backend_refs: Some(vec![
+                        gateway_api::apis::experimental::tcproutes::TCPRouteRulesBackendRefs {
+                            name: "svc".into(),
+                            port: Some(backend_port),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }],
+            },
+            status: Default::default(),
+        }
+    }
+
+    fn tcp_ports() -> TcpListenerPorts {
+        Arc::new([(9000, "tcpgw".to_string())].into_iter().collect())
+    }
+
+    #[test]
+    fn tcp_route_produces_one_catch_all_entrypoint_per_rule() {
+        let scope = tcp_scope(9000);
+        let route = tcp_route(9000);
+        let ports = scope.effective_tcp_ports(&route);
+        assert!(ports.contains(&9000));
+
+        let eps = tcp_route_to_entrypoints(&route, &r1(), &scope, "tcpgw", 9000);
+        assert_eq!(eps.len(), 1);
+        let ep = &eps[0];
+        assert!(matches!(ep.protocol, Protocol::Tcp));
+        assert_eq!(ep.config.entrypoint.as_deref(), Some("tcpgw"));
+        // Raw TCP: no SNI, whole port forwarded.
+        assert_eq!(ep.config.sni, None);
+        assert!(ep.config.hostnames.is_empty());
+        assert_eq!(ep.backends.len(), 1);
+        assert_eq!(ep.backends[0].port, 9000);
+    }
+
+    #[test]
+    fn tcp_route_needs_a_tcp_listener() {
+        // A TLS listener is not a TCP listener — a TCPRoute must not attach.
+        let scope = tls_scope(None, 9000);
+        assert!(!scope.accepts_tcp_route(&tcp_route(9000)));
+    }
+
+    #[test]
+    fn tcp_route_ignores_a_plain_http_listener() {
+        let scope = default_scope(); // gw with no listeners
+        assert!(!scope.accepts_tcp_route(&tcp_route(9000)));
+    }
+
+    #[test]
+    fn tcp_route_with_unresolvable_backend_produces_nothing() {
+        let scope = tcp_scope(9000);
+        let eps = tcp_route_to_entrypoints(&tcp_route(9000), &r0(), &scope, "tcpgw", 9000);
+        assert!(eps.is_empty());
+    }
+
+    #[test]
+    fn tcp_apply_and_delete_round_trip_through_storage() {
+        let scope = tcp_scope(9000);
+        let storage: Arc<RwLock<BTreeMap<String, Entrypoint>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let index: TcpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let route = tcp_route(9000);
+
+        assert!(apply_tcp_route(
+            &route,
+            &storage,
+            &index,
+            &r1(),
+            &scope,
+            &tcp_ports()
+        ));
+        assert_eq!(storage.read().unwrap().len(), 1);
+
+        assert!(delete_tcp_route(&route, &storage, &index));
+        assert!(storage.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tcp_apply_on_undeclared_port_tracks_the_route_with_no_entrypoints() {
+        // Gateway asks for 9443; only 9000 is declared under `proxy.tcp`.
+        let scope = tcp_scope(9443);
+        let storage: Arc<RwLock<BTreeMap<String, Entrypoint>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let index: TcpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let route = tcp_route(9000);
+
+        apply_tcp_route(&route, &storage, &index, &r1(), &scope, &tcp_ports());
+        assert!(storage.read().unwrap().is_empty());
+        assert_eq!(index.read().unwrap().len(), 1);
+
+        // Declare 9443 and re-resolve: the route lands.
+        let ports = Arc::new([(9443, "tcpgw".to_string())].into_iter().collect());
+        assert!(re_resolve_all_tcp(&storage, &index, &r1(), &scope, &ports));
+        assert_eq!(storage.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tcp_entrypoint_ids_cannot_collide_with_tls() {
+        // The `-tcp/` vs `-tls/` id prefix keeps the two route kinds apart in
+        // the shared storage map.
+        let tcp_scope = tcp_scope(9000);
+        let tcp = tcp_route(9000);
+        let tcp_eps = tcp_route_to_entrypoints(&tcp, &r1(), &tcp_scope, "gw", 9000);
+        assert!(tcp_eps[0].id.starts_with("k8s-gateway-tcp/"));
+    }
+
     /// Resolver test double: returns the same canned IP for every Service
     /// it's asked about — enough for the tests that only care about
     /// "backend address ends up in the entrypoint".
@@ -3494,6 +4044,37 @@ mod tests {
         // Nothing changed: the grant doesn't authorise any Service ref.
         assert!(!scope.upsert_reference_grant(&grant));
         assert!(!scope.allows_backend_ref("default", "other"));
+    }
+
+    #[test]
+    fn grant_from_tcproute_authorises_a_cross_namespace_service_ref() {
+        use gateway_api::apis::standard::referencegrants::{
+            ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+        };
+        // A ReferenceGrant naming TCPRoute (not HTTPRoute) must be recognised,
+        // or a cross-namespace TCPRoute backend can never be reached.
+        let grant = ReferenceGrant {
+            metadata: ObjectMeta {
+                namespace: Some("other".into()),
+                name: Some("grant".into()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: GATEWAY_API_GROUP.into(),
+                    kind: "TCPRoute".into(),
+                    namespace: "default".into(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: String::new(),
+                    kind: "Service".into(),
+                    name: None,
+                }],
+            },
+        };
+        let scope = GatewayScope::new();
+        assert!(scope.upsert_reference_grant(&grant));
+        assert!(scope.allows_backend_ref("default", "other"));
     }
 
     #[test]
