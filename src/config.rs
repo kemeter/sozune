@@ -644,6 +644,36 @@ pub struct HttpsConfig {
     /// HTTP/2 negotiation on the TLS listener.
     #[serde(default)]
     pub http2: Http2Config,
+    /// TLS protocol versions and cipher selection on the listener.
+    #[serde(default)]
+    pub tls: TlsOptions,
+}
+
+/// TLS hardening for the HTTPS listener. These are **listener-wide**: Sōzu (and
+/// the TLS stack under it) applies protocol versions and ciphers at bind time,
+/// so every hostname served on the port shares them — they cannot vary per
+/// route. All fields default to `None`, leaving Sōzu's defaults in place.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TlsOptions {
+    /// Lowest TLS version accepted. `None` keeps Sōzu's default. Accepts
+    /// `"1.2"` or `"1.3"`. Set to `"1.3"` to refuse TLS 1.2 entirely.
+    #[serde(default)]
+    pub min_version: Option<String>,
+    /// Highest TLS version accepted. `None` keeps Sōzu's default. Same values
+    /// as `min_version`; must be `>= min_version`.
+    #[serde(default)]
+    pub max_version: Option<String>,
+    /// Cipher suites to allow, by rustls name — both TLS 1.3 suites
+    /// (`"TLS13_AES_256_GCM_SHA384"`) and TLS 1.2 suites
+    /// (`"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"`) go in this one list. `None`
+    /// keeps Sōzu's default set. A name Sōzu doesn't recognise is dropped with
+    /// a log line; an all-unrecognised list fails the HTTPS worker at startup.
+    ///
+    /// Note the coupling: this is the only cipher input Sōzu reads, across both
+    /// versions. Listing only TLS 1.2 suites therefore leaves no TLS 1.3 suite
+    /// enabled — include the 1.3 suites you want too.
+    #[serde(default)]
+    pub ciphers: Option<Vec<String>>,
 }
 
 /// HTTP/2 listener settings. Both fields default to `None`, which leaves
@@ -918,6 +948,7 @@ impl Default for HttpsConfig {
             listen_address: default_https_port(),
             error_pages: BTreeMap::new(),
             http2: Http2Config::default(),
+            tls: TlsOptions::default(),
         }
     }
 }

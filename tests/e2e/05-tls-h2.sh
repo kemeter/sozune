@@ -31,3 +31,36 @@ else
     fail "TLS h2: no h2 in ALPN negotiation (full log below)"
     echo "$alpn_log" | sed -n '/ALPN/p;/SSL connection/p' | head -10
 fi
+
+# --- Listener TLS version floor (proxy.https.tls.min_version: "1.3") -------
+# Version negotiation happens before certificate validation, so a 1.2-only
+# client is rejected at the handshake even though we serve no valid cert. This
+# proves the min_version floor is applied to the listener.
+log "[05] TLS: min_version 1.3 rejects a TLS 1.2 client"
+
+v12=$(curl -k -s -v --tlsv1.2 --tls-max 1.2 --max-time 3 \
+    "https://127.0.0.1:$HTTPS_PORT/" 2>&1 || true)
+# A rejected 1.2 client fails at the handshake: either a protocol-version alert
+# or the listener closing the connection (unexpected eof / TLS connect error).
+# What must NOT appear is a certificate-stage error, which would mean the
+# version was accepted and negotiation got past it.
+if echo "$v12" | grep -qiE "alert protocol version|no protocols available|version too low|unexpected eof|tls connect error|handshake fail|tlsv1 alert" \
+    && ! echo "$v12" | grep -qi "certificate"; then
+    pass "TLS 1.2 client is rejected by the 1.3-only listener"
+else
+    fail "TLS 1.2 client was not rejected (min_version not applied?)"
+    echo "$v12" | sed -n '/SSL/p;/alert/p;/TLS/p' | head -8
+fi
+
+# A 1.3 client gets past version negotiation (it then fails on the cert, which
+# is expected — we only care that the version floor let it through).
+log "[05] TLS: min_version 1.3 admits a TLS 1.3 client"
+
+v13=$(curl -k -s -v --tlsv1.3 --max-time 3 \
+    "https://127.0.0.1:$HTTPS_PORT/" 2>&1 || true)
+if echo "$v13" | grep -qiE "alert protocol version|no protocols available|version too low"; then
+    fail "TLS 1.3 client was wrongly rejected on version"
+    echo "$v13" | sed -n '/SSL/p;/alert/p' | head -8
+else
+    pass "TLS 1.3 client passes version negotiation"
+fi

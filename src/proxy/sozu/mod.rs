@@ -26,8 +26,8 @@ use sozu_command_lib::{
         ActivateListener, AddBackend, Cluster, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, PathRule, QueryMetricsOptions, RemoveBackend, Request,
         RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, ResponseStatus, RulePosition,
-        SocketAddress, UdpClusterConfig, WorkerRequest, WorkerResponse, request::RequestType,
-        response_content::ContentType,
+        SocketAddress, TlsVersion, UdpClusterConfig, WorkerRequest, WorkerResponse,
+        request::RequestType, response_content::ContentType,
     },
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -452,6 +452,8 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     ));
     apply_listener_error_pages(&mut https_builder, &config.https.error_pages, "HTTPS");
     apply_listener_http2(&mut https_builder, &config.https.http2);
+    apply_listener_tls_options(&mut https_builder, &config.https.tls)
+        .map_err(|e| anyhow::anyhow!("Invalid HTTPS TLS options: {e}"))?;
     // Behind the gate the worker only ever sees loopback connections, losing the
     // real client IP. So the gate prepends a PROXY-v2 header carrying the true
     // peer, and the worker is told to expect it — otherwise client-IP matching,
@@ -2394,6 +2396,68 @@ fn apply_listener_http2(builder: &mut ListenerBuilder, http2: &crate::config::Ht
     }
 }
 
+/// Parse a config TLS version string (`"1.2"` / `"1.3"`) into Sōzu's enum.
+fn parse_tls_version(s: &str) -> anyhow::Result<TlsVersion> {
+    match s {
+        "1.2" => Ok(TlsVersion::TlsV12),
+        "1.3" => Ok(TlsVersion::TlsV13),
+        other => anyhow::bail!("unsupported TLS version `{other}` (accepted: \"1.2\", \"1.3\")"),
+    }
+}
+
+/// Apply listener-wide TLS options (versions, ciphers) to the HTTPS builder.
+///
+/// Sōzu takes an explicit *list* of enabled versions, not a range, so a
+/// `min`/`max` pair is expanded into the versions it spans. Only 1.2 and 1.3
+/// are in play (Sōzune never enables older ones), which keeps the expansion to
+/// three cases. A `max < min` pair is rejected rather than silently emptied.
+fn apply_listener_tls_options(
+    builder: &mut ListenerBuilder,
+    tls: &crate::config::TlsOptions,
+) -> anyhow::Result<()> {
+    let min = tls
+        .min_version
+        .as_deref()
+        .map(parse_tls_version)
+        .transpose()?;
+    let max = tls
+        .max_version
+        .as_deref()
+        .map(parse_tls_version)
+        .transpose()?;
+
+    // Only touch versions when the operator pinned at least one bound; absent
+    // leaves Sōzu's default (`[TlsV12, TlsV13]`).
+    if min.is_some() || max.is_some() {
+        // Default the open bound to the widest Sōzune supports.
+        let lo = min.unwrap_or(TlsVersion::TlsV12) as i32;
+        let hi = max.unwrap_or(TlsVersion::TlsV13) as i32;
+        if hi < lo {
+            anyhow::bail!(
+                "TLS max_version must be >= min_version (got min={:?}, max={:?})",
+                tls.min_version,
+                tls.max_version
+            );
+        }
+        let versions: Vec<TlsVersion> = [TlsVersion::TlsV12, TlsVersion::TlsV13]
+            .into_iter()
+            .filter(|v| {
+                let n = *v as i32;
+                n >= lo && n <= hi
+            })
+            .collect();
+        builder.with_tls_versions(versions);
+    }
+
+    // Sōzu reads ciphers only from `cipher_list` (TLS 1.2 and 1.3 alike, by
+    // rustls name); its `cipher_suites` field is never consulted by the worker,
+    // so everything goes through this one call.
+    if let Some(ciphers) = &tls.ciphers {
+        builder.with_cipher_list(Some(ciphers.clone()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2410,11 +2474,88 @@ mod tests {
         builder.to_tls(None).expect("to_tls should succeed")
     }
 
+    fn tls_listener_with_options(
+        tls: &crate::config::TlsOptions,
+    ) -> anyhow::Result<sozu_command_lib::proto::command::HttpsListenerConfig> {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(0, 0, 0, 0, 8443));
+        apply_listener_tls_options(&mut builder, tls)?;
+        builder
+            .to_tls(None)
+            .map_err(|e| anyhow::anyhow!("to_tls: {e}"))
+    }
+
     #[test]
     fn http2_default_advertises_h2_and_http11() {
         let cfg = tls_listener_with_http2(&Http2Config::default());
         assert!(cfg.alpn_protocols.iter().any(|p| p == "h2"));
         assert!(cfg.alpn_protocols.iter().any(|p| p == "http/1.1"));
+    }
+
+    #[test]
+    fn tls_options_default_leaves_both_versions() {
+        // No bound pinned → Sōzu's default (1.2 + 1.3) stays.
+        let cfg = tls_listener_with_options(&crate::config::TlsOptions::default()).unwrap();
+        assert!(cfg.versions.contains(&(TlsVersion::TlsV12 as i32)));
+        assert!(cfg.versions.contains(&(TlsVersion::TlsV13 as i32)));
+    }
+
+    #[test]
+    fn tls_min_1_3_drops_1_2() {
+        let tls = crate::config::TlsOptions {
+            min_version: Some("1.3".into()),
+            ..Default::default()
+        };
+        let cfg = tls_listener_with_options(&tls).unwrap();
+        assert_eq!(cfg.versions, vec![TlsVersion::TlsV13 as i32]);
+    }
+
+    #[test]
+    fn tls_max_1_2_drops_1_3() {
+        let tls = crate::config::TlsOptions {
+            max_version: Some("1.2".into()),
+            ..Default::default()
+        };
+        let cfg = tls_listener_with_options(&tls).unwrap();
+        assert_eq!(cfg.versions, vec![TlsVersion::TlsV12 as i32]);
+    }
+
+    #[test]
+    fn tls_max_below_min_is_rejected() {
+        let tls = crate::config::TlsOptions {
+            min_version: Some("1.3".into()),
+            max_version: Some("1.2".into()),
+            ..Default::default()
+        };
+        let err = tls_listener_with_options(&tls).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_version must be >= min_version")
+        );
+    }
+
+    #[test]
+    fn tls_unknown_version_is_rejected() {
+        let tls = crate::config::TlsOptions {
+            min_version: Some("1.1".into()),
+            ..Default::default()
+        };
+        let err = tls_listener_with_options(&tls).unwrap_err();
+        assert!(err.to_string().contains("unsupported TLS version"));
+    }
+
+    #[test]
+    fn tls_ciphers_are_forwarded_as_cipher_list() {
+        // rustls names, and forwarded to `cipher_list` — the only cipher field
+        // Sōzu's worker actually reads.
+        let tls = crate::config::TlsOptions {
+            ciphers: Some(vec!["TLS13_AES_256_GCM_SHA384".into()]),
+            ..Default::default()
+        };
+        let cfg = tls_listener_with_options(&tls).unwrap();
+        assert_eq!(
+            cfg.cipher_list,
+            vec!["TLS13_AES_256_GCM_SHA384".to_string()]
+        );
     }
 
     #[test]
