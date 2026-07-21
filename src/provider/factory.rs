@@ -205,7 +205,7 @@ pub async fn start_services(
         // Ingress provider. If the cluster does not have the CRDs
         // installed we log and move on — Ingress alone is enough.
         //
-        // Five watchers run side by side, sharing a single
+        // Six watchers run side by side, sharing a single
         // `GatewayScope`:
         //   - GatewayClass watcher    — accepts classes whose
         //     controllerName matches sōzune's identity
@@ -217,6 +217,7 @@ pub async fn start_services(
         //   - TLSRoute watcher        — same, for TLS passthrough; exits
         //                               quietly when the (experimental) CRD
         //                               is absent
+        //   - TCPRoute watcher        — same, for raw TCP forwarding
         // Mutations to the scope notify the route watchers, which
         // re-resolve every tracked route so changes propagate without
         // waiting for the periodic tick.
@@ -301,6 +302,29 @@ pub async fn start_services(
                 .await
                 {
                     error!("Gateway API: TLSRoute watcher failed: {}", e);
+                }
+            });
+
+            // TCPRoute: raw TCP forwarding of a whole listener port, same
+            // static-port requirement as TLSRoute.
+            let tcp_client = client.clone();
+            let tcp_storage = Arc::clone(&storage_for_gateway);
+            let tcp_reload_tx = reload_tx_for_gateway.clone();
+            let tcp_resolver = Arc::clone(&resolver);
+            let tcp_scope = scope.clone();
+            let tcp_listener_ports = gateway::tcp_listener_ports(&tcp_listeners_for_gateway);
+            tokio::spawn(async move {
+                if let Err(e) = gateway::run_tcproute_watcher(
+                    tcp_client,
+                    tcp_storage,
+                    tcp_reload_tx,
+                    tcp_resolver,
+                    tcp_scope,
+                    tcp_listener_ports,
+                )
+                .await
+                {
+                    error!("Gateway API: TCPRoute watcher failed: {}", e);
                 }
             });
 

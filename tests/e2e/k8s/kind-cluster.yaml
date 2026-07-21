@@ -19,3 +19,7 @@ nodes:
       - containerPort: 18444
         hostPort: 18444
         protocol: TCP
+      # Raw TCP listener, for the TCPRoute suite.
+      - containerPort: 18445
+        hostPort: 18445
+        protocol: TCP

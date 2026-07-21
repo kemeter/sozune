@@ -284,3 +284,69 @@ spec:
     - backendRefs:
         - name: svc-tls
           port: 8443
+---
+# --- Raw TCP (TCPRoute) ---------------------------------------------------
+# A plain TCP echo backend. TCPRoute forwards the whole listener port to it,
+# no SNI, no TLS.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-tcp
+  namespace: sozune-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svc-tcp
+  template:
+    metadata:
+      labels:
+        app: svc-tcp
+    spec:
+      containers:
+        - name: tcp
+          image: alpine/socat
+          args: ["TCP-LISTEN:9000,fork,reuseaddr", "SYSTEM:'echo k8s-tcproute-ok'"]
+          ports:
+            - containerPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-tcp
+  namespace: sozune-test
+spec:
+  selector:
+    app: svc-tcp
+  ports:
+    - port: 9000
+      targetPort: 9000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tcpgw
+  namespace: sozune-test
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: raw
+      protocol: TCP
+      port: 18445
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: tcp-raw
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: tcpgw
+      sectionName: raw
+  rules:
+    - backendRefs:
+        - name: svc-tcp
+          port: 9000
