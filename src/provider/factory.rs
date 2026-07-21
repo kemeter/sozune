@@ -205,7 +205,7 @@ pub async fn start_services(
         // Ingress provider. If the cluster does not have the CRDs
         // installed we log and move on — Ingress alone is enough.
         //
-        // Six watchers run side by side, sharing a single
+        // Seven watchers run side by side, sharing a single
         // `GatewayScope`:
         //   - GatewayClass watcher    — accepts classes whose
         //     controllerName matches sōzune's identity
@@ -218,10 +218,12 @@ pub async fn start_services(
         //                               quietly when the (experimental) CRD
         //                               is absent
         //   - TCPRoute watcher        — same, for raw TCP forwarding
+        //   - UDPRoute watcher        — same, for datagram forwarding
         // Mutations to the scope notify the route watchers, which
         // re-resolve every tracked route so changes propagate without
         // waiting for the periodic tick.
         let tcp_listeners_for_gateway = config.proxy.tcp.clone();
+        let udp_listeners_for_gateway = config.proxy.udp.clone();
         tokio::spawn(async move {
             let client = match kubernetes_provider_for_gateway.build_client().await {
                 Ok(c) => c,
@@ -325,6 +327,29 @@ pub async fn start_services(
                 .await
                 {
                     error!("Gateway API: TCPRoute watcher failed: {}", e);
+                }
+            });
+
+            // UDPRoute: datagram forwarding of a whole listener port, over the
+            // `proxy.udp` listeners.
+            let udp_client = client.clone();
+            let udp_storage = Arc::clone(&storage_for_gateway);
+            let udp_reload_tx = reload_tx_for_gateway.clone();
+            let udp_resolver = Arc::clone(&resolver);
+            let udp_scope = scope.clone();
+            let udp_listener_ports = gateway::udp_listener_ports(&udp_listeners_for_gateway);
+            tokio::spawn(async move {
+                if let Err(e) = gateway::run_udproute_watcher(
+                    udp_client,
+                    udp_storage,
+                    udp_reload_tx,
+                    udp_resolver,
+                    udp_scope,
+                    udp_listener_ports,
+                )
+                .await
+                {
+                    error!("Gateway API: UDPRoute watcher failed: {}", e);
                 }
             });
 

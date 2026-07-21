@@ -35,6 +35,7 @@ use crate::model::{
 use futures_util::StreamExt;
 use gateway_api::apis::experimental::tcproutes::{TCPRoute, TCPRouteParentRefs, TCPRouteRules};
 use gateway_api::apis::experimental::tlsroutes::{TLSRoute, TLSRouteParentRefs, TLSRouteRules};
+use gateway_api::apis::experimental::udproutes::{UDPRoute, UDPRouteParentRefs, UDPRouteRules};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
@@ -83,11 +84,11 @@ type RouteIndex = Arc<RwLock<HashMap<String, TrackedRoute>>>;
 
 const SOURCE_TAG: &str = "k8s-gateway";
 
-/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute, TLSRoute
-/// and TCPRoute. Each scope mutation posts one permit per watcher so all
-/// re-resolve immediately instead of one waiting out its periodic tick.
+/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute, TLSRoute,
+/// TCPRoute and UDPRoute. Each scope mutation posts one permit per watcher so
+/// all re-resolve immediately instead of one waiting out its periodic tick.
 /// Bump this when adding another route watcher.
-const SCOPE_SUBSCRIBERS: usize = 3;
+const SCOPE_SUBSCRIBERS: usize = 4;
 
 /// In-memory snapshot of the Gateway API resources sōzune has decided to
 /// honour. The HTTPRoute watcher consults this on every apply to decide
@@ -165,6 +166,7 @@ macro_rules! impl_parent_ref {
 impl_parent_ref!(HTTPRouteParentRefs);
 impl_parent_ref!(TLSRouteParentRefs);
 impl_parent_ref!(TCPRouteParentRefs);
+impl_parent_ref!(UDPRouteParentRefs);
 
 #[derive(Default, Debug)]
 pub struct ScopeState {
@@ -365,6 +367,59 @@ impl GatewayScope {
             for listener in listeners.into_iter().filter(Self::listener_serves_tcp) {
                 // Honour a parentRef that pins a sectionName/port, exactly as
                 // the TLS path does.
+                let name_ok = p.section_name.as_deref().is_none_or(|s| s == listener.name);
+                let port_ok = p.port.is_none_or(|port| port == listener.port);
+                if name_ok && port_ok {
+                    ports.insert(listener.port);
+                }
+            }
+        }
+        ports
+    }
+
+    /// True iff this listener can carry a UDPRoute: protocol `UDP`.
+    fn listener_serves_udp(l: &ListenerInfo) -> bool {
+        l.protocol.eq_ignore_ascii_case("UDP")
+    }
+
+    /// True iff `parent_ref` binds this UDPRoute to a `UDP` listener we own.
+    fn accepts_udp_parent_ref(
+        &self,
+        route_namespace: &str,
+        parent_ref: &UDPRouteParentRefs,
+    ) -> bool {
+        self.accepts_parent_ref_where(route_namespace, parent_ref, Some(Self::listener_serves_udp))
+    }
+
+    /// True iff at least one `parentRef` binds this UDPRoute to a listener we
+    /// can serve.
+    pub fn accepts_udp_route(&self, route: &UDPRoute) -> bool {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return false;
+        };
+        refs.iter()
+            .any(|p| self.accepts_udp_parent_ref(route_ns, p))
+    }
+
+    /// The Gateway listener ports this UDPRoute binds to, resolved to
+    /// `proxy.udp` listeners by the caller. Like TCPRoute, no hostnames — a
+    /// datagram listener forwards the whole port.
+    fn effective_udp_ports(&self, route: &UDPRoute) -> std::collections::BTreeSet<i32> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let mut ports = std::collections::BTreeSet::new();
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return ports;
+        };
+        for p in refs
+            .iter()
+            .filter(|p| self.accepts_udp_parent_ref(route_ns, p))
+        {
+            let ns = p.namespace.as_deref().unwrap_or(route_ns);
+            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+                continue;
+            };
+            for listener in listeners.into_iter().filter(Self::listener_serves_udp) {
                 let name_ok = p.section_name.as_deref().is_none_or(|s| s == listener.name);
                 let port_ok = p.port.is_none_or(|port| port == listener.port);
                 if name_ok && port_ok {
@@ -680,10 +735,10 @@ impl GatewayScope {
     /// being referenced).
     pub fn allows_backend_ref(&self, from_ns: &str, to_ns: &str) -> bool {
         // Grants are keyed by `(from_ns, to_ns)`, not by route kind, so a grant
-        // authorising e.g. HTTPRoute→Service also lets a TLSRoute/TCPRoute in
-        // the same namespace reach that target. This is slightly more permissive
-        // than the spec (a grant names one `from.kind`); tightening it to a
-        // per-kind key is a separate hardening step.
+        // authorising e.g. HTTPRoute→Service also lets a TLSRoute/TCPRoute/
+        // UDPRoute in the same namespace reach that target. This is slightly
+        // more permissive than the spec (a grant names one `from.kind`);
+        // tightening it to a per-kind key is a separate hardening step.
         if from_ns == to_ns {
             return true;
         }
@@ -825,7 +880,10 @@ fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
         .iter()
         .filter(|f| {
             f.group == GATEWAY_API_GROUP
-                && matches!(f.kind.as_str(), "HTTPRoute" | "TLSRoute" | "TCPRoute")
+                && matches!(
+                    f.kind.as_str(),
+                    "HTTPRoute" | "TLSRoute" | "TCPRoute" | "UDPRoute"
+                )
         })
         .map(|f| f.namespace.clone())
         .collect()
@@ -2768,6 +2826,335 @@ fn log_tcp_route(action: &str, route: &TCPRoute) {
     debug!("Gateway API: TCPRoute {} {}/{}", action, ns, name);
 }
 
+// ---------- UDPRoute ----------
+//
+// The datagram twin of TCPRoute: forward a whole `proxy.udp` listener port to
+// the backends, one catch-all `Protocol::Udp` entrypoint per (route, port).
+
+/// Maps a Gateway listener port onto the name of a statically declared
+/// `proxy.udp` listener. Same static-port contract as TCP.
+pub type UdpListenerPorts = Arc<HashMap<i32, String>>;
+
+pub fn udp_listener_ports(udp: &[crate::config::UdpListenerConfig]) -> UdpListenerPorts {
+    Arc::new(
+        udp.iter()
+            .map(|l| (i32::from(l.listen), l.name.clone()))
+            .collect(),
+    )
+}
+
+struct TrackedUdpRoute {
+    route: UDPRoute,
+    entrypoint_ids: Vec<String>,
+}
+
+type UdpRouteIndex = Arc<RwLock<HashMap<String, TrackedUdpRoute>>>;
+
+/// Convert a UDPRoute into `Protocol::Udp` entrypoints, one catch-all per rule
+/// on the resolved listener.
+pub fn udp_route_to_entrypoints(
+    route: &UDPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+    listener_name: &str,
+    port: i32,
+) -> Vec<Entrypoint> {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    let Some(route_name) = route.metadata.name.as_deref() else {
+        return Vec::new();
+    };
+
+    route
+        .spec
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(rule_index, rule)| {
+            let backends = udp_rule_backends(rule, namespace, route_name, resolver, grants);
+            if backends.is_empty() {
+                return None;
+            }
+            Some(Entrypoint {
+                id: format!("{SOURCE_TAG}-udp/{namespace}/{route_name}/{port}/{rule_index}"),
+                name: format!("{route_name}-{port}-{rule_index}"),
+                backends,
+                protocol: Protocol::Udp,
+                config: EntrypointConfig {
+                    entrypoint: Some(listener_name.to_string()),
+                    ..tls_entrypoint_defaults()
+                },
+                source: Some(format!("{SOURCE_TAG}-udp/{namespace}/{route_name}")),
+            })
+        })
+        .collect()
+}
+
+/// Resolve a UDPRoute rule's `backendRefs` to pod IPs. Same handling as the TCP
+/// path; duplicated because `UDPRouteRules` is a distinct generated type.
+fn udp_rule_backends(
+    rule: &UDPRouteRules,
+    namespace: &str,
+    route_name: &str,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Vec<Backend> {
+    let Some(backend_refs) = rule.backend_refs.as_ref() else {
+        return Vec::new();
+    };
+    backend_refs
+        .iter()
+        .flat_map(|b| {
+            let Some(port_i32) = b.port else {
+                return Vec::new();
+            };
+            let Ok(port) = u16::try_from(port_i32) else {
+                return Vec::new();
+            };
+            let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
+            let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
+            if !kind_ok || !group_ok {
+                return Vec::new();
+            }
+            let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+            if !grants.allows(namespace, target_ns) {
+                warn!(
+                    "Gateway API: UDPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
+                    namespace, route_name, target_ns, b.name
+                );
+                return Vec::new();
+            }
+            let weight = b.weight.unwrap_or(100).max(0) as u32;
+            resolver
+                .pod_ips(target_ns, &b.name)
+                .into_iter()
+                .map(|address| Backend {
+                    address,
+                    port,
+                    weight,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn apply_udp_route(
+    route: &UDPRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &UdpRouteIndex,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    listener_ports: &UdpListenerPorts,
+) -> bool {
+    let uid = match route.metadata.uid.as_deref() {
+        Some(u) => u.to_string(),
+        None => {
+            warn!("Gateway API: UDPRoute without uid, skipping");
+            return false;
+        }
+    };
+
+    let new_entrypoints = if !scope.accepts_udp_route(route) {
+        Vec::new()
+    } else {
+        scope
+            .effective_udp_ports(route)
+            .into_iter()
+            .flat_map(|port| match listener_ports.get(&port) {
+                Some(listener_name) => {
+                    udp_route_to_entrypoints(route, resolver, scope, listener_name, port)
+                }
+                None => {
+                    let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+                    let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+                    warn!(
+                        "Gateway API: UDPRoute {}/{} binds to a Gateway listener on port {} but no `proxy.udp` listener is declared there — declare one in config.yaml, Sōzune does not open UDP ports on the fly",
+                        ns, name, port
+                    );
+                    Vec::new()
+                }
+            })
+            .collect()
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    if let Some(previous) = index_guard.get(&uid) {
+        for id in &previous.entrypoint_ids {
+            if storage_guard.remove(id).is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    let new_ids: Vec<String> = new_entrypoints.iter().map(|e| e.id.clone()).collect();
+    for ep in new_entrypoints {
+        storage_guard.insert(ep.id.clone(), ep);
+        changed = true;
+    }
+
+    index_guard.insert(
+        uid,
+        TrackedUdpRoute {
+            route: route.clone(),
+            entrypoint_ids: new_ids,
+        },
+    );
+
+    changed
+}
+
+fn delete_udp_route(
+    route: &UDPRoute,
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &UdpRouteIndex,
+) -> bool {
+    let Some(uid) = route.metadata.uid.as_deref() else {
+        return false;
+    };
+
+    let mut index_guard = match index.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let Some(tracked) = index_guard.remove(uid) else {
+        return false;
+    };
+
+    let mut storage_guard = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for id in tracked.entrypoint_ids {
+        if storage_guard.remove(&id).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn re_resolve_all_udp(
+    storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    index: &UdpRouteIndex,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    listener_ports: &UdpListenerPorts,
+) -> bool {
+    let tracked: Vec<UDPRoute> = match index.read() {
+        Ok(g) => g.values().map(|t| t.route.clone()).collect(),
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+
+    let mut changed = false;
+    for route in &tracked {
+        if apply_udp_route(route, storage, index, resolver, scope, listener_ports) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Watch UDPRoutes and keep their entrypoints in sync. `v1alpha2`/experimental
+/// like TCPRoute, so the CRD is probed and the watcher exits quietly if absent.
+pub async fn run_udproute_watcher(
+    client: Client,
+    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    reload_tx: mpsc::Sender<()>,
+    resolver: Arc<dyn ServiceResolver>,
+    scope: GatewayScope,
+    listener_ports: UdpListenerPorts,
+) -> anyhow::Result<()> {
+    let api: Api<UDPRoute> = Api::all(client);
+    if api.list(&Default::default()).await.is_err() {
+        info!(
+            "Gateway API: UDPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
+        );
+        return Ok(());
+    }
+
+    let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    let index: UdpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+    let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    resolve_ticker.tick().await;
+
+    info!("Gateway API: UDPRoute watcher started");
+
+    loop {
+        let changed = tokio::select! {
+            event = stream.next() => match event {
+                Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    log_udp_route("apply", &route);
+                    apply_udp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                }
+                Some(Ok(Event::Delete(route))) => {
+                    log_udp_route("delete", &route);
+                    delete_udp_route(&route, &storage, &index)
+                }
+                Some(Ok(Event::Init)) => {
+                    debug!("Gateway API: UDPRoute init");
+                    false
+                }
+                Some(Ok(Event::InitDone)) => {
+                    debug!("Gateway API: UDPRoute init done");
+                    false
+                }
+                Some(Err(e)) => {
+                    error!("Gateway API: UDPRoute watcher error: {}", e);
+                    false
+                }
+                None => break,
+            },
+            _ = resolve_ticker.tick() => {
+                re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+            }
+            _ = scope.changed() => {
+                debug!("Gateway API: scope changed, re-resolving UDP routes");
+                re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+            }
+        };
+        if changed && let Err(e) = reload_tx.send(()).await {
+            error!("Gateway API: failed to send reload signal: {}", e);
+        }
+    }
+
+    warn!("Gateway API: UDPRoute watcher stream ended unexpectedly");
+    Ok(())
+}
+
+fn log_udp_route(action: &str, route: &UDPRoute) {
+    let ns = route
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or("<no-namespace>");
+    let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
+    debug!("Gateway API: UDPRoute {} {}/{}", action, ns, name);
+}
+
 /// Maps a Gateway listener port onto the name of a statically declared
 /// `proxy.tcp` listener.
 ///
@@ -3675,6 +4062,135 @@ mod tests {
         let tcp = tcp_route(9000);
         let tcp_eps = tcp_route_to_entrypoints(&tcp, &r1(), &tcp_scope, "gw", 9000);
         assert!(tcp_eps[0].id.starts_with("k8s-gateway-tcp/"));
+    }
+
+    // ---------- UDPRoute ----------
+
+    fn udp_scope(port: i32) -> GatewayScope {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "sozune".into(),
+                listeners: vec![GatewayListeners {
+                    name: "udp".into(),
+                    port,
+                    protocol: "UDP".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: Default::default(),
+        });
+        scope
+    }
+
+    fn udp_route(backend_port: i32) -> UDPRoute {
+        UDPRoute {
+            metadata: ObjectMeta {
+                name: Some("dgram".into()),
+                namespace: Some("default".into()),
+                uid: Some("uid-udp-1".into()),
+                ..Default::default()
+            },
+            spec: gateway_api::apis::experimental::udproutes::UDPRouteSpec {
+                parent_refs: Some(vec![UDPRouteParentRefs {
+                    name: "gw".into(),
+                    ..Default::default()
+                }]),
+                rules: vec![UDPRouteRules {
+                    backend_refs: Some(vec![
+                        gateway_api::apis::experimental::udproutes::UDPRouteRulesBackendRefs {
+                            name: "svc".into(),
+                            port: Some(backend_port),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }],
+            },
+            status: Default::default(),
+        }
+    }
+
+    fn udp_ports() -> UdpListenerPorts {
+        Arc::new([(53, "dns".to_string())].into_iter().collect())
+    }
+
+    #[test]
+    fn udp_route_produces_one_catch_all_entrypoint_per_rule() {
+        let scope = udp_scope(53);
+        let route = udp_route(53);
+        assert!(scope.effective_udp_ports(&route).contains(&53));
+
+        let eps = udp_route_to_entrypoints(&route, &r1(), &scope, "dns", 53);
+        assert_eq!(eps.len(), 1);
+        let ep = &eps[0];
+        assert!(matches!(ep.protocol, Protocol::Udp));
+        assert_eq!(ep.config.entrypoint.as_deref(), Some("dns"));
+        assert_eq!(ep.config.sni, None);
+        assert!(ep.config.hostnames.is_empty());
+        assert_eq!(ep.backends[0].port, 53);
+    }
+
+    #[test]
+    fn udp_route_needs_a_udp_listener() {
+        // A TCP listener is not a UDP listener.
+        let scope = tcp_scope(53);
+        assert!(!scope.accepts_udp_route(&udp_route(53)));
+    }
+
+    #[test]
+    fn udp_route_with_unresolvable_backend_produces_nothing() {
+        let scope = udp_scope(53);
+        let eps = udp_route_to_entrypoints(&udp_route(53), &r0(), &scope, "dns", 53);
+        assert!(eps.is_empty());
+    }
+
+    #[test]
+    fn udp_apply_and_delete_round_trip_through_storage() {
+        let scope = udp_scope(53);
+        let storage: Arc<RwLock<BTreeMap<String, Entrypoint>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let index: UdpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let route = udp_route(53);
+
+        assert!(apply_udp_route(
+            &route,
+            &storage,
+            &index,
+            &r1(),
+            &scope,
+            &udp_ports()
+        ));
+        assert_eq!(storage.read().unwrap().len(), 1);
+
+        assert!(delete_udp_route(&route, &storage, &index));
+        assert!(storage.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn udp_entrypoint_ids_cannot_collide_with_tcp() {
+        // Distinct `-udp/` vs `-tcp/` prefixes keep the kinds apart.
+        let scope = udp_scope(53);
+        let eps = udp_route_to_entrypoints(&udp_route(53), &r1(), &scope, "dns", 53);
+        assert!(eps[0].id.starts_with("k8s-gateway-udp/"));
+    }
+
+    #[test]
+    fn udp_listener_ports_maps_port_to_name() {
+        let listeners = vec![crate::config::UdpListenerConfig {
+            name: "dns".into(),
+            listen: 53,
+        }];
+        let ports = udp_listener_ports(&listeners);
+        assert_eq!(ports.get(&53).map(String::as_str), Some("dns"));
+        assert!(ports.get(&443).is_none());
     }
 
     /// Resolver test double: returns the same canned IP for every Service

@@ -350,3 +350,70 @@ spec:
     - backendRefs:
         - name: svc-tcp
           port: 9000
+---
+# --- Raw UDP (UDPRoute) ---------------------------------------------------
+# A UDP echo backend. UDPRoute forwards the whole datagram port to it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-udp
+  namespace: sozune-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: svc-udp
+  template:
+    metadata:
+      labels:
+        app: svc-udp
+    spec:
+      containers:
+        - name: udp
+          image: alpine/socat
+          args: ["UDP-LISTEN:9001,fork,reuseaddr", "SYSTEM:'echo k8s-udproute-ok'"]
+          ports:
+            - containerPort: 9001
+              protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-udp
+  namespace: sozune-test
+spec:
+  selector:
+    app: svc-udp
+  ports:
+    - port: 9001
+      targetPort: 9001
+      protocol: UDP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: udpgw
+  namespace: sozune-test
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: raw
+      protocol: UDP
+      port: 18446
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata:
+  name: udp-raw
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: udpgw
+      sectionName: raw
+  rules:
+    - backendRefs:
+        - name: svc-udp
+          port: 9001

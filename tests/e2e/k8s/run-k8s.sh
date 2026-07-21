@@ -52,6 +52,9 @@ kubectl apply -f "$K8S_DIR/tlsroute-crd-v1.2.0.yaml" >/dev/null
 log "Installing TCPRoute CRD (experimental v1.2.0)..."
 kubectl apply -f "$K8S_DIR/tcproute-crd-v1.2.0.yaml" >/dev/null
 
+log "Installing UDPRoute CRD (experimental v1.2.0)..."
+kubectl apply -f "$K8S_DIR/udproute-crd-v1.2.0.yaml" >/dev/null
+
 # -- Workload manifests (must come before the sozune Pod so the namespace
 # and ingresses already exist when sozune starts watching).
 log "Applying workload manifests..."
