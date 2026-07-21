@@ -23,3 +23,7 @@ nodes:
       - containerPort: 18445
         hostPort: 18445
         protocol: TCP
+      # UDP listener, for the UDPRoute suite.
+      - containerPort: 18446
+        hostPort: 18446
+        protocol: UDP

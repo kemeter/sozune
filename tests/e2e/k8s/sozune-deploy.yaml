@@ -31,6 +31,7 @@ rules:
         "httproutes",
         "tlsroutes",
         "tcproutes",
+        "udproutes",
         "gateways",
         "gatewayclasses",
         "referencegrants",
@@ -89,6 +90,10 @@ data:
         # to this named listener.
         - name: tcpraw
           listen: 18445
+      # UDPRoute attaches to a `proxy.udp` listener, resolved by port.
+      udp:
+        - name: udpraw
+          listen: 18446
 
     middleware:
       port: 13180

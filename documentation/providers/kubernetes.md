@@ -306,7 +306,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 - Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
-- `GRPCRoute`, `UDPRoute`.
+- `GRPCRoute`.
 
 ### HTTPRoute filters
 
@@ -532,6 +532,49 @@ proxy:
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is honoured. |
 | `parentRefs` | `sectionName` and `port` select a listener. A route may bind listeners on several ports; each gets its own entrypoint. |
 
+## Gateway API (UDPRoute)
+
+`UDPRoute` is the datagram counterpart to TCPRoute: it forwards a whole UDP listener port to its backends. Same shape, same constraints — the only difference is the listener protocol (`UDP`) and that it resolves against `proxy.udp` listeners rather than `proxy.tcp`.
+
+`UDPRoute` is `v1alpha2`/experimental; the watcher probes for the CRD and skips quietly when it is absent.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: udpgw
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: dns
+      protocol: UDP
+      port: 53
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata:
+  name: my-dns
+spec:
+  parentRefs:
+    - name: udpgw
+      sectionName: dns
+  rules:
+    - backendRefs:
+        - name: coredns
+          port: 53
+```
+
+The Gateway's `UDP` listener port must match a `proxy.udp` entry in `config.yaml`, exactly as TCPRoute requires a `proxy.tcp` one:
+
+```yaml
+proxy:
+  udp:
+    - name: dns
+      listen: 53
+```
+
+Support is the same as TCPRoute — one catch-all entrypoint per rule, Service-typed backends, `ReferenceGrant` for cross-namespace, no hostnames or filters — on a `UDP` listener.
+
 ## ACME / Let's Encrypt
 
 When a Service is annotated with `sozune.http.<svc>.tls=true`, or an Ingress declares `spec.tls[].hosts`, Sōzune provisions a certificate for the declared hostnames. The HTTP-01 challenge responder runs inside the Sōzune pod, so:
@@ -548,7 +591,7 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
-- **Gateway API: `GRPCRoute`, `UDPRoute`, and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
+- **Gateway API: `GRPCRoute` and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
 - **TLSRoute and TCPRoute serve on a pre-declared port.** The listener's port must already be bound by a `proxy.tcp` entry — Sōzune does not open TCP ports from a Gateway alone. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what HTTPS entrypoints are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables
