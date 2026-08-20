@@ -37,7 +37,7 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Map Sōzune's [`LoadBalancer`](crate::model::LoadBalancer) to the Sōzu
 /// worker's `LoadBalancingAlgorithms` discriminant.
@@ -64,6 +64,38 @@ fn lb_algorithm(lb: LoadBalancer) -> LoadBalancingAlgorithms {
 /// the old config in the worker. Full-equality on `Entrypoint` makes that
 /// class of bug impossible.
 type RoutingSnapshot = BTreeMap<String, Entrypoint>;
+
+/// Whether every frontend an entrypoint declares actually landed in Sōzu.
+///
+/// A rolling deploy briefly runs the old and the new container under the same
+/// hostname, and Sōzu answers the second `AddHttpFrontend` with "already
+/// exists". Recording such an entrypoint as live is what strands a route: the
+/// next reload finds it unchanged in the snapshot, skips it, and never retries
+/// the add — so once the old cluster departs the hostname keeps a backend with
+/// no frontend of its own. Reporting the rejection keeps the entrypoint out of
+/// the snapshot, exactly like a SNI clash, so the following reload installs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendOutcome {
+    Installed,
+    Rejected,
+}
+
+/// Record a rejected entrypoint so it is left out of the snapshot, which is
+/// what gets its frontend retried on the next reload. Never clears an existing
+/// skip: a cluster held back for another reason stays held back.
+fn note_frontend_outcome(
+    cluster_id: &str,
+    outcome: FrontendOutcome,
+    skipped: &mut BTreeSet<String>,
+) {
+    if outcome == FrontendOutcome::Rejected {
+        warn!(
+            "Frontend rejected for cluster {}: retrying on the next reload",
+            cluster_id
+        );
+        skipped.insert(cluster_id.to_string());
+    }
+}
 
 /// Command channel for a single Sōzu L4 (TCP or UDP) worker, paired with the
 /// port it binds. We need the port at routing time to build the
@@ -986,7 +1018,7 @@ fn configure_sozu_routing(
         storage.len()
     );
 
-    let skipped = skipped_on_sni_clash(storage);
+    let mut skipped = skipped_on_sni_clash(storage);
 
     // Sort entrypoints by priority descending (higher priority first).
     // Since Sozu Pre rules are matched in insertion order, registering
@@ -1057,7 +1089,7 @@ fn configure_sozu_routing(
 
                 let https_addr = channels.https_addr();
                 let http_port = channels.http_port;
-                configure_http_entrypoint(
+                let outcome = configure_http_entrypoint(
                     &mut channels.http,
                     &mut channels.https,
                     cluster_id,
@@ -1066,6 +1098,8 @@ fn configure_sozu_routing(
                     https_addr,
                     middleware_port,
                 )?;
+
+                note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
             Protocol::Tcp => {
                 configure_tcp_entrypoint(&mut channels.tcp, cluster_id, entrypoint);
@@ -1090,8 +1124,9 @@ fn configure_http_entrypoint(
     http_port: u16,
     https_addr: SocketAddress,
     middleware_port: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<FrontendOutcome> {
     // Add cluster for both HTTP and HTTPS
+    let mut outcome = FrontendOutcome::Installed;
     let authorized_hashes = build_authorized_hashes(&entrypoint.config.auth);
     let frontend_required_auth = if authorized_hashes.is_empty() {
         None
@@ -1206,6 +1241,7 @@ fn configure_http_entrypoint(
                     "Failed to add HTTP frontend for {} [{}] (may already exist): {}",
                     hostname, method_tag, e
                 );
+                outcome = FrontendOutcome::Rejected;
             }
 
             // HTTPS frontend if TLS is enabled
@@ -1242,13 +1278,35 @@ fn configure_http_entrypoint(
                     RequestType::AddHttpsFrontend(https_front),
                 ) {
                     Ok(_) => info!("HTTPS frontend added for {} [{}]", hostname, method_tag),
-                    Err(e) => error!(
-                        "Failed to add HTTPS frontend for {} [{}]: {}",
-                        hostname, method_tag, e
-                    ),
+                    Err(e) => {
+                        error!(
+                            "Failed to add HTTPS frontend for {} [{}]: {}",
+                            hostname, method_tag, e
+                        );
+                        outcome = FrontendOutcome::Rejected;
+                    }
                 }
             }
         }
+    }
+
+    // Sōzu refused at least one frontend. The entrypoint is about to be left
+    // out of the snapshot so the next reload retries it, and anything installed
+    // in the meantime has to go with it: a frontend the snapshot does not know
+    // about is one `apply_routing_diff` will never remove, and on the retry it
+    // would come back as a duplicate rejection of our own making, pinning the
+    // entrypoint outside the snapshot for good.
+    if outcome == FrontendOutcome::Rejected {
+        remove_http_frontends(
+            command_channel,
+            command_channel_https,
+            cluster_id,
+            entrypoint,
+            http_port,
+            https_addr,
+        );
+        remove_cluster(command_channel, command_channel_https, cluster_id);
+        return Ok(outcome);
     }
 
     // Add backends
@@ -1340,7 +1398,7 @@ fn configure_http_entrypoint(
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn configure_tcp_entrypoint(
@@ -2664,6 +2722,99 @@ mod tests {
             tcp_ep("b", "gateway", Some("b.example.com")),
         ]);
         assert!(skipped_on_sni_clash(&storage).is_empty());
+    }
+
+    /// The production failure this guards, as a state machine over two reloads.
+    ///
+    /// Reload 1 runs the departing and arriving containers side by side under
+    /// one hostname. Sōzu refuses the arriving frontend as a duplicate. If that
+    /// rejection is swallowed, the arriving entrypoint is written to the
+    /// snapshot as live; reload 2 then finds it unchanged, skips it, and never
+    /// retries the add — so when the departing cluster is torn down the
+    /// hostname is left with backends and no frontend of its own, and no later
+    /// reload repairs it.
+    ///
+    /// This asserts the skip conditions themselves, so a fourth skip path that
+    /// swallowed the retry would fail here rather than pass unnoticed.
+    #[test]
+    fn a_rejected_frontend_is_reapplied_on_the_next_reload() {
+        let entrypoint = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+
+        // Reload 1 rejected the add, so the entrypoint is kept out of the
+        // snapshot reload 2 diffs against.
+        let mut previous = RoutingSnapshot::new();
+        previous.insert("app_new".to_string(), entrypoint.clone());
+        let mut skipped = BTreeSet::new();
+        note_frontend_outcome("app_new", FrontendOutcome::Rejected, &mut skipped);
+        for cluster_id in &skipped {
+            previous.remove(cluster_id);
+        }
+
+        // Reload 2, against configure_sozu_routing's three skip conditions.
+        assert!(
+            !skipped_on_sni_clash(&previous).contains("app_new"),
+            "no SNI clash, so that guard must not hold the retry back"
+        );
+        assert_ne!(
+            previous.get("app_new"),
+            Some(&entrypoint),
+            "an unchanged entrypoint is skipped — this is the equality the drop breaks"
+        );
+        assert!(
+            !previous.contains_key("app_new"),
+            "with no previous entry the backends-only branch cannot fire either"
+        );
+    }
+
+    /// The converse, so the fix cannot degrade into "never record anything":
+    /// an entrypoint whose frontends landed stays in the snapshot, and reload 2
+    /// leaves it alone instead of re-adding a frontend Sōzu would then reject
+    /// as a duplicate — the very loop this code avoids elsewhere.
+    #[test]
+    fn an_installed_frontend_stays_in_the_snapshot() {
+        let entrypoint = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+
+        let mut previous = RoutingSnapshot::new();
+        previous.insert("app_new".to_string(), entrypoint.clone());
+        let mut skipped = BTreeSet::new();
+        note_frontend_outcome("app_new", FrontendOutcome::Installed, &mut skipped);
+        for cluster_id in &skipped {
+            previous.remove(cluster_id);
+        }
+
+        assert_eq!(
+            previous.get("app_new"),
+            Some(&entrypoint),
+            "an installed entrypoint stays live, so reload 2 skips it"
+        );
+    }
+
+    /// A rejection on any one frontend condemns the whole entrypoint, because
+    /// the snapshot records entrypoints, not individual frontends: a partially
+    /// installed entrypoint recorded as live would strand the frontends that
+    /// were refused.
+    #[test]
+    fn a_rejected_entrypoint_joins_the_skipped_set() {
+        let mut skipped = BTreeSet::new();
+        note_frontend_outcome("app_new", FrontendOutcome::Rejected, &mut skipped);
+        assert!(skipped.contains("app_new"));
+    }
+
+    #[test]
+    fn an_installed_entrypoint_is_left_out_of_the_skipped_set() {
+        let mut skipped = BTreeSet::new();
+        note_frontend_outcome("app_new", FrontendOutcome::Installed, &mut skipped);
+        assert!(skipped.is_empty());
+    }
+
+    /// A cluster already skipped for another reason (a SNI clash) must stay
+    /// skipped when its frontends happen to land, or the snapshot would record
+    /// a route the operator still has to fix.
+    #[test]
+    fn an_installed_entrypoint_does_not_clear_an_existing_skip() {
+        let mut skipped = BTreeSet::from(["app_new".to_string()]);
+        note_frontend_outcome("app_new", FrontendOutcome::Installed, &mut skipped);
+        assert!(skipped.contains("app_new"));
     }
 
     #[test]
