@@ -65,6 +65,11 @@ pub trait Middleware: Send + Sync {
 /// Run the request phase of every middleware in order. Returns `Err(response)`
 /// the moment one short-circuits, so the caller can return it without touching
 /// the backend.
+///
+/// The `Err` variant is a ready response, not an error: `result_large_err`
+/// wants it boxed, which would put an allocation on the request path to
+/// describe a short-circuit that is already the uncommon case.
+#[allow(clippy::result_large_err)]
 pub async fn run_request_phase(
     middlewares: &[Arc<dyn Middleware>],
     ctx: &mut RequestCtx,
