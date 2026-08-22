@@ -302,7 +302,7 @@ impl DockerProvider {
                                 };
                                 let mut keys_to_remove = Vec::new();
                                 for (key, entrypoint) in storage_write.iter_mut() {
-                                    entrypoint.backends.retain(|b| b.address != container_ip);
+                                    drop_backends_of(entrypoint, &container_ip, self.name);
                                     if entrypoint.backends.is_empty() {
                                         keys_to_remove.push(key.clone());
                                     }
@@ -320,22 +320,24 @@ impl DockerProvider {
                                 // Drop any cached diagnostics for this container — it's gone.
                                 diagnostics::remove(&diagnostics, container_id);
                                 // Stopped containers lose their network IP, so we read from
-                                // the per-container tracker populated at `start` time. If the
-                                // tracker has no entry (event arrived before we ever saw it),
-                                // fall back to 127.0.0.1 so the cleanup pass at least runs —
-                                // the warn! makes the partial cleanup visible in the logs.
-                                let container_ip = self
+                                // the per-container tracker populated at `start` time. With no
+                                // entry (the event arrived before we ever saw the container)
+                                // there is nothing to clean up *by address*: guessing
+                                // 127.0.0.1 and sweeping on it would delete the backends of
+                                // every host-network container instead. Leave the routes to
+                                // the next full scan, which rebuilds them from what is live.
+                                let Some(container_ip) = self
                                     .container_ips
                                     .lock()
                                     .ok()
                                     .and_then(|mut ips| ips.remove(container_id.as_str()))
-                                    .unwrap_or_else(|| {
-                                        warn!(
-                                            "No tracked IP for stopped container {}, cleanup may be incomplete",
-                                            container_id
-                                        );
-                                        "127.0.0.1".to_string()
-                                    });
+                                else {
+                                    warn!(
+                                        "no tracked IP for stopped container {}; leaving its routes to the next scan",
+                                        container_id
+                                    );
+                                    continue;
+                                };
                                 let mut storage_write = match storage.write() {
                                     Ok(guard) => guard,
                                     Err(e) => {
@@ -350,7 +352,7 @@ impl DockerProvider {
                                 let mut keys_to_remove = Vec::new();
                                 for (key, entrypoint) in storage_write.iter_mut() {
                                     // Remove this container's IP from backends
-                                    entrypoint.backends.retain(|b| b.address != container_ip);
+                                    drop_backends_of(entrypoint, &container_ip, self.name);
 
                                     // If no backends left, mark for removal
                                     if entrypoint.backends.is_empty() {
@@ -389,7 +391,7 @@ impl DockerProvider {
                                     // Remove old entries for this container
                                     let mut keys_to_remove = Vec::new();
                                     for (key, entrypoint) in storage_write.iter_mut() {
-                                        entrypoint.backends.retain(|b| b.address != container_ip);
+                                        drop_backends_of(entrypoint, &container_ip, self.name);
                                         if entrypoint.backends.is_empty() {
                                             keys_to_remove.push(key.clone());
                                         }
@@ -835,14 +837,27 @@ mod health_tests {
     }
 }
 
+/// Drop the backends a departing container contributed to one entrypoint.
+///
+/// Scoped to entrypoints this provider owns: matching on the address alone
+/// reached across providers, so a Docker container stopping stripped backends
+/// from file, consul or API entrypoints that happened to share the address --
+/// `127.0.0.1` most of all, which is what a host-network container resolves to.
+fn drop_backends_of(entrypoint: &mut Entrypoint, container_ip: &str, provider: &str) {
+    if entrypoint.source.as_deref() != Some(provider) {
+        return;
+    }
+    entrypoint.backends.retain(|b| b.address != container_ip);
+}
+
 #[cfg(test)]
-mod merge_tests {
+pub(super) mod merge_tests {
     use super::*;
     use crate::model::{
         Backend, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
     };
 
-    fn ep(host: &str, path: Option<&str>, ip: &str) -> Entrypoint {
+    pub(super) fn ep(host: &str, path: Option<&str>, ip: &str) -> Entrypoint {
         Entrypoint {
             id: "x".into(),
             backends: vec![Backend::new(ip, 80)],
@@ -952,5 +967,55 @@ mod merge_tests {
             "container-bbbb",
         );
         assert_eq!(map.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod stop_cleanup_tests {
+    use super::*;
+    use crate::model::Backend;
+
+    fn with(source: Option<&str>, backends: Vec<Backend>) -> Entrypoint {
+        let mut entrypoint = super::merge_tests::ep("app.example.com", None, "10.0.0.1");
+        entrypoint.backends = backends;
+        entrypoint.source = source.map(str::to_string);
+        entrypoint
+    }
+
+    /// A stopped container must take its own backends with it and nothing
+    /// else. Matching on the address alone removed every backend that happened
+    /// to share the IP, across every entrypoint in the store.
+    #[test]
+    fn only_the_stopped_container_s_backends_go() {
+        let mut entrypoint = with(
+            Some("docker"),
+            vec![Backend::new("10.0.0.1", 80), Backend::new("10.0.0.2", 80)],
+        );
+
+        drop_backends_of(&mut entrypoint, "10.0.0.1", "docker");
+
+        assert_eq!(entrypoint.backends, vec![Backend::new("10.0.0.2", 80)]);
+    }
+
+    /// Entrypoints from another provider are not ours to prune. A Docker
+    /// container stopping used to strip backends from file, consul or API
+    /// entrypoints that shared the address — `127.0.0.1` above all.
+    #[test]
+    fn another_provider_s_entrypoint_is_left_alone() {
+        let mut entrypoint = with(Some("file"), vec![Backend::new("127.0.0.1", 80)]);
+
+        drop_backends_of(&mut entrypoint, "127.0.0.1", "docker");
+
+        assert_eq!(entrypoint.backends, vec![Backend::new("127.0.0.1", 80)]);
+    }
+
+    /// An entrypoint with no source is not attributable to Docker either.
+    #[test]
+    fn an_unsourced_entrypoint_is_left_alone() {
+        let mut entrypoint = with(None, vec![Backend::new("10.0.0.1", 80)]);
+
+        drop_backends_of(&mut entrypoint, "10.0.0.1", "docker");
+
+        assert_eq!(entrypoint.backends, vec![Backend::new("10.0.0.1", 80)]);
     }
 }
