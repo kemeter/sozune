@@ -643,14 +643,23 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                         Some(cmd) => {
                             info!("Adding certificate for {}", cmd.hostname);
                             let https_addr = channels.https_addr();
-                            if let Err(e) = add_certificate(
+                            let added = add_certificate(
                                 &mut channels.https,
                                 https_addr,
                                 &cmd.cert_pem,
                                 &cmd.chain,
                                 &cmd.key_pem,
                                 std::slice::from_ref(&cmd.hostname),
-                            ) {
+                            );
+
+                            // The sender wrote the certificate to disk before
+                            // handing it over, so only this answer tells it
+                            // whether the hostname can actually serve TLS.
+                            if let Some(accepted) = cmd.accepted {
+                                let _ = accepted.send(added.is_ok());
+                            }
+
+                            if let Err(e) = added {
                                 error!(
                                     "Failed to add certificate for {}: {}",
                                     cmd.hostname, e
