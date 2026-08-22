@@ -96,6 +96,21 @@ fn retain_applied(snapshot: &mut RoutingSnapshot, applied: &BTreeSet<String>) {
     snapshot.retain(|cluster_id, _| applied.contains(cluster_id));
 }
 
+/// The id Sozu knows a backend by.
+///
+/// Sozu keys a backend on the id it was added under, so the add and the later
+/// removal have to agree. Deriving it from address and port rather than from
+/// the position in the list keeps that true when a rescale reorders or removes
+/// entries: a backend that moves from index 2 to index 1 is still the same
+/// backend, and one that leaves takes its own id with it.
+///
+/// `index` is accepted so callers can keep their loop variable, but it is
+/// deliberately unused - it is what the old positional scheme keyed on, and
+/// taking it here makes that impossible to reintroduce by accident.
+fn backend_id(cluster_id: &str, _index: usize, backend: &Backend) -> String {
+    format!("{cluster_id}-backend-{}-{}", backend.address, backend.port)
+}
+
 /// Whether a cluster's backends leave it able to serve.
 ///
 /// A frontend is all-or-nothing, but backends are not: losing one of three
@@ -1434,7 +1449,7 @@ fn configure_http_entrypoint(
 
             let backend = AddBackend {
                 cluster_id: cluster_id.to_string(),
-                backend_id: format!("{}-backend-{}", cluster_id, backend_index),
+                backend_id: backend_id(cluster_id, backend_index, backend_entry),
                 address,
                 load_balancing_parameters: Some(LoadBalancingParams { weight }),
                 sticky_id: None,
@@ -1987,12 +2002,7 @@ fn add_backends(
                 continue;
             }
         };
-        // Stable, address-derived id so add and remove agree regardless of
-        // position in the backend list.
-        let backend_id = format!(
-            "{cluster_id}-backend-{}-{}",
-            backend_entry.address, backend_entry.port
-        );
+        let backend_id = backend_id(cluster_id, 0, backend_entry);
         let add = AddBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
@@ -2039,10 +2049,7 @@ fn remove_backend_set(
                 continue;
             }
         };
-        let backend_id = format!(
-            "{cluster_id}-backend-{}-{}",
-            backend_entry.address, backend_entry.port
-        );
+        let backend_id = backend_id(cluster_id, 0, backend_entry);
         let remove = RemoveBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
@@ -2084,7 +2091,7 @@ fn remove_backends(
                 continue;
             }
         };
-        let backend_id = format!("{}-backend-{}", cluster_id, i);
+        let backend_id = backend_id(cluster_id, i, backend_entry);
         let remove = RemoveBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
@@ -3155,6 +3162,54 @@ mod tests {
                 match_client_ip: Vec::new(),
             },
         }
+    }
+
+    /// Sōzu keys a backend by the id it was added under, so an add and its
+    /// later removal have to agree on that id. They did not: the first install
+    /// numbered backends by their position in the list, while the rescale path
+    /// derives the id from the address. `docker compose --scale web=3` then
+    /// down to 2 therefore sent `RemoveBackend` for an id Sōzu had never seen,
+    /// and the departed container kept taking a third of the traffic — no
+    /// error, since the command itself succeeds against a live cluster.
+    #[test]
+    fn a_backend_is_removed_under_the_id_it_was_added_with() {
+        let backend = Backend::new("10.0.0.3", 80);
+
+        assert_eq!(
+            backend_id("http_web", 2, &backend),
+            backend_id("http_web", 0, &backend),
+            "add and remove must name the same backend"
+        );
+    }
+
+    /// The id must not move when a backend's position changes, or scaling down
+    /// the middle of a list renames every backend after it and orphans them
+    /// all. Address and port are what identify a backend to us, so they are
+    /// what the id is built from.
+    #[test]
+    fn a_backend_keeps_its_id_when_its_position_moves() {
+        let backend = Backend::new("10.0.0.3", 80);
+
+        assert_eq!(
+            backend_id("http_web", 0, &backend),
+            backend_id("http_web", 7, &backend),
+            "position must not appear in the id"
+        );
+    }
+
+    /// Two backends of one cluster must never collide, including the same host
+    /// on two ports.
+    #[test]
+    fn two_backends_of_a_cluster_get_distinct_ids() {
+        let a = Backend::new("10.0.0.1", 80);
+        let b = Backend::new("10.0.0.2", 80);
+        let same_host_other_port = Backend::new("10.0.0.1", 8080);
+
+        assert_ne!(backend_id("http_web", 0, &a), backend_id("http_web", 1, &b));
+        assert_ne!(
+            backend_id("http_web", 0, &a),
+            backend_id("http_web", 1, &same_host_other_port)
+        );
     }
 
     #[test]
