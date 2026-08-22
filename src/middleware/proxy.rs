@@ -90,7 +90,7 @@ pub async fn handle_proxy(
                     return diag::internal_error("middleware-routing-corrupted").into_response();
                 }
             };
-            (table.get_route_by_host(&host), table.known_hosts())
+            (table.get_route(&host, &path), table.known_hosts())
         };
 
         let route = match route {

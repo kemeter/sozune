@@ -50,9 +50,16 @@ pub struct MiddlewareAppState {
 pub type MiddlewareState = Arc<RwLock<MiddlewareRouteTable>>;
 
 /// Route table mapping hostname → middleware config + real backends
+/// The routes one hostname carries, each with the path prefix it was declared
+/// with. `None` is a route with no path: the catch-all for that hostname.
+type HostRoutes = Vec<(Option<String>, Arc<MiddlewareRoute>)>;
+
 #[derive(Debug, Default)]
 pub struct MiddlewareRouteTable {
-    pub(super) routes: std::collections::HashMap<String, Arc<MiddlewareRoute>>,
+    /// Keyed by hostname, but a hostname can carry several routes: Sozu routes
+    /// on host *and* path, so one entry per hostname would drop all but the
+    /// last one stored.
+    pub(super) routes: std::collections::HashMap<String, HostRoutes>,
 }
 
 /// Middleware configuration for a single entrypoint.
@@ -90,14 +97,53 @@ impl std::fmt::Debug for MiddlewareRoute {
     }
 }
 
+/// Whether `request_path` falls under `prefix`, on a segment boundary.
+///
+/// `/api` covers `/api` and `/api/users`, but not `/apifoo` — a prefix that
+/// matched mid-segment would capture paths it was never given.
+fn prefix_matches(prefix: &str, request_path: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    match request_path.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Index of the candidate that should serve `request_path`: the longest prefix
+/// that matches, with a pathless route as the catch-all.
+///
+/// Sozu already routed the request on host *and* path before handing it over,
+/// so this only has to reproduce that choice among the routes sharing a
+/// hostname. Resolving on the hostname alone let whichever entrypoint was
+/// stored last serve every path under it.
+fn best_match(candidates: &[Option<String>], request_path: &str) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| match path {
+            Some(prefix) => prefix_matches(prefix, request_path),
+            None => true,
+        })
+        .max_by_key(|(_, path)| path.as_deref().map(str::len).unwrap_or(0))
+        .map(|(index, _)| index)
+}
+
 impl MiddlewareRouteTable {
     pub fn update_routes_for_entrypoint(
         &mut self,
         hostnames: &[String],
+        path: Option<String>,
         route: Arc<MiddlewareRoute>,
     ) {
         for hostname in hostnames {
-            self.routes.insert(hostname.clone(), Arc::clone(&route));
+            self.routes
+                .entry(hostname.clone())
+                .or_default()
+                .push((path.clone(), Arc::clone(&route)));
         }
     }
 
@@ -105,10 +151,13 @@ impl MiddlewareRouteTable {
         self.routes.clear();
     }
 
-    pub fn get_route_by_host(&self, host: &str) -> Option<Arc<MiddlewareRoute>> {
+    pub fn get_route(&self, host: &str, request_path: &str) -> Option<Arc<MiddlewareRoute>> {
         // Strip port from host header if present (e.g. "example.com:8080" -> "example.com")
         let hostname = host.split(':').next().unwrap_or(host);
-        self.routes.get(hostname).cloned()
+        let candidates = self.routes.get(hostname)?;
+
+        let paths: Vec<Option<String>> = candidates.iter().map(|(p, _)| p.clone()).collect();
+        best_match(&paths, request_path).map(|index| Arc::clone(&candidates[index].1))
     }
 
     pub fn known_hosts(&self) -> Vec<String> {
@@ -377,4 +426,61 @@ pub async fn serve(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod route_key_tests {
+    use super::*;
+
+    /// Sozu routes on host *and* path and hands the request to the middleware
+    /// server, which used to resolve it by host alone. Two entrypoints on one
+    /// hostname therefore collapsed into whichever was inserted last, decided
+    /// by cluster-id order:
+    ///
+    /// ```text
+    /// api: app.example.com /api  rateLimit=10
+    /// web: app.example.com /     compress
+    /// ```
+    ///
+    /// `GET /api/users` was matched by Sozu against the /api frontend, then
+    /// sent to *web's* backends with web's middleware stack — the rate limit
+    /// never ran. An ip_allow_list or forward_auth on the losing route was
+    /// dropped the same way, silently.
+    #[test]
+    fn the_longest_matching_prefix_wins() {
+        let candidates = vec![Some("/api".to_string()), Some("/".to_string())];
+
+        assert_eq!(best_match(&candidates, "/api/users"), Some(0));
+        assert_eq!(best_match(&candidates, "/index.html"), Some(1));
+    }
+
+    /// A route with no path serves everything under the hostname, so it is the
+    /// catch-all and must lose to any prefix that matches.
+    #[test]
+    fn a_pathless_route_is_the_catch_all() {
+        let candidates = vec![Some("/api".to_string()), None];
+
+        assert_eq!(best_match(&candidates, "/api/users"), Some(0));
+        assert_eq!(best_match(&candidates, "/other"), Some(1));
+    }
+
+    /// A prefix only matches on a segment boundary: /apifoo is not under /api,
+    /// or a route would capture hostnames it was never given.
+    #[test]
+    fn a_prefix_matches_only_on_a_segment_boundary() {
+        let candidates = vec![Some("/api".to_string())];
+
+        assert_eq!(best_match(&candidates, "/api"), Some(0));
+        assert_eq!(best_match(&candidates, "/api/users"), Some(0));
+        assert_eq!(best_match(&candidates, "/apifoo"), None);
+    }
+
+    /// Nothing matches: the caller answers 404 rather than picking a route at
+    /// random, which is what host-only keying amounted to.
+    #[test]
+    fn no_candidate_matches() {
+        let candidates = vec![Some("/api".to_string()), Some("/admin".to_string())];
+
+        assert_eq!(best_match(&candidates, "/"), None);
+    }
 }
