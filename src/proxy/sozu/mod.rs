@@ -96,6 +96,21 @@ fn retain_applied(snapshot: &mut RoutingSnapshot, applied: &BTreeSet<String>) {
     snapshot.retain(|cluster_id, _| applied.contains(cluster_id));
 }
 
+/// Whether a cluster's backends leave it able to serve.
+///
+/// A frontend is all-or-nothing, but backends are not: losing one of three
+/// still leaves somewhere to send traffic, and retrying the entrypoint over it
+/// would re-send frontends Sōzu already accepted and refuse them as duplicates.
+/// Losing every one is different — the route survives with nothing behind it
+/// and answers 503 until something retries the adds.
+fn backend_outcome(attempted: usize, rejected: usize) -> FrontendOutcome {
+    if attempted > 0 && rejected == attempted {
+        FrontendOutcome::Rejected
+    } else {
+        FrontendOutcome::Installed
+    }
+}
+
 /// Record a rejected entrypoint so it is left out of the snapshot, which is
 /// what gets its frontend retried on the next reload. Never clears an existing
 /// skip: a cluster held back for another reason stays held back.
@@ -1377,6 +1392,7 @@ fn configure_http_entrypoint(
             backup: None,
         };
 
+        let mut rejected = 0usize;
         if let Err(e) = send_to_worker(
             command_channel,
             format!("add-backend-http-{}-0", cluster_id),
@@ -1386,6 +1402,7 @@ fn configure_http_entrypoint(
                 "Failed to add HTTP middleware backend {} (may already exist): {}",
                 backend.backend_id, e
             );
+            rejected += 1;
         }
         if entrypoint.config.tls
             && let Err(e) = send_to_worker(
@@ -1399,6 +1416,10 @@ fn configure_http_entrypoint(
                 e
             );
         }
+
+        // The middleware path installs one synthetic backend pointing at the
+        // middleware server, so losing it leaves the cluster with nothing.
+        outcome = backend_outcome(1, rejected);
     } else {
         debug!(
             "Setting up {} backends for {}: {:?}",
@@ -1406,6 +1427,7 @@ fn configure_http_entrypoint(
             entrypoint.name,
             entrypoint.backends
         );
+        let mut rejected = 0usize;
         for (backend_index, backend_entry) in entrypoint.backends.iter().enumerate() {
             let address = parse_backend_address(backend_entry)?;
             let weight = backend_entry.weight as i32;
@@ -1429,6 +1451,7 @@ fn configure_http_entrypoint(
                     "Failed to add HTTP backend {} (may already exist): {}",
                     backend.backend_id, e
                 );
+                rejected += 1;
             }
 
             // HTTPS backend only if TLS is enabled
@@ -1445,6 +1468,11 @@ fn configure_http_entrypoint(
                 }
             }
         }
+
+        // Judged on the HTTP adds: the HTTPS worker carries the same backend
+        // set, so a cluster that kept none of them has nowhere to send traffic
+        // and would answer 503 until a later reload retries the adds.
+        outcome = backend_outcome(entrypoint.backends.len(), rejected);
     }
 
     Ok(outcome)
@@ -2981,6 +3009,36 @@ mod tests {
         retain_applied(&mut snapshot, &applied);
 
         assert_eq!(snapshot.len(), 2, "nothing was held back");
+    }
+
+    /// A cluster whose frontends landed but whose backends were all refused is
+    /// live in name only: Sōzu has a route and nothing to send it to, so the
+    /// hostname serves 503s. Recording it as applied means the next reload
+    /// judges it unchanged and never retries the backends, so the 503s stay.
+    #[test]
+    fn a_cluster_left_without_backends_is_retried() {
+        assert_eq!(
+            backend_outcome(3, 3),
+            FrontendOutcome::Rejected,
+            "every backend refused leaves the cluster serving nothing"
+        );
+    }
+
+    /// One refused backend out of several is not worth another reload: the
+    /// cluster still has somewhere to send traffic, and retrying the whole
+    /// entrypoint would re-send the frontends Sōzu already accepted, which it
+    /// then refuses as duplicates.
+    #[test]
+    fn a_cluster_that_kept_a_backend_is_left_alone() {
+        assert_eq!(backend_outcome(3, 1), FrontendOutcome::Installed);
+        assert_eq!(backend_outcome(3, 0), FrontendOutcome::Installed);
+    }
+
+    /// An entrypoint that declares no backends at all is a configuration the
+    /// operator chose, not a failed send — nothing to retry.
+    #[test]
+    fn a_cluster_with_no_backends_declared_is_not_a_rejection() {
+        assert_eq!(backend_outcome(0, 0), FrontendOutcome::Installed);
     }
 
     #[test]
