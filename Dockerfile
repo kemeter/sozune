@@ -7,8 +7,10 @@ RUN bun install --frozen-lockfile
 COPY dashboard/ ./
 RUN bun run build
 
-# Pinned to 1.95.0: rustc 1.96 SIGSEGVs in thin-LTO codegen on this dependency set.
-FROM rust:1.95.0-bookworm AS builder
+# Pinned so a toolchain release cannot change what this image compiles to.
+# 1.95.0 was chosen when 1.96 SIGSEGVd in thin-LTO codegen on this dependency
+# set; 1.95.0 now does the same as the crate has grown, and 1.98.0 does not.
+FROM rust:1.98.0-bookworm AS builder
 # protobuf-compiler: sozu's build.rs runs protoc to generate command.rs.
 # rustfmt: that same build.rs calls prost_build with .format(true), which shells
 # out to rustfmt — absent from the base image, so the generated module is never
