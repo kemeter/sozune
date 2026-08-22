@@ -1102,10 +1102,12 @@ fn configure_sozu_routing(
                 note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
             Protocol::Tcp => {
-                configure_tcp_entrypoint(&mut channels.tcp, cluster_id, entrypoint);
+                let outcome = configure_tcp_entrypoint(&mut channels.tcp, cluster_id, entrypoint);
+                note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
             Protocol::Udp => {
-                configure_udp_entrypoint(&mut channels.udp, cluster_id, entrypoint);
+                let outcome = configure_udp_entrypoint(&mut channels.udp, cluster_id, entrypoint);
+                note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
         }
 
@@ -1405,7 +1407,7 @@ fn configure_tcp_entrypoint(
     tcp_channels: &mut L4Channels,
     cluster_id: &str,
     entrypoint: &Entrypoint,
-) {
+) -> FrontendOutcome {
     debug!(
         "Configuring TCP cluster `{}` (backends: {:?})",
         entrypoint.name, entrypoint.backends
@@ -1417,7 +1419,10 @@ fn configure_tcp_entrypoint(
                 "TCP entrypoint `{}` has no listener reference, skipping",
                 entrypoint.name
             );
-            return;
+            // A missing listener is operator misconfiguration, not something
+            // Sōzu would accept on a later reload: retrying it every time would
+            // spin without ever converging.
+            return FrontendOutcome::Installed;
         }
     };
 
@@ -1429,7 +1434,9 @@ fn configure_tcp_entrypoint(
                  Declare it under `proxy.tcp` in the config.",
                 entrypoint.name, listener_name
             );
-            return;
+            // Also misconfiguration: the listener has to be declared in the
+            // config before any reload could apply this entrypoint.
+            return FrontendOutcome::Installed;
         }
     };
     let listener_port = listener.port;
@@ -1475,6 +1482,8 @@ fn configure_tcp_entrypoint(
         ..Default::default()
     };
 
+    let mut outcome = FrontendOutcome::Installed;
+
     if let Err(e) = send_to_worker(
         channel,
         format!("add-frontend-tcp-{}", cluster_id),
@@ -1484,6 +1493,15 @@ fn configure_tcp_entrypoint(
             "Failed to add TCP frontend for cluster {} on listener {}: {}",
             cluster_id, listener_name, e
         );
+        outcome = FrontendOutcome::Rejected;
+    }
+
+    // Nothing routes without the frontend, and the entrypoint is about to be
+    // held back from the snapshot so the next reload retries it. Leave the
+    // cluster behind and the retry meets its own leftovers as a duplicate.
+    if outcome == FrontendOutcome::Rejected {
+        remove_l4_cluster(channel, cluster_id, "tcp");
+        return outcome;
     }
 
     for backend_entry in &entrypoint.backends {
@@ -1515,13 +1533,15 @@ fn configure_tcp_entrypoint(
             debug!("Failed to add TCP backend {backend_id} (may already exist): {e}");
         }
     }
+
+    outcome
 }
 
 fn configure_udp_entrypoint(
     udp_channels: &mut L4Channels,
     cluster_id: &str,
     entrypoint: &Entrypoint,
-) {
+) -> FrontendOutcome {
     debug!(
         "Configuring UDP cluster `{}` (backends: {:?})",
         entrypoint.name, entrypoint.backends
@@ -1533,7 +1553,10 @@ fn configure_udp_entrypoint(
                 "UDP entrypoint `{}` has no listener reference, skipping",
                 entrypoint.name
             );
-            return;
+            // A missing listener is operator misconfiguration, not something
+            // Sōzu would accept on a later reload: retrying it every time would
+            // spin without ever converging.
+            return FrontendOutcome::Installed;
         }
     };
 
@@ -1545,7 +1568,9 @@ fn configure_udp_entrypoint(
                  Declare it under `proxy.udp` in the config.",
                 entrypoint.name, listener_name
             );
-            return;
+            // Also misconfiguration: the listener has to be declared in the
+            // config before any reload could apply this entrypoint.
+            return FrontendOutcome::Installed;
         }
     };
     let listener_port = listener.port;
@@ -1587,6 +1612,8 @@ fn configure_udp_entrypoint(
         ..Default::default()
     };
 
+    let mut outcome = FrontendOutcome::Installed;
+
     if let Err(e) = send_to_worker(
         channel,
         format!("add-frontend-udp-{}", cluster_id),
@@ -1596,6 +1623,14 @@ fn configure_udp_entrypoint(
             "Failed to add UDP frontend for cluster {} on listener {}: {}",
             cluster_id, listener_name, e
         );
+        outcome = FrontendOutcome::Rejected;
+    }
+
+    // Same reasoning as TCP: no frontend, no route, so take the cluster back
+    // out rather than leave the retry a duplicate to trip over.
+    if outcome == FrontendOutcome::Rejected {
+        remove_l4_cluster(channel, cluster_id, "udp");
+        return outcome;
     }
 
     for backend_entry in &entrypoint.backends {
@@ -1626,6 +1661,23 @@ fn configure_udp_entrypoint(
         ) {
             debug!("Failed to add UDP backend {backend_id} (may already exist): {e}");
         }
+    }
+
+    outcome
+}
+
+/// Undo the cluster an L4 entrypoint installed before its frontend was refused.
+fn remove_l4_cluster(
+    channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    proto: &str,
+) {
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("rm-cluster-{proto}-{cluster_id}"),
+        RequestType::RemoveCluster(cluster_id.to_string()),
+    ) {
+        debug!("Failed to remove {proto} cluster {cluster_id} after a rejected frontend: {e}");
     }
 }
 
@@ -2793,6 +2845,44 @@ mod tests {
     /// the snapshot records entrypoints, not individual frontends: a partially
     /// installed entrypoint recorded as live would strand the frontends that
     /// were refused.
+    /// The HTTP fix, restated for L4: an entrypoint whose frontend Sōzu refused
+    /// must stay out of the snapshot whatever its protocol, or the next reload
+    /// finds it unchanged, skips it, and the route stays dead for good.
+    ///
+    /// This walks the reload the same way the HTTP test does, but for a TCP
+    /// entrypoint — the protocol is not what decides whether a rejection can be
+    /// retried.
+    #[test]
+    fn a_rejected_tcp_frontend_is_reapplied_on_the_next_reload() {
+        let entrypoint = tcp_ep("db", "gateway", Some("db.example.com"));
+
+        let mut previous = RoutingSnapshot::new();
+        previous.insert("db".to_string(), entrypoint.clone());
+        let mut skipped = BTreeSet::new();
+        note_frontend_outcome("db", FrontendOutcome::Rejected, &mut skipped);
+        for cluster_id in &skipped {
+            previous.remove(cluster_id);
+        }
+
+        assert_ne!(
+            previous.get("db"),
+            Some(&entrypoint),
+            "an unchanged entrypoint is skipped — this is the equality the drop breaks"
+        );
+    }
+
+    /// Guards the wiring rather than the helper: every protocol arm of
+    /// `configure_sozu_routing` must be able to report a rejection, so a
+    /// protocol that silently returns `()` cannot slip back in. A `()` return
+    /// makes this fail to compile, which is the point.
+    #[test]
+    fn every_protocol_reports_whether_its_frontend_landed() {
+        fn assert_reports(_: fn(&mut L4Channels, &str, &Entrypoint) -> FrontendOutcome) {}
+
+        assert_reports(configure_tcp_entrypoint);
+        assert_reports(configure_udp_entrypoint);
+    }
+
     #[test]
     fn a_rejected_entrypoint_joins_the_skipped_set() {
         let mut skipped = BTreeSet::new();
