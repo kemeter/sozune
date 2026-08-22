@@ -983,7 +983,11 @@ fn update_middleware_routes(
                 entrypoint.config.hostnames,
                 route.middlewares.len(),
             );
-            table.update_routes_for_entrypoint(&entrypoint.config.hostnames, route);
+            table.update_routes_for_entrypoint(
+                &entrypoint.config.hostnames,
+                entrypoint.config.path.as_ref().map(|p| p.value.clone()),
+                route,
+            );
         }
     }
 }
