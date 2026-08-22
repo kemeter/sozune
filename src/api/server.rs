@@ -646,6 +646,7 @@ async fn update_entrypoint(
     Path(id): Path<String>,
     Json(payload): Json<CreateEntrypointRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let stored;
     {
         let mut storage = match state.storage.write() {
             Ok(guard) => guard,
@@ -688,7 +689,8 @@ async fn update_entrypoint(
             config: payload.config,
             source: Some("api".to_string()),
         };
-        storage.insert(id.clone(), entrypoint);
+        storage.insert(id.clone(), entrypoint.clone());
+        stored = entrypoint;
     }
 
     if let Err(e) = state.reload_tx.send(()).await {
@@ -698,10 +700,12 @@ async fn update_entrypoint(
         );
     }
 
-    let storage = state.storage.read().unwrap();
-    let entrypoint = &storage[&id];
+    // Echo what was stored rather than reading the map again. The write lock is
+    // released above and the send below is an await point, so a concurrent
+    // DELETE can empty the entry in between — indexing it would panic and
+    // poison the store for every later request.
     info!("Updated entrypoint: {}", id);
-    (StatusCode::OK, Json(serde_json::json!(entrypoint)))
+    (StatusCode::OK, Json(serde_json::json!(stored)))
 }
 
 async fn delete_entrypoint(
@@ -1038,6 +1042,105 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_to_json(response.into_body()).await;
         assert_eq!(json["name"], "web-updated");
+    }
+
+    /// The update handler used to drop the write lock, await on the reload
+    /// channel, then re-read the entrypoint out of the map to echo it back:
+    ///
+    /// ```ignore
+    /// let storage = state.storage.read().unwrap();
+    /// let entrypoint = &storage[&id];
+    /// ```
+    ///
+    /// Both halves are a crash. A DELETE landing in that window removes the
+    /// key, and indexing a `BTreeMap` with a missing key panics; and the
+    /// `.unwrap()` was the only lock in this file that panicked on poisoning
+    /// instead of answering 500 like its thirty neighbours. Either one poisons
+    /// the store for good, after which every handler reports "internal state
+    /// corrupted, restart required" until the process is restarted.
+    ///
+    /// The read was never needed — the handler already holds the value it
+    /// stored. This pins that: the response must be the entrypoint that was
+    /// written, produced without going back to the map.
+    #[tokio::test]
+    async fn update_echoes_what_it_stored_without_reading_back() {
+        let state = test_state();
+        let app = test_app(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = body_to_json(response.into_body()).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let mut updated_json = sample_entrypoint_json();
+        updated_json["name"] = serde_json::json!("web-updated");
+
+        let response = app
+            .oneshot(
+                Request::put(format!("/entrypoints/{id}"))
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(updated_json.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["name"], "web-updated");
+        assert_eq!(json["id"], id.as_str());
+    }
+
+    /// The store must be readable after an update: a handler that panicked
+    /// while holding the lock would poison it and take every later request
+    /// with it.
+    #[tokio::test]
+    async fn update_leaves_the_store_usable() {
+        let state = test_state();
+        let app = test_app(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = body_to_json(response.into_body()).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let mut updated_json = sample_entrypoint_json();
+        updated_json["name"] = serde_json::json!("web-updated");
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/entrypoints/{id}"))
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(updated_json.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            state.storage.read().is_ok(),
+            "a panic under the lock would poison the store for every later request"
+        );
     }
 
     #[tokio::test]
