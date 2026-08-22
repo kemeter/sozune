@@ -3,15 +3,15 @@ pub mod inventory;
 pub mod resolver;
 pub mod tls_alpn_responder;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use cheti::{AccountStore, Dns01Solver, FileAccountStore, TlsAlpn01Solver};
 use instant_acme::{Account, ChallengeType, Identifier, NewAccount, NewOrder, Order, OrderStatus};
 use rcgen::{CertificateParams, KeyPair};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AcmeConfig, ResolverConfig};
@@ -128,6 +128,43 @@ pub struct CertCommand {
     pub cert_pem: String,
     pub key_pem: String,
     pub chain: Vec<String>,
+    /// Answered with whether the HTTPS worker took the certificate. Without it
+    /// the sender cannot tell a delivered certificate from one that was only
+    /// written to disk, and would leave the hostname unable to serve TLS until
+    /// a restart reloaded the file.
+    pub accepted: Option<oneshot::Sender<bool>>,
+}
+
+/// What the certificate file on disk says about a hostname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDisk {
+    /// No file: the hostname has never been provisioned.
+    Missing,
+    /// A file whose remaining lifetime is still comfortable.
+    Fresh,
+    /// A file close enough to expiry that it is due for renewal.
+    Expiring,
+}
+
+/// Whether the HTTPS worker actually accepted the certificate we last sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerHolds {
+    Yes,
+    No,
+}
+
+/// Whether a hostname needs the ACME pass to act on it.
+///
+/// The file on disk is not the whole state: `provision_certificate` writes it
+/// before handing the material to the HTTPS worker, and that send can fail
+/// without anything retrying it. Judging on the file alone leaves such a
+/// hostname looking done while the worker has nothing to serve TLS with, until
+/// a restart reloads every cert from disk.
+fn needs_resend(on_disk: OnDisk, worker: WorkerHolds) -> bool {
+    match on_disk {
+        OnDisk::Missing | OnDisk::Expiring => true,
+        OnDisk::Fresh => worker == WorkerHolds::No,
+    }
 }
 
 pub struct AcmeManager {
@@ -143,6 +180,10 @@ pub struct AcmeManager {
     notify: Arc<Notify>,
     /// Per-hostname backoff after failed provisioning attempts.
     backoff: Backoff,
+    /// Hostnames whose certificate is on disk but which the HTTPS worker did
+    /// not take, so the next pass sends the material again instead of reading
+    /// the file and calling the hostname done.
+    undelivered: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl AcmeManager {
@@ -164,6 +205,7 @@ impl AcmeManager {
             certs_dir,
             notify,
             backoff: Backoff::default(),
+            undelivered: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -340,13 +382,24 @@ impl AcmeManager {
             warn!("Skipping invalid hostname: {}", hostname);
             return false;
         }
+
+        let worker = if self.is_undelivered(hostname) {
+            WorkerHolds::No
+        } else {
+            WorkerHolds::Yes
+        };
+
+        needs_resend(self.on_disk(hostname).await, worker)
+    }
+
+    /// What the certificate file says about a hostname, expiry included.
+    async fn on_disk(&self, hostname: &str) -> OnDisk {
         let cert_path = self.certs_dir.join(path_safe(hostname)).join("cert.pem");
         if !cert_path.exists() {
-            return true;
+            return OnDisk::Missing;
         }
 
-        // Read and parse existing cert to check expiration
-        match tokio::fs::read_to_string(&cert_path).await {
+        let expiring = match tokio::fs::read_to_string(&cert_path).await {
             Ok(pem_data) => cheti::needs_renewal_ratio_checked(&pem_data, RENEWAL_FLOOR_DAYS)
                 .unwrap_or_else(|e| {
                     warn!(
@@ -356,6 +409,31 @@ impl AcmeManager {
                     true
                 }),
             Err(_) => true,
+        };
+
+        if expiring {
+            OnDisk::Expiring
+        } else {
+            OnDisk::Fresh
+        }
+    }
+
+    fn is_undelivered(&self, hostname: &str) -> bool {
+        self.undelivered
+            .lock()
+            .map(|set| set.contains(hostname))
+            .unwrap_or(false)
+    }
+
+    fn mark_undelivered(&self, hostname: &str) {
+        if let Ok(mut set) = self.undelivered.lock() {
+            set.insert(hostname.to_string());
+        }
+    }
+
+    fn mark_delivered(&self, hostname: &str) {
+        if let Ok(mut set) = self.undelivered.lock() {
+            set.remove(hostname);
         }
     }
 
@@ -406,16 +484,42 @@ impl AcmeManager {
             .await?;
 
         let (cert_pem, chain) = split_pem_chain(&cert_chain_pem);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
         self.cert_tx
             .send(CertCommand {
                 hostname: hostname.to_string(),
                 cert_pem,
                 key_pem,
                 chain,
+                accepted: Some(accepted_tx),
             })
             .await?;
 
-        info!("Certificate for {} provisioned successfully", hostname);
+        // The certificate is on disk either way. What decides whether this
+        // hostname can serve TLS is the worker taking it, so remember a refusal
+        // and let the next pass send the material again — the file alone would
+        // read as "done" forever.
+        match accepted_rx.await {
+            Ok(true) => {
+                self.mark_delivered(hostname);
+                info!("Certificate for {} provisioned successfully", hostname);
+            }
+            Ok(false) => {
+                self.mark_undelivered(hostname);
+                warn!(
+                    "Certificate for {} was saved but the HTTPS worker refused it; resending on the next pass",
+                    hostname
+                );
+            }
+            Err(_) => {
+                // The reload handler dropped the sender (shutting down, or the
+                // channel closed). Treat it as undelivered: resending is
+                // cheap and costs no ACME order, since the cert is on disk.
+                self.mark_undelivered(hostname);
+                debug!("No answer for {}'s certificate; will resend", hostname);
+            }
+        }
+
         Ok(())
     }
 
@@ -708,6 +812,9 @@ impl AcmeManager {
                     cert_pem: cert,
                     key_pem,
                     chain,
+                    // Startup load: a refusal here is picked up by the first
+                    // provisioning pass, which reads the same file.
+                    accepted: None,
                 })
                 .await
             {
@@ -921,6 +1028,41 @@ fn parse_utc_stamp_to_epoch(stamp: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A certificate on disk the HTTPS worker never accepted is not a
+    /// certificate: `add_certificate` can fail after `save_certificate` has
+    /// already written the file, and nothing retries the send. Because the file
+    /// is there and still valid, the renewal pass judges the hostname done, so
+    /// HTTPS stays broken for it until the process restarts and reloads every
+    /// cert from disk.
+    ///
+    /// Whether the worker holds it is what decides a resend, not the file.
+    #[test]
+    fn a_certificate_the_worker_never_took_is_sent_again() {
+        assert!(needs_resend(OnDisk::Fresh, WorkerHolds::No));
+    }
+
+    /// The ordinary case: the worker has it and the file is fresh, so the pass
+    /// leaves the hostname alone rather than burning an ACME order on it.
+    #[test]
+    fn a_certificate_the_worker_holds_is_left_alone() {
+        assert!(!needs_resend(OnDisk::Fresh, WorkerHolds::Yes));
+    }
+
+    /// An expiring certificate is renewed whoever holds it — the resend path
+    /// must not shadow the renewal one.
+    #[test]
+    fn an_expiring_certificate_is_renewed_even_when_the_worker_holds_it() {
+        assert!(needs_resend(OnDisk::Expiring, WorkerHolds::Yes));
+        assert!(needs_resend(OnDisk::Expiring, WorkerHolds::No));
+    }
+
+    /// Nothing on disk means a first provision, not a resend of something that
+    /// does not exist.
+    #[test]
+    fn a_hostname_with_no_certificate_still_needs_one() {
+        assert!(needs_resend(OnDisk::Missing, WorkerHolds::No));
+    }
 
     #[test]
     fn is_wildcard_detects_leading_star_dot() {
