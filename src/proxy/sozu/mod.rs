@@ -80,6 +80,22 @@ enum FrontendOutcome {
     Rejected,
 }
 
+/// A reload that gave up partway, carrying the entrypoints it had applied
+/// before the error so the caller can keep the rest out of the snapshot. The
+/// alternative — returning the error alone — is what let unsent entrypoints be
+/// recorded as live and skipped by every later reload.
+struct ReloadFailure {
+    error: anyhow::Error,
+    applied: BTreeSet<String>,
+}
+
+/// Drop from the snapshot every entrypoint a reload did not apply, so the next
+/// one retries them instead of judging them unchanged and skipping them for
+/// good.
+fn retain_applied(snapshot: &mut RoutingSnapshot, applied: &BTreeSet<String>) {
+    snapshot.retain(|cluster_id, _| applied.contains(cluster_id));
+}
+
 /// Record a rejected entrypoint so it is left out of the snapshot, which is
 /// what gets its frontend retried on the next reload. Never clears an existing
 /// skip: a cluster held back for another reason stays held back.
@@ -870,7 +886,18 @@ fn handle_reload(
                 }
                 info!("Configuration reloaded successfully");
             }
-            Err(e) => error!("Failed to reload configuration: {}", e),
+            Err(ReloadFailure { error, applied }) => {
+                // The reload stopped partway. Only what it got through was
+                // sent to a worker; recording the rest as live would hide it
+                // from every later reload, which is how one bad backend
+                // address takes every lower-priority route down with it.
+                let held_back = current_snapshot.len().saturating_sub(applied.len());
+                retain_applied(&mut current_snapshot, &applied);
+                error!(
+                    "Failed to reload configuration: {}. {} entrypoint(s) were not applied and will be retried",
+                    error, held_back
+                );
+            }
         }
     });
 
@@ -1012,13 +1039,16 @@ fn configure_sozu_routing(
     previous: &RoutingSnapshot,
     cluster_setup_delay_ms: u64,
     middleware_port: u16,
-) -> anyhow::Result<BTreeSet<String>> {
+) -> Result<BTreeSet<String>, ReloadFailure> {
     info!(
         "Applying Sōzu configuration for {} entrypoints",
         storage.len()
     );
 
     let mut skipped = skipped_on_sni_clash(storage);
+    // Every entrypoint the loop gets through, so a mid-loop failure can still
+    // tell the caller what actually reached a worker.
+    let mut applied: BTreeSet<String> = BTreeSet::new();
 
     // Sort entrypoints by priority descending (higher priority first).
     // Since Sozu Pre rules are matched in insertion order, registering
@@ -1089,7 +1119,7 @@ fn configure_sozu_routing(
 
                 let https_addr = channels.https_addr();
                 let http_port = channels.http_port;
-                let outcome = configure_http_entrypoint(
+                let outcome = match configure_http_entrypoint(
                     &mut channels.http,
                     &mut channels.https,
                     cluster_id,
@@ -1097,7 +1127,13 @@ fn configure_sozu_routing(
                     http_port,
                     https_addr,
                     middleware_port,
-                )?;
+                ) {
+                    Ok(outcome) => outcome,
+                    // Giving up here is fine, but the entrypoints the loop has
+                    // not reached were never sent: hand back what did land so
+                    // the rest stays out of the snapshot and is retried.
+                    Err(error) => return Err(ReloadFailure { error, applied }),
+                };
 
                 note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
@@ -1110,6 +1146,8 @@ fn configure_sozu_routing(
                 note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
         }
+
+        applied.insert(cluster_id.clone());
 
         thread::sleep(std::time::Duration::from_millis(cluster_setup_delay_ms));
     }
@@ -2881,6 +2919,59 @@ mod tests {
 
         assert_reports(configure_tcp_entrypoint);
         assert_reports(configure_udp_entrypoint);
+    }
+
+    /// A reload that dies partway must not leave the survivors recorded as live.
+    ///
+    /// `configure_sozu_routing` walks entrypoints in priority order and gives
+    /// up on the first hard error — today a malformed backend address. Whatever
+    /// it had not reached yet was never sent to a worker, but the snapshot was
+    /// still returned whole, so the next reload found those entrypoints
+    /// unchanged, skipped them, and never applied them. The higher the priority
+    /// of the broken entrypoint, the more routes go with it.
+    ///
+    /// `applied` names what actually reached a worker, so the caller can keep
+    /// the rest out of the snapshot and let the following reload retry them.
+    #[test]
+    fn a_failed_reload_keeps_unsent_entrypoints_out_of_the_snapshot() {
+        let reached = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let never_reached = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+
+        let mut snapshot = RoutingSnapshot::new();
+        snapshot.insert("high_priority".to_string(), reached.clone());
+        snapshot.insert("low_priority".to_string(), never_reached);
+
+        // The reload died after the first entrypoint, so only that one landed.
+        let applied = BTreeSet::from(["high_priority".to_string()]);
+        retain_applied(&mut snapshot, &applied);
+
+        assert_eq!(
+            snapshot.get("high_priority"),
+            Some(&reached),
+            "an entrypoint that reached a worker stays live"
+        );
+        assert!(
+            !snapshot.contains_key("low_priority"),
+            "an entrypoint the reload never reached must be retried, not recorded"
+        );
+    }
+
+    /// A reload that ran to the end records everything it applied, so the next
+    /// one skips the unchanged entrypoints instead of re-sending frontends
+    /// Sōzu would then refuse as duplicates.
+    #[test]
+    fn a_complete_reload_keeps_every_applied_entrypoint() {
+        let a = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let b = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+
+        let mut snapshot = RoutingSnapshot::new();
+        snapshot.insert("a".to_string(), a.clone());
+        snapshot.insert("b".to_string(), b.clone());
+
+        let applied = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        retain_applied(&mut snapshot, &applied);
+
+        assert_eq!(snapshot.len(), 2, "nothing was held back");
     }
 
     #[test]
