@@ -598,10 +598,39 @@ async fn get_entrypoint(
     }
 }
 
+/// Reject a hostname that would match hosts the caller was never given.
+///
+/// The same gate the label parser and the HTTP provider apply: Sozu reads a
+/// name containing `/` as a regex and a bare `*` as every host, and frontends
+/// go in ahead of every other route. Leaving the API open would just move the
+/// exploit to this door.
+fn reject_unroutable_hostname(
+    config: &crate::model::EntrypointConfig,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let bad = config
+        .hostnames
+        .iter()
+        .find(|h| !crate::labels::fields::host::is_routable_hostname(h))?;
+
+    warn!("refusing entrypoint: `{}` is not a hostname", bad);
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "hostname is not routable",
+            "hostname": bad,
+            "hint": "use a plain hostname, or `*.example.com` for a wildcard",
+        })),
+    ))
+}
+
 async fn create_entrypoint(
     State(state): State<AppState>,
     Json(payload): Json<CreateEntrypointRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(refusal) = reject_unroutable_hostname(&payload.config) {
+        return refusal;
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
 
     let entrypoint = Entrypoint {
@@ -646,6 +675,10 @@ async fn update_entrypoint(
     Path(id): Path<String>,
     Json(payload): Json<CreateEntrypointRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(refusal) = reject_unroutable_hostname(&payload.config) {
+        return refusal;
+    }
+
     let stored;
     {
         let mut storage = match state.storage.write() {
@@ -1141,6 +1174,100 @@ mod tests {
             state.storage.read().is_ok(),
             "a panic under the lock would poison the store for every later request"
         );
+    }
+
+    /// #145 refused a regex hostname from a label and from the HTTP provider,
+    /// but the API was left open. Sozu reads a name containing `/` as a regex
+    /// and a bare `*` as every host, and frontends go in at `RulePosition::Pre`
+    /// — so one POST could put a rule in front of every legitimate route.
+    #[tokio::test]
+    async fn creating_an_entrypoint_refuses_a_regex_hostname() {
+        let state = test_state();
+        let app = test_app(state.clone());
+
+        for bad in ["/.*/", "*", "a/b.com"] {
+            let mut payload = sample_entrypoint_json();
+            payload["config"]["hostnames"] = serde_json::json!([bad]);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/entrypoints")
+                        .header("authorization", admin_auth())
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "`{bad}` must not become a route"
+            );
+        }
+    }
+
+    /// The same door on update: an entrypoint created with a good hostname must
+    /// not be able to change into a catch-all.
+    #[tokio::test]
+    async fn updating_an_entrypoint_refuses_a_regex_hostname() {
+        let state = test_state();
+        let app = test_app(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_entrypoint_json().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = body_to_json(response.into_body()).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let mut payload = sample_entrypoint_json();
+        payload["config"]["hostnames"] = serde_json::json!(["/.*/"]);
+
+        let response = app
+            .oneshot(
+                Request::put(format!("/entrypoints/{id}"))
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A wildcard Sozu handles natively must still be accepted.
+    #[tokio::test]
+    async fn a_leading_wildcard_is_accepted_by_the_api() {
+        let state = test_state();
+        let app = test_app(state.clone());
+
+        let mut payload = sample_entrypoint_json();
+        payload["config"]["hostnames"] = serde_json::json!(["*.example.com"]);
+
+        let response = app
+            .oneshot(
+                Request::post("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
