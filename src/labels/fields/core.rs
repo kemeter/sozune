@@ -84,6 +84,10 @@ pub fn parse_priority(
 
 /// Parse the backendTimeout label (milliseconds). Returns `None` when absent
 /// or invalid; non-numeric values emit `W003`.
+///
+/// `0` is accepted and means "no timeout": the request waits as long as the
+/// backend takes. It is indistinguishable from a typo, so it is noted in the
+/// log rather than left silent.
 pub fn parse_backend_timeout(
     labels: &HashMap<String, String>,
     prefix: &str,
@@ -92,6 +96,12 @@ pub fn parse_backend_timeout(
     let key = format!("{prefix}backendTimeout");
     let raw = labels.get(&key)?;
     match raw.parse::<u64>() {
+        Ok(0) => {
+            tracing::warn!(
+                "{key}=0 disables the backend timeout: requests to this route wait indefinitely"
+            );
+            Some(0)
+        }
         Ok(t) => Some(t),
         Err(_) => {
             diagnostics.push(

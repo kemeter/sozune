@@ -31,11 +31,15 @@ pub fn backend_unreachable(detail: &str) -> Response<Body> {
 }
 
 /// 504 Gateway Timeout — backend did not respond within the configured deadline.
-pub fn backend_timeout(target: &str, secs: u64) -> Response<Body> {
+pub fn backend_timeout(target: &str, limit: Option<std::time::Duration>) -> Response<Body> {
+    let waited = match limit {
+        Some(limit) => format!("{}ms", limit.as_millis()),
+        None => "the time allowed".to_string(),
+    };
     diag_response(
         StatusCode::GATEWAY_TIMEOUT,
         "backend-timeout",
-        format!("sozune: backend at {target} did not respond within {secs}s.\n"),
+        format!("sozune: backend at {target} did not respond within {waited}.\n"),
     )
 }
 
