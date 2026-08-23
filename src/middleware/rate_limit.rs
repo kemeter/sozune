@@ -86,19 +86,24 @@ impl RateLimiter {
             });
 
             // A flood of fresh addresses leaves nothing idle to drop, so age
-            // alone cannot hold the line. Drop the buckets closest to full
-            // instead: a source at full tokens has spent nothing, so forgetting
-            // it grants nothing, while a source under its limit — the one the
-            // limiter exists to hold back — keeps its depleted bucket.
+            // alone cannot hold the line. Drop the buckets that have spent
+            // little: forgetting a source at full tokens grants it nothing,
+            // while a source under its limit — the one the limiter exists to
+            // hold back — keeps its depleted bucket.
+            //
+            // One pass over the map, keeping whatever is below half its
+            // capacity. Sorting every key instead cost a millisecond under the
+            // lock every request on the route waits on, which a distributed
+            // flood can trigger over and over.
             if buckets.len() >= MAX_TRACKED_SOURCES {
-                let mut by_tokens: Vec<(String, f64)> = buckets
-                    .iter()
-                    .map(|(ip, bucket)| (ip.clone(), bucket.tokens))
-                    .collect();
-                by_tokens.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let spent_enough = self.burst / 2.0;
+                buckets.retain(|_, bucket| bucket.tokens < spent_enough);
 
-                for (ip, _) in by_tokens.into_iter().take(MAX_TRACKED_SOURCES / 2) {
-                    buckets.remove(&ip);
+                // Still full: every source is at or near its burst, so none is
+                // being held back and the map can start over. Better a moment
+                // of amnesia than a map that grows without bound.
+                if buckets.len() >= MAX_TRACKED_SOURCES {
+                    buckets.clear();
                 }
             }
         }
@@ -214,6 +219,33 @@ mod growth_tests {
             "tracked {} sources, cap is {}",
             limiter.bucket_count(),
             MAX_TRACKED_SOURCES
+        );
+    }
+
+    /// The sweep runs under the global mutex, so whatever it costs is a stall
+    /// every request on the route pays, and a distributed flood can trigger it
+    /// over and over. Sorting meant cloning all 10k keys into a vector first;
+    /// deciding per bucket needs neither the copy nor the ordering.
+    ///
+    /// Asserted on behaviour rather than on a stopwatch: a timing bound that
+    /// fits release is exceeded three times over in debug, and the ratio
+    /// between a sweeping and a non-sweeping check is too noisy to separate
+    /// the two shapes. What holds either way is that a sweep leaves the map
+    /// under the cap in one pass, so no second sweep is queued behind it.
+    #[test]
+    fn one_sweep_is_enough_to_get_back_under_the_cap() {
+        let limiter = RateLimiter::new(0, 10);
+
+        for n in 0..MAX_TRACKED_SOURCES {
+            limiter.check(&format!("10.{}.{}.{}", n / 65536, (n / 256) % 256, n % 256));
+        }
+
+        limiter.check("203.0.113.7");
+
+        assert!(
+            limiter.bucket_count() < MAX_TRACKED_SOURCES,
+            "still {} sources after a sweep: the next check sweeps again",
+            limiter.bucket_count()
         );
     }
 
