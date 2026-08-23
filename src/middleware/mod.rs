@@ -352,9 +352,10 @@ pub fn build_middleware_route(
     }
 
     if let Some(rl) = config.rate_limit.as_ref() {
-        middlewares.push(Arc::new(RateLimitMiddleware::new(RateLimiter::new(
-            rl.average, rl.burst,
-        ))));
+        middlewares.push(Arc::new(RateLimitMiddleware::new(
+            RateLimiter::new(rl.average, rl.burst),
+            trusted_proxies.clone(),
+        )));
     }
 
     if let Some(max) = config.in_flight_req {

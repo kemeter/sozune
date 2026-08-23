@@ -6,6 +6,8 @@ use axum::body::Body;
 use axum::http::Request;
 use tracing::warn;
 
+use crate::middleware::ip_allow_list::{TrustedProxies, resolve_client_ip};
+
 use super::chain::{Flow, Middleware, RequestCtx};
 use super::diag;
 
@@ -23,6 +25,18 @@ struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
 }
+
+/// How many sources a limiter tracks before it sweeps the idle ones.
+///
+/// The map holds one bucket per source, so without a bound it grows for every
+/// address ever seen — on a public port, unbounded growth driven by
+/// unauthenticated traffic. Sweeping when the map crosses this mark keeps that
+/// finite while leaving ordinary traffic untouched: a proxy fronting a few
+/// thousand clients never reaches it.
+const MAX_TRACKED_SOURCES: usize = 10_000;
+
+/// How long a bucket survives without being used.
+const BUCKET_IDLE_TTL_SECS: u64 = 3600;
 
 /// Result of a rate limit check
 pub enum RateLimitResult {
@@ -62,6 +76,33 @@ impl RateLimiter {
 
         let now = Instant::now();
 
+        // Sweep before inserting, so a flood of one-shot sources cannot push
+        // the map past the cap.
+        if buckets.len() >= MAX_TRACKED_SOURCES {
+            // Idle buckets first: nothing is lost by forgetting a source that
+            // has not been seen in an hour.
+            buckets.retain(|_, bucket| {
+                now.duration_since(bucket.last_refill).as_secs() < BUCKET_IDLE_TTL_SECS
+            });
+
+            // A flood of fresh addresses leaves nothing idle to drop, so age
+            // alone cannot hold the line. Drop the buckets closest to full
+            // instead: a source at full tokens has spent nothing, so forgetting
+            // it grants nothing, while a source under its limit — the one the
+            // limiter exists to hold back — keeps its depleted bucket.
+            if buckets.len() >= MAX_TRACKED_SOURCES {
+                let mut by_tokens: Vec<(String, f64)> = buckets
+                    .iter()
+                    .map(|(ip, bucket)| (ip.clone(), bucket.tokens))
+                    .collect();
+                by_tokens.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+                for (ip, _) in by_tokens.into_iter().take(MAX_TRACKED_SOURCES / 2) {
+                    buckets.remove(&ip);
+                }
+            }
+        }
+
         let bucket = buckets
             .entry(source_ip.to_string())
             .or_insert_with(|| TokenBucket {
@@ -83,19 +124,40 @@ impl RateLimiter {
         }
     }
 
-    /// Remove stale buckets that haven't been used recently. Exercised by
-    /// the rate_limit tests; not yet wired into the runtime — should be
-    /// called periodically (every minute or so) to prevent unbounded growth
-    /// when many ephemeral clients hit the limiter.
-    #[allow(dead_code)]
-    pub fn cleanup(&self) {
-        let mut buckets = match self.buckets.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
+    /// How many sources are currently tracked. Test-only: the sweep runs
+    /// inside `check`, so nothing in the runtime needs to ask.
+    #[cfg(test)]
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.lock().map(|b| b.len()).unwrap_or(0)
+    }
 
+    /// Forget the sources that have not been seen in a while. `check` does
+    /// this itself once the map crosses `MAX_TRACKED_SOURCES`; this exposes
+    /// the same sweep on its own.
+    #[cfg(test)]
+    pub fn cleanup(&self) {
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return;
+        };
         let now = Instant::now();
-        buckets.retain(|_, bucket| now.duration_since(bucket.last_refill).as_secs() < 3600);
+        buckets.retain(|_, bucket| {
+            now.duration_since(bucket.last_refill).as_secs() < BUCKET_IDLE_TTL_SECS
+        });
+    }
+}
+
+/// The identity a bucket is charged to.
+///
+/// Goes through `resolve_client_ip`, so `X-Forwarded-For` is only believed
+/// when the peer is a trusted proxy. Keying on the leftmost entry — which the
+/// client writes — handed every request a fresh bucket, so the limiter never
+/// fired, and each forged value left a permanent map entry behind.
+fn source_key(req: &Request<Body>, ctx: &RequestCtx, trusted: &TrustedProxies) -> String {
+    match resolve_client_ip(req, ctx, trusted) {
+        Some(ip) => ip.to_string(),
+        // No peer and nothing trustworthy to read: charge the hostname, so a
+        // route still has one shared bucket rather than none at all.
+        None => ctx.host.clone(),
     }
 }
 
@@ -104,11 +166,12 @@ impl RateLimiter {
 /// rate-limit step in `handle_proxy`.
 pub struct RateLimitMiddleware {
     limiter: RateLimiter,
+    trusted: TrustedProxies,
 }
 
 impl RateLimitMiddleware {
-    pub fn new(limiter: RateLimiter) -> Self {
-        Self { limiter }
+    pub fn new(limiter: RateLimiter, trusted: TrustedProxies) -> Self {
+        Self { limiter, trusted }
     }
 }
 
@@ -119,21 +182,126 @@ impl Middleware for RateLimitMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
-        // Prefer the leftmost X-Forwarded-For entry; fall back to the host,
-        // matching the prior inline behavior.
-        let source_ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| ctx.host.clone());
+        let source_ip = source_key(req, ctx, &self.trusted);
 
         if matches!(self.limiter.check(&source_ip), RateLimitResult::Limited) {
             warn!("Rate limited request from {} to {}", source_ip, ctx.host);
             return Flow::ShortCircuit(diag::rate_limited(&ctx.host));
         }
         Flow::Continue
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+
+    /// `cleanup` existed, carried a comment describing the very leak it was
+    /// meant to prevent, and was marked `#[allow(dead_code)]` — nothing ever
+    /// called it. One bucket per source seen, kept forever: on a public port
+    /// that is unbounded growth from unauthenticated traffic.
+    #[test]
+    fn buckets_do_not_accumulate_for_every_source_ever_seen() {
+        let limiter = RateLimiter::new(1000, 1000);
+
+        // Past the cap, so the sweep has to have run for the map to stay under.
+        for n in 0..(MAX_TRACKED_SOURCES + 5_000) {
+            limiter.check(&format!("10.{}.{}.{}", n / 65536, (n / 256) % 256, n % 256));
+        }
+
+        assert!(
+            limiter.bucket_count() <= MAX_TRACKED_SOURCES,
+            "tracked {} sources, cap is {}",
+            limiter.bucket_count(),
+            MAX_TRACKED_SOURCES
+        );
+    }
+
+    /// Eviction picks the buckets closest to full, so what it forgets are the
+    /// sources that have spent nothing — forgetting those grants them nothing.
+    /// A depleted bucket, the one the limiter exists to hold back, outlives a
+    /// full one.
+    #[test]
+    fn eviction_forgets_the_sources_that_spent_nothing_first() {
+        let limiter = RateLimiter::new(0, 10);
+
+        // Spend this one down to empty.
+        for _ in 0..10 {
+            limiter.check("203.0.113.7");
+        }
+
+        // Every flooding source spends one of its ten tokens, so each sits at
+        // nine — above the depleted one, and dropped ahead of it.
+        for n in 0..(MAX_TRACKED_SOURCES + 5_000) {
+            limiter.check(&format!("10.{}.{}.{}", n / 65536, (n / 256) % 256, n % 256));
+        }
+
+        assert!(
+            matches!(limiter.check("203.0.113.7"), RateLimitResult::Limited),
+            "an emptied bucket must outlive the full ones a flood creates"
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::middleware::ip_allow_list::TrustedProxies;
+    use std::net::SocketAddr;
+
+    fn ctx(peer: &str) -> RequestCtx {
+        RequestCtx {
+            host: "app.example.com".to_string(),
+            client_addr: Some(peer.parse::<SocketAddr>().unwrap()),
+            is_tls: false,
+            method: axum::http::Method::GET,
+            path: "/".to_string(),
+            client_encoding: None,
+            pending_response_headers: Vec::new(),
+            in_flight_guards: Vec::new(),
+        }
+    }
+
+    /// The limiter keyed on the leftmost `X-Forwarded-For` entry, which the
+    /// client writes. A fresh forged value per request meant a fresh bucket per
+    /// request: the limiter never fired, and every forged value also added a
+    /// permanent map entry, so unauthenticated traffic grew memory without
+    /// bound. `ip_allow_list` already had the answer — only believe the header
+    /// when the peer is a trusted proxy.
+    #[test]
+    fn a_forged_header_does_not_buy_a_fresh_bucket() {
+        let trusted = TrustedProxies::new(&[]);
+        let ctx = ctx("203.0.113.7:5000");
+
+        let first = source_key(&header("1.2.3.4"), &ctx, &trusted);
+        let second = source_key(&header("5.6.7.8"), &ctx, &trusted);
+
+        assert_eq!(
+            first, second,
+            "with no trusted proxy the peer is the client, whatever the header says"
+        );
+        assert_eq!(first, "203.0.113.7");
+    }
+
+    /// Behind a proxy we do trust, the header is how the real client is known,
+    /// so it must still be honoured — read right to left, as `resolve_client_ip`
+    /// does.
+    #[test]
+    fn a_trusted_proxy_s_header_is_still_honoured() {
+        let trusted = TrustedProxies::new(&["10.0.0.0/8".to_string()]);
+        let ctx = ctx("10.0.0.9:5000");
+
+        assert_eq!(
+            source_key(&header("203.0.113.7"), &ctx, &trusted),
+            "203.0.113.7"
+        );
+    }
+
+    fn header(value: &str) -> Request<Body> {
+        Request::builder()
+            .header("x-forwarded-for", value)
+            .body(Body::empty())
+            .unwrap()
     }
 }
 
