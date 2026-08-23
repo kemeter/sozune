@@ -31,8 +31,26 @@ impl HttpProvider {
         let entrypoints: Vec<Entrypoint> = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("Failed to parse HTTP provider response: {}", e))?;
 
+        // Same gate the label path applies: a name holding `/` is a regex to
+        // Sozu and a bare `*` matches every host, so an entrypoint from an
+        // upstream control plane could otherwise claim the whole proxy.
         Ok(entrypoints
             .into_iter()
+            .filter(|ep| {
+                let bad = ep
+                    .config
+                    .hostnames
+                    .iter()
+                    .find(|h| !crate::labels::fields::host::is_routable_hostname(h));
+                if let Some(bad) = bad {
+                    warn!(
+                        "dropping entrypoint `{}` from the HTTP provider: `{}` is not a hostname",
+                        ep.id, bad
+                    );
+                    return false;
+                }
+                true
+            })
             .map(|ep| (ep.id.clone(), ep))
             .collect())
     }
