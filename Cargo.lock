@@ -3986,6 +3986,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rcgen 0.14.8",
+ "regex",
  "reqwest",
  "rust-embed",
  "rustls",
