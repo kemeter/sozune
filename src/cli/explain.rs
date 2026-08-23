@@ -140,7 +140,7 @@ const ENTRIES: &[Entry] = &[
         cause: "The `backend_timeout` value is not a positive integer (milliseconds).",
         effect: "Default timeout applies.",
         fix: "Express the timeout in milliseconds as a positive integer.",
-        example: Some("sozune.http.web.backend_timeout=30000  # 30s"),
+        example: Some("sozune.http.web.backend_timeout=30000  # 30s, or 0 to wait indefinitely"),
     },
     Entry {
         code: "W004",

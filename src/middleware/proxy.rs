@@ -232,7 +232,7 @@ pub async fn handle_proxy(
             }
         };
 
-        let timeout_secs = route.backend_timeout.unwrap_or(30);
+        let timeout = backend_timeout(route.backend_timeout);
 
         // Buffer the request body up front so each retry can replay it. The
         // body has to be owned bytes — a streaming body can only be sent once.
@@ -262,18 +262,13 @@ pub async fn handle_proxy(
             let response_future = state.http_client.request(forwarded_req);
 
             // `Ok(resp)` on success, `Err((msg, is_timeout))` otherwise.
-            let result = if timeout_secs == 0 {
-                response_future.await.map_err(|e| (e.to_string(), false))
-            } else {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    response_future,
-                )
-                .await
-                {
+            let result = if let Some(limit) = timeout {
+                match tokio::time::timeout(limit, response_future).await {
                     Ok(result) => result.map_err(|e| (e.to_string(), false)),
-                    Err(_) => Err((format!("timed out after {timeout_secs}s"), true)),
+                    Err(_) => Err((format!("timed out after {}ms", limit.as_millis()), true)),
                 }
+            } else {
+                response_future.await.map_err(|e| (e.to_string(), false))
             };
 
             match result {
@@ -311,7 +306,7 @@ pub async fn handle_proxy(
                 }
                 // Preserve the distinct 504 for a timeout; 502 otherwise.
                 let resp = if last_was_timeout {
-                    diag::backend_timeout(&target_uri, timeout_secs).into_response()
+                    diag::backend_timeout(&target_uri, timeout).into_response()
                 } else {
                     diag::backend_unreachable(&format!("backend at {target_uri}: {last_err}"))
                         .into_response()
@@ -521,4 +516,65 @@ async fn handle_websocket(
     response_builder
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// How long to wait on a backend, from the label's millisecond value.
+///
+/// `None` means no timeout at all, which a route asks for with `0`. Everything
+/// else is milliseconds: the parser documents the label that way, its
+/// diagnostic hint says so, and `sozune explain W003` gives
+/// `backend_timeout=30000  # 30s` as the example. Reading it as seconds turned
+/// that example into eight hours.
+fn backend_timeout(configured_ms: Option<u64>) -> Option<std::time::Duration> {
+    const DEFAULT_MS: u64 = 30_000;
+
+    match configured_ms.unwrap_or(DEFAULT_MS) {
+        0 => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// The label is documented in milliseconds — the parser says so, its
+    /// diagnostic hint says so, and `sozune explain W003` gives
+    /// `backend_timeout=30000  # 30s` as the example. The consumer read it as
+    /// seconds, so following that example bought a timeout of 30000 seconds:
+    /// eight hours and twenty minutes during which a hung backend pins a
+    /// connection, a task and the buffered request body.
+    #[test]
+    fn the_documented_example_means_thirty_seconds() {
+        assert_eq!(
+            backend_timeout(Some(30_000)),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// The default has to keep meaning what it did: 30 seconds.
+    #[test]
+    fn the_default_is_thirty_seconds() {
+        assert_eq!(
+            backend_timeout(None),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// Zero is how a route says "wait as long as it takes". It is worth
+    /// keeping, but it must stay explicit rather than being what a typo
+    /// silently produces.
+    #[test]
+    fn zero_means_no_timeout() {
+        assert_eq!(backend_timeout(Some(0)), None);
+    }
+
+    /// Sub-second values are the point of a millisecond unit.
+    #[test]
+    fn a_sub_second_timeout_survives_the_conversion() {
+        assert_eq!(
+            backend_timeout(Some(250)),
+            Some(std::time::Duration::from_millis(250))
+        );
+    }
 }
