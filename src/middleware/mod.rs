@@ -50,9 +50,80 @@ pub struct MiddlewareAppState {
 pub type MiddlewareState = Arc<RwLock<MiddlewareRouteTable>>;
 
 /// Route table mapping hostname → middleware config + real backends
-/// The routes one hostname carries, each with the path prefix it was declared
-/// with. `None` is a route with no path: the catch-all for that hostname.
-type HostRoutes = Vec<(Option<String>, Arc<MiddlewareRoute>)>;
+/// How a route's path was declared, kept whole.
+///
+/// `PathConfig` carries a rule type as well as a value, and only `Prefix`
+/// covers what sits below it. Keeping just the string treated `Exact` as a
+/// prefix and turned `Regex` into a literal prefix that normally matches
+/// nothing — so the middleware server could answer 404, or hand the request to
+/// a different route, for a frontend Sozu had matched correctly.
+#[derive(Debug)]
+pub enum PathMatch {
+    Prefix(String),
+    Exact(String),
+    /// `None` when the pattern would not compile: it then matches nothing,
+    /// which keeps a broken route dark rather than letting it swallow the
+    /// hostname.
+    Regex(Option<regex::Regex>, String),
+}
+
+impl PathMatch {
+    fn from_config(path: &crate::model::PathConfig) -> Self {
+        match path.rule_type {
+            crate::model::PathRuleType::Prefix => PathMatch::Prefix(path.value.clone()),
+            crate::model::PathRuleType::Exact => PathMatch::Exact(path.value.clone()),
+            crate::model::PathRuleType::Regex => {
+                let compiled = regex::Regex::new(&path.value).ok();
+                if compiled.is_none() {
+                    warn!(
+                        "path regex `{}` does not compile; the route will match nothing",
+                        path.value
+                    );
+                }
+                PathMatch::Regex(compiled, path.value.clone())
+            }
+        }
+    }
+
+    fn matches(&self, request_path: &str) -> bool {
+        match self {
+            PathMatch::Prefix(prefix) => prefix_matches(prefix, request_path),
+            PathMatch::Exact(value) => request_path == value,
+            PathMatch::Regex(compiled, _) => {
+                compiled.as_ref().is_some_and(|r| r.is_match(request_path))
+            }
+        }
+    }
+
+    /// How specific this match is, for picking between two that both apply.
+    /// An exact match beats any prefix; among prefixes the longest wins.
+    fn specificity(&self) -> usize {
+        match self {
+            PathMatch::Exact(value) => usize::MAX - value.len(),
+            PathMatch::Prefix(value) => value.len(),
+            PathMatch::Regex(_, value) => value.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn exact(value: &str) -> Self {
+        PathMatch::Exact(value.to_string())
+    }
+
+    #[cfg(test)]
+    fn regex(value: &str) -> Self {
+        PathMatch::Regex(regex::Regex::new(value).ok(), value.to_string())
+    }
+
+    #[cfg(test)]
+    fn prefix(value: &str) -> Self {
+        PathMatch::Prefix(value.to_string())
+    }
+}
+
+/// The routes one hostname carries, each with the path it was declared with.
+/// `None` is a route with no path: the catch-all for that hostname.
+type HostRoutes = Vec<(Option<PathMatch>, Arc<MiddlewareRoute>)>;
 
 #[derive(Debug, Default)]
 pub struct MiddlewareRouteTable {
@@ -120,15 +191,15 @@ fn prefix_matches(prefix: &str, request_path: &str) -> bool {
 /// so this only has to reproduce that choice among the routes sharing a
 /// hostname. Resolving on the hostname alone let whichever entrypoint was
 /// stored last serve every path under it.
-fn best_match(candidates: &[Option<String>], request_path: &str) -> Option<usize> {
+fn best_match<T>(candidates: &[(Option<PathMatch>, T)], request_path: &str) -> Option<usize> {
     candidates
         .iter()
         .enumerate()
-        .filter(|(_, path)| match path {
-            Some(prefix) => prefix_matches(prefix, request_path),
+        .filter(|(_, (path, _))| match path {
+            Some(matcher) => matcher.matches(request_path),
             None => true,
         })
-        .max_by_key(|(_, path)| path.as_deref().map(str::len).unwrap_or(0))
+        .max_by_key(|(_, (path, _))| path.as_ref().map(PathMatch::specificity).unwrap_or(0))
         .map(|(index, _)| index)
 }
 
@@ -136,14 +207,16 @@ impl MiddlewareRouteTable {
     pub fn update_routes_for_entrypoint(
         &mut self,
         hostnames: &[String],
-        path: Option<String>,
+        path: Option<&crate::model::PathConfig>,
         route: Arc<MiddlewareRoute>,
     ) {
         for hostname in hostnames {
+            // Built per hostname: a compiled regex cannot be cloned, and the
+            // same path under two hostnames is two independent matchers.
             self.routes
                 .entry(hostname.clone())
                 .or_default()
-                .push((path.clone(), Arc::clone(&route)));
+                .push((path.map(PathMatch::from_config), Arc::clone(&route)));
         }
     }
 
@@ -156,8 +229,7 @@ impl MiddlewareRouteTable {
         let hostname = host.split(':').next().unwrap_or(host);
         let candidates = self.routes.get(hostname)?;
 
-        let paths: Vec<Option<String>> = candidates.iter().map(|(p, _)| p.clone()).collect();
-        best_match(&paths, request_path).map(|index| Arc::clone(&candidates[index].1))
+        best_match(candidates, request_path).map(|index| Arc::clone(&candidates[index].1))
     }
 
     pub fn known_hosts(&self) -> Vec<String> {
@@ -449,17 +521,52 @@ mod route_key_tests {
     /// dropped the same way, silently.
     #[test]
     fn the_longest_matching_prefix_wins() {
-        let candidates = vec![Some("/api".to_string()), Some("/".to_string())];
+        let candidates = vec![
+            (Some(PathMatch::prefix("/api")), ()),
+            (Some(PathMatch::prefix("/")), ()),
+        ];
 
         assert_eq!(best_match(&candidates, "/api/users"), Some(0));
         assert_eq!(best_match(&candidates, "/index.html"), Some(1));
+    }
+
+    /// `PathConfig` carries a rule type, and only `Prefix` covers what sits
+    /// below it. Keeping just the string treated an `Exact` route as a prefix,
+    /// so `/api/users` matched a route declared to serve `/api` alone — and a
+    /// `Regex` became a literal prefix that normally matches nothing, which is
+    /// worse than what host-only resolution did for those routes.
+    #[test]
+    fn an_exact_path_does_not_swallow_what_is_below_it() {
+        let exact = vec![(Some(PathMatch::exact("/api")), ())];
+
+        assert_eq!(best_match(&exact, "/api"), Some(0));
+        assert_eq!(best_match(&exact, "/api/users"), None);
+    }
+
+    /// A regex route matches what the regex says, not what its source text
+    /// looks like as a prefix.
+    #[test]
+    fn a_regex_path_matches_by_pattern() {
+        let regex = vec![(Some(PathMatch::regex("^/api/v[0-9]+/")), ())];
+
+        assert_eq!(best_match(&regex, "/api/v2/users"), Some(0));
+        assert_eq!(best_match(&regex, "/api/users"), None);
+    }
+
+    /// An unparseable regex must not silently become a catch-all: it matches
+    /// nothing, so the route stays dark rather than swallowing the hostname.
+    #[test]
+    fn an_unparseable_regex_matches_nothing() {
+        let broken = vec![(Some(PathMatch::regex("^/api/v[0-9")), ())];
+
+        assert_eq!(best_match(&broken, "/api/v2/users"), None);
     }
 
     /// A route with no path serves everything under the hostname, so it is the
     /// catch-all and must lose to any prefix that matches.
     #[test]
     fn a_pathless_route_is_the_catch_all() {
-        let candidates = vec![Some("/api".to_string()), None];
+        let candidates = vec![(Some(PathMatch::prefix("/api")), ()), (None, ())];
 
         assert_eq!(best_match(&candidates, "/api/users"), Some(0));
         assert_eq!(best_match(&candidates, "/other"), Some(1));
@@ -469,7 +576,7 @@ mod route_key_tests {
     /// or a route would capture hostnames it was never given.
     #[test]
     fn a_prefix_matches_only_on_a_segment_boundary() {
-        let candidates = vec![Some("/api".to_string())];
+        let candidates = vec![(Some(PathMatch::prefix("/api")), ())];
 
         assert_eq!(best_match(&candidates, "/api"), Some(0));
         assert_eq!(best_match(&candidates, "/api/users"), Some(0));
@@ -480,7 +587,10 @@ mod route_key_tests {
     /// random, which is what host-only keying amounted to.
     #[test]
     fn no_candidate_matches() {
-        let candidates = vec![Some("/api".to_string()), Some("/admin".to_string())];
+        let candidates = vec![
+            (Some(PathMatch::prefix("/api")), ()),
+            (Some(PathMatch::prefix("/admin")), ()),
+        ];
 
         assert_eq!(best_match(&candidates, "/"), None);
     }

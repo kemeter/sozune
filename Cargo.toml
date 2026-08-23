@@ -11,6 +11,10 @@ axum-server = "0.7.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 
+# Already in the tree through sozu; declared directly so the middleware server
+# can compile a route's path regex itself instead of leaning on a transitive
+# dependency.
+regex = "1"
 sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.0" }
 sozu-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.0" }
 anyhow = "1.0.99"
