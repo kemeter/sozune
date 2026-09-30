@@ -716,6 +716,13 @@ pub struct TcpListenerConfig {
     /// backend intact.
     #[serde(default)]
     pub sni_preread_max_bytes: Option<u32>,
+    /// Seconds a connection may stay silent in both directions before it is
+    /// closed. Absent leaves Sōzu's defaults, under which a connection is
+    /// dropped after 30s without a byte either way — too short for a database,
+    /// where a slow query or a pooled connection at rest sends nothing for
+    /// longer than that. Must be greater than zero: Sōzu has no "never" value.
+    #[serde(default)]
+    pub idle_timeout: Option<u32>,
 }
 
 /// Per-source connection-rate limit for a TCP listener. A token bucket: a burst
@@ -2226,6 +2233,27 @@ tcp:
         assert_eq!(rl.exempt, vec!["172.16.0.0/12".to_string()]);
         // Absent rate_limit stays None (no limit).
         assert!(config.tcp[1].rate_limit.is_none());
+    }
+
+    #[test]
+    fn test_tcp_idle_timeout_deserialization() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+tcp:
+  - name: postgres
+    listen: 5432
+    idle_timeout: 3600
+  - name: redis
+    listen: 6379
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tcp[0].idle_timeout, Some(3600));
+        // Absent idle_timeout stays None (Sōzu's defaults apply).
+        assert!(config.tcp[1].idle_timeout.is_none());
     }
 
     #[test]

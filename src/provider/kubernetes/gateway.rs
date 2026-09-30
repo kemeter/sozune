@@ -3899,6 +3899,7 @@ mod tests {
                 rate_limit: None,
                 sni_preread_timeout: None,
                 sni_preread_max_bytes: None,
+                idle_timeout: None,
             },
             crate::config::TcpListenerConfig {
                 name: "pg".into(),
@@ -3907,6 +3908,7 @@ mod tests {
                 rate_limit: None,
                 sni_preread_timeout: None,
                 sni_preread_max_bytes: None,
+                idle_timeout: None,
             },
         ];
         let ports = tcp_listener_ports(&listeners);

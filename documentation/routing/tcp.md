@@ -28,6 +28,7 @@ proxy:
 | `name` | Identifier referenced by service labels. Must be unique across `proxy.tcp`. |
 | `listen` | Port to bind on `0.0.0.0`. |
 | `ip_allow_list` | CIDRs / bare IPs allowed to connect, checked at `accept()`. Empty (default) = allow all. See [Source-IP allow-list](#source-ip-allow-list). |
+| `idle_timeout` | Seconds a connection may stay silent in both directions before it is closed. Absent keeps Sōzu's defaults (closed after `30`s of silence). See [Idle timeout](#idle-timeout). |
 | `sni_preread_timeout` | Seconds to wait for a complete TLS ClientHello before dropping the connection. Default `5`. Only consulted when the listener carries SNI routes. See [Route by SNI](#route-by-sni-tls-passthrough). |
 | `sni_preread_max_bytes` | Cap on the bytes buffered while looking for the ClientHello. Default `16384`. Bounds the hello, not the connection. |
 
@@ -95,6 +96,24 @@ proxy:
 This is a token bucket: a source may open `max_conns` connections back-to-back (the burst), after which it refills at `max_conns / per_seconds` per second. A source over its budget is dropped at `accept()`. Sources matching `exempt` are never limited — use it for internal ranges (e.g. Docker) that open legitimate startup bursts.
 
 It covers the same ground as HAProxy's `stick-table … conn_rate(3s)` + `reject if { src_conn_rate gt N } !exempt`. The token bucket smooths the rate rather than counting a fixed 3-second window, so a brief startup burst is tolerated and a sustained flood is throttled — without the boundary double-burst a fixed window allows. Absent `rate_limit` = no limit.
+
+## Idle timeout
+
+A TCP connection that carries no byte in either direction is closed after a while. By default that is 30 seconds, which suits request/response protocols and is too short for a database: a query that takes longer to answer, or a pooled connection waiting for its next use, sends nothing for longer than that and gets cut.
+
+```yaml
+proxy:
+  tcp:
+    - name: postgres
+      listen: 5432
+      idle_timeout: 3600   # seconds
+```
+
+`idle_timeout` is the longest silence tolerated. Any byte, from the client or from the backend, starts the count again, so a connection that keeps exchanging data is never closed by it, however long it lives.
+
+Pick a value above the longest silence you expect: the slowest query, or the idle time your connection pool allows before it recycles a connection. TCP keepalive probes do not count — they carry no data, so they do not reset the timer.
+
+The value must be greater than zero. There is no "never" setting; use a large number of seconds instead. Sōzune refuses to start on `idle_timeout: 0` rather than close every connection as it opens.
 
 ## Route by SNI (TLS passthrough)
 
