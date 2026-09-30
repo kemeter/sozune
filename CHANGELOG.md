@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Routing
+
+- Idle timeout on TCP listeners — `idle_timeout` on a `proxy.tcp` listener sets how many seconds a connection may stay silent in both directions before it is closed. Absent keeps Sōzu's defaults, which drop a connection after 30s without a byte either way: a query that runs longer, or a pooled connection at rest, was cut with no way to raise the limit. See [TCP routing docs](documentation/routing/tcp.md#idle-timeout).
+
 ### Middleware
 
 - WASM plugin execution policy — three operator-set fields on a plugin declaration in `config.yaml` control when it runs and how it fails. `skip_paths` (path globs like `*.js`, `*.css`, `/assets/*`) and `skip_methods` skip the plugin entirely for matching requests — no body buffering, no guest call — so an analytics plugin no longer buffers a multi-megabyte JS bundle on every hit just to ignore it. `fail_open` (default `true`) means a guest that errors lets the request continue to the backend untouched instead of returning `502`; set it `false` for a security plugin (WAF / bouncer) that must fail closed. Previously any guest error in the request phase returned `502`, so a plugin failing to reach its collector could take a site down. See [WASM plugins docs](documentation/middleware/wasm-plugins.md#execution-policy-skip_paths-skip_methods-fail_open).

@@ -334,6 +334,8 @@ fn spawn_tcp_workers(
         // defaults (5s / 16 KiB) in place.
         builder.sni_preread_timeout = tcp_cfg.sni_preread_timeout;
         builder.sni_preread_max_bytes = tcp_cfg.sni_preread_max_bytes;
+        apply_tcp_listener_idle_timeout(&mut builder, tcp_cfg.idle_timeout)
+            .map_err(|e| anyhow::anyhow!("TCP listener `{}`: {}", tcp_cfg.name, e))?;
         let listener_config = builder.to_tcp(None).map_err(|e| {
             anyhow::anyhow!(
                 "Could not create TCP listener `{}` on 127.0.0.1:{}: {}",
@@ -2592,6 +2594,31 @@ fn apply_listener_http2(builder: &mut ListenerBuilder, http2: &crate::config::Ht
     }
 }
 
+/// Apply a TCP listener's `idle_timeout` onto a `ListenerBuilder`.
+///
+/// Sōzu keeps two timers per TCP session, one per side, and a byte read on
+/// either side re-arms both. Whichever is shorter therefore decides how long a
+/// connection may stay silent, so a single value is written to both. `None`
+/// leaves Sōzu's defaults in place. Zero is refused: Sōzu would arm a timer
+/// that fires on the next tick and close every connection as it opens.
+fn apply_tcp_listener_idle_timeout(
+    builder: &mut ListenerBuilder,
+    idle_timeout: Option<u32>,
+) -> anyhow::Result<()> {
+    let Some(seconds) = idle_timeout else {
+        return Ok(());
+    };
+    if seconds == 0 {
+        anyhow::bail!(
+            "`idle_timeout` must be greater than zero (there is no \"never\" value; use a large number of seconds instead)"
+        );
+    }
+    builder
+        .with_front_timeout(Some(seconds))
+        .with_back_timeout(Some(seconds));
+    Ok(())
+}
+
 /// Parse a config TLS version string (`"1.2"` / `"1.3"`) into Sōzu's enum.
 fn parse_tls_version(s: &str) -> anyhow::Result<TlsVersion> {
     match s {
@@ -2678,6 +2705,53 @@ mod tests {
         builder
             .to_tls(None)
             .map_err(|e| anyhow::anyhow!("to_tls: {e}"))
+    }
+
+    fn tcp_listener_with_idle_timeout(
+        idle_timeout: Option<u32>,
+    ) -> anyhow::Result<sozu_command_lib::proto::command::TcpListenerConfig> {
+        let mut builder = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, 5432));
+        apply_tcp_listener_idle_timeout(&mut builder, idle_timeout)?;
+        builder
+            .to_tcp(None)
+            .map_err(|e| anyhow::anyhow!("to_tcp: {e}"))
+    }
+
+    #[test]
+    fn tcp_idle_timeout_unset_keeps_sozu_defaults() {
+        let cfg = tcp_listener_with_idle_timeout(None).unwrap();
+        assert_eq!(
+            cfg.front_timeout,
+            sozu_command_lib::config::DEFAULT_FRONT_TIMEOUT
+        );
+        assert_eq!(
+            cfg.back_timeout,
+            sozu_command_lib::config::DEFAULT_BACK_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn tcp_idle_timeout_sets_both_sides() {
+        // Either timer closes the session, so raising only one would leave
+        // the other's default in charge.
+        let cfg = tcp_listener_with_idle_timeout(Some(3600)).unwrap();
+        assert_eq!(cfg.front_timeout, 3600);
+        assert_eq!(cfg.back_timeout, 3600);
+    }
+
+    #[test]
+    fn tcp_idle_timeout_leaves_connect_timeout_alone() {
+        let cfg = tcp_listener_with_idle_timeout(Some(3600)).unwrap();
+        assert_eq!(
+            cfg.connect_timeout,
+            sozu_command_lib::config::DEFAULT_CONNECT_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn tcp_idle_timeout_zero_is_refused() {
+        let err = tcp_listener_with_idle_timeout(Some(0)).unwrap_err();
+        assert!(err.to_string().contains("greater than zero"), "{err}");
     }
 
     #[test]
