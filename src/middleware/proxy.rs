@@ -523,7 +523,7 @@ async fn handle_websocket(
 /// `None` means no timeout at all, which a route asks for with `0`. Everything
 /// else is milliseconds: the parser documents the label that way, its
 /// diagnostic hint says so, and `sozune explain W003` gives
-/// `backend_timeout=30000  # 30s` as the example. Reading it as seconds turned
+/// `backendTimeout=30000  # 30s` as the example. Reading it as seconds turned
 /// that example into eight hours.
 fn backend_timeout(configured_ms: Option<u64>) -> Option<std::time::Duration> {
     const DEFAULT_MS: u64 = 30_000;
@@ -540,7 +540,7 @@ mod timeout_tests {
 
     /// The label is documented in milliseconds — the parser says so, its
     /// diagnostic hint says so, and `sozune explain W003` gives
-    /// `backend_timeout=30000  # 30s` as the example. The consumer read it as
+    /// `backendTimeout=30000  # 30s` as the example. The consumer read it as
     /// seconds, so following that example bought a timeout of 30000 seconds:
     /// eight hours and twenty minutes during which a hung backend pins a
     /// connection, a task and the buffered request body.

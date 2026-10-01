@@ -19,6 +19,10 @@ All notable changes to this project will be documented in this file.
 - Gateway & GatewayClass status reporting — sōzune now writes the standard conditions back onto the resources it owns: `Accepted` on a GatewayClass whose `controllerName` is `kemeter.io/sozune`, and `Accepted` + `Programmed` on every Gateway pointing at such a class. Visible via `kubectl get`/`describe`, so an operator can confirm a Gateway is being served without reading sōzune's logs. Resources owned by another controller are left untouched, per the Gateway API spec. Needs the `gateways/status` and `gatewayclasses/status` patch verbs in RBAC. See [Status conditions](documentation/providers/kubernetes.md#status-conditions).
 - ReferenceGrant enforcement — cross-namespace `backendRefs` on an HTTPRoute now require a `ReferenceGrant` in the target namespace trusting the route's namespace, per the Gateway API spec. Without a grant the backend is dropped (logged, and reflected as `ResolvedRefs=False`) instead of being routed. Previously a cross-namespace ref was honoured unconditionally, which let any route author reach any Service cluster-wide. Same-namespace refs are unaffected. Needs the `referencegrants` read verb in RBAC. See [Cross-namespace backends](documentation/providers/kubernetes.md#cross-namespace-backends-referencegrant).
 
+### CLI
+
+- `sozune explain` examples for `W003`, `W005` and `W006` used label names the parser does not know (`backend_timeout`, `redirect.policy`, `redirect.scheme`), so copying the fix yielded a `W013`. `E004`, `I002` and `W017` described the wrong cause or effect. Every example is now checked against the label catalog.
+
 ## [0.14.0] - 2026-07-04
 
 ### TLS / ACME

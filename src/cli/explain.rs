@@ -26,7 +26,6 @@ pub fn run(args: ExplainArgs) -> i32 {
 struct Entry {
     code: &'static str,
     title: &'static str,
-    severity: &'static str,
     cause: &'static str,
     effect: &'static str,
     fix: &'static str,
@@ -36,7 +35,7 @@ struct Entry {
 fn render(e: &Entry) -> String {
     let mut out = String::new();
     out.push_str(&format!("{} — {}\n", e.code, e.title));
-    out.push_str(&format!("severity: {}\n\n", e.severity));
+    out.push_str(&format!("severity: {}\n\n", severity(e.code)));
     out.push_str("Cause\n");
     out.push_str(&format!("  {}\n\n", e.cause));
     out.push_str("Effect\n");
@@ -52,6 +51,16 @@ fn render(e: &Entry) -> String {
     out
 }
 
+/// Severity is carried by the code's prefix (`E`, `W`, `I`), the same rule
+/// `DiagnosticCode::severity` applies, so the two cannot disagree.
+fn severity(code: &str) -> &'static str {
+    match code.chars().next() {
+        Some('E') => "error",
+        Some('W') => "warning",
+        _ => "info",
+    }
+}
+
 fn lookup(code: &str) -> Option<&'static Entry> {
     ENTRIES.iter().find(|e| e.code == code)
 }
@@ -64,16 +73,14 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "E001",
         title: "Routing disabled for this candidate",
-        severity: "error",
         cause: "The label `sozune.enable` is missing or set to a falsey value, and the provider does not enable routing by default.",
         effect: "The candidate is silently skipped. No frontend or backend is registered.",
-        fix: "Set `sozune.enable=true` on the container/service, or enable the provider's `enabled_default` setting.",
+        fix: "Set `sozune.enable=true` on the container/service, or enable the provider's `expose_by_default` setting.",
         example: Some("docker run -l sozune.enable=true -l sozune.http.web.host=example.com nginx"),
     },
     Entry {
         code: "E002",
         title: "Missing host label",
-        severity: "error",
         cause: "An HTTP entrypoint was declared but no `sozune.http.<name>.host` label was provided.",
         effect: "The entrypoint is dropped. Sōzu cannot match requests without a hostname.",
         fix: "Add a host label for the entrypoint. The hostname must be a valid DNS name.",
@@ -82,7 +89,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "E003",
         title: "Container inspection failed",
-        severity: "error",
         cause: "The provider could not query the container/service runtime to read its labels or networking info (Docker socket unreachable, Kubernetes API timeout, etc.).",
         effect: "The candidate is skipped. Routing for this workload is not updated.",
         fix: "Verify the provider's connectivity. For Docker: `docker ps` should work; check socket permissions. For Kubernetes: check kubeconfig and cluster reachability.",
@@ -90,17 +96,15 @@ const ENTRIES: &[Entry] = &[
     },
     Entry {
         code: "E004",
-        title: "No services exposed",
-        severity: "error",
-        cause: "The candidate has no exposed port that sozune can route to (no `EXPOSE`, no port mapping, no service port).",
-        effect: "Skipped. Sōzu has nowhere to forward traffic.",
-        fix: "Expose at least one port on the container, or set `sozune.http.<name>.port` explicitly.",
-        example: Some("sozune.http.web.port=8080"),
+        title: "No service declared",
+        cause: "Routing is enabled for the candidate, but no `sozune.<protocol>.<name>.*` label declares a service to expose.",
+        effect: "Skipped. Nothing is routed for this workload.",
+        fix: "Declare at least one service: a host for HTTP, or an entrypoint for raw TCP.",
+        example: Some("sozune.http.web.host=example.com"),
     },
     Entry {
         code: "E005",
         title: "Missing L4 entrypoint reference",
-        severity: "error",
         cause: "An L4 (TCP or UDP) service has no `sozune.<tcp|udp>.<name>.entrypoint=<listener>` label, or the value is empty.",
         effect: "The entrypoint is dropped — Sōzune has no listener to attach the backend to.",
         fix: "Reference a listener declared under `proxy.tcp` / `proxy.udp` in the config.",
@@ -109,7 +113,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "E006",
         title: "Missing UDP port",
-        severity: "error",
         cause: "A UDP service has no `sozune.udp.<name>.port` label. Datagram protocols have no default port to fall back to.",
         effect: "The UDP route is dropped rather than bound to the HTTP fallback port (8080).",
         fix: "Set the backend port explicitly on the UDP service.",
@@ -118,16 +121,14 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W001",
         title: "Invalid port value",
-        severity: "warning",
-        cause: "The port label contains a value that is not a positive integer between 0 and 65535.",
-        effect: "The invalid port is ignored. sozune falls back to the candidate's default exposed port if any.",
+        cause: "The port label contains a value that is not an integer between 0 and 65535.",
+        effect: "The invalid port is ignored. sozune falls back to the protocol's default port.",
         fix: "Set the port to an integer in [0, 65535].",
         example: Some("sozune.http.web.port=8080"),
     },
     Entry {
         code: "W002",
         title: "Invalid priority value",
-        severity: "warning",
         cause: "The priority label is not a valid integer.",
         effect: "Falls back to the default priority (0). Route ordering may differ from intent.",
         fix: "Use an integer. Higher values are matched first.",
@@ -136,16 +137,14 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W003",
         title: "Invalid backend timeout",
-        severity: "warning",
-        cause: "The `backend_timeout` value is not a positive integer (milliseconds).",
-        effect: "Default timeout applies.",
-        fix: "Express the timeout in milliseconds as a positive integer.",
-        example: Some("sozune.http.web.backend_timeout=30000  # 30s, or 0 to wait indefinitely"),
+        cause: "The `backendTimeout` value is not a non-negative integer (milliseconds).",
+        effect: "The default timeout (30s) applies.",
+        fix: "Express the timeout in milliseconds as a non-negative integer. `0` disables the timeout.",
+        example: Some("sozune.http.web.backendTimeout=30000  # 30s, or 0 to wait indefinitely"),
     },
     Entry {
         code: "W004",
         title: "Invalid rate limit configuration",
-        severity: "warning",
         cause: "Rate-limit fields (`average`, `burst`) are missing, malformed, or inconsistent.",
         effect: "Rate limiting is not enabled for this entrypoint.",
         fix: "Set both `ratelimit.average` (req/s) and `ratelimit.burst` (allowed peak) to positive integers.",
@@ -154,25 +153,22 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W005",
         title: "Invalid redirect policy",
-        severity: "warning",
         cause: "The redirect policy value is not one of the accepted options.",
         effect: "The redirect rule is dropped.",
         fix: "Use one of: `forward`, `permanent`, `unauthorized`.",
-        example: Some("sozune.http.web.redirect.policy=permanent"),
+        example: Some("sozune.http.web.redirect=permanent"),
     },
     Entry {
         code: "W006",
         title: "Invalid redirect scheme",
-        severity: "warning",
         cause: "The redirect scheme value is not one of the accepted options.",
         effect: "The redirect rule is dropped.",
         fix: "Use one of: `use_same`, `use_http`, `use_https`.",
-        example: Some("sozune.http.web.redirect.scheme=use_https"),
+        example: Some("sozune.http.web.redirectScheme=use_https"),
     },
     Entry {
         code: "W007",
         title: "Malformed basic auth entry",
-        severity: "warning",
         cause: "A basic-auth user entry does not match the `username:password_hash` format.",
         effect: "The malformed entry is skipped. Other valid users still apply.",
         fix: "Provide credentials as `user:bcrypt_hash`. Generate hashes with `htpasswd -nbB user pass`.",
@@ -181,7 +177,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W008",
         title: "Blocked header injection",
-        severity: "warning",
         cause: "A header in `headers.*` is on the protected list (Host, Connection, Content-Length, etc.) and cannot be safely overridden.",
         effect: "The header is not injected.",
         fix: "Remove the protected header from your config. If you need to set it, use a dedicated label (e.g. host rewriting).",
@@ -190,7 +185,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W009",
         title: "Network not found on container",
-        severity: "warning",
         cause: "The configured `network` label references a Docker network the container is not attached to.",
         effect: "Falls back to another available network.",
         fix: "Attach the container to the network, or remove the `network` label to let sozune pick one.",
@@ -199,7 +193,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W010",
         title: "No reachable IP, fell back to localhost",
-        severity: "warning",
         cause: "sozune could not determine a routable IP for the candidate from any provider network.",
         effect: "Routes resolve to 127.0.0.1, which is almost certainly wrong for a remote container.",
         fix: "Ensure the container has a network with an IP address visible from sozune (host network, shared bridge, or pod network).",
@@ -208,7 +201,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W011",
         title: "Empty basic auth list",
-        severity: "warning",
         cause: "`auth.basic` was set but contained no usable entries after parsing.",
         effect: "Authentication is not applied. The endpoint is open.",
         fix: "Provide at least one valid `user:hash` entry, or remove the `auth.basic` label entirely.",
@@ -217,7 +209,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W012",
         title: "Invalid protocol",
-        severity: "warning",
         cause: "The protocol segment of a label is not one of the accepted values.",
         effect: "The entrypoint is dropped.",
         fix: "Use `http`, `tcp`, or `udp` as the protocol segment.",
@@ -226,16 +217,14 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W013",
         title: "Unknown label",
-        severity: "warning",
         cause: "A label starting with `sozune.` does not match any known field.",
         effect: "The label is ignored. May indicate a typo.",
-        fix: "Check the label spelling. See https://sozune.dev/docs/labels for the supported set. The diagnostic message often suggests a likely correction.",
+        fix: "Check the label spelling. See https://sozune.kemeter.io/documentation/providers/docker for the supported set. The diagnostic message often suggests a likely correction.",
         example: None,
     },
     Entry {
         code: "W014",
         title: "Invalid HTTP method",
-        severity: "warning",
         cause: "A method listed in `methods=...` is not a recognized HTTP verb.",
         effect: "The invalid verb is dropped. Other valid methods in the same label still apply.",
         fix: "Use one of: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE. Methods are case-insensitive (uppercased internally).",
@@ -244,7 +233,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W015",
         title: "ACME enabled but no TLS entrypoint",
-        severity: "warning",
         cause: "`acme.enabled=true` in the configuration, but no HTTP entrypoint declares `tls=true`. ACME has nothing to provision.",
         effect: "The ACME manager runs but never requests a certificate.",
         fix: "Either disable ACME (`acme.enabled=false`) or set `sozune.http.<svc>.tls=true` on at least one entrypoint.",
@@ -253,7 +241,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W016",
         title: "https_redirect without tls",
-        severity: "warning",
         cause: "`httpsRedirect=true` was set on an entrypoint that has `tls=false`. The redirect target (HTTPS) is not configured for this hostname.",
         effect: "Clients are redirected to a port that has no TLS listener for this hostname; they get a connection error.",
         fix: "Set `tls=true` on the same entrypoint (and configure ACME or a static cert), or remove `httpsRedirect`.",
@@ -262,16 +249,14 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W017",
         title: "rate_limit.burst lower than rate_limit.average",
-        severity: "warning",
-        cause: "Token bucket configured with `burst < average`. The burst capacity (max tokens) cannot exceed the refill rate (average), making the burst window meaningless.",
-        effect: "Effective rate limit is `burst`, not `average`. Bursts of traffic are rejected sooner than expected.",
+        cause: "Token bucket configured with `burst < average`. `average` is the refill rate (requests per second) and `burst` the bucket capacity, so the bucket can never hold one second's worth of traffic.",
+        effect: "Evenly spread requests still flow at `average`, but any spike larger than `burst` is rejected, so bursty clients get 429 well below the average you set.",
         fix: "Set `burst >= average`. A common pattern is `burst = 2 * average` to absorb short spikes.",
         example: Some("sozune.http.api.ratelimit.average=100\nsozune.http.api.ratelimit.burst=200"),
     },
     Entry {
         code: "W018",
         title: "Route collision (same host + path)",
-        severity: "warning",
         cause: "Two or more candidates declare an entrypoint matching the same `(host, path)` pair.",
         effect: "Only the highest-priority candidate is reachable; the others are shadowed and silently unreachable.",
         fix: "Use distinct hostnames or paths. If the overlap is intentional, set `sozune.http.<svc>.priority=N` to make precedence explicit (higher wins).",
@@ -280,7 +265,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W019",
         title: "Invalid forwardAuth.address",
-        severity: "warning",
         cause: "`forwardAuth.address` was not a valid absolute URL, or used a scheme other than http/https.",
         effect: "The forward-auth middleware is disabled for this route; requests are no longer sent to the auth server and pass through unauthenticated.",
         fix: "Set `forwardAuth.address` to an absolute http/https URL pointing at the auth endpoint.",
@@ -289,7 +273,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W020",
         title: "Invalid or refused error page",
-        severity: "warning",
         cause: "An `errorPages.<code>` label used a status sozu does not support, or a `file://` value (refused for provider labels as non-trusted input).",
         effect: "That error page is dropped; the default response is served for the status instead.",
         fix: "Use a supported status (301, 400, 401, 404, 408, 413, 421, 429, 502, 503, 504, 507) and inline the body in the label value, or set file-backed pages in static config.",
@@ -298,7 +281,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W021",
         title: "Invalid healthCheck field",
-        severity: "warning",
         cause: "`healthCheck.status` was not an HTTP status in 100–599, or `healthCheck.timeout` was not a positive integer.",
         effect: "The offending field falls back to its default (2xx/3xx expected status, default timeout); the health check still runs.",
         fix: "Set `healthCheck.status` to an integer between 100 and 599, and `healthCheck.timeout` to milliseconds as a positive integer.",
@@ -309,7 +291,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W022",
         title: "Invalid loadBalancer algorithm",
-        severity: "warning",
         cause: "`loadBalancer` was not a recognised algorithm, or a flow-affine algorithm (hrw/maglev) was requested on a protocol other than UDP.",
         effect: "The balancer falls back to round_robin for this service.",
         fix: "Use one of round_robin, random, power_of_two, least_connections; reserve hrw/maglev for `sozune.udp.*` services.",
@@ -318,7 +299,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W023",
         title: "Invalid retry.attempts",
-        severity: "warning",
         cause: "`retry.attempts` was not a valid positive integer.",
         effect: "Retries are disabled for this route; a failed upstream attempt is not retried.",
         fix: "Set `retry.attempts` to the total number of attempts as an integer of 2 or more.",
@@ -327,7 +307,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W024",
         title: "Invalid circuitBreaker field",
-        severity: "warning",
         cause: "A `circuitBreaker.*` field was out of range: `threshold` outside (0, 1], or `minRequests`/`cooldown` not a positive integer.",
         effect: "The offending field falls back to its default; the breaker stays enabled with the remaining configured values.",
         fix: "Use a `threshold` ratio in (0, 1], and positive integers for `minRequests` and `cooldown` (seconds).",
@@ -338,7 +317,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W025",
         title: "Invalid inFlightReq",
-        severity: "warning",
         cause: "`inFlightReq` was not a positive integer (it was zero, negative, or non-numeric).",
         effect: "The in-flight limiter is disabled for this route; concurrent requests per IP are unbounded.",
         fix: "Set `inFlightReq` to the max concurrent requests per IP as an integer of 1 or more.",
@@ -347,7 +325,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W026",
         title: "Invalid or ignored plugin config label",
-        severity: "warning",
         cause: "A `sozune.<proto>.<svc>.plugins.<name>.<key>` label was malformed (no sub-key, or nested past the depth limit), or was set on a TCP/UDP route where plugins do not run.",
         effect: "The plugin-config label is dropped. The plugin runs with its global config (or not at all on L4), which can silently differ from what was intended.",
         fix: "Give the label a sub-key (`plugins.<name>.<key>=<value>`), keep nesting shallow, and only set plugin config on HTTP routes.",
@@ -356,7 +333,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W027",
         title: "Invalid backend weight",
-        severity: "warning",
         cause: "A `weight` label was not a valid non-negative integer (it was negative or non-integer).",
         effect: "The backend keeps its default weight (100) and stays in rotation; the intended traffic share is not applied.",
         fix: "Set `weight` to a non-negative integer. Only the `random` balancer honours it; a weight of 0 keeps the backend wired but excludes it from selection.",
@@ -365,7 +341,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W028",
         title: "Invalid SNI pattern",
-        severity: "warning",
         cause: "An `sni` label was not a routable pattern — empty, non-ASCII, carrying a wildcard beyond a single leading `*.` label, containing `/`, or holding an empty label — or it was set on a UDP route, which has no TLS ClientHello to read.",
         effect: "The SNI is dropped and the route falls back to the listener's catch-all behaviour, so it never matches the name you intended.",
         fix: "Use an exact hostname or one leading wildcard label. Write internationalised names as punycode A-labels. On UDP, remove the label or move the route to a TCP entrypoint.",
@@ -374,7 +349,6 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "I001",
         title: "Path defaulted",
-        severity: "info",
         cause: "No `sozune.http.<name>.path` label was provided.",
         effect: "The entrypoint matches `/` (everything under the host). This is usually intended.",
         fix: "If you need narrower matching, set `sozune.http.<name>.path` (prefix, exact, or regex).",
@@ -383,10 +357,9 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "I002",
         title: "Port defaulted",
-        severity: "info",
-        cause: "No explicit port label was set; sozune used the candidate's first exposed port.",
-        effect: "Routing works as long as the right port is exposed first. Brittle if the container exposes several ports.",
-        fix: "Set `sozune.http.<name>.port` explicitly to lock the choice.",
+        cause: "No `sozune.<protocol>.<name>.port` label was set; sozune used the protocol default (80 for HTTP, 8080 otherwise).",
+        effect: "Routing works only if the backend listens on that default port.",
+        fix: "Set `sozune.<protocol>.<name>.port` to the port the backend listens on.",
         example: Some("sozune.http.web.port=8080"),
     },
 ];
@@ -394,7 +367,9 @@ const ENTRIES: &[Entry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::diagnostic::DiagnosticCode;
+    use crate::labels::catalog::detect_unknown_labels;
+    use crate::labels::diagnostic::{DiagnosticCode, Severity};
+    use std::collections::HashMap;
 
     #[test]
     fn every_diagnostic_code_has_an_entry() {
@@ -408,9 +383,58 @@ mod tests {
     }
 
     #[test]
-    fn lookup_is_case_insensitive_via_run() {
+    fn every_entry_is_a_diagnostic_code() {
+        let codes: Vec<&str> = DiagnosticCode::all().iter().map(|c| c.as_str()).collect();
+        for e in ENTRIES {
+            assert!(
+                codes.contains(&e.code),
+                "explain entry {} has no DiagnosticCode",
+                e.code
+            );
+        }
+    }
+
+    #[test]
+    fn severity_matches_diagnostic_code() {
+        for &c in DiagnosticCode::all() {
+            let expected = match c.severity() {
+                Severity::Error => "error",
+                Severity::Warn => "warning",
+                Severity::Info => "info",
+            };
+            assert_eq!(severity(c.as_str()), expected, "{}", c.as_str());
+        }
+    }
+
+    /// An example is meant to be copied. Every `sozune.*` label it shows must
+    /// be one the parser knows, or following the fix yields a W013.
+    #[test]
+    fn example_labels_are_known() {
+        for e in ENTRIES {
+            let Some(example) = e.example else {
+                continue;
+            };
+            let labels: HashMap<String, String> = example
+                .split_whitespace()
+                .filter(|t| t.starts_with("sozune."))
+                .filter_map(|t| t.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let mut diagnostics = Vec::new();
+            detect_unknown_labels(&labels, &mut diagnostics);
+            assert!(
+                diagnostics.is_empty(),
+                "explain {} example uses unknown labels: {:?}",
+                e.code,
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_is_case_sensitive() {
         assert!(lookup("E001").is_some());
-        assert!(lookup("w013").is_none(), "lookup itself is case-sensitive");
+        assert!(lookup("w013").is_none());
     }
 
     #[test]
