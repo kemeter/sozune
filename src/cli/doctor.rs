@@ -529,9 +529,22 @@ fn check_certs_dir(certs_dir: &str, results: &mut Vec<CheckResult>) {
     }
 }
 
+/// Creates, then removes, a file only this run owns: `create_new` refuses to
+/// open an existing path, so a file already in `dir` is never truncated or
+/// deleted, whatever its name.
 fn probe_writable(dir: &Path) -> std::io::Result<()> {
-    let probe = dir.join(".sozune-doctor-write-probe");
-    std::fs::write(&probe, b"ok")?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".sozune-doctor-probe-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
 }
@@ -1004,6 +1017,19 @@ mod tests {
         assert!(!sozune_is_running(&cfg).await);
     }
 
+    #[test]
+    fn write_probe_leaves_existing_files_alone() {
+        let dir = std::env::temp_dir().join(format!("sozune-doctor-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_probe = dir.join(".sozune-doctor-write-probe");
+        std::fs::write(&old_probe, b"keep me").unwrap();
+
+        probe_writable(&dir).unwrap();
+
+        assert_eq!(std::fs::read(&old_probe).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn missing_certs_dir_under_a_writable_parent_is_ok_and_not_created() {
