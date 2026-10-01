@@ -22,6 +22,10 @@ entrypoints.yaml
 middleware.md
 ROADMAP.md
 
+# The image pins the same version through its `rust:` tag. Copied in, this
+# file makes rustup fetch clippy on every build, which the image never runs.
+rust-toolchain.toml
+
 # E2E test infrastructure and perf bench (not needed for the binary)
 tests/e2e/
 bench/

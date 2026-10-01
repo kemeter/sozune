@@ -1,0 +1,7 @@
+# Single source for the Rust version: rustup reads it locally and in CI, so a
+# new stable release cannot change what lints or compiles until it is bumped
+# here. Keep the `rust:` tag in the Dockerfile on the same version.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

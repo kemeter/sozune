@@ -8,8 +8,9 @@ COPY dashboard/ ./
 RUN bun run build
 
 # Pinned so a toolchain release cannot change what this image compiles to.
-# 1.95.0 was chosen when 1.96 SIGSEGVd in thin-LTO codegen on this dependency
-# set; 1.95.0 now does the same as the crate has grown, and 1.98.0 does not.
+# Same version as rust-toolchain.toml: bump both together. 1.96 and later
+# 1.95.0 SIGSEGVd in thin-LTO codegen on this dependency set, so check that a
+# release build still completes before bumping.
 FROM rust:1.98.0-bookworm AS builder
 # protobuf-compiler: sozu's build.rs runs protoc to generate command.rs.
 # rustfmt: that same build.rs calls prost_build with .format(true), which shells
