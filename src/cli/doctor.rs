@@ -370,7 +370,24 @@ async fn sozune_is_running(cfg: &AppConfig) -> bool {
         return false;
     };
     let url = format!("http://{}/health", socket_address(&host, port));
-    matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
+    let Ok(response) = client.get(&url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    response
+        .text()
+        .await
+        .is_ok_and(|body| is_sozune_health(&body))
+}
+
+/// Any HTTP service can answer `/health` with a 200. Only sozune names itself
+/// in the body, so another process holding the API port is not mistaken for
+/// a running instance and its port conflict stays reported.
+fn is_sozune_health(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .is_ok_and(|v| v.get("service").and_then(|s| s.as_str()) == Some("sozune"))
 }
 
 async fn check_bind(listener: &Listener, results: &mut Vec<CheckResult>) {
@@ -959,21 +976,34 @@ mod tests {
         assert!(titles.contains(&"metrics listener"));
     }
 
-    #[tokio::test]
-    async fn running_instance_is_detected_through_the_api() {
+    async fn serve_health(body: &'static str) -> AppConfig {
         let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
-        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let app =
+            axum::Router::new().route("/health", axum::routing::get(move || async move { body }));
         tokio::spawn(async move { axum::serve(server, app).await });
 
         let mut cfg = AppConfig::default();
         cfg.api.enabled = true;
         cfg.api.listen_address = addr.to_string();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn running_instance_is_detected_through_the_api() {
+        let mut cfg = serve_health(r#"{"status":"ok","service":"sozune"}"#).await;
         assert!(sozune_is_running(&cfg).await);
 
         cfg.api.enabled = false;
         assert!(!sozune_is_running(&cfg).await);
     }
+
+    #[tokio::test]
+    async fn another_service_answering_health_is_not_sozune() {
+        let cfg = serve_health(r#"{"status":"ok"}"#).await;
+        assert!(!sozune_is_running(&cfg).await);
+    }
+
 
     #[test]
     fn missing_certs_dir_under_a_writable_parent_is_ok_and_not_created() {

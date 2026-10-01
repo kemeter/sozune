@@ -301,7 +301,10 @@ pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
 }
 
 async fn health() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ok", "service": "sozune"})),
+    )
 }
 
 /// Returns the authenticated user's identity. The dashboard hits this on

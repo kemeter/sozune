@@ -98,10 +98,10 @@ curl http://localhost:3035/health
 ```
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "service": "sozune" }
 ```
 
-Returns `200 OK` as long as the API server can answer. It does not validate downstream state (worker reachability, provider connectivity).
+Returns `200 OK` as long as the API server can answer. It does not validate downstream state (worker reachability, provider connectivity). `service` tells sozune apart from another process answering on the same port; `sozune doctor` relies on it to detect a running instance.
 
 ### `GET /me`
 
