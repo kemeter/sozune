@@ -303,7 +303,7 @@ services:
       # Generous backend timeout so the slow `?wait=` probe requests below
       # actually hold their in-flight slots instead of being cut at the 2s
       # default — otherwise the slots free before the over-limit probe lands.
-      - "sozune.http.svcinflight.backendTimeout=10"
+      - "sozune.http.svcinflight.backendTimeout=10000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-compress:
@@ -319,7 +319,7 @@ services:
     labels:
       - "sozune.enable=true"
       - "sozune.http.svctimeout.host=$HOST_TIMEOUT"
-      - "sozune.http.svctimeout.backendTimeout=2"
+      - "sozune.http.svctimeout.backendTimeout=2000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-regex:
