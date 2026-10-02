@@ -18,8 +18,8 @@ regex = "1"
 # Already in the tree through regex; declared directly so a regex hostname can
 # be parsed to check where its alternations sit before Sozu anchors it.
 regex-syntax = "0.8"
-sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.0" }
-sozu-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.0" }
+sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.1" }
+sozu-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.1" }
 anyhow = "1.0.99"
 bollard = "0.20"
 async-trait = "0.1.89"
