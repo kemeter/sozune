@@ -15,6 +15,9 @@ serde_json = "1.0.143"
 # can compile a route's path regex itself instead of leaning on a transitive
 # dependency.
 regex = "1"
+# Already in the tree through regex; declared directly so a regex hostname can
+# be parsed to check where its alternations sit before Sozu anchors it.
+regex-syntax = "0.8"
 sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.0" }
 sozu-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.0" }
 anyhow = "1.0.99"

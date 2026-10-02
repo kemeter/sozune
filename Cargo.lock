@@ -3987,6 +3987,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rcgen 0.14.8",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rust-embed",
  "rustls",
