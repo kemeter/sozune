@@ -22,7 +22,7 @@ labels:
 
 `foo.example.com` matches; `bar.foo.example.com` does not. The leading `*` is required — patterns like `app*.example.com` are rejected.
 
-The bare `*` matches everything (any host).
+A bare `*`, which would match every host, is refused: one service could otherwise take the traffic of every other route on the proxy.
 
 ## Regex
 
@@ -36,6 +36,13 @@ labels:
 The example matches `cdn1.example.com`, `cdn42.example.com`, but not `cdnabc.example.com`. The `.` outside the regex segment is treated as a literal DNS separator (not a regex metacharacter).
 
 You can have several regex segments in the same hostname, e.g. `/v[0-9]+/./api[a-z]/.example.com`.
+
+A regex hostname must stay inside one domain, so that it cannot match hosts given to other services:
+
+- it ends with at least two literal labels (`.example.com`): `/.*/` and `/.*/.com` are refused;
+- a regex segment does not alternate at its top level: write `/(?:eu|us)-cdn/.example.com`, not `/eu-cdn|us-cdn/.example.com`, whose alternation would escape the anchoring and match any host.
+
+A refused hostname rejects the whole route, with `E002` from labels and `400` from the API.
 
 ## Mixed list
 

@@ -604,8 +604,8 @@ async fn get_entrypoint(
 /// Reject a hostname that would match hosts the caller was never given.
 ///
 /// The same gate the label parser and the HTTP provider apply: Sozu reads a
-/// name containing `/` as a regex and a bare `*` as every host, and frontends
-/// go in ahead of every other route. Leaving the API open would just move the
+/// bare `*` as every host and a regex without a literal domain can match any
+/// host, and frontends go in ahead of every other route. Leaving the API open would just move the
 /// exploit to this door.
 fn reject_unroutable_hostname(
     config: &crate::model::EntrypointConfig,
@@ -621,7 +621,7 @@ fn reject_unroutable_hostname(
         Json(serde_json::json!({
             "error": "hostname is not routable",
             "hostname": bad,
-            "hint": "use a plain hostname, or `*.example.com` for a wildcard",
+            "hint": "use a plain hostname, `*.example.com` for a wildcard, or a regex label under a fixed domain such as `/cdn[0-9]+/.example.com`",
         })),
     ))
 }
