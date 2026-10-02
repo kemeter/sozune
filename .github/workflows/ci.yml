@@ -33,9 +33,9 @@ jobs:
       - name: Dashboard lint (biome)
         run: cd dashboard && bun run lint
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # Installs the version and components pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
 
       # save-if: only main writes the cache; PRs restore it. Keeps PR branches
       # from filling the 10 GB per-repo cache quota (and evicting each other).
@@ -63,7 +63,8 @@ jobs:
       - name: Build dashboard
         run: cd dashboard && bun install --frozen-lockfile && bun run build
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,7 +87,8 @@ jobs:
       - name: Build dashboard
         run: cd dashboard && bun install --frozen-lockfile && bun run build
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
         with:
