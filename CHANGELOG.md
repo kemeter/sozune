@@ -19,6 +19,13 @@ All notable changes to this project will be documented in this file.
 - Gateway & GatewayClass status reporting — sōzune now writes the standard conditions back onto the resources it owns: `Accepted` on a GatewayClass whose `controllerName` is `kemeter.io/sozune`, and `Accepted` + `Programmed` on every Gateway pointing at such a class. Visible via `kubectl get`/`describe`, so an operator can confirm a Gateway is being served without reading sōzune's logs. Resources owned by another controller are left untouched, per the Gateway API spec. Needs the `gateways/status` and `gatewayclasses/status` patch verbs in RBAC. See [Status conditions](documentation/providers/kubernetes.md#status-conditions).
 - ReferenceGrant enforcement — cross-namespace `backendRefs` on an HTTPRoute now require a `ReferenceGrant` in the target namespace trusting the route's namespace, per the Gateway API spec. Without a grant the backend is dropped (logged, and reflected as `ResolvedRefs=False`) instead of being routed. Previously a cross-namespace ref was honoured unconditionally, which let any route author reach any Service cluster-wide. Same-namespace refs are unaffected. Needs the `referencegrants` read verb in RBAC. See [Cross-namespace backends](documentation/providers/kubernetes.md#cross-namespace-backends-referencegrant).
 
+### CLI
+
+- `sozune doctor` can be run against a live instance — when the API answers `/health` as sozune, the bind checks are skipped instead of reporting every port as held by "another process". `GET /health` now returns `"service": "sozune"` next to `status`, so another service answering on the API port is not mistaken for a running instance.
+- `sozune doctor` checks everything sozune binds — UDP listeners, the ACME challenge and TLS-ALPN-01 ports, and the metrics listener are probed, and two listeners sharing a port are reported (each probed fine on its own, then the second failed at startup). Kubernetes, Consul and Ring providers are now checked. The middleware port is probed on loopback, where it actually binds, and IPv6 API/dashboard addresses no longer fail to parse.
+- `sozune doctor` no longer creates a missing ACME `certs_dir`; it reports whether sozune will be able to create it. The privileged-ports warning no longer shows for non-root users whose binds already passed.
+- `sozune explain` examples for `W003`, `W005` and `W006` used label names the parser does not know (`backend_timeout`, `redirect.policy`, `redirect.scheme`), so copying the fix yielded a `W013`. `E004`, `I002` and `W017` described the wrong cause or effect. Every example is now checked against the label catalog.
+
 ## [0.14.0] - 2026-07-04
 
 ### TLS / ACME

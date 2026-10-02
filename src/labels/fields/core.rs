@@ -39,7 +39,7 @@ pub fn parse_port(
                     )
                     .with_label(&key)
                     .with_value(raw)
-                    .with_hint("port must be a positive integer between 0 and 65535"),
+                    .with_hint("port must be an integer between 0 and 65535"),
                 );
                 default
             }
@@ -107,11 +107,13 @@ pub fn parse_backend_timeout(
             diagnostics.push(
                 Diagnostic::new(
                     DiagnosticCode::W003InvalidTimeout,
-                    "backendTimeout is not a valid integer, no timeout applied",
+                    "backendTimeout is not a valid integer, the default timeout (30s) applies",
                 )
                 .with_label(&key)
                 .with_value(raw)
-                .with_hint("expected milliseconds as a positive integer"),
+                .with_hint(
+                    "expected milliseconds as a non-negative integer, 0 disables the timeout",
+                ),
             );
             None
         }

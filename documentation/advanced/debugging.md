@@ -54,3 +54,23 @@ Configured backends:
 ## Configuration validation at boot
 
 `SOZUNE_DEBUG` only affects runtime responses. For diagnostics that surface at config-load time (typos in Docker labels, missing required fields, unknown protocols), use `sozune validate`. Both paths share the same diagnostic codes (`E001` … `W013`, `I001` …), so what `validate` reports cannot drift from what the proxy actually does.
+
+Run `sozune explain <CODE>` for the cause, effect, fix and a copyable example of any code `validate` reports.
+
+## Checking the environment
+
+`sozune doctor` checks the host sozune runs on, before or after it starts:
+
+- the config file parses;
+- every port sozune binds is free: HTTP, HTTPS, TCP and UDP listeners, the middleware port, the ACME challenge and TLS-ALPN-01 ports, and the API, dashboard and metrics listeners when enabled. Two listeners configured on the same port are reported as a conflict;
+- ACME has a contact email and its `certs_dir` is writable (or can be created);
+- each enabled provider is reachable: Docker, Podman and Swarm sockets, Nomad, Consul, Ring and HTTP endpoints, the Kubernetes kubeconfig or in-cluster credentials, the `config_file` path.
+
+```bash
+sozune doctor            # all checks
+sozune doctor --offline  # skip provider checks
+```
+
+When sozune is already running, its ports are taken by definition. If the API is enabled, `doctor` detects the running instance through `/health` and skips the bind checks. Without the API it cannot tell sozune from another process, so stop sozune first.
+
+`doctor` exits with `1` when a check fails, `0` otherwise (warnings included).

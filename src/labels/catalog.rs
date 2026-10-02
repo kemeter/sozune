@@ -80,7 +80,7 @@ pub fn detect_unknown_labels(labels: &HashMap<String, String>, diagnostics: &mut
             diag = diag.with_hint(format!("did you mean `{suggestion}`?"));
         } else {
             diag = diag
-                .with_hint("see https://sozune.dev/docs/labels for the list of supported labels");
+                .with_hint("see https://sozune.kemeter.io/documentation/providers/docker for the list of supported labels");
         }
         diagnostics.push(diag);
     }
@@ -228,7 +228,7 @@ mod tests {
         );
         assert_eq!(diags.len(), 1);
         let hint = diags[0].hint.as_deref().unwrap();
-        assert!(hint.contains("sozune.dev"));
+        assert!(hint.contains("sozune.kemeter.io/documentation"));
     }
 
     #[test]

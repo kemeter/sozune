@@ -7,7 +7,7 @@ use crate::config::AppConfig;
 
 #[derive(Args, Debug)]
 pub struct DoctorArgs {
-    /// Skip checks that touch the network (provider sockets, ACME directory).
+    /// Skip checks that reach providers (sockets, HTTP endpoints, kubeconfig).
     #[arg(long)]
     pub offline: bool,
 }
@@ -73,11 +73,21 @@ pub async fn run(args: DoctorArgs, config_path: &str) -> i32 {
         }
     };
 
-    // 2. Ports bindable
-    check_proxy_ports(&config, &mut results).await;
-    check_middleware_port(&config, &mut results).await;
-    check_api_port(&config, &mut results).await;
-    check_dashboard_port(&config, &mut results).await;
+    // 2. Ports: two listeners on one port never start, whatever the host
+    // state. Probing the binds only makes sense while sozune is stopped:
+    // a running instance holds every one of them.
+    let listeners = collect_listeners(&config, &mut results);
+    check_port_conflicts(&listeners, &mut results);
+    if sozune_is_running(&config).await {
+        results.push(CheckResult::ok(
+            "instance",
+            "sozune is running (the API answered /health), bind checks skipped",
+        ));
+    } else {
+        for listener in &listeners {
+            check_bind(listener, &mut results).await;
+        }
+    }
 
     // 3. ACME
     check_acme(&config, &mut results);
@@ -87,7 +97,7 @@ pub async fn run(args: DoctorArgs, config_path: &str) -> i32 {
         check_providers(&config, &mut results).await;
     }
 
-    // 5. Privileges (low-port binding without root)
+    // 5. Privileges (low-port binding)
     check_privileges(&config, &mut results);
 
     print_results(&results);
@@ -105,7 +115,7 @@ async fn check_config(path: &str, results: &mut Vec<CheckResult>) -> Option<AppC
                 "file not found, sozune will start with default configuration",
             )
             .with_fix(format!(
-                "create `{path}` (see https://sozune.dev/docs/configuration)"
+                "create `{path}` (see https://sozune.kemeter.io/documentation/configuration/overview)"
             )),
         );
         return Some(AppConfig::default());
@@ -134,118 +144,283 @@ async fn check_config(path: &str, results: &mut Vec<CheckResult>) -> Option<AppC
         Err(e) => {
             results.push(
                 CheckResult::fail("config", format!("config file `{path}`"), e.to_string())
-                    .with_fix("run `sozune validate` for a per-candidate diagnostic, or fix the YAML at the reported line"),
+                    .with_fix("fix the config at the reported line"),
             );
             None
         }
     }
 }
 
-async fn check_proxy_ports(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
-    check_tcp_port(
-        results,
-        "proxy",
-        "HTTP listener",
-        cfg.proxy.http.listen_address,
-    )
-    .await;
-    check_tcp_port(
-        results,
-        "proxy",
-        "HTTPS listener",
-        cfg.proxy.https.listen_address,
-    )
-    .await;
-    for tcp in &cfg.proxy.tcp {
-        check_tcp_port(
-            results,
-            "proxy",
-            &format!("TCP listener `{}`", tcp.name),
-            tcp.listen,
-        )
-        .await;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
+/// A socket sozune binds at startup, with the address it actually uses.
+struct Listener {
+    category: &'static str,
+    title: String,
+    host: String,
+    port: u16,
+    transport: Transport,
+}
+
+impl Listener {
+    fn new(
+        category: &'static str,
+        title: impl Into<String>,
+        host: &str,
+        port: u16,
+        transport: Transport,
+    ) -> Self {
+        Self {
+            category,
+            title: title.into(),
+            host: host.to_string(),
+            port,
+            transport,
+        }
+    }
+
+    fn port_label(&self) -> String {
+        match self.transport {
+            Transport::Tcp => format!("port {}", self.port),
+            Transport::Udp => format!("udp port {}", self.port),
+        }
     }
 }
 
-async fn check_middleware_port(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
-    check_tcp_port(
-        results,
+const ANY: &str = "0.0.0.0";
+const LOOPBACK: &str = "127.0.0.1";
+
+/// Every listener sozune would bind with this config. Proxy listeners take
+/// all interfaces; the middleware and ACME responders stay on loopback.
+fn collect_listeners(cfg: &AppConfig, results: &mut Vec<CheckResult>) -> Vec<Listener> {
+    let mut listeners = vec![
+        Listener::new(
+            "proxy",
+            "HTTP listener",
+            ANY,
+            cfg.proxy.http.listen_address,
+            Transport::Tcp,
+        ),
+        Listener::new(
+            "proxy",
+            "HTTPS listener",
+            ANY,
+            cfg.proxy.https.listen_address,
+            Transport::Tcp,
+        ),
+    ];
+    for tcp in &cfg.proxy.tcp {
+        listeners.push(Listener::new(
+            "proxy",
+            format!("TCP listener `{}`", tcp.name),
+            ANY,
+            tcp.listen,
+            Transport::Tcp,
+        ));
+    }
+    for udp in &cfg.proxy.udp {
+        listeners.push(Listener::new(
+            "proxy",
+            format!("UDP listener `{}`", udp.name),
+            ANY,
+            udp.listen,
+            Transport::Udp,
+        ));
+    }
+    listeners.push(Listener::new(
         "middleware",
         "middleware port",
+        LOOPBACK,
         cfg.middleware.port,
-    )
-    .await;
-}
-
-async fn check_api_port(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
-    if !cfg.api.enabled {
-        return;
+        Transport::Tcp,
+    ));
+    if let Some(acme) = cfg.acme.as_ref().filter(|a| a.enabled) {
+        listeners.push(Listener::new(
+            "acme",
+            "ACME HTTP-01 challenge port",
+            LOOPBACK,
+            acme.challenge_port,
+            Transport::Tcp,
+        ));
+        listeners.push(Listener::new(
+            "acme",
+            "ACME TLS-ALPN-01 responder port",
+            LOOPBACK,
+            acme.tls_alpn_port,
+            Transport::Tcp,
+        ));
     }
-    match parse_listen_address(&cfg.api.listen_address) {
-        Some((host, port)) => {
-            check_tcp_port_with_host(results, "api", "API listener", &host, port).await
-        }
-        None => results.push(CheckResult::warn(
+    if cfg.api.enabled {
+        push_address_listener(
+            &mut listeners,
+            results,
             "api",
             "API listener",
-            format!("could not parse `{}`", cfg.api.listen_address),
-        )),
+            &cfg.api.listen_address,
+        );
     }
-}
-
-async fn check_dashboard_port(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
-    if !cfg.dashboard.enabled {
-        return;
-    }
-    match parse_listen_address(&cfg.dashboard.listen_address) {
-        Some((host, port)) => {
-            check_tcp_port_with_host(results, "dashboard", "dashboard listener", &host, port).await
-        }
-        None => results.push(CheckResult::warn(
+    if cfg.dashboard.enabled {
+        push_address_listener(
+            &mut listeners,
+            results,
             "dashboard",
             "dashboard listener",
-            format!("could not parse `{}`", cfg.dashboard.listen_address),
+            &cfg.dashboard.listen_address,
+        );
+    }
+    if cfg.metrics.enabled {
+        push_address_listener(
+            &mut listeners,
+            results,
+            "metrics",
+            "metrics listener",
+            &cfg.metrics.listen_address,
+        );
+    }
+    listeners
+}
+
+fn push_address_listener(
+    listeners: &mut Vec<Listener>,
+    results: &mut Vec<CheckResult>,
+    category: &'static str,
+    title: &str,
+    address: &str,
+) {
+    match parse_listen_address(address) {
+        Some((host, port)) => {
+            listeners.push(Listener::new(category, title, &host, port, Transport::Tcp));
+        }
+        None => results.push(CheckResult::warn(
+            category,
+            title,
+            format!("could not parse `{address}`"),
         )),
     }
 }
 
-async fn check_tcp_port(
-    results: &mut Vec<CheckResult>,
-    category: &'static str,
-    title: &str,
-    port: u16,
-) {
-    check_tcp_port_with_host(results, category, title, "0.0.0.0", port).await
+/// Two listeners sharing a port each probe fine on their own, then the
+/// second one fails at startup. Port 0 asks the kernel for a free port, so
+/// it never collides.
+fn check_port_conflicts(listeners: &[Listener], results: &mut Vec<CheckResult>) {
+    for (i, a) in listeners.iter().enumerate() {
+        for b in &listeners[i + 1..] {
+            if a.port != 0
+                && a.port == b.port
+                && a.transport == b.transport
+                && hosts_overlap(&a.host, &b.host)
+            {
+                results.push(
+                    CheckResult::fail(
+                        "ports",
+                        a.port_label(),
+                        format!("claimed by both {} and {}", a.title, b.title),
+                    )
+                    .with_fix("give each listener its own port in the config"),
+                );
+            }
+        }
+    }
 }
 
-async fn check_tcp_port_with_host(
-    results: &mut Vec<CheckResult>,
-    category: &'static str,
-    title: &str,
-    host: &str,
-    port: u16,
-) {
-    let addr = format!("{host}:{port}");
-    match tokio::net::TcpListener::bind(&addr).await {
-        Ok(listener) => {
-            drop(listener);
+/// A wildcard address (`0.0.0.0`, `::`) takes the port on every interface,
+/// so it collides with any other host on the same port.
+fn hosts_overlap(a: &str, b: &str) -> bool {
+    a == b || is_unspecified(a) || is_unspecified(b)
+}
+
+fn is_unspecified(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_unspecified())
+        .unwrap_or(false)
+}
+
+/// `host:port`, with IPv6 hosts bracketed so the pair parses back.
+fn socket_address(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Whether a sozune instance already answers on the configured API address.
+/// Without the API there is no way to tell sozune from another process on
+/// the same ports.
+async fn sozune_is_running(cfg: &AppConfig) -> bool {
+    if !cfg.api.enabled {
+        return false;
+    }
+    let Some((host, port)) = parse_listen_address(&cfg.api.listen_address) else {
+        return false;
+    };
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() && ip.is_ipv4() => LOOPBACK.to_string(),
+        Ok(ip) if ip.is_unspecified() => "::1".to_string(),
+        _ => host,
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("http://{}/health", socket_address(&host, port));
+    let Ok(response) = client.get(&url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    response
+        .text()
+        .await
+        .is_ok_and(|body| is_sozune_health(&body))
+}
+
+/// Any HTTP service can answer `/health` with a 200. Only sozune names itself
+/// in the body, so another process holding the API port is not mistaken for
+/// a running instance and its port conflict stays reported.
+fn is_sozune_health(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .is_ok_and(|v| v.get("service").and_then(|s| s.as_str()) == Some("sozune"))
+}
+
+async fn check_bind(listener: &Listener, results: &mut Vec<CheckResult>) {
+    let addr = socket_address(&listener.host, listener.port);
+    let bound = match listener.transport {
+        Transport::Tcp => tokio::net::TcpListener::bind(&addr).await.map(drop),
+        Transport::Udp => tokio::net::UdpSocket::bind(&addr).await.map(drop),
+    };
+    let title = format!("{} ({})", listener.title, listener.port_label());
+    match bound {
+        Ok(()) => {
             results.push(CheckResult::ok(
-                category,
-                format!("{title} (port {port}) bindable"),
+                listener.category,
+                format!("{title} bindable"),
             ));
         }
         Err(e) => {
             let detail = format!("cannot bind {addr}: {e}");
-            let fix = if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
-                "run sozune as root, or grant CAP_NET_BIND_SERVICE: `sudo setcap 'cap_net_bind_service=+ep' $(which sozune)`"
+            let fix = if e.kind() == std::io::ErrorKind::PermissionDenied && listener.port < 1024 {
+                "run sozune as root, or grant CAP_NET_BIND_SERVICE: `sudo setcap 'cap_net_bind_service=+ep' $(which sozune)`".to_string()
             } else if e.kind() == std::io::ErrorKind::AddrInUse {
-                "another process is already using this port; identify it with `ss -lntp | grep :PORT` and stop it, or change the port in the config"
+                let ss = match listener.transport {
+                    Transport::Tcp => "ss -lntp",
+                    Transport::Udp => "ss -lnup",
+                };
+                format!(
+                    "another process is already using this port; identify it with `{ss} | grep :{}` and stop it, or change the port in the config. If it is sozune itself, enable the API so doctor can detect a running instance",
+                    listener.port
+                )
             } else {
-                "check the listen address and the host's network configuration"
+                "check the listen address and the host's network configuration".to_string()
             };
-            results.push(
-                CheckResult::fail(category, format!("{title} (port {port})"), detail).with_fix(fix),
-            );
+            results.push(CheckResult::fail(listener.category, title, detail).with_fix(fix));
         }
     }
 }
@@ -279,47 +454,7 @@ fn check_acme(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
         ));
     }
 
-    let dir = Path::new(&acme.certs_dir);
-    if !dir.exists()
-        && let Err(e) = std::fs::create_dir_all(dir)
-    {
-        results.push(
-            CheckResult::fail(
-                "acme",
-                format!("ACME directory `{}`", acme.certs_dir),
-                format!("does not exist and cannot be created: {e}"),
-            )
-            .with_fix(format!(
-                "create the directory and ensure sozune can write to it: `mkdir -p {} && chown $(id -un) {}`",
-                acme.certs_dir, acme.certs_dir
-            )),
-        );
-        return;
-    }
-
-    let probe = dir.join(".sozune-doctor-write-probe");
-    match std::fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            results.push(CheckResult::ok(
-                "acme",
-                format!("ACME directory `{}` writable", acme.certs_dir),
-            ));
-        }
-        Err(e) => {
-            results.push(
-                CheckResult::fail(
-                    "acme",
-                    format!("ACME directory `{}`", acme.certs_dir),
-                    format!("not writable: {e}"),
-                )
-                .with_fix(format!(
-                    "grant write permission to sozune: `chown $(id -un) {}`",
-                    acme.certs_dir
-                )),
-            );
-        }
-    }
+    check_certs_dir(&acme.certs_dir, results);
 
     if acme.staging {
         results.push(
@@ -331,6 +466,87 @@ fn check_acme(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
             .with_fix("set `acme.staging=false` for production"),
         );
     }
+}
+
+/// sozune creates `certs_dir` (and any missing parent) when it stores the
+/// first account or certificate, so a missing directory is fine as long as
+/// its closest existing ancestor is writable. Doctor never creates it.
+fn check_certs_dir(certs_dir: &str, results: &mut Vec<CheckResult>) {
+    let dir = Path::new(certs_dir);
+    if dir.exists() {
+        match probe_writable(dir) {
+            Ok(()) => results.push(CheckResult::ok(
+                "acme",
+                format!("ACME directory `{certs_dir}` writable"),
+            )),
+            Err(e) => results.push(
+                CheckResult::fail(
+                    "acme",
+                    format!("ACME directory `{certs_dir}`"),
+                    format!("not writable: {e}"),
+                )
+                .with_fix(format!(
+                    "grant write permission to sozune: `chown $(id -un) {certs_dir}`"
+                )),
+            ),
+        }
+        return;
+    }
+
+    let ancestor = dir
+        .ancestors()
+        .skip(1)
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            }
+        })
+        .find(|p| p.exists())
+        .unwrap_or(Path::new("."));
+    match probe_writable(ancestor) {
+        Ok(()) => results.push(CheckResult::ok(
+            "acme",
+            format!(
+                "ACME directory `{certs_dir}` will be created on first use (`{}` writable)",
+                ancestor.display()
+            ),
+        )),
+        Err(e) => results.push(
+            CheckResult::fail(
+                "acme",
+                format!("ACME directory `{certs_dir}`"),
+                format!(
+                    "does not exist and cannot be created: `{}` not writable: {e}",
+                    ancestor.display()
+                ),
+            )
+            .with_fix(format!(
+                "create the directory and ensure sozune can write to it: `mkdir -p {certs_dir} && chown $(id -un) {certs_dir}`"
+            )),
+        ),
+    }
+}
+
+/// Creates, then removes, a file only this run owns: `create_new` refuses to
+/// open an existing path, so a file already in `dir` is never truncated or
+/// deleted, whatever its name.
+fn probe_writable(dir: &Path) -> std::io::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".sozune-doctor-probe-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 async fn check_providers(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
@@ -359,6 +575,21 @@ async fn check_providers(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
     {
         check_http_endpoint(results, "http", "HTTP provider endpoint", &h.url).await;
     }
+    if let Some(c) = &cfg.providers.consul
+        && c.enabled
+    {
+        check_http_endpoint(results, "consul", "Consul endpoint", &c.endpoint).await;
+    }
+    if let Some(r) = &cfg.providers.ring
+        && r.enabled
+    {
+        check_http_endpoint(results, "ring", "Ring endpoint", &r.endpoint).await;
+    }
+    if let Some(k) = &cfg.providers.kubernetes
+        && k.enabled
+    {
+        check_kubernetes(&k.kubeconfig, results).await;
+    }
     if let Some(c) = &cfg.providers.config_file
         && c.enabled
     {
@@ -378,6 +609,47 @@ async fn check_providers(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
                 .with_fix("create the file or set providers.config_file.enabled=false"),
             );
         }
+    }
+}
+
+/// An empty `kubeconfig` means in-cluster: the ServiceAccount token and the
+/// API server address the kubelet injects into every pod.
+async fn check_kubernetes(kubeconfig: &str, results: &mut Vec<CheckResult>) {
+    if !kubeconfig.is_empty() {
+        match tokio::fs::read(kubeconfig).await {
+            Ok(_) => results.push(CheckResult::ok(
+                "kubernetes",
+                format!("kubeconfig `{kubeconfig}` readable"),
+            )),
+            Err(e) => results.push(
+                CheckResult::fail(
+                    "kubernetes",
+                    format!("kubeconfig `{kubeconfig}`"),
+                    format!("cannot read: {e}"),
+                )
+                .with_fix("point providers.kubernetes.kubeconfig at a readable kubeconfig, or leave it empty when running in the cluster"),
+            ),
+        }
+        return;
+    }
+
+    let token = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+    let has_host = std::env::var("KUBERNETES_SERVICE_HOST").is_ok_and(|h| !h.is_empty());
+    let has_token = tokio::fs::try_exists(token).await.unwrap_or(false);
+    if has_host && has_token {
+        results.push(CheckResult::ok(
+            "kubernetes",
+            "in-cluster credentials found",
+        ));
+    } else {
+        results.push(
+            CheckResult::fail(
+                "kubernetes",
+                "in-cluster credentials",
+                "no kubeconfig set and not running in a pod (KUBERNETES_SERVICE_HOST or the ServiceAccount token is missing)",
+            )
+            .with_fix("run sozune inside the cluster with a ServiceAccount, or set providers.kubernetes.kubeconfig"),
+        );
     }
 }
 
@@ -429,20 +701,7 @@ async fn check_http_endpoint(
     title: &str,
     url: &str,
 ) {
-    let host_port = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or("");
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(80)),
-        None => (
-            host_port.to_string(),
-            if url.starts_with("https://") { 443 } else { 80 },
-        ),
-    };
-    if host.is_empty() {
+    let Some((host, port)) = endpoint_address(url) else {
         results.push(
             CheckResult::warn(
                 category,
@@ -452,8 +711,8 @@ async fn check_http_endpoint(
             .with_fix("use the form `http://host:port`"),
         );
         return;
-    }
-    let addr = format!("{host}:{port}");
+    };
+    let addr = socket_address(&host, port);
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(&addr),
@@ -485,32 +744,39 @@ async fn check_http_endpoint(
     }
 }
 
+/// Host and port an endpoint URL connects to, with the scheme's default port
+/// when none is given. IPv6 hosts come back unbracketed. A bare `host:port`
+/// is read as `http://`.
+fn endpoint_address(endpoint: &str) -> Option<(String, u16)> {
+    let parsed = if endpoint.contains("://") {
+        url::Url::parse(endpoint).ok()?
+    } else {
+        url::Url::parse(&format!("http://{endpoint}")).ok()?
+    };
+    let host = match parsed.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, parsed.port_or_known_default()?))
+}
+
+/// Only root is reported here: without it, a privileged port that cannot be
+/// bound already fails its bind check with the setcap fix attached.
 fn check_privileges(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
     let needs_low_port = cfg.proxy.http.listen_address < 1024
         || cfg.proxy.https.listen_address < 1024
-        || cfg.proxy.tcp.iter().any(|t| t.listen < 1024);
+        || cfg.proxy.tcp.iter().any(|t| t.listen < 1024)
+        || cfg.proxy.udp.iter().any(|u| u.listen < 1024);
 
-    if !needs_low_port {
-        return;
-    }
-
-    let is_root = unsafe { libc_geteuid() == 0 };
-    if is_root {
+    if needs_low_port && unsafe { libc_geteuid() == 0 } {
         results.push(CheckResult::ok(
             "privileges",
             "running as root, can bind privileged ports",
         ));
-    } else {
-        // We can't reliably probe CAP_NET_BIND_SERVICE without libc bindings,
-        // so we rely on the bind probe results elsewhere and just hint here.
-        results.push(
-            CheckResult::warn(
-                "privileges",
-                "binding privileged ports as non-root",
-                "ports below 1024 require root or CAP_NET_BIND_SERVICE; if the bind checks above passed, you already have it",
-            )
-            .with_fix("if a port check failed: `sudo setcap 'cap_net_bind_service=+ep' $(which sozune)`"),
-        );
     }
 }
 
@@ -606,6 +872,22 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_address_defaults_the_port_and_unbrackets_ipv6() {
+        let cases = [
+            ("http://nomad:4646/v1", Some(("nomad", 4646))),
+            ("https://consul.local", Some(("consul.local", 443))),
+            ("http://[::1]", Some(("::1", 80))),
+            ("http://[::1]:8500", Some(("::1", 8500))),
+            ("127.0.0.1:8080", Some(("127.0.0.1", 8080))),
+            ("http://", None),
+        ];
+        for (endpoint, expected) in cases {
+            let expected = expected.map(|(h, p)| (h.to_string(), p));
+            assert_eq!(endpoint_address(endpoint), expected, "{endpoint}");
+        }
+    }
+
+    #[test]
     fn exit_code_is_one_with_failure() {
         let results = vec![CheckResult::fail("x", "t", "d")];
         assert_eq!(exit_code(&results), 1);
@@ -617,13 +899,147 @@ mod tests {
         assert_eq!(exit_code(&results), 0);
     }
 
+    fn listener(title: &str, host: &str, port: u16, transport: Transport) -> Listener {
+        Listener::new("test", title, host, port, transport)
+    }
+
     #[tokio::test]
-    async fn tcp_port_bind_check_ok_on_random_port() {
+    async fn bind_check_ok_on_ephemeral_ports() {
         let mut results = Vec::new();
-        // Bind to port 0 → kernel assigns. Then close, then re-probe.
-        // We can't easily capture the assigned port across two binds, so
-        // just check that probing port 0 returns Ok.
-        check_tcp_port(&mut results, "test", "ephemeral", 0).await;
+        check_bind(&listener("tcp", LOOPBACK, 0, Transport::Tcp), &mut results).await;
+        check_bind(&listener("udp", LOOPBACK, 0, Transport::Udp), &mut results).await;
+        assert!(results.iter().all(|r| r.status == Status::Ok));
+    }
+
+    #[tokio::test]
+    async fn bind_check_fails_on_a_taken_port() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let mut results = Vec::new();
+        check_bind(
+            &listener("tcp", LOOPBACK, port, Transport::Tcp),
+            &mut results,
+        )
+        .await;
+        assert_eq!(results[0].status, Status::Fail);
+        assert!(results[0].fix.as_deref().unwrap().contains("ss -lntp"));
+    }
+
+    #[tokio::test]
+    async fn bind_check_brackets_ipv6_hosts() {
+        let mut results = Vec::new();
+        check_bind(&listener("tcp", "::1", 0, Transport::Tcp), &mut results).await;
+        let detail = results[0].detail.as_deref().unwrap_or("");
+        assert!(!detail.contains("invalid socket address"), "{detail}");
+    }
+
+    #[test]
+    fn same_port_on_a_wildcard_and_loopback_conflicts() {
+        let mut results = Vec::new();
+        check_port_conflicts(
+            &[
+                listener("HTTP listener", ANY, 3037, Transport::Tcp),
+                listener("middleware port", LOOPBACK, 3037, Transport::Tcp),
+            ],
+            &mut results,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Fail);
+    }
+
+    #[test]
+    fn same_port_on_distinct_hosts_or_transports_does_not_conflict() {
+        let mut results = Vec::new();
+        check_port_conflicts(
+            &[
+                listener("a", "127.0.0.1", 53, Transport::Tcp),
+                listener("b", "10.0.0.1", 53, Transport::Tcp),
+                listener("c", ANY, 5353, Transport::Tcp),
+                listener("d", ANY, 5353, Transport::Udp),
+                listener("e", ANY, 0, Transport::Tcp),
+                listener("f", ANY, 0, Transport::Tcp),
+            ],
+            &mut results,
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn listeners_include_udp_acme_and_metrics() {
+        let mut cfg = AppConfig::default();
+        cfg.proxy.udp.push(crate::config::UdpListenerConfig {
+            name: "dns".into(),
+            listen: 53,
+        });
+        cfg.acme = Some(crate::config::AcmeConfig {
+            enabled: true,
+            email: "ops@example.com".into(),
+            certs_dir: "/tmp".into(),
+            staging: false,
+            challenge_port: 3036,
+            tls_alpn_port: 3040,
+            resolvers: Default::default(),
+        });
+        cfg.metrics.enabled = true;
+        let listeners = collect_listeners(&cfg, &mut Vec::new());
+        let titles: Vec<&str> = listeners.iter().map(|l| l.title.as_str()).collect();
+        assert!(titles.contains(&"UDP listener `dns`"));
+        assert!(titles.contains(&"ACME HTTP-01 challenge port"));
+        assert!(titles.contains(&"ACME TLS-ALPN-01 responder port"));
+        assert!(titles.contains(&"metrics listener"));
+    }
+
+    async fn serve_health(body: &'static str) -> AppConfig {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let app =
+            axum::Router::new().route("/health", axum::routing::get(move || async move { body }));
+        tokio::spawn(async move { axum::serve(server, app).await });
+
+        let mut cfg = AppConfig::default();
+        cfg.api.enabled = true;
+        cfg.api.listen_address = addr.to_string();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn running_instance_is_detected_through_the_api() {
+        let mut cfg = serve_health(r#"{"status":"ok","service":"sozune"}"#).await;
+        assert!(sozune_is_running(&cfg).await);
+
+        cfg.api.enabled = false;
+        assert!(!sozune_is_running(&cfg).await);
+    }
+
+    #[tokio::test]
+    async fn another_service_answering_health_is_not_sozune() {
+        let cfg = serve_health(r#"{"status":"ok"}"#).await;
+        assert!(!sozune_is_running(&cfg).await);
+    }
+
+    #[test]
+    fn write_probe_leaves_existing_files_alone() {
+        let dir = std::env::temp_dir().join(format!("sozune-doctor-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_probe = dir.join(".sozune-doctor-write-probe");
+        std::fs::write(&old_probe, b"keep me").unwrap();
+
+        probe_writable(&dir).unwrap();
+
+        assert_eq!(std::fs::read(&old_probe).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_certs_dir_under_a_writable_parent_is_ok_and_not_created() {
+        let parent = std::env::temp_dir().join(format!("sozune-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join("certs");
+        let mut results = Vec::new();
+        check_certs_dir(dir.to_str().unwrap(), &mut results);
         assert_eq!(results[0].status, Status::Ok);
+        assert!(!dir.exists(), "doctor must not create certs_dir");
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 }
