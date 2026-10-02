@@ -20,6 +20,9 @@ TCP_ALLOW_PORT=15558
 TCP_DENY_PORT=15559
 TCP_FLOOD_PORT=15560
 TCP_SNI_PORT=15561
+# Host side of Authelia's port mapping, where sozune reaches the verify
+# endpoint. Overridable when something else on the host already holds 9091.
+AUTHELIA_HOST_PORT="${AUTHELIA_HOST_PORT:-9091}"
 API_USER="admin"
 API_PASSWORD="test-secret-token"
 API_PASSWORD_HASH=$(printf '%s' "$API_PASSWORD" | sha256sum | cut -d' ' -f1)
