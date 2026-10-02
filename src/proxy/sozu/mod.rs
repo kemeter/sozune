@@ -1899,11 +1899,14 @@ fn poll_worker_metrics(
                     // only comes from the Sōzu main process, which we don't run.
                     Some(ContentType::WorkerMetrics(wm)) => return wm.proxy,
                     Some(ContentType::Metrics(agg)) => return agg.proxying,
-                    other => {
-                        debug!(
-                            "metrics: unexpected content from {} worker: {:?}",
-                            name, other
-                        );
+                    // Content is not printed: Sōzu keeps `Debug` off it since
+                    // 2.2.1, as some variants carry certificates and keys.
+                    Some(_) => {
+                        debug!("metrics: unexpected content type from {} worker", name);
+                        return Default::default();
+                    }
+                    None => {
+                        debug!("metrics: empty content from {} worker", name);
                         return Default::default();
                     }
                 }
