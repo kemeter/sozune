@@ -303,7 +303,7 @@ services:
       # Generous backend timeout so the slow `?wait=` probe requests below
       # actually hold their in-flight slots instead of being cut at the 2s
       # default — otherwise the slots free before the over-limit probe lands.
-      - "sozune.http.svcinflight.backendTimeout=10"
+      - "sozune.http.svcinflight.backendTimeout=10000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-compress:
@@ -319,7 +319,7 @@ services:
     labels:
       - "sozune.enable=true"
       - "sozune.http.svctimeout.host=$HOST_TIMEOUT"
-      - "sozune.http.svctimeout.backendTimeout=2"
+      - "sozune.http.svctimeout.backendTimeout=2000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-regex:
@@ -373,7 +373,7 @@ services:
     # Map 9091 onto the host so sozune (running on the host, not inside the
     # compose network) can reach Authelia's verify endpoint directly.
     ports:
-      - "127.0.0.1:9091:9091"
+      - "127.0.0.1:$AUTHELIA_HOST_PORT:9091"
     volumes:
       - "$AUTHELIA_CONFIG_DIR:/config"
     labels:
@@ -458,7 +458,7 @@ services:
     labels:
       - "sozune.enable=true"
       - "sozune.http.svcfauth.host=$HOST_FAUTH"
-      - "sozune.http.svcfauth.forwardAuth.address=http://127.0.0.1:9091/api/verify?rd=https://$HOST_AUTHELIA"
+      - "sozune.http.svcfauth.forwardAuth.address=http://127.0.0.1:$AUTHELIA_HOST_PORT/api/verify?rd=https://$HOST_AUTHELIA"
       - "sozune.http.svcfauth.forwardAuth.responseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
       - "sozune.http.svcfauth.forwardAuth.trustForwardHeader=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
