@@ -4,8 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- `backendTimeout` is now read in milliseconds, as it was always documented. It used to be applied as seconds, so a route that set `backendTimeout=30` meaning 30 seconds now times out after 30ms: multiply such values by 1000. Values written in milliseconds (e.g. `30000`) now behave as intended instead of lasting 1000 times longer. The default (30s) and `0` (no timeout) are unchanged.
+- A bare `*` hostname, and a regex hostname that does not stay inside a literal domain, are now refused, from labels (`E002`), the HTTP provider and the API (`400`): they could match the hosts of every other route. Exact names, `*.` wildcards and regexes such as `/cdn[0-9]+/.example.com` are still accepted. See [Regex hostnames](documentation/routing/hostnames.md#regex).
+
+### TLS / ACME
+
+- TLS-ALPN-01 challenge — a resolver with `challenge: tls-alpn-01` obtains certificates over the TLS handshake on 443, with neither port 80 (HTTP-01) nor DNS API credentials (DNS-01). Only when such a resolver is configured, sōzune fronts 443 with a gate that sends ACME validation handshakes to a local responder and everything else, undecrypted, to the HTTPS worker; the client IP is preserved. Without one, 443 is served exactly as before. See [TLS-ALPN-01](documentation/tls/acme.md#tls-alpn-01-no-port-80-no-dns-api).
+- TLS versions and ciphers — `proxy.https.tls.min_version`, `max_version` and `ciphers` (rustls names) restrict what the HTTPS listener accepts, e.g. TLS 1.3 only. They apply to the whole listener, not per route: Sōzu sets them when it binds. An unknown version, an inverted range or a list with no recognised cipher fails startup. See [TLS versions and ciphers](documentation/tls/overview.md#tls-versions-and-ciphers).
+- An ACME order that failed at startup (e.g. the challenge route not yet in place) is retried after its backoff (60s, then 5min, …) instead of waiting for the next 12-hour renewal pass.
+- A certificate the HTTPS worker refused is sent again on the next pass. The file on disk used to be taken as proof it was served, so the hostname had no TLS until a restart.
+
 ### Routing
 
+- TCP routing by SNI (TLS passthrough) — `sozune.tcp.<svc>.sni=<host>` routes TLS connections on one TCP listener to different backends by the server name in the ClientHello, without terminating TLS: the client completes its handshake with the backend. Exact names and one leading `*.` wildcard are accepted; anything else emits `W028`. A listener is either SNI-routed or catch-all, a Sōzu constraint. See [Route by SNI](documentation/routing/tcp.md#route-by-sni-tls-passthrough).
 - Idle timeout on TCP listeners — `idle_timeout` on a `proxy.tcp` listener sets how many seconds a connection may stay silent in both directions before it is closed. Absent keeps Sōzu's defaults, which drop a connection after 30s without a byte either way: a query that runs longer, or a pooled connection at rest, was cut with no way to raise the limit. See [TCP routing docs](documentation/routing/tcp.md#idle-timeout).
 
 ### Middleware
@@ -18,6 +31,9 @@ All notable changes to this project will be documented in this file.
 - HTTPRoute header / query / method matching — an `HTTPRoute` rule's `matches[]` can now constrain on `headers[]`, `queryParams[]`, and `method` in addition to `path`. Within a match they are ANDed (a request must satisfy every condition); across matches they are ORed. Header and query matches support `Exact` and presence-only; a `RegularExpression` header/query match is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. Reuses the same entrypoint model the label providers already populate for `matchHeaders`/`matchQuery`/method routing. See [HTTPRoute support](documentation/providers/kubernetes.md#gateway-api-httproute).
 - Gateway & GatewayClass status reporting — sōzune now writes the standard conditions back onto the resources it owns: `Accepted` on a GatewayClass whose `controllerName` is `kemeter.io/sozune`, and `Accepted` + `Programmed` on every Gateway pointing at such a class. Visible via `kubectl get`/`describe`, so an operator can confirm a Gateway is being served without reading sōzune's logs. Resources owned by another controller are left untouched, per the Gateway API spec. Needs the `gateways/status` and `gatewayclasses/status` patch verbs in RBAC. See [Status conditions](documentation/providers/kubernetes.md#status-conditions).
 - ReferenceGrant enforcement — cross-namespace `backendRefs` on an HTTPRoute now require a `ReferenceGrant` in the target namespace trusting the route's namespace, per the Gateway API spec. Without a grant the backend is dropped (logged, and reflected as `ResolvedRefs=False`) instead of being routed. Previously a cross-namespace ref was honoured unconditionally, which let any route author reach any Service cluster-wide. Same-namespace refs are unaffected. Needs the `referencegrants` read verb in RBAC. See [Cross-namespace backends](documentation/providers/kubernetes.md#cross-namespace-backends-referencegrant).
+- TLSRoute — route TLS connections by SNI to Services without decrypting them, on a Gateway listener with `protocol: TLS` and `tls.mode: Passthrough`. See [TLSRoute](documentation/providers/kubernetes.md#gateway-api-tlsroute).
+- TCPRoute — forward a whole TCP listener port to Services, with no SNI or TLS involved. See [TCPRoute](documentation/providers/kubernetes.md#gateway-api-tcproute).
+- UDPRoute — forward a whole UDP listener port to Services, the datagram counterpart of TCPRoute. See [UDPRoute](documentation/providers/kubernetes.md#gateway-api-udproute).
 
 ### CLI
 
@@ -25,6 +41,21 @@ All notable changes to this project will be documented in this file.
 - `sozune doctor` checks everything sozune binds — UDP listeners, the ACME challenge and TLS-ALPN-01 ports, and the metrics listener are probed, and two listeners sharing a port are reported (each probed fine on its own, then the second failed at startup). Kubernetes, Consul and Ring providers are now checked. The middleware port is probed on loopback, where it actually binds, and IPv6 API/dashboard addresses no longer fail to parse.
 - `sozune doctor` no longer creates a missing ACME `certs_dir`; it reports whether sozune will be able to create it. The privileged-ports warning no longer shows for non-root users whose binds already passed.
 - `sozune explain` examples for `W003`, `W005` and `W006` used label names the parser does not know (`backend_timeout`, `redirect.policy`, `redirect.scheme`), so copying the fix yielded a `W013`. `E004`, `I002` and `W017` described the wrong cause or effect. Every example is now checked against the label catalog.
+
+### Security
+
+- Two routes on one hostname with different paths (e.g. `/api` and `/`) shared the middleware stack of whichever was stored last, so a rate limit, IP allow-list or forward auth on the other route could be skipped. Each request now runs the middleware of the route it matched: exact paths first, then the longest prefix, regex paths as declared.
+- The rate limiter keyed clients on `X-Forwarded-For` whatever sent it. It now trusts the header only from a trusted proxy, like the IP allow-list, and its per-client map is bounded.
+
+### Reliability
+
+- A frontend, TCP/UDP route, or whole set of backends that Sōzu refused (typically during a rolling deploy, while the old and new containers claim the same hostname) was recorded as applied and never retried, leaving the hostname without a route until a restart. It is now retried on the next reload.
+- A reload stopped by one invalid backend address no longer marks the routes it never reached as applied; they are retried on the next reload.
+- Scaling a service down could leave the removed container in the load-balancing set: backends were removed under a different id than the one they were added with.
+- A stopping Docker container only removes the backends it contributed. It used to remove every backend sharing its address, including those of other providers and of other host-network containers.
+- Concurrent `PUT` and `DELETE` on the same entrypoint could crash the API handler and leave config management answering errors until a restart.
+- Entrypoints that only redirect (`permanent`, `unauthorized`) no longer register a backend that the health checker probes and reports unhealthy forever.
+- Sōzu upgraded to 2.2.0, with WebSocket fixes, stricter HTTP/1 `Transfer-Encoding` framing and a dependency security update.
 
 ## [0.14.0] - 2026-07-04
 
