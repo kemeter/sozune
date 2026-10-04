@@ -16,12 +16,13 @@ pub fn is_routable_hostname(hostname: &str) -> bool {
     if hostname.contains('/') {
         return is_routable_regex_hostname(hostname);
     }
+    // An empty label (`.example.com`, `example..com`, `example.com.`) panicked
+    // every Sozu worker before 2.2.1; since then the worker refuses it, and the
+    // route would be retried on every reload without ever landing.
     let trailing = hostname.strip_prefix("*.").unwrap_or(hostname);
-    !trailing.is_empty()
-        && !trailing.contains('*')
+    !trailing.contains('*')
         && !trailing.contains('\\')
-        && trailing != "."
-        && !trailing.contains("..")
+        && trailing.split('.').all(|label| !label.is_empty())
 }
 
 /// One dot-separated piece of a hostname, as Sozu's
@@ -226,6 +227,12 @@ mod tests {
             "/cdn.example.com",
             "*./cdn/.example.com",
             "/cdn/..example.com",
+            ".example.com",
+            "example..com",
+            "example.com.",
+            "*..example.com",
+            "*.",
+            ".",
         ] {
             let mut diags = Vec::new();
             assert!(

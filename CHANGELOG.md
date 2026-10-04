@@ -54,6 +54,7 @@ All notable changes to this project will be documented in this file.
 - Scaling a service down could leave the removed container in the load-balancing set: backends were removed under a different id than the one they were added with.
 - A stopping Docker container only removes the backends it contributed. It used to remove every backend sharing its address, including those of other providers and of other host-network containers.
 - Concurrent `PUT` and `DELETE` on the same entrypoint could crash the API handler and leave config management answering errors until a restart.
+- A hostname with an empty label (`.example.com`, `example..com`, a trailing `.`) crashed every Sōzu worker at once. It is now refused, with `E002` from labels and `400` from the API.
 - Entrypoints that only redirect (`permanent`, `unauthorized`) no longer register a backend that the health checker probes and reports unhealthy forever.
 - Sōzu upgraded to 2.2.1, with WebSocket fixes, stricter HTTP/1 `Transfer-Encoding` framing, and workers that reject a malformed hostname instead of crashing. Certificates and private keys are redacted from Sōzu's debug logs.
 

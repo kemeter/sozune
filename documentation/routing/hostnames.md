@@ -11,6 +11,8 @@ labels:
 
 A literal hostname. Matched against the request's `Host` header.
 
+Every label must be non-empty: `.example.com`, `example..com` and a trailing `.` are refused.
+
 ## Wildcard
 
 A wildcard matches exactly one DNS label.
