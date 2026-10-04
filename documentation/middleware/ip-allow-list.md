@@ -61,6 +61,8 @@ With this setup, the client IP is resolved like this:
 2. **`trusted_proxies` is set but the TCP peer isn't in it**: `X-Forwarded-For` is still ignored — an untrusted peer can't speak about who is behind it.
 3. **`trusted_proxies` is set and the TCP peer is one of them**: walk `X-Forwarded-For` *right to left*, skipping every entry that is itself a trusted proxy. The first non-trusted entry is the client. If every XFF entry is trusted (a long internal chain), fall back to the TCP peer.
 
+The TCP peer is the address that connected to Sōzune. Middlewares run in a separate server that only Sōzu talks to, over loopback; Sōzu hands that address over as the last `X-Forwarded-For` entry, and that is the peer the rules above apply to. An entry of `127.0.0.1` therefore matches a client that really connects from the machine itself, not every client.
+
 This is the standard *rightmost trusted* algorithm — the same model Cloudflare, NGINX with `set_real_ip_from`, and HAProxy use. It is the only safe way to honour `X-Forwarded-For` without letting an attacker forge their identity.
 
 ### IPv6 / dual-stack note

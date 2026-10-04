@@ -19,8 +19,13 @@
 //! [`ProxyConfig::trusted_proxies`] (CIDRs of reverse-proxies that sit in
 //! front of Sōzune):
 //!
-//! - **No trusted proxy configured** (the safe default): `X-Forwarded-For`
-//!   is **ignored entirely** and the direct TCP peer is the client.
+//! The middleware server only ever talks to Sōzu, over loopback. Sōzu appends
+//! the address that connected to it as the last `X-Forwarded-For` entry, so
+//! for a request from loopback that entry is the peer the rules below apply
+//! to — the one hop of the header Sōzu itself vouches for.
+//!
+//! - **No trusted proxy configured** (the safe default): the rest of
+//!   `X-Forwarded-For` is **ignored** and the peer is the client.
 //! - **Trusted proxies configured**: parse `X-Forwarded-For` right-to-left,
 //!   skipping every entry that matches a trusted-proxy CIDR. The first
 //!   non-trusted entry is the client. If every entry is trusted (very long
@@ -98,52 +103,58 @@ impl TrustedProxies {
 
 /// Resolve the client IP from the request and the TCP peer.
 ///
-/// Algorithm (see module docstring for the rationale):
+/// The middleware server listens on loopback and only Sōzu connects to it, so
+/// its own TCP peer is always Sōzu, never the client. Sōzu appends the address
+/// that connected to *it* as the last `X-Forwarded-For` entry; for a request
+/// arriving from loopback, that entry stands in for the TCP peer. Taking
+/// loopback itself would make every client look like `127.0.0.1`.
 ///
-/// 1. If `trusted_proxies` is empty → return the TCP peer (XFF ignored).
-/// 2. If `trusted_proxies` is non-empty **and** the TCP peer is *not* trusted
-///    → return the TCP peer (XFF dropped, the peer is the client itself).
-/// 3. Otherwise, walk `X-Forwarded-For` **right to left**, skipping trusted
-///    entries; the first non-trusted entry is the client.
-/// 4. If every XFF entry is trusted or none parses → fall back to the TCP
-///    peer.
+/// From that peer on, the algorithm (see module docstring for the rationale):
+///
+/// 1. If `trusted_proxies` is empty → return the peer (the rest of XFF is
+///    ignored).
+/// 2. If `trusted_proxies` is non-empty **and** the peer is *not* trusted →
+///    return the peer (XFF dropped, the peer is the client itself).
+/// 3. Otherwise, walk the remaining `X-Forwarded-For` entries **right to
+///    left**, skipping trusted ones; the first non-trusted entry is the client.
+/// 4. If every entry is trusted or none parses → fall back to the peer.
 pub fn resolve_client_ip(
     req: &Request<Body>,
     ctx: &RequestCtx,
     trusted: &TrustedProxies,
 ) -> Option<IpAddr> {
-    let peer = ctx.client_addr.map(|a| a.ip());
+    let tcp_peer = ctx.client_addr.map(|a| a.ip())?;
 
-    // Cases 1 and 2: XFF is not trustworthy → return the TCP peer.
-    if trusted.is_empty() {
-        return peer;
-    }
-    let peer_ip = peer?;
-    if !trusted.contains(peer_ip) {
-        return Some(peer_ip);
-    }
-
-    // Case 3: TCP peer is a trusted proxy. Walk XFF right to left, skipping
-    // trusted hops. The first non-trusted entry is the real client.
-    if let Some(value) = req
+    // Right to left: the entry Sōzu appended comes first.
+    let mut hops = req
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-    {
-        for token in value.split(',').rev() {
-            let token = token.trim();
-            if let Ok(ip) = IpAddr::from_str(token)
-                && !trusted.contains(ip)
-            {
-                return Some(ip);
-            }
-        }
+        .into_iter()
+        .flat_map(|value| value.rsplit(','))
+        .filter_map(|token| IpAddr::from_str(token.trim()).ok());
+
+    let peer = if unmap_ipv4(tcp_peer).is_loopback() {
+        hops.next().unwrap_or(tcp_peer)
+    } else {
+        tcp_peer
+    };
+
+    // Cases 1 and 2: the rest of XFF is not trustworthy → return the peer.
+    if trusted.is_empty() || !trusted.contains(peer) {
+        return Some(peer);
+    }
+
+    // Case 3: the peer is a trusted proxy. Walk the remaining hops right to
+    // left, skipping trusted ones. The first non-trusted entry is the client.
+    if let Some(client) = hops.find(|ip| !trusted.contains(*ip)) {
+        return Some(client);
     }
 
     // Case 4: every XFF entry was trusted (long internal chain) → fall back
     // to the peer, which itself is a trusted proxy. Treat it as the client of
     // last resort; the allow-list will decide if it's permitted.
-    Some(peer_ip)
+    Some(peer)
 }
 
 pub struct IpAllowListMiddleware {
@@ -368,6 +379,88 @@ mod tests {
         let r = req(None);
         let c = ctx(None);
         assert_eq!(resolve_client_ip(&r, &c, &trusted), None);
+    }
+
+    // ---- Behind Sōzu: the middleware's peer is always loopback -----------
+    //
+    // Sōzu connects to the middleware server from loopback and appends the
+    // address that connected to it to `X-Forwarded-For`. Taking the loopback
+    // peer as the client made every request look like `127.0.0.1`: an
+    // allow-list naming it let everyone in, any other one let no one in, and
+    // every client shared one rate-limit bucket.
+
+    #[test]
+    fn behind_sozu_the_client_is_the_hop_sozu_appended() {
+        let trusted = TrustedProxies::default();
+        let r = req(Some("203.0.113.42"));
+        let c = ctx(Some("127.0.0.1"));
+        assert_eq!(
+            resolve_client_ip(&r, &c, &trusted),
+            Some(ip("203.0.113.42"))
+        );
+    }
+
+    #[test]
+    fn behind_sozu_a_forged_xff_does_not_replace_the_client() {
+        // The client sent `X-Forwarded-For: 10.0.0.1`; Sōzu appended the
+        // address it really came from.
+        let trusted = TrustedProxies::default();
+        let list = IpAllowList::new(&["10.0.0.0/8".to_string()]);
+        let r = req(Some("10.0.0.1, 198.51.100.7"));
+        let c = ctx(Some("127.0.0.1"));
+        let resolved = resolve_client_ip(&r, &c, &trusted).unwrap();
+        assert_eq!(resolved, ip("198.51.100.7"));
+        assert!(!list.allows(resolved));
+    }
+
+    #[test]
+    fn behind_sozu_a_loopback_allow_list_does_not_admit_remote_clients() {
+        let trusted = TrustedProxies::default();
+        let list = IpAllowList::new(&["127.0.0.1".to_string()]);
+        let r = req(Some("198.51.100.7"));
+        let c = ctx(Some("127.0.0.1"));
+        assert!(!list.allows(resolve_client_ip(&r, &c, &trusted).unwrap()));
+    }
+
+    #[test]
+    fn behind_sozu_a_trusted_load_balancer_is_walked_past() {
+        // client 203.0.113.42 -> load balancer 10.0.0.5 -> Sōzu -> middleware.
+        // The balancer wrote the client, Sōzu appended the balancer.
+        let trusted = TrustedProxies::new(&["10.0.0.0/8".to_string()]);
+        let r = req(Some("203.0.113.42, 10.0.0.5"));
+        let c = ctx(Some("127.0.0.1"));
+        assert_eq!(
+            resolve_client_ip(&r, &c, &trusted),
+            Some(ip("203.0.113.42"))
+        );
+    }
+
+    #[test]
+    fn behind_sozu_an_untrusted_peer_cannot_vouch_for_anyone() {
+        // A client reaching Sōzu directly, claiming to be behind 10.0.0.5.
+        let trusted = TrustedProxies::new(&["10.0.0.0/8".to_string()]);
+        let r = req(Some("10.0.0.5, 198.51.100.7"));
+        let c = ctx(Some("127.0.0.1"));
+        assert_eq!(
+            resolve_client_ip(&r, &c, &trusted),
+            Some(ip("198.51.100.7"))
+        );
+    }
+
+    #[test]
+    fn loopback_without_xff_stays_loopback() {
+        let trusted = TrustedProxies::default();
+        let r = req(None);
+        let c = ctx(Some("127.0.0.1"));
+        assert_eq!(resolve_client_ip(&r, &c, &trusted), Some(ip("127.0.0.1")));
+    }
+
+    #[test]
+    fn ipv6_loopback_peer_is_sozu_too() {
+        let trusted = TrustedProxies::default();
+        let r = req(Some("2001:db8::7"));
+        let c = ctx(Some("::1"));
+        assert_eq!(resolve_client_ip(&r, &c, &trusted), Some(ip("2001:db8::7")));
     }
 
     // ---- End-to-end: the resolver feeds the allow-list -------------------
