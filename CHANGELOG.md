@@ -50,6 +50,7 @@ All notable changes to this project will be documented in this file.
 ### Reliability
 
 - A frontend, TCP/UDP route, or whole set of backends that Sōzu refused (typically during a rolling deploy, while the old and new containers claim the same hostname) was recorded as applied and never retried, leaving the hostname without a route until a restart. It is now retried on the next reload.
+- A route added or changed while sozune was running was matched after every route already in place, whatever its priority. Redeploying the container of an `/api` route with priority 10 could hand its traffic to a `/` route with priority 0 on the same host until sozune restarted. Priority now holds across reloads.
 - A reload stopped by one invalid backend address no longer marks the routes it never reached as applied; they are retried on the next reload.
 - Scaling a service down could leave the removed container in the load-balancing set: backends were removed under a different id than the one they were added with.
 - A stopping Docker container only removes the backends it contributed. It used to remove every backend sharing its address, including those of other providers and of other host-network containers.
