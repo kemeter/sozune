@@ -967,7 +967,10 @@ fn update_middleware_routes(
 
     let forward_auth_client = middleware::build_forward_auth_client();
 
-    for (cluster_id, entrypoint) in storage {
+    // Same order as the frontends: a wildcard or regex hostname is resolved by
+    // trying patterns in turn, and the first to match must be the route Sōzu
+    // picked.
+    for (cluster_id, entrypoint) in routing_order(storage) {
         if !matches!(entrypoint.protocol, Protocol::Http) {
             continue;
         }
@@ -1075,6 +1078,17 @@ fn skipped_on_sni_clash(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<Stri
     skipped
 }
 
+/// The order Sōzu matches routes in: priority descending, then cluster id.
+/// Sōzu checks its Pre rules in insertion order, first match wins, so this is
+/// both the order frontends are sent in and the order anything reproducing
+/// Sōzu's choice has to try them in.
+pub(crate) fn routing_order(storage: &BTreeMap<String, Entrypoint>) -> Vec<(&String, &Entrypoint)> {
+    let mut ordered: Vec<(&String, &Entrypoint)> = storage.iter().collect();
+    // Stable sort over the BTreeMap's id order: ties keep their ids ascending.
+    ordered.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
+    ordered
+}
+
 /// Applies `storage` to the workers. Returns the cluster IDs deliberately left
 /// out, which the caller must also drop from the snapshot so they are retried
 /// once whatever blocks them is fixed.
@@ -1095,11 +1109,7 @@ fn configure_sozu_routing(
     // tell the caller what actually reached a worker.
     let mut applied: BTreeSet<String> = BTreeSet::new();
 
-    // Sort entrypoints by priority descending (higher priority first).
-    // Since Sozu Pre rules are matched in insertion order, registering
-    // higher-priority routes first ensures they take precedence.
-    let mut sorted_entrypoints: Vec<(&String, &Entrypoint)> = storage.iter().collect();
-    sorted_entrypoints.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
+    let sorted_entrypoints = routing_order(storage);
 
     // Sōzu appends every new frontend to its Pre rules, so a route installed
     // on this reload lands behind every route already live, whatever their

@@ -26,6 +26,7 @@ use in_flight_req::{InFlightLimiter, InFlightReqMiddleware};
 use ip_allow_list::{IpAllowList, IpAllowListMiddleware, TrustedProxies};
 use rate_limit::{RateLimitMiddleware, RateLimiter};
 use request_match::RequestMatchMiddleware;
+use sozu_lib::router::DomainRule;
 
 /// Build the shared HTTP client used by forward-auth middlewares. Same config
 /// as before: short timeout, no redirect following.
@@ -131,6 +132,11 @@ pub struct MiddlewareRouteTable {
     /// on host *and* path, so one entry per hostname would drop all but the
     /// last one stored.
     pub(super) routes: std::collections::HashMap<String, HostRoutes>,
+    /// Wildcard and regex hostnames, in the order Sozu tries them, each with
+    /// the key its routes are stored under. The request carries the host it
+    /// was sent to, not the pattern that matched it, so these are matched with
+    /// Sozu's own `DomainRule`.
+    patterns: Vec<(DomainRule, String)>,
 }
 
 /// Middleware configuration for a single entrypoint.
@@ -166,6 +172,12 @@ impl std::fmt::Debug for MiddlewareRoute {
             )
             .finish()
     }
+}
+
+/// Whether Sozu reads `hostname` as a pattern (wildcard or regex) rather than
+/// a literal name.
+fn is_host_pattern(hostname: &str) -> bool {
+    hostname.contains('*') || hostname.contains('/')
 }
 
 /// Whether `request_path` falls under `prefix`, on a segment boundary.
@@ -211,6 +223,15 @@ impl MiddlewareRouteTable {
         route: Arc<MiddlewareRoute>,
     ) {
         for hostname in hostnames {
+            if is_host_pattern(hostname) && !self.patterns.iter().any(|(_, key)| key == hostname) {
+                match hostname.parse::<DomainRule>() {
+                    Ok(rule) => self.patterns.push((rule, hostname.clone())),
+                    Err(()) => warn!(
+                        "hostname pattern `{}` cannot be parsed; requests to it will find no route",
+                        hostname
+                    ),
+                }
+            }
             // Built per hostname: a compiled regex cannot be cloned, and the
             // same path under two hostnames is two independent matchers.
             self.routes
@@ -222,14 +243,24 @@ impl MiddlewareRouteTable {
 
     pub fn clear(&mut self) {
         self.routes.clear();
+        self.patterns.clear();
     }
 
+    /// The route serving `host` and `request_path`: among the routes declared
+    /// for that exact hostname first, then among those of each wildcard or
+    /// regex hostname it matches, in the order Sozu tries them.
     pub fn get_route(&self, host: &str, request_path: &str) -> Option<Arc<MiddlewareRoute>> {
         // Strip port from host header if present (e.g. "example.com:8080" -> "example.com")
         let hostname = host.split(':').next().unwrap_or(host);
-        let candidates = self.routes.get(hostname)?;
-
-        best_match(candidates, request_path).map(|index| Arc::clone(&candidates[index].1))
+        let exact = self.routes.get(hostname).into_iter();
+        let patterns = self
+            .patterns
+            .iter()
+            .filter(|(rule, _)| rule.matches(hostname.as_bytes()))
+            .filter_map(|(_, key)| self.routes.get(key));
+        exact.chain(patterns).find_map(|candidates| {
+            best_match(candidates, request_path).map(|index| Arc::clone(&candidates[index].1))
+        })
     }
 
     pub fn known_hosts(&self) -> Vec<String> {
@@ -581,6 +612,104 @@ mod route_key_tests {
         assert_eq!(best_match(&candidates, "/api"), Some(0));
         assert_eq!(best_match(&candidates, "/api/users"), Some(0));
         assert_eq!(best_match(&candidates, "/apifoo"), None);
+    }
+
+    fn backend_named(name: &str) -> Arc<MiddlewareRoute> {
+        Arc::new(MiddlewareRoute {
+            backends: vec![(name.to_string(), 80)],
+            backend_counter: AtomicUsize::new(0),
+            backend_timeout: None,
+            retry_attempts: 1,
+            circuit_breaker: None,
+            middlewares: Vec::new(),
+        })
+    }
+
+    fn routed_to(table: &MiddlewareRouteTable, host: &str, path: &str) -> Option<String> {
+        table
+            .get_route(host, path)
+            .map(|route| route.backends[0].0.clone())
+    }
+
+    /// Sozu matches a wildcard or regex hostname and forwards the request with
+    /// the host it was sent to. Keyed on the pattern alone, the table found no
+    /// route for that host and the middleware answered 502.
+    #[test]
+    fn a_pattern_hostname_resolves_the_host_it_matched() {
+        let mut table = MiddlewareRouteTable::default();
+        table.update_routes_for_entrypoint(
+            &["*.example.com".to_string()],
+            None,
+            backend_named("wild"),
+        );
+        table.update_routes_for_entrypoint(
+            &["/node[0-9]+/.example.org".to_string()],
+            None,
+            backend_named("regex"),
+        );
+
+        assert_eq!(
+            routed_to(&table, "app.example.com", "/").as_deref(),
+            Some("wild")
+        );
+        assert_eq!(
+            routed_to(&table, "node7.example.org:8080", "/").as_deref(),
+            Some("regex")
+        );
+        assert_eq!(routed_to(&table, "a.b.example.com", "/"), None);
+        assert_eq!(routed_to(&table, "nodex.example.org", "/"), None);
+    }
+
+    /// A literal hostname is tried before any pattern, and when none of its
+    /// paths match the request falls through to a pattern that covers it, as
+    /// it does in Sozu.
+    #[test]
+    fn a_literal_hostname_comes_before_the_patterns_covering_it() {
+        let mut table = MiddlewareRouteTable::default();
+        table.update_routes_for_entrypoint(
+            &["*.example.com".to_string()],
+            None,
+            backend_named("wild"),
+        );
+        table.update_routes_for_entrypoint(
+            &["app.example.com".to_string()],
+            Some(&crate::model::PathConfig {
+                value: "/admin".to_string(),
+                rule_type: crate::model::PathRuleType::Prefix,
+            }),
+            backend_named("admin"),
+        );
+
+        assert_eq!(
+            routed_to(&table, "app.example.com", "/admin/users").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            routed_to(&table, "app.example.com", "/").as_deref(),
+            Some("wild")
+        );
+    }
+
+    /// Patterns are tried in the order they were added, which is the order
+    /// Sozu checks its rules in.
+    #[test]
+    fn overlapping_patterns_resolve_in_insertion_order() {
+        let mut table = MiddlewareRouteTable::default();
+        table.update_routes_for_entrypoint(
+            &["*.example.com".to_string()],
+            None,
+            backend_named("first"),
+        );
+        table.update_routes_for_entrypoint(
+            &["/[a-z]+/.example.com".to_string()],
+            None,
+            backend_named("second"),
+        );
+
+        assert_eq!(
+            routed_to(&table, "app.example.com", "/").as_deref(),
+            Some("first")
+        );
     }
 
     /// Nothing matches: the caller answers 404 rather than picking a route at
