@@ -46,6 +46,7 @@ All notable changes to this project will be documented in this file.
 
 - Two routes on one hostname with different paths (e.g. `/api` and `/`) shared the middleware stack of whichever was stored last, so a rate limit, IP allow-list or forward auth on the other route could be skipped. Each request now runs the middleware of the route it matched: exact paths first, then the longest prefix, regex paths as declared.
 - The rate limiter keyed clients on `X-Forwarded-For` whatever sent it. It now trusts the header only from a trusted proxy, like the IP allow-list, and its per-client map is bounded.
+- Middlewares that act on the client address (`ipAllowList`, `matchClientIP`, `rateLimit`, `inFlightReq`) saw every client as `127.0.0.1`, the address Sōzu reaches them from. An allow-list naming `127.0.0.1` let every client in, any other allow-list refused them all, and all clients of a route shared one rate-limit bucket. They now see the address that connected to Sōzune, with `trusted_proxies` applied as documented.
 
 ### Reliability
 
