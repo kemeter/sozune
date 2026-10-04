@@ -1101,6 +1101,12 @@ fn configure_sozu_routing(
     let mut sorted_entrypoints: Vec<(&String, &Entrypoint)> = storage.iter().collect();
     sorted_entrypoints.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
 
+    // Sōzu appends every new frontend to its Pre rules, so a route installed
+    // on this reload lands behind every route already live, whatever their
+    // priorities. Once one is installed, each live HTTP route that sorts after
+    // it is moved back behind it.
+    let mut reorder_live_routes = false;
+
     for (cluster_id, entrypoint) in sorted_entrypoints {
         // Sending a frontend Sōzu is going to refuse would still mark it
         // applied, and the snapshot would then hide it from every later
@@ -1109,20 +1115,17 @@ fn configure_sozu_routing(
             continue;
         }
 
-        // Skip entrypoints that are byte-for-byte identical to the previous
-        // snapshot. apply_routing_diff() only removes stale/changed entries,
-        // so anything still in `previous` is already live in the workers and
-        // re-adding it makes Sōzu reject the command as a duplicate.
-        if previous.get(cluster_id) == Some(entrypoint) {
-            continue;
-        }
-
-        // Backends-only change: apply_routing_diff() already updated the
-        // backends in place and left the frontend live. Re-adding here would
-        // duplicate the frontend/backends, so skip it.
+        // Already live, unchanged or with only its backends changed (which
+        // apply_routing_diff() updated in place): re-adding it would make Sōzu
+        // reject the command as a duplicate. Its frontends only move when a
+        // route installed earlier in this loop must pass in front of them.
         if let Some(old) = previous.get(cluster_id)
-            && is_backends_only_change(old, entrypoint)
+            && (old == entrypoint || is_backends_only_change(old, entrypoint))
         {
+            if reorder_live_routes && entrypoint.protocol == Protocol::Http {
+                let outcome = reinstall_http_frontends(channels, cluster_id, old, entrypoint);
+                note_frontend_outcome(cluster_id, outcome, &mut skipped);
+            }
             continue;
         }
 
@@ -1180,6 +1183,9 @@ fn configure_sozu_routing(
                     Err(error) => return Err(ReloadFailure { error, applied }),
                 };
 
+                if outcome == FrontendOutcome::Installed {
+                    reorder_live_routes = true;
+                }
                 note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
             Protocol::Tcp => {
@@ -1201,63 +1207,74 @@ fn configure_sozu_routing(
     Ok(skipped)
 }
 
-fn configure_http_entrypoint(
+/// Moves a live route's frontends to the end of Sōzu's Pre rules, behind a
+/// route installed earlier in the same reload. Its cluster and backends stay
+/// as they are. `live` is what Sōzu currently holds, used for the removal.
+///
+/// A refusal on the way back leaves the route with no frontend, so it is torn
+/// down completely: the caller keeps it out of the snapshot and the next
+/// reload installs it from scratch rather than meeting its own leftovers.
+fn reinstall_http_frontends(
+    channels: &mut Channels,
+    cluster_id: &str,
+    live: &Entrypoint,
+    entrypoint: &Entrypoint,
+) -> FrontendOutcome {
+    let https_addr = channels.https_addr();
+    let http_port = channels.http_port;
+    remove_http_frontends(
+        &mut channels.http,
+        &mut channels.https,
+        cluster_id,
+        live,
+        http_port,
+        https_addr,
+    );
+    let outcome = add_http_frontends(
+        &mut channels.http,
+        &mut channels.https,
+        cluster_id,
+        entrypoint,
+        http_port,
+        https_addr,
+    );
+    if outcome == FrontendOutcome::Rejected {
+        remove_http_frontends(
+            &mut channels.http,
+            &mut channels.https,
+            cluster_id,
+            entrypoint,
+            http_port,
+            https_addr,
+        );
+        remove_backends(
+            &mut channels.http,
+            &mut channels.https,
+            cluster_id,
+            entrypoint,
+        );
+        remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
+    }
+    outcome
+}
+
+/// Sends the HTTP (and, with TLS, HTTPS) frontends of `entrypoint`: one per
+/// hostname and method. Sōzu appends each to its `Pre` rules, which it matches
+/// in insertion order, so where a call lands in the reload decides precedence.
+fn add_http_frontends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     cluster_id: &str,
     entrypoint: &Entrypoint,
     http_port: u16,
     https_addr: SocketAddress,
-    middleware_port: u16,
-) -> anyhow::Result<FrontendOutcome> {
-    // Add cluster for both HTTP and HTTPS
+) -> FrontendOutcome {
     let mut outcome = FrontendOutcome::Installed;
-    let authorized_hashes = build_authorized_hashes(&entrypoint.config.auth);
-    let frontend_required_auth = if authorized_hashes.is_empty() {
+    let frontend_required_auth = if build_authorized_hashes(&entrypoint.config.auth).is_empty() {
         None
     } else {
         Some(true)
     };
-    let cluster_answers = build_cluster_answers(&entrypoint.config.error_pages, cluster_id);
-    let cluster = Cluster {
-        cluster_id: cluster_id.to_string(),
-        sticky_session: entrypoint.config.sticky_session,
-        https_redirect: entrypoint.config.https_redirect,
-        proxy_protocol: None,
-        load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
-        load_metric: None,
-        answer_503: None,
-        http2: None,
-        authorized_hashes,
-        https_redirect_port: entrypoint.config.https_redirect_port.map(|p| p as u32),
-        www_authenticate: entrypoint.config.www_authenticate.clone(),
-        answers: cluster_answers,
-        ..Default::default()
-    };
-
-    // Send to HTTP and HTTPS workers - ignore errors if cluster already exists
-    if let Err(e) = send_to_worker(
-        command_channel,
-        format!("add-cluster-http-{}", cluster_id),
-        RequestType::AddCluster(cluster.clone()),
-    ) {
-        debug!(
-            "Failed to add HTTP cluster {} (may already exist): {}",
-            cluster_id, e
-        );
-    }
-    if let Err(e) = send_to_worker(
-        command_channel_https,
-        format!("add-cluster-https-{}", cluster_id),
-        RequestType::AddCluster(cluster),
-    ) {
-        debug!(
-            "Failed to add HTTPS cluster {} (may already exist): {}",
-            cluster_id, e
-        );
-    }
-
-    // Configure frontends for each hostname
     for hostname in &entrypoint.config.hostnames {
         let (path_rule, frontend_rewrite_path) = build_path_and_rewrite(
             entrypoint.config.path.as_ref(),
@@ -1374,6 +1391,68 @@ fn configure_http_entrypoint(
             }
         }
     }
+
+    outcome
+}
+
+fn configure_http_entrypoint(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+    http_port: u16,
+    https_addr: SocketAddress,
+    middleware_port: u16,
+) -> anyhow::Result<FrontendOutcome> {
+    // Add cluster for both HTTP and HTTPS
+    let authorized_hashes = build_authorized_hashes(&entrypoint.config.auth);
+    let cluster_answers = build_cluster_answers(&entrypoint.config.error_pages, cluster_id);
+    let cluster = Cluster {
+        cluster_id: cluster_id.to_string(),
+        sticky_session: entrypoint.config.sticky_session,
+        https_redirect: entrypoint.config.https_redirect,
+        proxy_protocol: None,
+        load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
+        load_metric: None,
+        answer_503: None,
+        http2: None,
+        authorized_hashes,
+        https_redirect_port: entrypoint.config.https_redirect_port.map(|p| p as u32),
+        www_authenticate: entrypoint.config.www_authenticate.clone(),
+        answers: cluster_answers,
+        ..Default::default()
+    };
+
+    // Send to HTTP and HTTPS workers - ignore errors if cluster already exists
+    if let Err(e) = send_to_worker(
+        command_channel,
+        format!("add-cluster-http-{}", cluster_id),
+        RequestType::AddCluster(cluster.clone()),
+    ) {
+        debug!(
+            "Failed to add HTTP cluster {} (may already exist): {}",
+            cluster_id, e
+        );
+    }
+    if let Err(e) = send_to_worker(
+        command_channel_https,
+        format!("add-cluster-https-{}", cluster_id),
+        RequestType::AddCluster(cluster),
+    ) {
+        debug!(
+            "Failed to add HTTPS cluster {} (may already exist): {}",
+            cluster_id, e
+        );
+    }
+
+    let mut outcome = add_http_frontends(
+        command_channel,
+        command_channel_https,
+        cluster_id,
+        entrypoint,
+        http_port,
+        https_addr,
+    );
 
     // Sōzu refused at least one frontend. The entrypoint is about to be left
     // out of the snapshot so the next reload retries it, and anything installed
