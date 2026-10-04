@@ -17,7 +17,10 @@ NETWORK="${COMPOSE_PROJECT}_default"
 cleanup_healthcheck_containers() {
     docker rm -f sozune-nohc sozune-hc-slow >/dev/null 2>&1 || true
 }
-trap cleanup_healthcheck_containers EXIT
+# No `trap ... EXIT`: this file is sourced, so it would replace the cleanup
+# trap run-all.sh relies on. Clearing up front removes an aborted run's
+# leftovers instead.
+cleanup_healthcheck_containers
 
 # -- Case 1: container without HEALTHCHECK is routed immediately --
 docker run -d --rm --name sozune-nohc \
@@ -97,4 +100,3 @@ else
 fi
 
 cleanup_healthcheck_containers
-trap - EXIT

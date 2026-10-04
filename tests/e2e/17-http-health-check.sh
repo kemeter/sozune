@@ -21,7 +21,10 @@ NETWORK="${COMPOSE_PROJECT}_default"
 cleanup_http_hc_containers() {
     docker rm -f sozune-hcok sozune-hcbad >/dev/null 2>&1 || true
 }
-trap cleanup_http_hc_containers EXIT
+# No `trap ... EXIT`: this file is sourced, so it would replace the cleanup
+# trap run-all.sh relies on. Clearing up front removes an aborted run's
+# leftovers instead.
+cleanup_http_hc_containers
 
 # -- Case 1: HTTP health check passes (whoami answers 200 on /) → routed --
 docker run -d --rm --name sozune-hcok \
@@ -82,4 +85,3 @@ else
 fi
 
 cleanup_http_hc_containers
-trap - EXIT

@@ -13,7 +13,10 @@ NETWORK="${COMPOSE_PROJECT}_default"
 cleanup_collision_containers() {
     docker rm -f sozune-collide-a sozune-collide-b >/dev/null 2>&1 || true
 }
-trap cleanup_collision_containers EXIT
+# No `trap ... EXIT`: this file is sourced, so it would replace the cleanup
+# trap run-all.sh relies on. Clearing up front removes an aborted run's
+# leftovers instead.
+cleanup_collision_containers
 
 # Start two containers, both using the `collide` service-name segment but
 # exposing distinct hostnames. Without the dedup-by-routing-surface fix the
@@ -45,4 +48,3 @@ else
 fi
 
 cleanup_collision_containers
-trap - EXIT
