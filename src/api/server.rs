@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware::{self as axum_middleware, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -39,6 +39,10 @@ pub struct AppState {
     /// thing per request — `/config` reads it under no lock since the parsed
     /// config is immutable once Sōzune is up.
     pub config: Arc<crate::config::AppConfig>,
+    /// The WASM plugins the proxy loaded, for the route resolver.
+    pub plugins: Arc<crate::middleware::PluginRegistry>,
+    /// The routes installed in Sōzu by the last reload, for the route resolver.
+    pub live_routes: crate::proxy::backend::LiveRoutes,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
@@ -239,10 +243,13 @@ pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
         .route("/config", get(crate::api::config_view::config))
         .route_layer(axum_middleware::from_fn(require_admin));
 
-    let me_route = Router::new().route("/me", get(me));
+    // Read-only, though a POST: describing a request to resolve takes a body.
+    let read_only = Router::new()
+        .route("/me", get(me))
+        .route("/routes/resolve", post(resolve_route));
 
     let authed = protected
-        .merge(me_route)
+        .merge(read_only)
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -309,6 +316,70 @@ async fn health() -> (StatusCode, Json<serde_json::Value>) {
 
 /// Returns the authenticated user's identity. The dashboard hits this on
 /// login to validate credentials and learn its role.
+/// Which route serves a request, and why. Reads the live routing state; sends
+/// nothing.
+async fn resolve_route(
+    State(state): State<AppState>,
+    Json(request): Json<crate::proxy::resolve::ResolveRequest>,
+) -> Response {
+    // Copied out: std locks cannot be held across the resolver's awaits.
+    let internal_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal server error"})),
+        )
+            .into_response()
+    };
+    let storage = match state.storage.read() {
+        Ok(storage) => storage.clone(),
+        Err(e) => {
+            error!(
+                "internal state corrupted (configuration store), restart required: {}",
+                e
+            );
+            return internal_error();
+        }
+    };
+    let live = match state.live_routes.read() {
+        Ok(live) => live.clone(),
+        Err(e) => {
+            error!(
+                "internal state corrupted (live routes), restart required: {}",
+                e
+            );
+            return internal_error();
+        }
+    };
+    let unhealthy = match state.unhealthy_backends.read() {
+        Ok(unhealthy) => unhealthy.clone(),
+        Err(e) => {
+            error!(
+                "internal state corrupted (health store), restart required: {}",
+                e
+            );
+            return internal_error();
+        }
+    };
+    let trusted_proxies =
+        crate::middleware::ip_allow_list::TrustedProxies::new(&state.config.proxy.trusted_proxies);
+    let inputs = crate::proxy::resolve::ResolveInputs {
+        storage: &storage,
+        live: &live,
+        unhealthy: &unhealthy,
+        acme_enabled: state.acme_enabled,
+        trusted_proxies: &trusted_proxies,
+        plugins: &state.plugins,
+    };
+    match crate::proxy::resolve::resolve(&inputs, &request).await {
+        Ok(resolution) => Json(resolution).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
 async fn me(req: Request) -> (StatusCode, Json<serde_json::Value>) {
     let identity = req.extensions().get::<Identity>().cloned();
     match identity {
@@ -866,6 +937,8 @@ mod tests {
             metrics: crate::proxy::metrics_snapshot::new_store(),
             request_metrics: crate::proxy::request_metrics::new_store(),
             config: Arc::new(crate::config::AppConfig::default()),
+            plugins: Arc::new(crate::middleware::PluginRegistry::new()),
+            live_routes: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -885,10 +958,12 @@ mod tests {
             .route("/providers", get(list_providers))
             .route_layer(axum_middleware::from_fn(require_admin));
 
-        let me_route = Router::new().route("/me", get(me));
+        let read_only = Router::new()
+            .route("/me", get(me))
+            .route("/routes/resolve", post(resolve_route));
 
         let authed = protected
-            .merge(me_route)
+            .merge(read_only)
             .route_layer(axum_middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
@@ -1544,6 +1619,90 @@ mod tests {
         let json = body_to_json(response.into_body()).await;
         assert_eq!(json["name"], "viewer");
         assert_eq!(json["role"], "read-only");
+    }
+
+    /// Resolving a route reads state and changes nothing: a read-only user
+    /// may do it, though it is a POST.
+    #[tokio::test]
+    async fn resolve_route_is_open_to_read_only_users() {
+        let state = test_state_with_users(vec![user("viewer", "viewer-pass", Role::ReadOnly)]);
+        let entrypoint: Entrypoint = serde_json::from_value(serde_json::json!({
+            "id": "web",
+            "name": "web",
+            "backends": [{ "address": "10.0.0.1", "port": 80, "weight": 100 }],
+            "protocol": "Http",
+            "config": sample_entrypoint_json()["config"].clone()
+        }))
+        .unwrap();
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("web".to_string(), entrypoint.clone());
+        // As a reload would, once the route reached Sōzu.
+        state
+            .live_routes
+            .write()
+            .unwrap()
+            .insert("web".to_string(), entrypoint);
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/routes/resolve")
+                    .header("authorization", basic("viewer", "viewer-pass"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": "http://example.com/" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_to_json(response.into_body()).await;
+        assert_eq!(json["outcome"], "proxied");
+        assert_eq!(json["route"]["id"], "web");
+    }
+
+    #[tokio::test]
+    async fn resolve_route_requires_auth() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::post("/routes/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": "http://example.com/" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn resolve_route_rejects_a_url_it_cannot_read() {
+        let app = test_app(test_state());
+
+        let response = app
+            .oneshot(
+                Request::post("/routes/resolve")
+                    .header("authorization", basic("admin", "admin-pass"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": "ftp://example.com/" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

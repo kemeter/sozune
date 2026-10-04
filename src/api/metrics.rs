@@ -454,6 +454,8 @@ mod tests {
             metrics: crate::proxy::metrics_snapshot::new_store(),
             request_metrics: crate::proxy::request_metrics::new_store(),
             config: Arc::new(crate::config::AppConfig::default()),
+            plugins: Arc::new(crate::middleware::PluginRegistry::new()),
+            live_routes: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 

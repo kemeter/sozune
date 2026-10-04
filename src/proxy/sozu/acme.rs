@@ -17,7 +17,7 @@ pub(super) fn register_acme_challenge_cluster(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     challenge_port: u16,
 ) -> anyhow::Result<()> {
-    let cluster_id = "acme-challenge".to_string();
+    let cluster_id = super::ACME_CHALLENGE_CLUSTER.to_string();
 
     let cluster = Cluster {
         cluster_id: cluster_id.clone(),

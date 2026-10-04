@@ -3,7 +3,7 @@ use clap::Parser;
 use futures_util::stream::StreamExt;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
@@ -211,6 +211,10 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let proxy_config = config.proxy.clone();
     let handle = tokio::runtime::Handle::current();
     let plugins = middleware::build_plugin_registry(&config.plugins, &handle);
+    // The plugins are `Arc`s: the API's copy shares them with the proxy.
+    let api_plugins = Arc::new(plugins.clone());
+    let live_routes: proxy::backend::LiveRoutes = Arc::new(RwLock::new(BTreeMap::new()));
+    let live_routes_proxy = Arc::clone(&live_routes);
     let metrics_store_proxy = Arc::clone(&metrics_store);
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
@@ -225,6 +229,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 tls_alpn_responder_port,
                 middleware_state: middleware_state_proxy,
                 middleware_port,
+                live_routes: live_routes_proxy,
                 plugins,
                 handle,
             },
@@ -284,6 +289,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         metrics: Arc::clone(&metrics_store),
         request_metrics: Arc::clone(&request_metrics_store),
         config: Arc::new(config.clone()),
+        plugins: api_plugins,
+        live_routes,
     };
     // Dedicated `/metrics` listener — independent of the API, so metrics can be
     // scraped without enabling/exposing the admin API. Reuses the same state and

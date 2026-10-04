@@ -486,6 +486,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         tls_alpn_responder_port,
         middleware_state,
         middleware_port,
+        live_routes,
         plugins,
         handle,
     } = inputs;
@@ -839,6 +840,13 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     &plugins,
                     &trusted_proxies_reload,
                 );
+                match live_routes.write() {
+                    Ok(mut live) => *live = previous_snapshot.clone(),
+                    Err(e) => error!(
+                        "internal state corrupted (live routes), restart required: {}",
+                        e
+                    ),
+                }
             }
         });
     });
@@ -964,7 +972,18 @@ fn update_middleware_routes(
     };
 
     table.clear();
+    fill_middleware_table(&mut table, storage, plugins, trusted_proxies);
+}
 
+/// Adds every HTTP route that goes through the middleware to `table`. Shared
+/// by the reload and by the route resolver, which builds a table of its own to
+/// see which route the middleware server would pick.
+pub(crate) fn fill_middleware_table(
+    table: &mut middleware::MiddlewareRouteTable,
+    storage: &BTreeMap<String, Entrypoint>,
+    plugins: &middleware::PluginRegistry,
+    trusted_proxies: &middleware::ip_allow_list::TrustedProxies,
+) {
     let forward_auth_client = middleware::build_forward_auth_client();
 
     // Same order as the frontends: a wildcard or regex hostname is resolved by
@@ -976,6 +995,7 @@ fn update_middleware_routes(
         }
         if middleware::needs_middleware(&entrypoint.config) {
             let route = middleware::build_middleware_route(
+                cluster_id,
                 &entrypoint.config,
                 &entrypoint.backends,
                 &forward_auth_client,
@@ -1149,19 +1169,7 @@ fn configure_sozu_routing(
                 // ACME path must be registered first to take priority over "/"
                 if channels.acme_challenge_port.is_some() {
                     for hostname in &entrypoint.config.hostnames {
-                        let acme_front = RequestHttpFrontend {
-                            cluster_id: Some("acme-challenge".to_string()),
-                            address: SocketAddress::new_v4(0, 0, 0, 0, channels.http_port),
-                            hostname: hostname.clone(),
-                            path: PathRule {
-                                value: "/.well-known/acme-challenge/".to_string(),
-                                kind: 0, // Prefix
-                            },
-                            method: None,
-                            position: RulePosition::Pre as i32,
-                            tags: BTreeMap::new(),
-                            ..Default::default()
-                        };
+                        let acme_front = build_acme_frontend(hostname, channels.http_port);
                         if let Err(e) = send_to_worker(
                             &mut channels.http,
                             format!("add-frontend-acme-{}", hostname),
@@ -1268,18 +1276,46 @@ fn reinstall_http_frontends(
     outcome
 }
 
-/// Sends the HTTP (and, with TLS, HTTPS) frontends of `entrypoint`: one per
-/// hostname and method. Sōzu appends each to its `Pre` rules, which it matches
-/// in insertion order, so where a call lands in the reload decides precedence.
-fn add_http_frontends(
-    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
-    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+/// The cluster ACME HTTP-01 challenges are routed to.
+pub(crate) const ACME_CHALLENGE_CLUSTER: &str = "acme-challenge";
+
+/// The frontend sending `hostname`'s ACME HTTP-01 challenges to the challenge
+/// server. It goes in just before the hostname's own frontends, so the more
+/// specific challenge path wins over a route on `/`.
+pub(crate) fn build_acme_frontend(hostname: &str, http_port: u16) -> RequestHttpFrontend {
+    RequestHttpFrontend {
+        cluster_id: Some(ACME_CHALLENGE_CLUSTER.to_string()),
+        address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+        hostname: hostname.to_string(),
+        path: PathRule {
+            value: "/.well-known/acme-challenge/".to_string(),
+            kind: 0, // Prefix
+        },
+        method: None,
+        position: RulePosition::Pre as i32,
+        tags: BTreeMap::new(),
+        ..Default::default()
+    }
+}
+
+/// The listener a frontend is installed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontListener {
+    Http,
+    Https,
+}
+
+/// The frontends of an HTTP `entrypoint`, in the order they are sent: one per
+/// hostname and method on the HTTP listener, plus its HTTPS twin when TLS is
+/// on. Built once here so what reaches the workers and anything reproducing
+/// Sōzu's routing (the route resolver) cannot drift apart.
+pub(crate) fn build_http_frontends(
     cluster_id: &str,
     entrypoint: &Entrypoint,
     http_port: u16,
     https_addr: SocketAddress,
-) -> FrontendOutcome {
-    let mut outcome = FrontendOutcome::Installed;
+) -> Vec<(FrontListener, RequestHttpFrontend)> {
+    let mut frontends = Vec::new();
     let frontend_required_auth = if build_authorized_hashes(&entrypoint.config.auth).is_empty() {
         None
     } else {
@@ -1321,8 +1357,7 @@ fn add_http_frontends(
         let frontend_rewrite_port = entrypoint.config.rewrite_port.map(|p| p as u32);
 
         for method in methods_for_frontend(&entrypoint.config.methods) {
-            let method_tag = method.as_deref().unwrap_or("any");
-            let http_front = RequestHttpFrontend {
+            let front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
                 address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
                 hostname: hostname.clone(),
@@ -1340,43 +1375,54 @@ fn add_http_frontends(
                 redirect_template: frontend_redirect_template.clone(),
                 ..Default::default()
             };
-
-            if let Err(e) = send_to_worker(
-                command_channel,
-                format!(
-                    "add-frontend-http-{}-{}-{}",
-                    cluster_id, hostname, method_tag
-                ),
-                RequestType::AddHttpFrontend(http_front),
-            ) {
-                debug!(
-                    "Failed to add HTTP frontend for {} [{}] (may already exist): {}",
-                    hostname, method_tag, e
-                );
-                outcome = FrontendOutcome::Rejected;
-            }
-
-            // HTTPS frontend if TLS is enabled
             if entrypoint.config.tls {
                 let https_front = RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
                     address: https_addr,
-                    hostname: hostname.clone(),
-                    path: path_rule.clone(),
-                    method: method.clone(),
-                    position: RulePosition::Pre as i32,
-                    tags: BTreeMap::new(),
-                    headers: frontend_headers.clone(),
-                    required_auth: frontend_required_auth,
-                    rewrite_path: frontend_rewrite_path.clone(),
-                    rewrite_host: frontend_rewrite_host.clone(),
-                    rewrite_port: frontend_rewrite_port,
-                    redirect: frontend_redirect,
-                    redirect_scheme: frontend_redirect_scheme,
-                    redirect_template: frontend_redirect_template.clone(),
-                    ..Default::default()
+                    ..front.clone()
                 };
+                frontends.push((FrontListener::Http, front));
+                frontends.push((FrontListener::Https, https_front));
+            } else {
+                frontends.push((FrontListener::Http, front));
+            }
+        }
+    }
+    frontends
+}
 
+/// Sends the HTTP (and, with TLS, HTTPS) frontends of `entrypoint`: one per
+/// hostname and method. Sōzu appends each to its `Pre` rules, which it matches
+/// in insertion order, so where a call lands in the reload decides precedence.
+fn add_http_frontends(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+    http_port: u16,
+    https_addr: SocketAddress,
+) -> FrontendOutcome {
+    let mut outcome = FrontendOutcome::Installed;
+    for (listener, front) in build_http_frontends(cluster_id, entrypoint, http_port, https_addr) {
+        let hostname = front.hostname.clone();
+        let method_tag = front.method.clone().unwrap_or_else(|| "any".to_string());
+        match listener {
+            FrontListener::Http => {
+                if let Err(e) = send_to_worker(
+                    command_channel,
+                    format!(
+                        "add-frontend-http-{}-{}-{}",
+                        cluster_id, hostname, method_tag
+                    ),
+                    RequestType::AddHttpFrontend(front),
+                ) {
+                    debug!(
+                        "Failed to add HTTP frontend for {} [{}] (may already exist): {}",
+                        hostname, method_tag, e
+                    );
+                    outcome = FrontendOutcome::Rejected;
+                }
+            }
+            FrontListener::Https => {
                 info!(
                     "Configuring HTTPS frontend for {} [{}] on cluster {}",
                     hostname, method_tag, cluster_id
@@ -1387,7 +1433,7 @@ fn add_http_frontends(
                         "add-frontend-https-{}-{}-{}",
                         cluster_id, hostname, method_tag
                     ),
-                    RequestType::AddHttpsFrontend(https_front),
+                    RequestType::AddHttpsFrontend(front),
                 ) {
                     Ok(_) => info!("HTTPS frontend added for {} [{}]", hostname, method_tag),
                     Err(e) => {
@@ -1401,7 +1447,6 @@ fn add_http_frontends(
             }
         }
     }
-
     outcome
 }
 
@@ -2243,19 +2288,7 @@ fn remove_acme_frontends(
     http_port: u16,
 ) {
     for hostname in hostnames {
-        let acme_front = RequestHttpFrontend {
-            cluster_id: Some("acme-challenge".to_string()),
-            address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
-            hostname: hostname.clone(),
-            path: PathRule {
-                value: "/.well-known/acme-challenge/".to_string(),
-                kind: 0, // Prefix
-            },
-            method: None,
-            position: RulePosition::Pre as i32,
-            tags: BTreeMap::new(),
-            ..Default::default()
-        };
+        let acme_front = build_acme_frontend(hostname, http_port);
 
         if let Err(e) = send_to_worker(
             command_channel,

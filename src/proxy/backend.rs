@@ -12,6 +12,10 @@ use tokio::sync::mpsc;
 /// every caller and forward (main.rs → init_proxy → start_sozu_proxy) only
 /// has to pass one value instead of nine — the inner fields are deliberately
 /// public so the sozu reload thread can take direct ownership of each.
+/// The routes the last reload actually installed in Sōzu. A stored route can
+/// be missing from it: refused by Sōzu, or not applied yet.
+pub type LiveRoutes = Arc<RwLock<BTreeMap<String, Entrypoint>>>;
+
 pub struct ProxyInputs {
     pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     pub shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -28,6 +32,8 @@ pub struct ProxyInputs {
     pub tls_alpn_responder_port: Option<u16>,
     pub middleware_state: MiddlewareState,
     pub middleware_port: u16,
+    /// Written after every reload, read by the route resolver.
+    pub live_routes: LiveRoutes,
     /// Compiled WASM plugins, keyed by declared name. Built once at startup.
     pub plugins: PluginRegistry,
     pub handle: tokio::runtime::Handle,
