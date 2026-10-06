@@ -6,6 +6,60 @@
   import { isAuthenticated } from '$lib/auth';
 
   let entrypoint = $state<Entrypoint | null>(null);
+
+  /** The route tester, pre-filled with a request this route serves: its first
+   *  literal hostname (a regex one cannot be turned into a URL; a wildcard is
+   *  given a sample label), its path, a method it accepts, over HTTPS when TLS
+   *  is on, and its query conditions. A regex path cannot be turned into a URL
+   *  either: the tester then opens on the host without resolving, for the path
+   *  to be completed. Only for HTTP routes. */
+  const testUrl = $derived.by(() => {
+    if (!entrypoint || entrypoint.protocol !== 'Http') return null;
+    const literal = entrypoint.config.hostnames.filter((h) => !h.includes('/'));
+    const exact = literal.find((h) => !h.startsWith('*.'));
+    const wildcard = literal.find((h) => h.startsWith('*.'));
+    // `www` is only a sample label: another route may serve that very host.
+    const host = exact ?? (wildcard ? `www.${wildcard.slice(2)}` : undefined);
+    if (!host) return '/resolve';
+    const rule = entrypoint.config.path as { value?: string; rule_type?: string } | null | undefined;
+    const regexPath = rule?.rule_type === 'Regex';
+    const path = rule?.value && !regexPath ? rule.value : '/';
+    const scheme = entrypoint.config.tls ? 'https' : 'http';
+    // Query conditions go into the URL; header ones cannot (the tester never
+    // takes headers from its URL), so the tester then opens without resolving,
+    // for them to be added: run as is, the route would answer 404.
+    // Written raw, not through URLSearchParams: the matcher compares raw query
+    // pairs, so an encoded `a%2Bb` would not match a condition on `a+b`. A
+    // value that cannot sit raw in a URL leaves the request to be completed.
+    type Condition = { key: string; value?: string };
+    const conditions = (entrypoint.config.match_query as Condition[] | undefined) ?? [];
+    const unsafe = /[&#\s]/;
+    const rawQuery = conditions.every((c) => !unsafe.test(c.key) && !unsafe.test(c.value ?? ''));
+    const search =
+      conditions.length > 0 && rawQuery
+        ? `?${conditions.map((c) => (c.value ? `${c.key}=${c.value}` : c.key)).join('&')}`
+        : '';
+    const params = new URLSearchParams({
+      url: `${scheme}://${host}${path.startsWith('/') ? path : `/${path}`}${search}`
+    });
+    const methods = entrypoint.config.methods as string[] | undefined;
+    if (methods && methods.length > 0 && !methods.includes('GET')) {
+      params.set('method', methods[0]);
+    }
+    // Left to be completed rather than resolved as is when the route needs what
+    // the link cannot carry: a header, credentials, or a client address.
+    const cfg = entrypoint.config;
+    const needsInput =
+      regexPath ||
+      !rawQuery ||
+      exact === undefined ||
+      ((cfg.match_headers as Condition[] | undefined) ?? []).length > 0 ||
+      ((cfg.match_client_ip as string[] | undefined) ?? []).length > 0 ||
+      ((cfg.ip_allow_list as string[] | undefined) ?? []).length > 0 ||
+      Boolean((cfg.auth as { basic?: unknown[] } | null | undefined)?.basic?.length);
+    if (needsInput) params.set('run', '0');
+    return `/resolve?${params}`;
+  });
   let loading = $state(true);
   let error = $state<string | null>(null);
   let lastRefresh = $state<Date | null>(null);
@@ -84,6 +138,9 @@
   <div class="header-actions">
     {#if lastRefresh}
       <span class="refresh-meta">updated {timeAgo(lastRefresh)}</span>
+    {/if}
+    {#if testUrl}
+      <a class="btn-secondary" href={testUrl}>Test a request</a>
     {/if}
     <button class="btn-secondary" onclick={() => load()} disabled={loading}>
       {loading ? 'loading…' : 'Refresh'}

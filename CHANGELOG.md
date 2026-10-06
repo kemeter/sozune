@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 
 - `POST /routes/resolve` — which route serves a request, and why, without sending it. Given a URL (plus method, headers and client address if they matter), it returns the route Sōzu picks, why each other route on the host loses (`shadowed` by a higher priority, `rejected` by its path, method or TLS setting, `refused` by Sōzu), what the route's middlewares decide (IP allow-list and match conditions are evaluated; rate limit, in-flight and forward auth are reported as applying), and the health of its backends. The answer comes from Sōzu's own router fed the frontends the workers hold, so it cannot drift from what the proxy does. Open to the `read-only` role. See [API docs](documentation/configuration/api.md#post-routesresolve).
 
+### Dashboard
+
+- Route tester page — which route serves a URL and why, with the shadowed, rejected and refused routes, the middleware decisions and the backends' health, from `POST /routes/resolve`. Each entrypoint's page links to it pre-filled. See [Dashboard](documentation/configuration/dashboard.md#pages).
+
 ### CLI
 
 - `sozune route <url>` — which route of the running instance serves a request, and why the others do not, rendered as a tree: the route, the routes it shadows or that are refused, the middleware decisions and the backends' health. Takes the method (`-X`), headers (`-H`) and client address (`--client-ip`), and exits `0` when a route serves the request, `1` when it is not served, `2` when the question could not be answered, with or without `--json`, so it can gate a deploy script. Asks the API (`POST /routes/resolve`). See [Debugging](documentation/advanced/debugging.md#which-route-serves-a-request).
