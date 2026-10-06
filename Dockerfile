@@ -31,6 +31,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release && cp target/release/sozune /sozune
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# Links the published package to the repository on GitHub.
+LABEL org.opencontainers.image.source="https://github.com/kemeter/sozune" \
+      org.opencontainers.image.description="Reverse proxy built on Sōzu" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=builder /sozune /sozune
 
 EXPOSE 80 443
