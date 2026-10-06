@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Upgrade notes
 
 - `backendTimeout` is now read in milliseconds, as it was always documented. It used to be applied as seconds, so a route that set `backendTimeout=30` meaning 30 seconds now times out after 30ms: multiply such values by 1000. Values written in milliseconds (e.g. `30000`) now behave as intended instead of lasting 1000 times longer. The default (30s) and `0` (no timeout) are unchanged.
+- A path prefix now matches on segment boundaries, as documented: a route on `/api` serves `/api`, `/api/users` and `/api?page=2`, but no longer `/apidocs`, which Sōzu used to hand it by comparing bytes. A route relying on that has to declare the longer prefix (or `/`) itself.
 - A bare `*` hostname, and a regex hostname that does not stay inside a literal domain, are now refused, from labels (`E002`), the HTTP provider and the API (`400`): they could match the hosts of every other route. Exact names, `*.` wildcards and regexes such as `/cdn[0-9]+/.example.com` are still accepted. See [Regex hostnames](documentation/routing/hostnames.md#regex).
 
 ### TLS / ACME
@@ -65,6 +66,7 @@ All notable changes to this project will be documented in this file.
 ### Reliability
 
 - A frontend, TCP/UDP route, or whole set of backends that Sōzu refused (typically during a rolling deploy, while the old and new containers claim the same hostname) was recorded as applied and never retried, leaving the hostname without a route until a restart. It is now retried on the next reload.
+- A route with a path prefix that goes through the middleware could answer `502` for a request like `/apidocs` under `/api`: Sōzu matched the prefix byte for byte, the middleware by segment, and found no route. Both now match by segment.
 - A wildcard (`*.example.com`) or regex hostname whose route goes through the middleware (rate limit, forward auth, compression, …) answered `502`: the middleware looked the route up by the literal host the request was sent to and never found the pattern. It now resolves patterns the way Sōzu does.
 - A route added or changed while sozune was running was matched after every route already in place, whatever its priority. Redeploying the container of an `/api` route with priority 10 could hand its traffic to a `/` route with priority 0 on the same host until sozune restarted. Priority now holds across reloads.
 - A reload stopped by one invalid backend address no longer marks the routes it never reached as applied; they are retried on the next reload.

@@ -127,18 +127,18 @@ pub(super) fn build_path_and_rewrite(
     };
 
     if !strip_prefix {
-        let kind = match path_config.rule_type {
-            PathRuleType::Prefix => 0,
-            PathRuleType::Regex => 1,
-            PathRuleType::Exact => 2,
-        };
-        return (
-            PathRule {
+        let rule = match path_config.rule_type {
+            PathRuleType::Prefix => segment_prefix_rule(&path_config.value),
+            PathRuleType::Regex => PathRule {
                 value: path_config.value.clone(),
-                kind,
+                kind: 1,
             },
-            None,
-        );
+            PathRuleType::Exact => PathRule {
+                value: path_config.value.clone(),
+                kind: 2,
+            },
+        };
+        return (rule, None);
     }
 
     match path_config.rule_type {
@@ -173,6 +173,26 @@ pub(super) fn build_path_and_rewrite(
                 None,
             )
         }
+    }
+}
+
+/// A prefix that matches on segment boundaries: `/app` covers `/app`,
+/// `/app/users` and `/app?x=1`, but not `/apple`. Sōzu's own prefix rule
+/// compares bytes, which would hand `/apple` to the `/app` route, so the rule
+/// goes as an anchored regex. Sōzu matches it against the path with its query,
+/// hence `?` as a boundary too. `/` alone stays a plain prefix: it covers
+/// everything either way.
+fn segment_prefix_rule(prefix: &str) -> PathRule {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return PathRule {
+            value: "/".to_string(),
+            kind: 0,
+        };
+    }
+    PathRule {
+        value: format!("^{}(?:[/?]|$)", regex_escape(trimmed)),
+        kind: 1,
     }
 }
 
@@ -557,8 +577,34 @@ mod tests {
         let rw = url_rewrite(None, Some("internal.svc"));
         let (path_rule, rewrite) =
             build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
-        assert_eq!(path_rule.kind, 0);
-        assert_eq!(path_rule.value, "/api");
+        assert_eq!(path_rule.kind, 1);
+        assert_eq!(path_rule.value, "^/api(?:[/?]|$)");
         assert!(rewrite.is_none());
+    }
+
+    /// Checked with Sōzu's own matcher: the rule is what decides, in the
+    /// worker, which requests reach the route.
+    #[test]
+    fn a_prefix_matches_on_segment_boundaries_in_sozu() {
+        use sozu_lib::router::{PathRule as SozuPathRule, PathRuleResult};
+        let matches = |prefix: &str, path: &str| {
+            let path_config = PathConfig {
+                rule_type: PathRuleType::Prefix,
+                value: prefix.to_string(),
+            };
+            let (rule, _) = build_path_and_rewrite(Some(&path_config), false, None, None, "test");
+            SozuPathRule::from_config(rule)
+                .is_some_and(|r| r.matches(path.as_bytes()) != PathRuleResult::None)
+        };
+
+        assert!(matches("/app", "/app"));
+        assert!(matches("/app", "/app/users"));
+        assert!(matches("/app", "/app?x=1"));
+        assert!(matches("/app/", "/app"));
+        assert!(!matches("/app", "/apple"));
+        assert!(!matches("/app", "/"));
+        assert!(matches("/", "/anything"));
+        assert!(matches("/a.b", "/a.b/c"));
+        assert!(!matches("/a.b", "/axb/c"));
     }
 }

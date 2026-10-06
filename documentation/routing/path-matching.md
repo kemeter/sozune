@@ -25,6 +25,7 @@ labels:
 | `/api` | yes |
 | `/api/` | yes |
 | `/api/users` | yes |
+| `/api?page=2` | yes |
 | `/apidocs` | no — segment-aware |
 
 ## Regex
