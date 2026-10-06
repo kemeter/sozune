@@ -57,6 +57,10 @@ Configured backends:
 
 Run `sozune explain <CODE>` for the cause, effect, fix and a copyable example of any code `validate` reports.
 
+## Which route serves a request
+
+`POST /routes/resolve` on the API answers *which route serves this URL, and why not the one I expected* without sending the request: the route Sōzu picks, why each other route on the same host loses (lower priority, other path, refused), what its middlewares decide, and the health of its backends. See [the endpoint reference](../configuration/api.md#post-routesresolve).
+
 ## Checking the environment
 
 `sozune doctor` checks the host sozune runs on, before or after it starts:

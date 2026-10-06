@@ -46,11 +46,11 @@ The hash format matches what sōzune accepts in route-level basic auth (`sozune.
 | Role | GET / HEAD / OPTIONS | POST / PUT / DELETE |
 |---|---|---|
 | `admin` (default) | yes | yes |
-| `read-only` | yes | `403 Forbidden` |
+| `read-only` | yes | `403 Forbidden`, except `POST /routes/resolve` |
 
 `role` can be omitted in `config.yaml`; it defaults to `admin`.
 
-Read-only users can still read every endpoint, including `/diagnostics` and `/me`. Write attempts return `403` with a JSON error body:
+Read-only users can still read every endpoint, including `/diagnostics` and `/me`, and resolve a route: `POST /routes/resolve` only reads. Write attempts return `403` with a JSON error body:
 
 ```json
 { "error": "read-only role cannot perform this operation" }
@@ -359,6 +359,52 @@ curl -u admin:your-password http://localhost:3035/diagnostics
 - `items`: per-candidate diagnostics, sorted by `candidate_id` for stable ordering
 
 The full diagnostic code reference is documented at [`sozune explain <CODE>`](/documentation/configuration/diagnostics).
+
+### `POST /routes/resolve`
+
+Which route serves a request, and why — without sending it. Sōzune answers from its live routing state, with Sōzu's own router and the middleware chain the route really runs. Available to both roles.
+
+```bash
+curl -u admin:your-password -X POST http://localhost:3035/routes/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://app.example.com/api/users", "method": "GET", "headers": {"X-Tenant": "acme"}, "client_ip": "203.0.113.7"}'
+```
+
+Only `url` is required. `method` defaults to `GET`. Without `client_ip`, rules on the client address (IP allow-list, client-IP matching) are reported as not evaluated.
+
+```json
+{
+  "outcome": "proxied",
+  "status": null,
+  "summary": "proxied by route `api`",
+  "route": { "id": "http_api", "name": "api", "source": "docker", "priority": 10 },
+  "candidates": [
+    {
+      "id": "http_web", "name": "web", "priority": 0,
+      "verdict": "shadowed",
+      "reason": "matches too, but `api` has a higher priority (10 > 0)"
+    }
+  ],
+  "pipeline": [
+    { "name": "ip-allow-list", "verdict": "pass", "detail": null },
+    { "name": "rate-limit", "verdict": "applies", "detail": "depends on the client's recent requests" }
+  ],
+  "backends": [
+    { "address": "10.0.0.4:8080", "healthy": true, "reason": null },
+    { "address": "10.0.0.5:8080", "healthy": false, "reason": "connection refused" }
+  ]
+}
+```
+
+- `outcome`: `proxied` (sent to a backend), `redirected`, `rejected` (a route matched but sōzune answers with an error, see `status`), `acme_challenge`, or `no_route`.
+- `status`: the status sōzune answers with itself; `null` when a backend answers.
+- `candidates`: the other routes whose hostname matches, each with a `verdict` — `shadowed` (would match, but a route tried before it matches first), `rejected` (its path, method or TLS setting does not match), or `refused` (Sōzu refused it, so it is not live).
+- `pipeline`: the route's middlewares in the order they run. `pass` and `blocked` are decided on the request; `applies` depends on live state (rate-limit buckets, in-flight requests, the forward-auth server) and is not decided; `not_evaluated` needs `client_ip`, comes after a blocking step, or is `basic-auth`: credentials are never checked by this endpoint, so a route protected by basic auth is reported as proxied *if the credentials are valid*, and as a `401` when the request carries none.
+- `backends`: the route's backends and their health-check state.
+
+The answer reflects the routes the last reload installed in Sōzu. While a reload is being applied, a route that just started answering can still be missing from it for a moment.
+
+A malformed `url`, a scheme other than `http`/`https`, or a method or header that is not valid HTTP returns `400`.
 
 ## Entrypoint schema
 

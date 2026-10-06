@@ -7,7 +7,7 @@ pub mod in_flight_req;
 pub mod ip_allow_list;
 mod proxy;
 pub mod rate_limit;
-mod request_match;
+pub(crate) mod request_match;
 mod wasm;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -145,6 +145,8 @@ pub struct MiddlewareRouteTable {
 /// `backend_timeout` is not a middleware — it's a property of the backend
 /// forward itself — so it stays a plain field.
 pub struct MiddlewareRoute {
+    /// The entrypoint (Sōzu cluster) this route was built from.
+    pub cluster_id: String,
     pub backends: Vec<(String, u16)>,
     pub backend_counter: AtomicUsize,
     pub backend_timeout: Option<u64>,
@@ -160,6 +162,7 @@ pub struct MiddlewareRoute {
 impl std::fmt::Debug for MiddlewareRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MiddlewareRoute")
+            .field("cluster_id", &self.cluster_id)
             .field("backends", &self.backends)
             .field("backend_timeout", &self.backend_timeout)
             .field(
@@ -388,6 +391,7 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
 /// `ProxyConfig` and gates how `X-Forwarded-For` is interpreted by the
 /// allow-list — see [`ip_allow_list`] for the trust model.
 pub fn build_middleware_route(
+    cluster_id: &str,
     config: &EntrypointConfig,
     backends: &[Backend],
     forward_auth_client: &reqwest::Client,
@@ -491,6 +495,7 @@ pub fn build_middleware_route(
         .map(|cfg| Arc::new(circuit_breaker::CircuitBreaker::new(cfg)));
 
     Arc::new(MiddlewareRoute {
+        cluster_id: cluster_id.to_string(),
         backends: backends
             .iter()
             .map(|b| (b.address.clone(), b.port))
@@ -616,6 +621,7 @@ mod route_key_tests {
 
     fn backend_named(name: &str) -> Arc<MiddlewareRoute> {
         Arc::new(MiddlewareRoute {
+            cluster_id: name.to_string(),
             backends: vec![(name.to_string(), 80)],
             backend_counter: AtomicUsize::new(0),
             backend_timeout: None,
