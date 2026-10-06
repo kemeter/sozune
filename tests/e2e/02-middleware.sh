@@ -98,6 +98,26 @@ else
     fail "strip prefix: backend did not receive /, got: $(echo "$strip_root_body" | grep -i 'GET ' | head -1)"
 fi
 
+# Sōzu matches and rewrites the path with its query: a query right after the
+# prefix must still match, and the query must reach the backend.
+strip_query_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_STRIP" \
+    "http://127.0.0.1:$HTTP_PORT/api?x=1" 2>/dev/null || echo "")
+if echo "$strip_query_body" | grep -q "GET /?x=1"; then
+    pass "strip prefix: /api?x=1 -> backend received /?x=1"
+else
+    fail "strip prefix: /api?x=1 did not reach the backend as /?x=1, got: $(echo "$strip_query_body" | grep -i 'GET ' | head -1)"
+fi
+
+strip_sub_query_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_STRIP" \
+    "http://127.0.0.1:$HTTP_PORT/api/info?x=1" 2>/dev/null || echo "")
+if echo "$strip_sub_query_body" | grep -q "GET /info?x=1"; then
+    pass "strip prefix: /api/info?x=1 -> backend received /info?x=1"
+else
+    fail "strip prefix: /api/info?x=1 did not reach the backend as /info?x=1, got: $(echo "$strip_sub_query_body" | grep -i 'GET ' | head -1)"
+fi
+
 log "[02] Middleware: add prefix"
 
 add_prefix_root_body=$(curl -s --max-time 2 \

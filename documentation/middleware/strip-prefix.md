@@ -33,6 +33,7 @@ labels:
 - The match is **path-segment aware**: `/api` does NOT strip `/apiv2/...`. Only `/api`, `/api/`, and `/api/<more>` are stripped — anything else returns `404`.
 - Trailing slashes on the prefix are normalised: `/api/` and `/api` behave identically.
 - The remaining path always starts with `/`. An exact match on the prefix (`/api`) becomes `/`.
+- The query string is kept: `/api/users?page=2` reaches the backend as `/users?page=2`, and `/api?page=2` as `/?page=2`.
 
 ## Notes
 
