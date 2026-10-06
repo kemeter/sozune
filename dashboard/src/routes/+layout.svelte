@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { page } from '$app/stores';
+  import { base } from '$app/paths';
   import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { clearAuth, identity, isAuthenticated } from '$lib/auth';
@@ -17,13 +18,17 @@
     saveTheme(theme);
   }
 
+  // Paths from the dashboard root, prefixed with `base` when rendered: a
+  // `./` link would resolve against the current page, so from
+  // /entrypoints/<id> it pointed under /entrypoints/.
   const nav = [
-    { href: './entrypoints', label: 'Entrypoints', icon: 'grid' },
-    { href: './providers', label: 'Providers', icon: 'plug' },
-    { href: './diagnostics', label: 'Diagnostics', icon: 'warning' },
-    { href: './certificates', label: 'Certificates', icon: 'lock' },
-    { href: './health', label: 'Health', icon: 'pulse' },
-    { href: './settings', label: 'Settings', icon: 'gear' }
+    { path: '/entrypoints', label: 'Entrypoints', icon: 'grid' },
+    { path: '/resolve', label: 'Route tester', icon: 'route' },
+    { path: '/providers', label: 'Providers', icon: 'plug' },
+    { path: '/diagnostics', label: 'Diagnostics', icon: 'warning' },
+    { path: '/certificates', label: 'Certificates', icon: 'lock' },
+    { path: '/health', label: 'Health', icon: 'pulse' },
+    { path: '/settings', label: 'Settings', icon: 'gear' }
   ];
 
   /** Number of error+warn diagnostics; shown as a badge on the Diagnostics
@@ -32,11 +37,9 @@
   let diagBadge = $state(0);
   let diagPoll: ReturnType<typeof setInterval> | null = null;
 
-  function isActive(href: string): boolean {
+  function isActive(path: string): boolean {
     const current = $page.url.pathname.replace(/\/$/, '');
-    const target = href.replace(/^\.\//, '/').replace(/\/$/, '');
-    if (target === '') return current === '';
-    return current === target || current.startsWith(target + '/');
+    return current === path || current.startsWith(path + '/');
   }
 
   let onLoginPage = $derived($page.url.pathname.endsWith('/login'));
@@ -58,7 +61,7 @@
     applyTheme(theme);
 
     if (!onLoginPage && !isAuthenticated()) {
-      goto('./login');
+      goto(`${base}/login`);
       return;
     }
     if (!onLoginPage) {
@@ -73,7 +76,7 @@
 
   function logout() {
     clearAuth();
-    goto('./login');
+    goto(`${base}/login`);
   }
 </script>
 
@@ -82,7 +85,7 @@
 {:else}
   <div class="shell">
     <aside class="sidebar">
-      <a class="brand" href="./" aria-label="Sōzune dashboard home">
+      <a class="brand" href={`${base}/`} aria-label="Sōzune dashboard home">
         <svg
           class="logo"
           viewBox="0 0 256 256"
@@ -105,7 +108,7 @@
 
       <nav>
         {#each nav as item}
-          <a href={item.href} class="nav-item" class:active={isActive(item.href)}>
+          <a href={`${base}${item.path}`} class="nav-item" class:active={isActive(item.path)}>
             <span class="nav-icon" data-icon={item.icon}>
               {#if item.icon === 'grid'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
@@ -117,6 +120,8 @@
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.4 1.4M11.55 11.55l1.4 1.4M3.05 12.95l1.4-1.4M11.55 4.45l1.4-1.4"/></svg>
               {:else if item.icon === 'warning'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L1.5 13.5h13L8 2z"/><path d="M8 6.5v3.5"/><circle cx="8" cy="11.5" r="0.5" fill="currentColor"/></svg>
+              {:else if item.icon === 'route'}
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="3.5" cy="3.5" r="1.5"/><circle cx="12.5" cy="12.5" r="1.5"/><path d="M5 3.5h4.5a2.5 2.5 0 0 1 0 5h-3a2.5 2.5 0 0 0 0 5H11"/></svg>
               {:else if item.icon === 'plug'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1v3M10 1v3"/><rect x="4" y="4" width="8" height="5" rx="1"/><path d="M8 9v3a2 2 0 0 0 2 2h2"/></svg>
               {/if}

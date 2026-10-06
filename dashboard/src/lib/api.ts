@@ -304,3 +304,52 @@ export function getMetrics(): Promise<MetricsView> {
 export function me(): Promise<{ name: string; role: 'admin' | 'read-only' }> {
   return request<{ name: string; role: 'admin' | 'read-only' }>('/me');
 }
+
+/** What `POST /routes/resolve` is asked: a request described, not sent. */
+export interface ResolveRequest {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  client_ip?: string;
+}
+
+export type ResolveOutcome = 'proxied' | 'redirected' | 'rejected' | 'acme_challenge' | 'no_route';
+
+export interface ResolveCandidate {
+  id: string;
+  name: string;
+  priority: number;
+  verdict: 'shadowed' | 'rejected' | 'refused';
+  reason: string;
+}
+
+export interface ResolveStep {
+  name: string;
+  verdict: 'pass' | 'blocked' | 'applies' | 'not_evaluated';
+  detail: string | null;
+}
+
+export interface ResolveBackend {
+  address: string;
+  healthy: boolean;
+  reason: string | null;
+}
+
+/** Which route serves the request and why, as `POST /routes/resolve` answers. */
+export interface Resolution {
+  outcome: ResolveOutcome;
+  /** Status sozune answers with itself; `null` when a backend answers. */
+  status: number | null;
+  summary: string;
+  route: { id: string; name: string; source: string | null; priority: number } | null;
+  candidates: ResolveCandidate[];
+  pipeline: ResolveStep[];
+  backends: ResolveBackend[];
+}
+
+export function resolveRoute(req: ResolveRequest): Promise<Resolution> {
+  return request<Resolution>('/routes/resolve', {
+    method: 'POST',
+    body: JSON.stringify(req)
+  });
+}

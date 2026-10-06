@@ -19,6 +19,7 @@ Restart sozune to pick up the change.
 - **Overview** — a landing page summarising entrypoints, backends, and diagnostics at a glance, so you can spot the health of the whole proxy in one screen.
 - **Entrypoints** — the full route list with drill-down filters (by host, provider, diagnostic) to go from the summary straight to a single route.
 - **Diagnostics** — every active warning/error, filterable, each linking back to the entrypoint that raised it.
+- **Route tester** — enter a URL (with a method, headers and a client IP if they matter) to see which route serves it and why the others do not: routes shadowed by a higher priority, rejected by their path, or refused by Sōzu, the middlewares the request goes through, and the health of the backends. Nothing is sent to a backend. Each entrypoint's page has a *Test a request* button that opens it pre-filled with a URL the route serves. Backed by `POST /routes/resolve`, the same answer as [`sozune route`](../advanced/debugging.md#which-route-serves-a-request).
 - **Config** — a read-only view of the effective running configuration, backed by the `GET /config` endpoint, with secrets masked. Use it to confirm what Sōzune actually loaded (environment overrides, provider merges) without exposing credentials.
 
 ## Authentication
