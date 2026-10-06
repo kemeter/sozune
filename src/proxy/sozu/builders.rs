@@ -133,32 +133,19 @@ pub(super) fn build_path_and_rewrite(
                 value: path_config.value.clone(),
                 kind: 1,
             },
-            PathRuleType::Exact => PathRule {
-                value: path_config.value.clone(),
-                kind: 2,
-            },
+            PathRuleType::Exact => exact_rule(&path_config.value),
         };
         return (rule, None);
     }
 
     match path_config.rule_type {
-        PathRuleType::Prefix => {
-            let escaped = regex_escape(path_config.value.trim_end_matches('/'));
-            let pattern = format!("^{}(?:/(.*))?$", escaped);
-            (
-                PathRule {
-                    value: pattern,
-                    kind: 1,
-                },
-                Some("/$PATH[1]".to_string()),
-            )
-        }
+        PathRuleType::Prefix => (
+            prefix_rule_capturing_rest(&path_config.value),
+            Some("/$PATH[1]$PATH[2]".to_string()),
+        ),
         PathRuleType::Exact => (
-            PathRule {
-                value: path_config.value.clone(),
-                kind: 2,
-            },
-            Some("/".to_string()),
+            exact_rule_capturing_query(&path_config.value),
+            Some("/$PATH[1]".to_string()),
         ),
         PathRuleType::Regex => {
             debug!(
@@ -173,6 +160,41 @@ pub(super) fn build_path_and_rewrite(
                 None,
             )
         }
+    }
+}
+
+/// Sōzu matches a path rule against the request path *with* its query
+/// (`/login?next=/`), and a rewrite replaces both. Every anchored rule below
+/// therefore accepts an optional query, and every rewrite carries it over.
+const QUERY: &str = r"(\?.*)?";
+
+/// `value` exactly, with or without a query: Sōzu's own exact rule would
+/// compare `/login` against `/login?next=/` and refuse it.
+fn exact_rule(value: &str) -> PathRule {
+    PathRule {
+        value: format!(r"^{}(?:\?.*)?$", regex_escape(value)),
+        kind: 1,
+    }
+}
+
+/// `value` exactly, the query (if any) captured as `$PATH[1]` for a rewrite.
+fn exact_rule_capturing_query(value: &str) -> PathRule {
+    PathRule {
+        value: format!("^{}{QUERY}$", regex_escape(value)),
+        kind: 1,
+    }
+}
+
+/// The segments below `prefix` as `$PATH[1]` (without the leading `/`) and
+/// the query as `$PATH[2]`: `/api/users?x=1` → `users`, `?x=1`; `/api?x=1` →
+/// ``, `?x=1`.
+fn prefix_rule_capturing_rest(prefix: &str) -> PathRule {
+    PathRule {
+        value: format!(
+            "^{}(?:/([^?]*))?{QUERY}$",
+            regex_escape(prefix.trim_end_matches('/'))
+        ),
+        kind: 1,
     }
 }
 
@@ -232,23 +254,20 @@ fn build_add_prefix_rewrite(
             Some(format!("{normalized}$PATH[1]")),
         ),
         Some(pc) => match pc.rule_type {
-            PathRuleType::Prefix => {
-                let escaped = regex_escape(pc.value.trim_end_matches('/'));
-                let pattern = format!("^({}(?:/.*)?)$", escaped);
-                (
-                    PathRule {
-                        value: pattern,
-                        kind: 1,
-                    },
-                    Some(format!("{normalized}$PATH[1]")),
-                )
-            }
-            PathRuleType::Exact => (
+            PathRuleType::Prefix => (
+                // The whole path as $PATH[1], the query as $PATH[2].
                 PathRule {
-                    value: pc.value.clone(),
-                    kind: 2,
+                    value: format!(
+                        "^({}(?:/[^?]*)?){QUERY}$",
+                        regex_escape(pc.value.trim_end_matches('/'))
+                    ),
+                    kind: 1,
                 },
-                Some(format!("{normalized}{}", pc.value)),
+                Some(format!("{normalized}$PATH[1]$PATH[2]")),
+            ),
+            PathRuleType::Exact => (
+                exact_rule_capturing_query(&pc.value),
+                Some(format!("{normalized}{}$PATH[1]", pc.value)),
             ),
             PathRuleType::Regex => (
                 PathRule {
@@ -289,41 +308,35 @@ fn build_replace_full_path(
     path_config: Option<&PathConfig>,
     new: &str,
 ) -> (PathRule, Option<String>) {
-    let rewrite = Some(new.to_string());
+    // The path is replaced, the query kept: it is not part of the path.
+    let keep_query = Some(format!("{new}$PATH[1]"));
     match path_config {
         // No route path constraint — match any path and collapse to `new`.
         None => (
             PathRule {
-                value: "^/.*$".to_string(),
+                value: format!("^/[^?]*{QUERY}$"),
                 kind: 1,
             },
-            rewrite,
+            keep_query,
         ),
         Some(pc) => match pc.rule_type {
-            PathRuleType::Prefix => {
-                let escaped = regex_escape(pc.value.trim_end_matches('/'));
-                let pattern = format!("^{}(?:/.*)?$", escaped);
-                (
-                    PathRule {
-                        value: pattern,
-                        kind: 1,
-                    },
-                    rewrite,
-                )
-            }
-            PathRuleType::Exact => (
+            PathRuleType::Prefix => (
                 PathRule {
-                    value: pc.value.clone(),
-                    kind: 2,
+                    value: format!(
+                        "^{}(?:/[^?]*)?{QUERY}$",
+                        regex_escape(pc.value.trim_end_matches('/'))
+                    ),
+                    kind: 1,
                 },
-                rewrite,
+                keep_query,
             ),
+            PathRuleType::Exact => (exact_rule_capturing_query(&pc.value), keep_query),
             PathRuleType::Regex => (
                 PathRule {
                     value: pc.value.clone(),
                     kind: 1,
                 },
-                rewrite,
+                Some(new.to_string()),
             ),
         },
     }
@@ -354,20 +367,13 @@ fn build_replace_prefix_match(
     };
 
     match pc.rule_type {
-        PathRuleType::Prefix => {
-            let escaped = regex_escape(pc.value.trim_end_matches('/'));
-            // Same capture as strip_prefix: the trailing segments (if any)
-            // land in $PATH[1]. `/api/users` → `/v2/users`; a bare `/api`
-            // (empty capture) → `/v2/`, mirroring strip_prefix's `/` result.
-            let pattern = format!("^{}(?:/(.*))?$", escaped);
-            (
-                PathRule {
-                    value: pattern,
-                    kind: 1,
-                },
-                Some(suffix_rewrite),
-            )
-        }
+        // Same capture as strip_prefix: the trailing segments (if any) land in
+        // $PATH[1], the query in $PATH[2]. `/api/users` → `/v2/users`; a bare
+        // `/api` (empty capture) → `/v2/`, mirroring strip_prefix's `/`.
+        PathRuleType::Prefix => (
+            prefix_rule_capturing_rest(&pc.value),
+            Some(format!("{suffix_rewrite}$PATH[2]")),
+        ),
         PathRuleType::Exact => {
             // An exact match has no trailing segments to keep — the path is
             // exactly the prefix, so it becomes exactly the replacement.
@@ -377,11 +383,8 @@ fn build_replace_prefix_match(
                 normalized
             };
             (
-                PathRule {
-                    value: pc.value.clone(),
-                    kind: 2,
-                },
-                Some(target),
+                exact_rule_capturing_query(&pc.value),
+                Some(format!("{target}$PATH[1]")),
             )
         }
         PathRuleType::Regex => {
@@ -434,28 +437,50 @@ mod tests {
 
     #[test]
     fn add_prefix_with_prefix_path_matcher_keeps_filter() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Prefix,
-            value: "/api".to_string(),
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/api")),
+                false,
+                Some("/foo"),
+                None,
+                "test",
+            )
         };
-        let (path_rule, rewrite) =
-            build_path_and_rewrite(Some(&path), false, Some("/foo"), None, "test");
-        assert_eq!(path_rule.kind, 1);
-        assert!(path_rule.value.contains("/api"));
-        assert_eq!(rewrite.as_deref(), Some("/foo$PATH[1]"));
+        assert_eq!(
+            forwarded(built(), "/api/users").as_deref(),
+            Some("/foo/api/users")
+        );
+        assert_eq!(
+            forwarded(built(), "/api?x=1").as_deref(),
+            Some("/foo/api?x=1")
+        );
+        assert_eq!(
+            forwarded(built(), "/api/users?x=1").as_deref(),
+            Some("/foo/api/users?x=1")
+        );
+        assert_eq!(forwarded(built(), "/apidocs"), None);
     }
 
     #[test]
     fn add_prefix_with_exact_path_matcher_uses_static_rewrite() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Exact,
-            value: "/health".to_string(),
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Exact, "/health")),
+                false,
+                Some("/foo"),
+                None,
+                "test",
+            )
         };
-        let (path_rule, rewrite) =
-            build_path_and_rewrite(Some(&path), false, Some("/foo"), None, "test");
-        assert_eq!(path_rule.kind, 2);
-        assert_eq!(path_rule.value, "/health");
-        assert_eq!(rewrite.as_deref(), Some("/foo/health"));
+        assert_eq!(
+            forwarded(built(), "/health").as_deref(),
+            Some("/foo/health")
+        );
+        assert_eq!(
+            forwarded(built(), "/health?full=1").as_deref(),
+            Some("/foo/health?full=1")
+        );
+        assert_eq!(forwarded(built(), "/health/x"), None);
     }
 
     #[test]
@@ -480,89 +505,148 @@ mod tests {
         }
     }
 
+    fn rule(rule_type: PathRuleType, value: &str) -> PathConfig {
+        PathConfig {
+            rule_type,
+            value: value.to_string(),
+        }
+    }
+
+    /// The path the backend receives for `request`, as Sōzu's own router
+    /// computes it from the rule and rewrite built here; `None` when the rule
+    /// does not match. The request path carries its query, as in Sōzu.
+    fn forwarded(built: (PathRule, Option<String>), request: &str) -> Option<String> {
+        use sozu_command_lib::proto::command::{RequestHttpFrontend, RulePosition, SocketAddress};
+        use sozu_lib::protocol::kawa_h1::parser::Method;
+        use sozu_lib::router::Router;
+
+        let (path, rewrite_path) = built;
+        let front = RequestHttpFrontend {
+            cluster_id: Some("test".to_string()),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 80),
+            hostname: "example.com".to_string(),
+            path,
+            rewrite_path,
+            position: RulePosition::Pre as i32,
+            ..Default::default()
+        }
+        .to_frontend()
+        .unwrap();
+        let mut router = Router::new();
+        router.add_http_front(&front).unwrap();
+        let result = router
+            .lookup("example.com", request, &Method::new(b"GET"))
+            .ok()?;
+        Some(result.rewritten_path.unwrap_or_else(|| request.to_string()))
+    }
+
     #[test]
     fn url_rewrite_replace_full_path_on_prefix_collapses_to_literal() {
         // `/api` (Prefix) → ReplaceFullPath("/new"): any sub-path collapses
-        // to the literal `/new`.
-        let path = PathConfig {
-            rule_type: PathRuleType::Prefix,
-            value: "/api".to_string(),
-        };
+        // to the literal `/new`; the query is not part of the path and stays.
         let rw = url_rewrite(Some(PathRewrite::ReplaceFullPath("/new".into())), None);
-        let (path_rule, rewrite) =
-            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
-        assert_eq!(path_rule.kind, 1);
-        assert_eq!(path_rule.value, "^/api(?:/.*)?$");
-        assert_eq!(rewrite.as_deref(), Some("/new"));
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/api")),
+                false,
+                None,
+                Some(&rw),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(built(), "/api/a/b").as_deref(), Some("/new"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/new?x=1"));
+        assert_eq!(forwarded(built(), "/apidocs"), None);
     }
 
     #[test]
     fn url_rewrite_replace_full_path_on_exact_uses_exact_match() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Exact,
-            value: "/health".to_string(),
-        };
         let rw = url_rewrite(Some(PathRewrite::ReplaceFullPath("/up".into())), None);
-        let (path_rule, rewrite) =
-            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
-        assert_eq!(path_rule.kind, 2);
-        assert_eq!(path_rule.value, "/health");
-        assert_eq!(rewrite.as_deref(), Some("/up"));
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Exact, "/health")),
+                false,
+                None,
+                Some(&rw),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(built(), "/health").as_deref(), Some("/up"));
+        assert_eq!(
+            forwarded(built(), "/health?x=1").as_deref(),
+            Some("/up?x=1")
+        );
+        assert_eq!(forwarded(built(), "/health/x"), None);
     }
 
     #[test]
     fn url_rewrite_replace_prefix_keeps_suffix() {
         // `/api` (Prefix) → ReplacePrefixMatch("/v2"): suffix preserved.
         // `/api/users` → `/v2/users`; a bare `/api` → `/v2/` (empty capture).
-        let path = PathConfig {
-            rule_type: PathRuleType::Prefix,
-            value: "/api".to_string(),
-        };
         let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
-        let (path_rule, rewrite) =
-            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
-        assert_eq!(path_rule.kind, 1);
-        assert_eq!(path_rule.value, "^/api(?:/(.*))?$");
-        assert_eq!(rewrite.as_deref(), Some("/v2/$PATH[1]"));
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/api")),
+                false,
+                None,
+                Some(&rw),
+                "test",
+            )
+        };
+        assert_eq!(
+            forwarded(built(), "/api/users").as_deref(),
+            Some("/v2/users")
+        );
+        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/v2/"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/v2/?x=1"));
+        assert_eq!(
+            forwarded(built(), "/api/users?x=1").as_deref(),
+            Some("/v2/users?x=1")
+        );
     }
 
     #[test]
     fn url_rewrite_replace_prefix_normalizes_replacement() {
         // A replacement with a trailing slash and no leading slash is
         // normalised like add_prefix: `v2/` → `/v2`.
-        let path = PathConfig {
-            rule_type: PathRuleType::Prefix,
-            value: "/api".to_string(),
-        };
         let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("v2/".into())), None);
-        let (_, rewrite) = build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
-        assert_eq!(rewrite.as_deref(), Some("/v2/$PATH[1]"));
+        let built = build_path_and_rewrite(
+            Some(&rule(PathRuleType::Prefix, "/api")),
+            false,
+            None,
+            Some(&rw),
+            "test",
+        );
+        assert_eq!(forwarded(built, "/api/users").as_deref(), Some("/v2/users"));
     }
 
     #[test]
     fn url_rewrite_replace_prefix_on_exact_uses_static_target() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Exact,
-            value: "/api".to_string(),
-        };
         let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
-        let (path_rule, rewrite) =
-            build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
-        assert_eq!(path_rule.kind, 2);
-        assert_eq!(path_rule.value, "/api");
-        assert_eq!(rewrite.as_deref(), Some("/v2"));
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Exact, "/api")),
+                false,
+                None,
+                Some(&rw),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/v2?x=1"));
     }
 
     #[test]
     fn url_rewrite_takes_precedence_over_strip_and_add_prefix() {
-        let path = PathConfig {
-            rule_type: PathRuleType::Prefix,
-            value: "/api".to_string(),
-        };
         let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
-        let (_, rewrite) =
-            build_path_and_rewrite(Some(&path), true, Some("/foo"), Some(&rw), "test");
-        assert_eq!(rewrite.as_deref(), Some("/v2/$PATH[1]"));
+        let built = build_path_and_rewrite(
+            Some(&rule(PathRuleType::Prefix, "/api")),
+            true,
+            Some("/foo"),
+            Some(&rw),
+            "test",
+        );
+        assert_eq!(forwarded(built, "/api/users").as_deref(), Some("/v2/users"));
     }
 
     #[test]
@@ -580,6 +664,67 @@ mod tests {
         assert_eq!(path_rule.kind, 1);
         assert_eq!(path_rule.value, "^/api(?:[/?]|$)");
         assert!(rewrite.is_none());
+    }
+
+    /// Sōzu matches against the path with its query: a query right after the
+    /// prefix (`/api?x=1`) used to fall outside `^/api(?:/(.*))?$`, and a
+    /// query after a sub-path was kept only by accident of the capture.
+    #[test]
+    fn strip_prefix_keeps_the_query_and_matches_it_after_the_prefix() {
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/api")),
+                true,
+                None,
+                None,
+                "test",
+            )
+        };
+        assert_eq!(forwarded(built(), "/api/users").as_deref(), Some("/users"));
+        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/?x=1"));
+        assert_eq!(
+            forwarded(built(), "/api/users?x=1").as_deref(),
+            Some("/users?x=1")
+        );
+        assert_eq!(forwarded(built(), "/apidocs"), None);
+    }
+
+    #[test]
+    fn strip_prefix_on_an_exact_path_keeps_the_query() {
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Exact, "/api")),
+                true,
+                None,
+                None,
+                "test",
+            )
+        };
+        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/?x=1"));
+    }
+
+    /// An exact route compared `/login` with `/login?next=/` and refused
+    /// every request carrying a query.
+    #[test]
+    fn an_exact_path_matches_with_a_query() {
+        let built = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Exact, "/login")),
+                false,
+                None,
+                None,
+                "test",
+            )
+        };
+        assert_eq!(forwarded(built(), "/login").as_deref(), Some("/login"));
+        assert_eq!(
+            forwarded(built(), "/login?next=/").as_deref(),
+            Some("/login?next=/")
+        );
+        assert_eq!(forwarded(built(), "/login/x"), None);
+        assert_eq!(forwarded(built(), "/loginx"), None);
     }
 
     /// Checked with Sōzu's own matcher: the rule is what decides, in the
