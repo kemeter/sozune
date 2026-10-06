@@ -11,6 +11,15 @@ docker run -d \
   ghcr.io/kemeter/sozune:latest
 ```
 
+### Image tags
+
+| Tag | Content |
+|---|---|
+| `latest` | The latest release. Use this one. |
+| `0.14.0` (any release) | That release, never updated. |
+| `edge` | The current state of `main`, rebuilt after every merge that passes CI. For trying a fix or feature before it is released: it is not a release, and can break at any time. `linux/amd64` only. |
+| `sha-<full commit hash>` | The `main` build of that commit, never rebuilt. |
+
 ## From source
 
 Requirements: stable Rust, Cargo.

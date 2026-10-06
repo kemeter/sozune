@@ -35,6 +35,10 @@ All notable changes to this project will be documented in this file.
 - TCPRoute — forward a whole TCP listener port to Services, with no SNI or TLS involved. See [TCPRoute](documentation/providers/kubernetes.md#gateway-api-tcproute).
 - UDPRoute — forward a whole UDP listener port to Services, the datagram counterpart of TCPRoute. See [UDPRoute](documentation/providers/kubernetes.md#gateway-api-udproute).
 
+### Distribution
+
+- `edge` image — `ghcr.io/kemeter/sozune:edge` is rebuilt from `main` after every merge that passes CI, with an immutable `sha-<full commit hash>` tag alongside, to try a fix or feature before it is released. `latest` still only follows releases. `linux/amd64` only. See [Image tags](documentation/getting-started/installation.md#image-tags).
+
 ### API
 
 - `POST /routes/resolve` — which route serves a request, and why, without sending it. Given a URL (plus method, headers and client address if they matter), it returns the route Sōzu picks, why each other route on the host loses (`shadowed` by a higher priority, `rejected` by its path, method or TLS setting, `refused` by Sōzu), what the route's middlewares decide (IP allow-list and match conditions are evaluated; rate limit, in-flight and forward auth are reported as applying), and the health of its backends. The answer comes from Sōzu's own router fed the frontends the workers hold, so it cannot drift from what the proxy does. Open to the `read-only` role. See [API docs](documentation/configuration/api.md#post-routesresolve).
