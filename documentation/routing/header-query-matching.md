@@ -38,6 +38,7 @@ labels:
 ## Behaviour
 
 - Header names are matched **case-insensitively**; values **exactly**.
+- Query keys and values are **percent-decoded** before being compared, so `version=%32` matches `version:2`. A `+` stays a literal `+`, as in any URL (only form bodies read it as a space).
 - All conditions are **AND**-combined: every header and every query condition must hold.
 - Sōzu routes on host/path/method only, so matching is enforced by a Sōzune middleware: the request is routed to the cluster, then rejected with `404 Not Found` if a condition fails — equivalent to the route not matching.
 

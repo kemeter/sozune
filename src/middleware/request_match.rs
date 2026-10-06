@@ -18,6 +18,12 @@ use crate::model::MatchCondition;
 /// a *routing* construct, distinct from the `ip_allow_list` *access filter*
 /// which returns `403`; both reuse the same CIDR parser and `X-Forwarded-For`
 /// trust model from [`super::ip_allow_list`].
+fn decode(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 pub struct RequestMatchMiddleware {
     headers: Vec<MatchCondition>,
     query: Vec<MatchCondition>,
@@ -57,14 +63,18 @@ impl RequestMatchMiddleware {
 
     /// Every query condition must hold against the request's query string.
     /// An empty `value` matches when the key is present with any value.
+    ///
+    /// Keys and values are percent-decoded before the comparison, so a client
+    /// writing `a+b` as `a%2Bb` still matches a condition on `a+b`. A `+`
+    /// stays a `+`: query strings are not form bodies.
     fn query_match(&self, req: &Request<Body>) -> bool {
         let query = req.uri().query().unwrap_or("");
-        let pairs: Vec<(&str, &str)> = query
+        let pairs: Vec<(String, String)> = query
             .split('&')
             .filter(|s| !s.is_empty())
             .map(|pair| match pair.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => (pair, ""),
+                Some((k, v)) => (decode(k), decode(v)),
+                None => (decode(pair), String::new()),
             })
             .collect();
         self.query.iter().all(|cond| {
@@ -178,6 +188,27 @@ mod tests {
     fn query_among_multiple_params() {
         let m = mw(vec![], vec![cond("version", "2")]);
         assert!(m.query_match(&req(&[], "/?a=1&version=2&b=3")));
+    }
+
+    /// The same value written encoded or not is the same value: a client (or
+    /// a library) that percent-encodes its query must still match.
+    #[test]
+    fn query_values_and_keys_are_percent_decoded() {
+        let m = mw(vec![], vec![cond("mode", "a+b")]);
+        assert!(m.query_match(&req(&[], "/?mode=a+b")));
+        assert!(m.query_match(&req(&[], "/?mode=a%2Bb")));
+        assert!(m.query_match(&req(&[], "/?m%6Fde=a+b")));
+
+        let spaced = mw(vec![], vec![cond("q", "a b")]);
+        assert!(spaced.query_match(&req(&[], "/?q=a%20b")));
+    }
+
+    /// `+` is a literal character in a query string, not a space: only form
+    /// bodies give it that meaning.
+    #[test]
+    fn a_plus_in_the_query_is_not_a_space() {
+        let m = mw(vec![], vec![cond("q", "a b")]);
+        assert!(!m.query_match(&req(&[], "/?q=a+b")));
     }
 
     #[test]

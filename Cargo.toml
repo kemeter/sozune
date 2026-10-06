@@ -18,6 +18,9 @@ regex = "1"
 # Already in the tree through regex; declared directly so a regex hostname can
 # be parsed to check where its alternations sit before Sozu anchors it.
 regex-syntax = "0.8"
+# Already in the tree through url; declared directly to decode the query of a
+# request before comparing it to a route's query conditions.
+percent-encoding = "2"
 sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.1" }
 sozu-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.1" }
 anyhow = "1.0.99"

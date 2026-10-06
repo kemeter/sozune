@@ -66,6 +66,13 @@ until [[ "$(fid_backend_for /)" == "fid-web" && "$(fid_backend_for /app)" == "fi
     sleep 0.5
 done
 
+# A prefix matches on segment boundaries: /apple is not under /app.
+if [[ "$(fid_backend_for /apple)" == "fid-web" ]]; then
+    pass "/apple is not served by the /app route"
+else
+    fail "/apple is served by $(fid_backend_for /apple), expected fid-web: the /app prefix matched mid-segment"
+fi
+
 for path in / /app /app/users /admin /admin/settings /shop "/app?x=1" /apple; do
     actual=$(fid_backend_for "$path")
     announced=$(fid_resolved_for "$path")
