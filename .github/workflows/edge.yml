@@ -1,0 +1,103 @@
+name: Edge image
+
+# Publishes the current state of main as `ghcr.io/<repo>:edge`, plus an
+# immutable `sha-<commit>` tag, once CI has passed on it. `latest` is left to
+# the release workflow: it only ever points to a tagged release.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    # Only a green main is published, and only from pushes (not PR runs of CI).
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    # One build per commit, so a rerun does not race itself. Builds of
+    # different commits run side by side: CI completes out of order, and a
+    # shared queue would let an older commit's run replace the current one's.
+    concurrency:
+      group: edge-build-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A sha tag is never rebuilt: the base image moves, so a rebuild of the
+      # same commit could differ from what was first published under it.
+      - name: Commit image
+        id: image
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ref="$IMAGE_NAME:sha-$HEAD_SHA"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # amd64 only: arm64 is built under emulation and takes hours, which is
+      # fine for a release but not for every merge.
+      - name: Build and push
+        if: steps.image.outputs.exists != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  promote:
+    needs: build
+    runs-on: ubuntu-latest
+    # Promotions never overlap. Each one points `edge` at the image of the
+    # commit main is at *now*, not at the commit that triggered it: whatever
+    # order runs finish or queue in, `edge` can only move to the head of main.
+    concurrency:
+      group: edge-promote
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Retagging copies the manifest: nothing is rebuilt. When the head of
+      # main has no image yet, its own run promotes it once built.
+      - name: Point edge at the head of main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          ref="$IMAGE_NAME:sha-$main_sha"
+          if ! docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "no image for main ($main_sha) yet, leaving edge as it is"
+            exit 0
+          fi
+          docker buildx imagetools create --tag "$IMAGE_NAME:edge" "$ref"
