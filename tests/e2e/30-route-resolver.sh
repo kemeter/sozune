@@ -76,4 +76,36 @@ for path in / /app /app/users /admin /admin/settings /shop "/app?x=1" /apple; do
     fi
 done
 
+# `sozune route` asks the same endpoint and exits 0 when a route serves the
+# request, 1 when none does.
+# run-all.sh runs under `set -e`: the exit status is captured, not tripped on.
+cli_exit=0
+cli_out=$("$SOZUNE_BIN" route "http://$HOST_FID/app/users" \
+    --api "$FID_API_URL" --user "$API_USER:$API_PASSWORD" 2>&1) || cli_exit=$?
+if [[ $cli_exit -eq 0 && "$cli_out" == *"route http_fidapp ("* ]]; then
+    pass "sozune route names the route that serves /app/users"
+else
+    fail "sozune route exited $cli_exit for /app/users: $cli_out"
+fi
+
+cli_exit=0
+cli_out=$("$SOZUNE_BIN" route "http://fdi.func-test.localhost/" \
+    --api "$FID_API_URL" --user "$API_USER:$API_PASSWORD" 2>&1) || cli_exit=$?
+if [[ $cli_exit -eq 1 && "$cli_out" == *"did you mean \`$HOST_FID\`"* ]]; then
+    pass "sozune route exits 1 for an unknown host and suggests the closest one"
+else
+    fail "sozune route exited $cli_exit for an unknown host: $cli_out"
+fi
+
+# The exit status does not depend on the output format: a script reading
+# --json gets the same answer from it.
+cli_exit=0
+"$SOZUNE_BIN" route "http://fdi.func-test.localhost/" --json \
+    --api "$FID_API_URL" --user "$API_USER:$API_PASSWORD" >/dev/null 2>&1 || cli_exit=$?
+if [[ $cli_exit -eq 1 ]]; then
+    pass "sozune route --json also exits 1 for an unknown host"
+else
+    fail "sozune route --json exited $cli_exit for an unknown host (expected 1)"
+fi
+
 cleanup_fid_containers

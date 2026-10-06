@@ -49,7 +49,7 @@ pub struct ResolveRequest {
     pub client_ip: Option<IpAddr>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Forwarded to a backend.
@@ -65,7 +65,7 @@ pub enum Outcome {
     NoRoute,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Resolution {
     pub outcome: Outcome,
     /// The status sozune answers with itself; `None` when a backend answers.
@@ -77,7 +77,7 @@ pub struct Resolution {
     pub backends: Vec<BackendState>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RouteSummary {
     pub id: String,
     pub name: String,
@@ -85,7 +85,7 @@ pub struct RouteSummary {
     pub priority: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub id: String,
     pub name: String,
@@ -94,7 +94,7 @@ pub struct Candidate {
     pub reason: String,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Would match, but a route tried before it matches first.
@@ -105,14 +105,14 @@ pub enum Verdict {
     Refused,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Step {
     pub name: String,
     pub verdict: StepVerdict,
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepVerdict {
     Pass,
@@ -122,7 +122,7 @@ pub enum StepVerdict {
     NotEvaluated,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BackendState {
     pub address: String,
     pub healthy: bool,

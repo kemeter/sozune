@@ -41,7 +41,10 @@ async fn main() -> anyhow::Result<()> {
     // defaults. The returned guard keeps the OTLP exporter alive and flushes it
     // on drop — bind it for the whole process.
     let early_cfg = resolve_early_config(&config_path).await;
-    let _tracing_guard = init_tracing(&early_cfg.log, &early_cfg.tracing);
+    // A subcommand's stdout is its result (`sozune route --json` is parsed by
+    // scripts): its logs go to stderr. `serve` keeps logging to stdout.
+    let logs_to_stderr = !matches!(cli.command, None | Some(Command::Serve));
+    let _tracing_guard = init_tracing(&early_cfg.log, &early_cfg.tracing, logs_to_stderr);
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(&config_path).await,
@@ -55,6 +58,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Doctor(args) => {
             let exit = cli::doctor::run(args, &config_path).await;
+            std::process::exit(exit);
+        }
+        Command::Route(args) => {
+            let exit = cli::route::run(args, &config_path).await;
             std::process::exit(exit);
         }
     }
@@ -86,6 +93,7 @@ fn log_env_filter() -> tracing_subscriber::EnvFilter {
 fn init_tracing(
     log: &config::LogConfig,
     tracing_cfg: &config::TracingConfig,
+    to_stderr: bool,
 ) -> Option<tracing_otel::TracingGuard> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -93,9 +101,15 @@ fn init_tracing(
 
     // The fmt layer mirrors the previous behaviour: text by default, or
     // newline-delimited JSON with flattened fields.
+    let writer = if to_stderr {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
     let fmt_layer = match log.format {
-        config::LogFormat::Text => tracing_subscriber::fmt::layer().boxed(),
+        config::LogFormat::Text => tracing_subscriber::fmt::layer().with_writer(writer).boxed(),
         config::LogFormat::Json => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
             .json()
             .flatten_event(true)
             .boxed(),
