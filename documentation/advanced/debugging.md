@@ -59,7 +59,40 @@ Run `sozune explain <CODE>` for the cause, effect, fix and a copyable example of
 
 ## Which route serves a request
 
-`POST /routes/resolve` on the API answers *which route serves this URL, and why not the one I expected* without sending the request: the route Sōzu picks, why each other route on the same host loses (lower priority, other path, refused), what its middlewares decide, and the health of its backends. See [the endpoint reference](../configuration/api.md#post-routesresolve).
+`sozune route` answers *which route serves this URL, and why not the one I expected* without sending the request: the route Sōzu picks, why each other route on the same host loses (lower priority, other path, refused), what its middlewares decide, and the health of its backends.
+
+```bash
+$ SOZUNE_API_PASSWORD=... sozune route https://app.example.com/api/users --user admin
+GET https://app.example.com/api/users
+
+✓ proxied by route `api`
+  route http_api (docker, priority 10)
+
+candidates
+└─ ✗ web · priority 0 · shadowed
+      matches too, but `api` has a higher priority (10 > 0)
+
+pipeline
+├─ ✓ ip-allow-list
+└─ • rate-limit
+      depends on the client's recent requests
+
+backends
+├─ ✓ 10.0.0.4:8080
+└─ ✗ 10.0.0.5:8080
+      connection refused
+```
+
+It asks the running instance, so the API must be enabled; it is reached at `api.listen_address` from the config, or at `--api <url>`. The user comes from `--user` or `SOZUNE_API_USER`, the password from `SOZUNE_API_PASSWORD` (or `--user name:password`); a `read-only` user is enough.
+
+| Option | |
+|---|---|
+| `-X, --method` | Request method (default `GET`) |
+| `-H, --header 'Name: value'` | Request header, repeatable |
+| `--client-ip <ip>` | Client address; IP allow-lists and client-IP matching are not evaluated without it |
+| `--json` | Print the API's JSON answer |
+
+It exits, with or without `--json`, `0` when a route serves the request (proxied, redirected, ACME challenge), `1` when it is not served (no route matches, or sozune answers it with an error such as a `403` or `404`), and `2` when the question could not be answered (API unreachable, credentials refused, invalid URL or header). The same answer is available from the API as `POST /routes/resolve`, see [the endpoint reference](../configuration/api.md#post-routesresolve).
 
 ## Checking the environment
 

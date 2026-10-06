@@ -3,6 +3,7 @@ use std::path::Path;
 
 use clap::Args;
 
+use super::{local_api_url, parse_listen_address, socket_address};
 use crate::config::AppConfig;
 
 #[derive(Args, Debug)]
@@ -339,15 +340,6 @@ fn is_unspecified(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `host:port`, with IPv6 hosts bracketed so the pair parses back.
-fn socket_address(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
 /// Whether a sozune instance already answers on the configured API address.
 /// Without the API there is no way to tell sozune from another process on
 /// the same ports.
@@ -355,13 +347,8 @@ async fn sozune_is_running(cfg: &AppConfig) -> bool {
     if !cfg.api.enabled {
         return false;
     }
-    let Some((host, port)) = parse_listen_address(&cfg.api.listen_address) else {
+    let Some(api) = local_api_url(&cfg.api.listen_address) else {
         return false;
-    };
-    let host = match host.parse::<std::net::IpAddr>() {
-        Ok(ip) if ip.is_unspecified() && ip.is_ipv4() => LOOPBACK.to_string(),
-        Ok(ip) if ip.is_unspecified() => "::1".to_string(),
-        _ => host,
     };
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(1))
@@ -369,7 +356,7 @@ async fn sozune_is_running(cfg: &AppConfig) -> bool {
     else {
         return false;
     };
-    let url = format!("http://{}/health", socket_address(&host, port));
+    let url = format!("{api}/health");
     let Ok(response) = client.get(&url).send().await else {
         return false;
     };
@@ -423,13 +410,6 @@ async fn check_bind(listener: &Listener, results: &mut Vec<CheckResult>) {
             results.push(CheckResult::fail(listener.category, title, detail).with_fix(fix));
         }
     }
-}
-
-fn parse_listen_address(s: &str) -> Option<(String, u16)> {
-    let (host, port) = s.rsplit_once(':')?;
-    let port: u16 = port.parse().ok()?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    Some((host.to_string(), port))
 }
 
 fn check_acme(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
