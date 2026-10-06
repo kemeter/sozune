@@ -3991,6 +3991,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "percent-encoding",
  "rcgen 0.14.8",
  "regex",
  "regex-syntax",

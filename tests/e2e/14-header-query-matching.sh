@@ -47,3 +47,16 @@ if [[ "$wrong_value" == "404" ]]; then
 else
     fail "request with wrong header value returned $wrong_value, expected 404"
 fi
+
+log "[14] Header/query matching: an encoded query value still matches"
+
+# `version=%32` is `version=2` percent-encoded: the condition compares the
+# decoded value.
+encoded_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: $HOST_MATCH" -H "X-Env: prod" \
+    "http://127.0.0.1:$HTTP_PORT/?version=%32" 2>/dev/null || echo "000")
+if [[ "$encoded_status" == "200" ]]; then
+    pass "request with a percent-encoded matching query is served (200)"
+else
+    fail "request with version=%32 returned $encoded_status, expected 200"
+fi

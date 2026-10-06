@@ -66,6 +66,7 @@ All notable changes to this project will be documented in this file.
 ### Reliability
 
 - A frontend, TCP/UDP route, or whole set of backends that Sōzu refused (typically during a rolling deploy, while the old and new containers claim the same hostname) was recorded as applied and never retried, leaving the hostname without a route until a restart. It is now retried on the next reload.
+- `matchQuery` compared the raw query string, so a client sending `version=%32` did not match `version:2`. Keys and values are now percent-decoded before the comparison.
 - A route with a path prefix that goes through the middleware could answer `502` for a request like `/apidocs` under `/api`: Sōzu matched the prefix byte for byte, the middleware by segment, and found no route. Both now match by segment.
 - A wildcard (`*.example.com`) or regex hostname whose route goes through the middleware (rate limit, forward auth, compression, …) answered `502`: the middleware looked the route up by the literal host the request was sent to and never found the pattern. It now resolves patterns the way Sōzu does.
 - A route added or changed while sozune was running was matched after every route already in place, whatever its priority. Redeploying the container of an `/api` route with priority 10 could hand its traffic to a `/` route with priority 0 on the same host until sozune restarted. Priority now holds across reloads.
