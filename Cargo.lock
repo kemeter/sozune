@@ -517,10 +517,12 @@ dependencies = [
 [[package]]
 name = "cheti"
 version = "0.1.0"
-source = "git+https://github.com/kemeter/cheti?rev=dca6075d67a8830e6796b47d9f217394b1580880#dca6075d67a8830e6796b47d9f217394b1580880"
+source = "git+https://github.com/kemeter/cheti?rev=726f4d6b1cb4bd53770bd590149522d8ec95a575#726f4d6b1cb4bd53770bd590149522d8ec95a575"
 dependencies = [
  "async-trait",
+ "data-encoding",
  "hex",
+ "hickory-proto",
  "hickory-resolver",
  "instant-acme",
  "percent-encoding",
@@ -1590,6 +1592,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
 dependencies = [
+ "bitflags",
  "data-encoding",
  "idna",
  "ipnet",
@@ -1598,7 +1601,9 @@ dependencies = [
  "prefix-trie",
  "rand 0.10.2",
  "ring",
+ "rustls-pki-types",
  "thiserror 2.0.21",
+ "time",
  "tinyvec",
  "tracing",
  "url",

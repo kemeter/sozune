@@ -95,6 +95,33 @@ Sōzune provisions each entry in `domains` on its own — no entrypoint required
 | OVH | `ovh` | `application_key_env`, `application_secret_env`, `consumer_key_env` | `endpoint`: `ovh-eu` (default), `ovh-ca` or `ovh-us` |
 | Gandi | `gandi` | `personal_access_token_env` | — |
 | Scaleway | `scaleway` | `secret_key_env` | — |
+| deSEC | `desec` | `token_env` | — |
+| DigitalOcean | `digitalocean` | `token_env` | — |
+| Hetzner | `hetzner` | `api_token_env` | — |
+| Infomaniak | `infomaniak` | `access_token_env` | — |
+| Porkbun | `porkbun` | `api_key_env`, `secret_api_key_env` | — |
+| RFC 2136 | `rfc2136` | `tsig_secret_env` | `tsig_algorithm`, `zone` (see below) |
+
+DigitalOcean, Hetzner, Infomaniak and Porkbun are tested against the documented APIs but not yet against live accounts: [report](https://github.com/kemeter/sozune/issues) anything that goes wrong. Porkbun only accepts API calls for a domain whose "API Access" is turned on in its domain settings.
+
+**RFC 2136 (self-hosted DNS).** For an authoritative server you run yourself (BIND, Knot DNS, PowerDNS), records are written through TSIG-signed dynamic updates, with no vendor API:
+
+```yaml
+acme:
+  resolvers:
+    bind:
+      challenge: dns-01
+      provider:
+        type: rfc2136
+        nameserver: ns1.example.com:53   # port 53 when omitted
+        tsig_key: acme-update            # key name, as declared on the server
+        tsig_secret_env: TSIG_SECRET     # base64 secret
+        tsig_algorithm: hmac-sha256      # or hmac-sha384, hmac-sha512 (default hmac-sha256)
+        zone: example.com                # optional
+      domains: ["*.example.com"]
+```
+
+The server must accept TXT updates under the zone for that key (`update-policy` on BIND). Without `zone`, the zone is found with an SOA lookup through the system resolver, which cannot see a private or split-horizon zone: set `zone` for those.
 
 **Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
 
@@ -234,7 +261,7 @@ Every TLS hostname is validated before it's used as a directory name. Names cont
 
 ## Limitations
 
-- **HTTP-01 and DNS-01.** DNS-01 is available through named resolvers (Cloudflare, OVH, Gandi, Scaleway), which also unlocks wildcard certificates. DNS-01 challenge solving is delegated to [cheti](https://github.com/kemeter/cheti).
+- **HTTP-01 and DNS-01.** DNS-01 is available through named resolvers (Cloudflare, deSEC, DigitalOcean, Gandi, Hetzner, Infomaniak, OVH, Porkbun, Scaleway, and RFC 2136 for self-hosted servers), which also unlocks wildcard certificates. For any other DNS provider, issue the certificate with [certbot](/documentation/tls/certbot) and load it from files. DNS-01 challenge solving is delegated to [cheti](https://github.com/kemeter/cheti).
 - **Let's Encrypt only.** The ACME directory URL is hardcoded. No support for custom ACME providers (ZeroSSL, Buypass, internal CA, Pebble for testing).
 - **No EAB.** No External Account Binding — incompatible with ACME providers that require it.
 - **Single account.** One ACME account is used for all certificates, stored at `certs_dir/account_credentials.json`. If the file is corrupt, Sōzune creates a new account on the next start.

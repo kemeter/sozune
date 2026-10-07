@@ -267,6 +267,39 @@ pub enum ProviderConfig {
     Scaleway {
         secret_key_env: String,
     },
+    Desec {
+        token_env: String,
+    },
+    #[serde(rename = "digitalocean")]
+    DigitalOcean {
+        token_env: String,
+    },
+    Hetzner {
+        api_token_env: String,
+    },
+    Infomaniak {
+        access_token_env: String,
+    },
+    Porkbun {
+        api_key_env: String,
+        secret_api_key_env: String,
+    },
+    /// RFC 2136 dynamic updates signed with TSIG, for a self-hosted
+    /// authoritative server (BIND, Knot DNS, PowerDNS).
+    #[serde(rename = "rfc2136")]
+    Rfc2136 {
+        /// `host` or `host:port` (port 53 by default).
+        nameserver: String,
+        tsig_key: String,
+        tsig_secret_env: String,
+        /// `hmac-sha256` (default), `hmac-sha384` or `hmac-sha512`.
+        #[serde(default)]
+        tsig_algorithm: Option<String>,
+        /// Zone to update. Without it the zone is found with an SOA lookup
+        /// through the system resolver, which cannot see a private zone.
+        #[serde(default)]
+        zone: Option<String>,
+    },
 }
 
 fn default_ovh_endpoint() -> String {
