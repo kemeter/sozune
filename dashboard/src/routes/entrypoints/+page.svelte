@@ -163,16 +163,37 @@
   /** Entrypoint id whose diagnostic popover is currently open. Click on a
    *  badge toggles; click anywhere else closes. */
   let openDiagFor = $state<string | null>(null);
+  /** The badge that opened the popover, given focus back when Escape closes
+   *  it so a keyboard user keeps their place. */
+  let diagTrigger: HTMLElement | null = null;
 
   function toggleDiagPopover(epId: string, ev: Event) {
     // Stop both the row's `goto` handler and the window-level closer.
     ev.stopPropagation();
     ev.preventDefault();
+    diagTrigger = ev.currentTarget as HTMLElement;
     openDiagFor = openDiagFor === epId ? null : epId;
+  }
+
+  function closeDiagPopoverFromKeyboard() {
+    closeDiagPopover();
+    diagTrigger?.focus();
+  }
+
+  /** Escape closes an open popover wherever focus went (Tab can take it out
+   *  of the popover), like a click elsewhere does. */
+  function closeDiagPopoverOnEscape(ev: KeyboardEvent) {
+    if (ev.key === 'Escape' && openDiagFor !== null) closeDiagPopoverFromKeyboard();
   }
 
   function closeDiagPopover() {
     openDiagFor = null;
+  }
+
+  /** Focus moves into the popover as it opens, so Escape (handled on the
+   *  popover) reaches it from the keyboard. */
+  function focusOnOpen(node: HTMLElement) {
+    node.focus();
   }
 
   function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
@@ -207,11 +228,13 @@
     void load();
     poll = setInterval(() => void load(true), 5000);
     window.addEventListener('click', closeDiagPopover);
+    window.addEventListener('keydown', closeDiagPopoverOnEscape);
   });
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
     window.removeEventListener('click', closeDiagPopover);
+    window.removeEventListener('keydown', closeDiagPopoverOnEscape);
   });
 
   function timeAgo(d: Date | null): string {
@@ -462,7 +485,13 @@
                       <div
                         class="diag-popover"
                         role="dialog"
+                        aria-label="Diagnostics for {ep.name || ep.id}"
+                        tabindex="-1"
+                        use:focusOnOpen
                         onclick={(ev) => ev.stopPropagation()}
+                        onkeydown={(ev) => {
+                          if (ev.key === 'Escape') closeDiagPopoverFromKeyboard();
+                        }}
                       >
                         {#each ep.diagnostics ?? [] as diag}
                           <div class="pop-diag pop-diag-{diag.severity}">

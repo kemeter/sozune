@@ -5,7 +5,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { clearAuth, identity, isAuthenticated } from '$lib/auth';
-  import { listDiagnostics } from '$lib/api';
+  import { getBaseUrl, getConfig, listDiagnostics } from '$lib/api';
   import { applyTheme, loadTheme, saveTheme, type Theme } from '$lib/theme';
 
   let { children } = $props();
@@ -28,6 +28,7 @@
     { path: '/diagnostics', label: 'Diagnostics', icon: 'warning' },
     { path: '/certificates', label: 'Certificates', icon: 'lock' },
     { path: '/health', label: 'Health', icon: 'pulse' },
+    { path: '/config', label: 'Config', icon: 'sliders' },
     { path: '/settings', label: 'Settings', icon: 'gear' }
   ];
 
@@ -35,7 +36,10 @@
    *  nav entry. Polled here so any page benefits from it without each page
    *  having to fetch it separately. */
   let diagBadge = $state(0);
-  let diagPoll: ReturnType<typeof setInterval> | null = null;
+  /** Version of the instance the dashboard talks to, not of the dashboard
+   *  build: the two are the same binary, but this is what is running. */
+  let version = $state<string | null>(null);
+  let poll: ReturnType<typeof setInterval> | null = null;
 
   function isActive(path: string): boolean {
     const current = $page.url.pathname.replace(/\/$/, '');
@@ -43,6 +47,39 @@
   }
 
   let onLoginPage = $derived($page.url.pathname.endsWith('/login'));
+
+  // Badge and version are polled while the shell is shown, from the first
+  // page after sign-in on: the layout is mounted once, often on /login. The
+  // version is re-read every time, so a retry, an upgrade or another API URL
+  // set in Settings shows within one period.
+  $effect(() => {
+    if (onLoginPage || !isAuthenticated()) {
+      if (poll) clearInterval(poll);
+      poll = null;
+      version = null;
+      return;
+    }
+    if (poll) return;
+    refreshShell();
+    poll = setInterval(refreshShell, 5000);
+  });
+
+  function refreshShell() {
+    void refreshDiagBadge();
+    void refreshVersion();
+  }
+
+  async function refreshVersion() {
+    const from = getBaseUrl();
+    try {
+      const v = await getConfig();
+      // A slow answer from an instance the dashboard has since left is
+      // dropped.
+      if (getBaseUrl() === from) version = v.version;
+    } catch {
+      if (getBaseUrl() === from) version = null;
+    }
+  }
 
   async function refreshDiagBadge() {
     try {
@@ -64,14 +101,10 @@
       goto(`${base}/login`);
       return;
     }
-    if (!onLoginPage) {
-      void refreshDiagBadge();
-      diagPoll = setInterval(() => void refreshDiagBadge(), 5000);
-    }
   });
 
   onDestroy(() => {
-    if (diagPoll) clearInterval(diagPoll);
+    if (poll) clearInterval(poll);
   });
 
   function logout() {
@@ -122,6 +155,8 @@
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L1.5 13.5h13L8 2z"/><path d="M8 6.5v3.5"/><circle cx="8" cy="11.5" r="0.5" fill="currentColor"/></svg>
               {:else if item.icon === 'route'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="3.5" cy="3.5" r="1.5"/><circle cx="12.5" cy="12.5" r="1.5"/><path d="M5 3.5h4.5a2.5 2.5 0 0 1 0 5h-3a2.5 2.5 0 0 0 0 5H11"/></svg>
+              {:else if item.icon === 'sliders'}
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 4h7M12 4h2M2 12h3M8 12h6"/><circle cx="10.5" cy="4" r="1.5"/><circle cx="6.5" cy="12" r="1.5"/></svg>
               {:else if item.icon === 'plug'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1v3M10 1v3"/><rect x="4" y="4" width="8" height="5" rx="1"/><path d="M8 9v3a2 2 0 0 0 2 2h2"/></svg>
               {/if}
@@ -167,7 +202,9 @@
             <span>Dark mode</span>
           {/if}
         </button>
-        <div class="version mono">v0.13.0</div>
+        {#if version}
+          <div class="version mono">v{version}</div>
+        {/if}
       </div>
     </aside>
 

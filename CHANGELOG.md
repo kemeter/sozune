@@ -49,6 +49,10 @@ All notable changes to this project will be documented in this file.
 
 ### Dashboard
 
+- Config page — the configuration the running instance loaded (listeners, API, dashboard, ACME and its resolvers, providers), from `GET /config`, with secrets masked. The page was documented but missing.
+- The diagnostics popover on the entrypoints list can be focused and closed with Escape.
+- The sidebar shows the version of the running instance, from `GET /config`, instead of a hardcoded `v0.13.0`.
+- The diagnostics badge in the sidebar updates after signing in; it used to wait for a page reload.
 - Route tester page — which route serves a URL and why, with the shadowed, rejected and refused routes, the middleware decisions and the backends' health, from `POST /routes/resolve`. Each entrypoint's page links to it pre-filled. See [Dashboard](documentation/configuration/dashboard.md#pages).
 
 ### CLI
