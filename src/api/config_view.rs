@@ -8,6 +8,9 @@
 //!   offline. We don't expose the user list at all.
 //! - Resolver credentials — only the *names* of the env vars referenced by
 //!   ACME resolvers travel; the values stay on the process.
+//! - Credentials in the HTTP provider URL — its user name, password and
+//!   query string are masked, and its auth header value is not part of the
+//!   view.
 //!
 //! The view is its own struct (not a re-export of `AppConfig`) so a new
 //! sensitive field added to the config doesn't silently cascade into the
@@ -153,6 +156,26 @@ fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
     }
 }
 
+/// Mask what a URL can carry as credentials: the user name (often a token on
+/// its own), the password and the query string, whole — a bare `?token` is
+/// as much a secret as `?token=value`. A URL that does not parse is masked whole, since nothing tells
+/// which part of it is secret.
+fn redact_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "***".to_string();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("***");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("***"));
+    }
+    if url.query().is_some() {
+        url.set_query(Some("***"));
+    }
+    url.to_string()
+}
+
 fn acme_view(acme: &AcmeConfig) -> AcmeView {
     let resolvers = acme
         .resolvers
@@ -247,7 +270,7 @@ fn providers_view(p: &ProvidersConfig) -> ProvidersView {
         }),
         http: p.http.as_ref().map(|h| HttpProviderView {
             enabled: h.enabled,
-            url: h.url.clone(),
+            url: redact_url(&h.url),
             poll_interval: h.poll_interval,
         }),
     }
@@ -325,6 +348,55 @@ mod tests {
             !json.contains("\"users\""),
             "user list must not be in /config payload"
         );
+    }
+
+    #[test]
+    fn http_provider_url_credentials_are_masked() {
+        let mut cfg = sample_app_config();
+        cfg.providers.http = Some(HttpProviderConfig {
+            enabled: true,
+            url: "https://user:s3cret@config.example.com/entrypoints?token=abc&env=prod".into(),
+            poll_interval: 10,
+            auth_header: "Authorization".into(),
+            auth_value: "Bearer header-secret".into(),
+        });
+        let view = ConfigView::from_app_config(&cfg);
+        let url = &view.providers.http.as_ref().unwrap().url;
+        assert_eq!(url, "https://***:***@config.example.com/entrypoints?***");
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("user:"));
+        assert!(!json.contains("s3cret"));
+        assert!(!json.contains("abc"));
+        assert!(!json.contains("header-secret"));
+    }
+
+    #[test]
+    fn token_as_url_user_name_is_masked() {
+        assert_eq!(
+            redact_url("https://tok3n@config.example.com/entrypoints"),
+            "https://***@config.example.com/entrypoints"
+        );
+    }
+
+    #[test]
+    fn bare_query_token_is_masked() {
+        assert_eq!(
+            redact_url("https://config.example.com/entrypoints?s3cret"),
+            "https://config.example.com/entrypoints?***"
+        );
+    }
+
+    #[test]
+    fn plain_http_provider_url_is_kept() {
+        assert_eq!(
+            redact_url("https://config.example.com/entrypoints"),
+            "https://config.example.com/entrypoints"
+        );
+    }
+
+    #[test]
+    fn unparseable_http_provider_url_is_masked_whole() {
+        assert_eq!(redact_url("not a url with s3cret"), "***");
     }
 
     #[test]

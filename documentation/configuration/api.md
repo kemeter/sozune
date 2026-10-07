@@ -316,6 +316,7 @@ Sample response:
 **Never exposed:**
 - `api.users` — neither the names nor the password hashes. Even hashed credentials enable offline brute-force attacks.
 - DNS-01 resolver secrets — only the *names* of the env vars referenced by ACME resolvers travel; their values stay on the process.
+- HTTP provider credentials — the URL's user name, password and query string are replaced by `***`, and `auth_value` is left out.
 
 ### `GET /diagnostics`
 
