@@ -217,15 +217,9 @@ fn forbidden(message: &str) -> Response {
         .into_response()
 }
 
-/// Run the API server. The caller assembles the [`AppState`] (it owns all the
-/// shared stores); `config` carries the listener address and CORS origins.
-pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
-    if state.users.is_empty() {
-        anyhow::bail!(
-            "API enabled but no users configured. Add at least one entry under `api.users`."
-        );
-    }
-
+/// Every route of the API with its auth layers, without CORS. Shared by
+/// `serve` and the tests, so the tests exercise the routes actually served.
+fn routes(state: AppState) -> Router {
     let protected = Router::new()
         .route(
             "/entrypoints",
@@ -255,11 +249,23 @@ pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
             auth_middleware,
         ));
 
-    let mut app = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/metrics", get(crate::api::metrics::metrics))
         .merge(authed)
-        .with_state(state);
+        .with_state(state)
+}
+
+/// Run the API server. The caller assembles the [`AppState`] (it owns all the
+/// shared stores); `config` carries the listener address and CORS origins.
+pub async fn serve(config: ApiConfig, state: AppState) -> anyhow::Result<()> {
+    if state.users.is_empty() {
+        anyhow::bail!(
+            "API enabled but no users configured. Add at least one entry under `api.users`."
+        );
+    }
+
+    let mut app = routes(state);
 
     let allow_origin = if config.cors_origins.is_empty() {
         AllowOrigin::any()
@@ -943,37 +949,7 @@ mod tests {
     }
 
     fn test_app(state: AppState) -> Router {
-        let protected = Router::new()
-            .route(
-                "/entrypoints",
-                get(list_entrypoints).post(create_entrypoint),
-            )
-            .route(
-                "/entrypoints/{id}",
-                get(get_entrypoint)
-                    .put(update_entrypoint)
-                    .delete(delete_entrypoint),
-            )
-            .route("/diagnostics", get(list_diagnostics))
-            .route("/providers", get(list_providers))
-            .route_layer(axum_middleware::from_fn(require_admin));
-
-        let read_only = Router::new()
-            .route("/me", get(me))
-            .route("/version", get(version))
-            .route("/routes/resolve", post(resolve_route));
-
-        let authed = protected
-            .merge(read_only)
-            .route_layer(axum_middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            ));
-
-        Router::new()
-            .route("/health", get(health))
-            .merge(authed)
-            .with_state(state)
+        routes(state)
     }
 
     /// Default credential matching `test_state()`'s default admin user.
@@ -2408,6 +2384,26 @@ mod tests {
             StatusCode::OK,
             "GET /diagnostics is a read endpoint and must be open to read-only users"
         );
+    }
+
+    /// The dashboard's Config page reads it with whatever role is signed in.
+    #[tokio::test]
+    async fn config_endpoint_allows_read_only_user() {
+        let app = test_app(test_state_with_users(vec![user(
+            "viewer",
+            "viewer-pass",
+            Role::ReadOnly,
+        )]));
+        let response = app
+            .oneshot(
+                Request::get("/config")
+                    .header("authorization", basic("viewer", "viewer-pass"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     // ---- /providers -----------------------------------------------------------
