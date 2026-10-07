@@ -960,6 +960,7 @@ mod tests {
 
         let read_only = Router::new()
             .route("/me", get(me))
+            .route("/version", get(version))
             .route("/routes/resolve", post(resolve_route));
 
         let authed = protected

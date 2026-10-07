@@ -49,6 +49,8 @@ All notable changes to this project will be documented in this file.
 
 ### Dashboard
 
+- The sidebar shows the version of the running instance, from `GET /config`, instead of a hardcoded `v0.13.0`.
+- The diagnostics badge in the sidebar updates after signing in; it used to wait for a page reload.
 - Route tester page — which route serves a URL and why, with the shadowed, rejected and refused routes, the middleware decisions and the backends' health, from `POST /routes/resolve`. Each entrypoint's page links to it pre-filled. See [Dashboard](documentation/configuration/dashboard.md#pages).
 
 ### CLI
