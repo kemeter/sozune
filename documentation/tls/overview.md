@@ -77,7 +77,7 @@ No route references a certificate: the handshake picks it by SNI, among the name
 
 Every file is checked at startup. A path that cannot be read, a key that does not belong to the certificate, an expired or not-yet-valid certificate, or one naming no host stops Sōzune with an error naming the file.
 
-**Read once, at startup.** Sōzune neither renews these certificates nor watches the files: restart it after replacing them (e.g. from a certbot `--deploy-hook`).
+**Read once, at startup.** Sōzune neither renews these certificates nor watches the files: restart it after replacing them. [Certbot](/documentation/tls/certbot) walks through the whole setup, renewal included.
 
 **Docker.** Certbot's `live/` directory holds symlinks into `archive/`, so mount the whole `/etc/letsencrypt`, not `live/` alone. The files are readable by root only by default.
 

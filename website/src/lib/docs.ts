@@ -88,7 +88,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'circuit-breaker',
     'wasm-plugins',
   ],
-  tls: ['overview', 'acme'],
+  tls: ['overview', 'acme', 'certbot'],
   configuration: ['overview', 'api', 'dashboard'],
   advanced: ['debugging', 'access-logs', 'health-checks', 'websocket'],
 };
