@@ -271,7 +271,7 @@ The `status` is derived from the same lifetime-ratio rule that drives ACME renew
 
 ### `GET /config`
 
-Read-only snapshot of the running configuration: listener ports, ACME settings, providers, the dashboard listener, and the API listener (without the user list). **Admin only.**
+Read-only snapshot of the running configuration: listeners (HTTP, HTTPS, TCP, UDP), TLS options, ACME settings, providers, the dashboard listener, and the API listener (without the user list). Available to both roles.
 
 ```bash
 curl -u admin:your-password http://localhost:3035/config
@@ -284,7 +284,17 @@ Sample response:
   "version": "0.13.0",
   "listeners": {
     "http":  { "port": 80 },
-    "https": { "port": 443 }
+    "https": { "port": 443 },
+    "tcp": [
+      { "name": "postgres", "port": 5432, "ip_allow_list": ["10.0.0.0/8"], "rate_limit": { "max_conns": 20, "per_seconds": 1, "exempt": [] }, "idle_timeout": 3600 }
+    ],
+    "udp": [{ "name": "dns", "port": 53 }]
+  },
+  "tls": {
+    "min_version": "1.3",
+    "max_version": null,
+    "ciphers": null,
+    "certificates": ["/etc/sozune/certs/fullchain.pem"]
   },
   "acme": {
     "enabled": true,
@@ -299,7 +309,8 @@ Sample response:
   "providers": {
     "docker": { "enabled": true, "endpoint": "unix:///var/run/docker.sock", "expose_by_default": false },
     "config_file": { "enabled": true, "path": "/etc/sozune/entrypoints.yaml", "watch": true }
-    // ... podman, swarm, kubernetes, nomad, consul, http: same shape, null when not configured
+    "http": { "enabled": true, "url": "https://config.example.com/entrypoints?***", "poll_interval": 10 }
+    // ... podman, swarm, kubernetes, nomad, consul, ring: null when not configured
   },
   "dashboard": {
     "enabled": true,
@@ -317,6 +328,7 @@ Sample response:
 - `api.users` — neither the names nor the password hashes. Even hashed credentials enable offline brute-force attacks.
 - DNS-01 resolver secrets — only the *names* of the env vars referenced by ACME resolvers travel; their values stay on the process.
 - HTTP provider credentials — the URL's user name, password and query string are replaced by `***`, and `auth_value` is left out.
+- Private key paths of the TLS certificate files — only the certificate file is listed.
 
 ### `GET /diagnostics`
 

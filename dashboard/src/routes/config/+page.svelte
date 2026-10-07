@@ -46,7 +46,8 @@
     for (const [name, v] of [
       ['Kubernetes', p.kubernetes],
       ['Nomad', p.nomad],
-      ['Consul', p.consul]
+      ['Consul', p.consul],
+      ['Ring', p.ring]
     ] as const) {
       if (v) rows.push({ name, enabled: v.enabled, details: [] });
     }
@@ -72,6 +73,15 @@
     }
     return rows.sort((a, b) => Number(b.enabled) - Number(a.enabled));
   });
+
+  const streamListeners = $derived(
+    config
+      ? [
+          ...config.listeners.tcp.map((l) => ({ ...l, protocol: 'tcp' as const })),
+          ...config.listeners.udp.map((l) => ({ ...l, protocol: 'udp' as const }))
+        ]
+      : []
+  );
 
   async function load() {
     loading = true;
@@ -149,6 +159,61 @@
         <dd>{config.dashboard.enabled ? 'yes' : 'no'}</dd>
         <dt>listen</dt>
         <dd class="mono">{config.dashboard.listen_address}</dd>
+      </dl>
+    </section>
+
+    {#if streamListeners.length > 0}
+      <section class="card wide">
+        <h2>TCP / UDP listeners</h2>
+        <div class="rows">
+          {#each streamListeners as l}
+            <div class="row">
+              <div class="row-head">
+                <span class="mono">{l.name}</span>
+                <span class="chip">{l.protocol}</span>
+                <span class="mono">:{l.port}</span>
+              </div>
+              {#if 'ip_allow_list' in l}
+                {#if l.ip_allow_list.length > 0}
+                  <div class="row-detail">
+                    allows <span class="mono">{l.ip_allow_list.join(', ')}</span>
+                  </div>
+                {/if}
+                {#if l.rate_limit}
+                  <div class="row-detail">
+                    rate limit
+                    <span class="mono">{l.rate_limit.max_conns} conns / {l.rate_limit.per_seconds}s</span>
+                  </div>
+                  {#if l.rate_limit.exempt.length > 0}
+                    <div class="row-detail">
+                      exempt from the limit
+                      <span class="mono">{l.rate_limit.exempt.join(', ')}</span>
+                    </div>
+                  {/if}
+                {/if}
+                {#if l.idle_timeout !== null}
+                  <div class="row-detail">idle timeout <span class="mono">{l.idle_timeout}s</span></div>
+                {/if}
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+    <section class="card wide">
+      <h2>TLS</h2>
+      <dl>
+        <dt>min version</dt>
+        <dd class="mono">{config.tls.min_version ?? 'default'}</dd>
+        <dt>max version</dt>
+        <dd class="mono">{config.tls.max_version ?? 'default'}</dd>
+        <dt>ciphers</dt>
+        <dd class="mono">{config.tls.ciphers ? config.tls.ciphers.join(', ') : 'default'}</dd>
+        <dt>certificate files</dt>
+        <dd class="mono">
+          {config.tls.certificates.length > 0 ? config.tls.certificates.join(', ') : 'none'}
+        </dd>
       </dl>
     </section>
 

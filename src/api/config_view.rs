@@ -18,7 +18,7 @@
 
 use crate::api::server::AppState;
 use crate::config::{
-    AcmeConfig, ApiConfig, AppConfig, ProvidersConfig, ProxyConfig, ResolverConfig,
+    AcmeConfig, ApiConfig, AppConfig, ProvidersConfig, ProxyConfig, ResolverConfig, TlsOptions,
 };
 use axum::Json;
 use axum::extract::State;
@@ -30,6 +30,7 @@ use std::collections::HashMap;
 pub struct ConfigView {
     pub version: &'static str,
     pub listeners: ListenersView,
+    pub tls: TlsView,
     pub acme: Option<AcmeView>,
     pub providers: ProvidersView,
     pub dashboard: DashboardView,
@@ -40,6 +41,40 @@ pub struct ConfigView {
 pub struct ListenersView {
     pub http: PortView,
     pub https: PortView,
+    pub tcp: Vec<TcpListenerView>,
+    pub udp: Vec<UdpListenerView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TcpListenerView {
+    pub name: String,
+    pub port: u16,
+    pub ip_allow_list: Vec<String>,
+    pub rate_limit: Option<TcpRateLimitView>,
+    pub idle_timeout: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TcpRateLimitView {
+    pub max_conns: u32,
+    pub per_seconds: u32,
+    pub exempt: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UdpListenerView {
+    pub name: String,
+    pub port: u16,
+}
+
+/// TLS settings of the HTTPS listener. `None` means Sōzu's default applies.
+/// Certificates are listed by their certificate file only.
+#[derive(Debug, Serialize)]
+pub struct TlsView {
+    pub min_version: Option<String>,
+    pub max_version: Option<String>,
+    pub ciphers: Option<Vec<String>>,
+    pub certificates: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +118,7 @@ pub struct ProvidersView {
     pub kubernetes: Option<ToggleView>,
     pub nomad: Option<ToggleView>,
     pub consul: Option<ToggleView>,
+    pub ring: Option<ToggleView>,
     pub config_file: Option<ConfigFileView>,
     pub http: Option<HttpProviderView>,
 }
@@ -134,6 +170,7 @@ impl ConfigView {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             listeners: listeners_view(&cfg.proxy),
+            tls: tls_view(&cfg.proxy.https.tls),
             acme: cfg.acme.as_ref().map(acme_view),
             providers: providers_view(&cfg.providers),
             dashboard: DashboardView {
@@ -153,6 +190,42 @@ fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
         https: PortView {
             port: proxy.https.listen_address,
         },
+        tcp: proxy
+            .tcp
+            .iter()
+            .map(|l| TcpListenerView {
+                name: l.name.clone(),
+                port: l.listen,
+                ip_allow_list: l.ip_allow_list.clone(),
+                rate_limit: l.rate_limit.as_ref().map(|r| TcpRateLimitView {
+                    max_conns: r.max_conns,
+                    per_seconds: r.per_seconds,
+                    exempt: r.exempt.clone(),
+                }),
+                idle_timeout: l.idle_timeout,
+            })
+            .collect(),
+        udp: proxy
+            .udp
+            .iter()
+            .map(|l| UdpListenerView {
+                name: l.name.clone(),
+                port: l.listen,
+            })
+            .collect(),
+    }
+}
+
+fn tls_view(tls: &TlsOptions) -> TlsView {
+    TlsView {
+        min_version: tls.min_version.clone(),
+        max_version: tls.max_version.clone(),
+        ciphers: tls.ciphers.clone(),
+        certificates: tls
+            .certificates
+            .iter()
+            .map(|c| c.cert_file.clone())
+            .collect(),
     }
 }
 
@@ -263,6 +336,7 @@ fn providers_view(p: &ProvidersConfig) -> ProvidersView {
             .map(|k| ToggleView { enabled: k.enabled }),
         nomad: p.nomad.as_ref().map(|n| ToggleView { enabled: n.enabled }),
         consul: p.consul.as_ref().map(|c| ToggleView { enabled: c.enabled }),
+        ring: p.ring.as_ref().map(|r| ToggleView { enabled: r.enabled }),
         config_file: p.config_file.as_ref().map(|f| ConfigFileView {
             enabled: f.enabled,
             path: f.path.clone(),
@@ -397,6 +471,56 @@ mod tests {
     #[test]
     fn unparseable_http_provider_url_is_masked_whole() {
         assert_eq!(redact_url("not a url with s3cret"), "***");
+    }
+
+    #[test]
+    fn view_exposes_tcp_and_udp_listeners() {
+        let mut cfg = sample_app_config();
+        cfg.proxy.tcp = vec![TcpListenerConfig {
+            name: "postgres".into(),
+            listen: 5432,
+            ip_allow_list: vec!["10.0.0.0/8".into()],
+            rate_limit: Some(TcpRateLimit {
+                max_conns: 20,
+                per_seconds: 1,
+                exempt: vec!["172.16.0.0/12".into()],
+            }),
+            sni_preread_timeout: None,
+            sni_preread_max_bytes: None,
+            idle_timeout: Some(3600),
+        }];
+        cfg.proxy.udp = vec![UdpListenerConfig {
+            name: "dns".into(),
+            listen: 53,
+        }];
+        let view = ConfigView::from_app_config(&cfg);
+        let tcp = &view.listeners.tcp[0];
+        assert_eq!((tcp.name.as_str(), tcp.port), ("postgres", 5432));
+        assert_eq!(tcp.ip_allow_list, vec!["10.0.0.0/8"]);
+        let rate_limit = tcp.rate_limit.as_ref().unwrap();
+        assert_eq!(rate_limit.max_conns, 20);
+        assert_eq!(rate_limit.exempt, vec!["172.16.0.0/12"]);
+        assert_eq!(tcp.idle_timeout, Some(3600));
+        assert_eq!(view.listeners.udp[0].port, 53);
+    }
+
+    #[test]
+    fn view_exposes_tls_options_without_key_files() {
+        let mut cfg = sample_app_config();
+        cfg.proxy.https.tls = TlsOptions {
+            min_version: Some("1.3".into()),
+            max_version: None,
+            ciphers: Some(vec!["TLS13_AES_256_GCM_SHA384".into()]),
+            certificates: vec![CertificateFile {
+                cert_file: "/certs/fullchain.pem".into(),
+                key_file: "/certs/privkey.pem".into(),
+            }],
+        };
+        let view = ConfigView::from_app_config(&cfg);
+        assert_eq!(view.tls.min_version.as_deref(), Some("1.3"));
+        assert_eq!(view.tls.certificates, vec!["/certs/fullchain.pem"]);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("privkey.pem"));
     }
 
     #[test]
