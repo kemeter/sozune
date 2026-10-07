@@ -92,7 +92,7 @@ Sōzune provisions each entry in `domains` on its own — no entrypoint required
 | Provider | `type` value | Required env vars | Optional fields |
 |---|---|---|---|
 | Cloudflare | `cloudflare` | `api_token_env` | — |
-| OVH | `ovh` | `application_key_env`, `application_secret_env`, `consumer_key_env` | `endpoint` (default `ovh-eu`) |
+| OVH | `ovh` | `application_key_env`, `application_secret_env`, `consumer_key_env` | `endpoint`: `ovh-eu` (default), `ovh-ca` or `ovh-us` |
 | Gandi | `gandi` | `personal_access_token_env` | — |
 | Scaleway | `scaleway` | `secret_key_env` | — |
 

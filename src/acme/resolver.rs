@@ -47,16 +47,20 @@ fn build_provider(cfg: &ProviderConfig) -> anyhow::Result<Box<dyn DnsProvider>> 
             Ok(Box::new(provider))
         }
         ProviderConfig::Ovh {
-            endpoint: _,
+            endpoint,
             application_key_env,
             application_secret_env,
             consumer_key_env,
         } => {
+            let api_base = ovh_api_base(endpoint)?;
             let app_key = read_env(application_key_env)?;
             let app_secret = read_env(application_secret_env)?;
             let consumer_key = read_env(consumer_key_env)?;
-            let provider = OvhProvider::new(OvhConfig::new(app_key, app_secret, consumer_key))
-                .map_err(|e| anyhow::anyhow!("build OVH provider: {e}"))?;
+            let config = OvhConfig::new(app_key, app_secret, consumer_key)
+                .with_api_base(api_base)
+                .map_err(|e| anyhow::anyhow!("OVH endpoint `{endpoint}`: {e}"))?;
+            let provider =
+                OvhProvider::new(config).map_err(|e| anyhow::anyhow!("build OVH provider: {e}"))?;
             Ok(Box::new(provider))
         }
         ProviderConfig::Gandi {
@@ -72,6 +76,19 @@ fn build_provider(cfg: &ProviderConfig) -> anyhow::Result<Box<dyn DnsProvider>> 
             let provider = ScalewayProvider::new(ScalewayConfig::new(key))
                 .map_err(|e| anyhow::anyhow!("build Scaleway provider: {e}"))?;
             Ok(Box::new(provider))
+        }
+    }
+}
+
+/// API base of an OVHcloud region, named as in OVH's own SDKs. Credentials
+/// belong to one region, so the wrong base fails every call.
+fn ovh_api_base(endpoint: &str) -> anyhow::Result<&'static str> {
+    match endpoint {
+        "ovh-eu" => Ok("https://eu.api.ovh.com/1.0"),
+        "ovh-ca" => Ok("https://ca.api.ovh.com/1.0"),
+        "ovh-us" => Ok("https://api.us.ovhcloud.com/1.0"),
+        other => {
+            anyhow::bail!("unknown OVH endpoint `{other}`: expected `ovh-eu`, `ovh-ca` or `ovh-us`")
         }
     }
 }
@@ -159,6 +176,50 @@ mod tests {
         let resolver = build_resolver(Some("legacy"), &acme).unwrap().unwrap();
         assert!(!resolver.supports_wildcard());
         assert!(matches!(resolver, Resolver::Http01));
+    }
+
+    #[test]
+    fn ovh_endpoints_map_to_their_region() {
+        assert_eq!(
+            ovh_api_base("ovh-eu").unwrap(),
+            "https://eu.api.ovh.com/1.0"
+        );
+        assert_eq!(
+            ovh_api_base("ovh-ca").unwrap(),
+            "https://ca.api.ovh.com/1.0"
+        );
+        assert_eq!(
+            ovh_api_base("ovh-us").unwrap(),
+            "https://api.us.ovhcloud.com/1.0"
+        );
+    }
+
+    #[test]
+    fn unknown_ovh_endpoint_is_refused() {
+        let mut acme = empty_acme();
+        acme.resolvers.insert(
+            "ovh".to_string(),
+            ResolverConfig::Dns01 {
+                provider: ProviderConfig::Ovh {
+                    endpoint: "ovh-asia".to_string(),
+                    application_key_env: "TEST_OVH_KEY".to_string(),
+                    application_secret_env: "TEST_OVH_SECRET".to_string(),
+                    consumer_key_env: "TEST_OVH_CONSUMER".to_string(),
+                },
+                domains: vec![],
+                ca_server: None,
+            },
+        );
+
+        let err = match build_resolver(Some("ovh"), &acme) {
+            Ok(_) => panic!("expected an error for ovh-asia"),
+            Err(e) => e,
+        };
+
+        assert!(
+            err.to_string().contains("unknown OVH endpoint `ovh-asia`"),
+            "{err}"
+        );
     }
 
     #[test]
