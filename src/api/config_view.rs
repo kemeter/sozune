@@ -191,6 +191,18 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
                 ),
                 Gandi { .. } => ("gandi", vec!["GANDI_PAT (configurable)"]),
                 Scaleway { .. } => ("scaleway", vec!["SCALEWAY_SECRET (configurable)"]),
+                Desec { .. } => ("desec", vec!["DESEC_TOKEN (configurable)"]),
+                DigitalOcean { .. } => ("digitalocean", vec!["DIGITALOCEAN_TOKEN (configurable)"]),
+                Hetzner { .. } => ("hetzner", vec!["HETZNER_API_TOKEN (configurable)"]),
+                Infomaniak { .. } => ("infomaniak", vec!["INFOMANIAK_ACCESS_TOKEN (configurable)"]),
+                Porkbun { .. } => (
+                    "porkbun",
+                    vec![
+                        "PORKBUN_API_KEY (configurable)",
+                        "PORKBUN_SECRET_API_KEY (configurable)",
+                    ],
+                ),
+                Rfc2136 { .. } => ("rfc2136", vec!["RFC2136_TSIG_SECRET (configurable)"]),
             };
             ResolverView::Dns01 {
                 provider: name,

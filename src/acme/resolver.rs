@@ -1,8 +1,10 @@
 //! Build cheti DNS providers from `AcmeConfig` resolver entries.
 
 use cheti::{
-    CloudflareConfig, CloudflareProvider, DnsProvider, GandiConfig, GandiProvider, OvhConfig,
-    OvhProvider, ScalewayConfig, ScalewayProvider,
+    CloudflareConfig, CloudflareProvider, DesecConfig, DesecProvider, DigitalOceanConfig,
+    DigitalOceanProvider, DnsProvider, GandiConfig, GandiProvider, HetznerConfig, HetznerProvider,
+    InfomaniakConfig, InfomaniakProvider, OvhConfig, OvhProvider, PorkbunConfig, PorkbunProvider,
+    Rfc2136Config, Rfc2136Provider, ScalewayConfig, ScalewayProvider, TsigAlgorithm,
 };
 
 use crate::config::{AcmeConfig, ProviderConfig, ResolverConfig};
@@ -75,6 +77,64 @@ fn build_provider(cfg: &ProviderConfig) -> anyhow::Result<Box<dyn DnsProvider>> 
             let key = read_env(secret_key_env)?;
             let provider = ScalewayProvider::new(ScalewayConfig::new(key))
                 .map_err(|e| anyhow::anyhow!("build Scaleway provider: {e}"))?;
+            Ok(Box::new(provider))
+        }
+        ProviderConfig::Desec { token_env } => {
+            let token = read_env(token_env)?;
+            let provider = DesecProvider::new(DesecConfig::new(token))
+                .map_err(|e| anyhow::anyhow!("build deSEC provider: {e}"))?;
+            Ok(Box::new(provider))
+        }
+        ProviderConfig::DigitalOcean { token_env } => {
+            let token = read_env(token_env)?;
+            let provider = DigitalOceanProvider::new(DigitalOceanConfig::new(token))
+                .map_err(|e| anyhow::anyhow!("build DigitalOcean provider: {e}"))?;
+            Ok(Box::new(provider))
+        }
+        ProviderConfig::Hetzner { api_token_env } => {
+            let token = read_env(api_token_env)?;
+            let provider = HetznerProvider::new(HetznerConfig::new(token))
+                .map_err(|e| anyhow::anyhow!("build Hetzner provider: {e}"))?;
+            Ok(Box::new(provider))
+        }
+        ProviderConfig::Infomaniak { access_token_env } => {
+            let token = read_env(access_token_env)?;
+            let provider = InfomaniakProvider::new(InfomaniakConfig::new(token))
+                .map_err(|e| anyhow::anyhow!("build Infomaniak provider: {e}"))?;
+            Ok(Box::new(provider))
+        }
+        ProviderConfig::Porkbun {
+            api_key_env,
+            secret_api_key_env,
+        } => {
+            let api_key = read_env(api_key_env)?;
+            let secret_api_key = read_env(secret_api_key_env)?;
+            let provider = PorkbunProvider::new(PorkbunConfig::new(api_key, secret_api_key))
+                .map_err(|e| anyhow::anyhow!("build Porkbun provider: {e}"))?;
+            Ok(Box::new(provider))
+        }
+        ProviderConfig::Rfc2136 {
+            nameserver,
+            tsig_key,
+            tsig_secret_env,
+            tsig_algorithm,
+            zone,
+        } => {
+            let secret = read_env(tsig_secret_env)?;
+            let mut config = Rfc2136Config::new(nameserver, tsig_key, secret);
+            if let Some(algorithm) = tsig_algorithm {
+                let algorithm: TsigAlgorithm = algorithm
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("RFC 2136 tsig_algorithm `{algorithm}`: {e}"))?;
+                config = config.with_algorithm(algorithm);
+            }
+            if let Some(zone) = zone {
+                config = config
+                    .with_zone(zone)
+                    .map_err(|e| anyhow::anyhow!("RFC 2136 zone `{zone}`: {e}"))?;
+            }
+            let provider = Rfc2136Provider::new(config)
+                .map_err(|e| anyhow::anyhow!("build RFC 2136 provider: {e}"))?;
             Ok(Box::new(provider))
         }
     }
@@ -176,6 +236,66 @@ mod tests {
         let resolver = build_resolver(Some("legacy"), &acme).unwrap().unwrap();
         assert!(!resolver.supports_wildcard());
         assert!(matches!(resolver, Resolver::Http01));
+    }
+
+    fn dns01_from_yaml(yaml: &str) -> AcmeConfig {
+        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut acme = empty_acme();
+        acme.resolvers.insert(
+            "dns".to_string(),
+            ResolverConfig::Dns01 {
+                provider,
+                domains: vec![],
+                ca_server: None,
+            },
+        );
+        acme
+    }
+
+    #[test]
+    fn every_new_provider_type_parses_and_builds() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            ("TEST_DNS_TOKEN", "token"),
+            ("TEST_DNS_SECRET", "c2VjcmV0LWtleS1mb3ItdHNpZw=="),
+        ]);
+
+        for yaml in [
+            "type: desec\ntoken_env: TEST_DNS_TOKEN",
+            "type: digitalocean\ntoken_env: TEST_DNS_TOKEN",
+            "type: hetzner\napi_token_env: TEST_DNS_TOKEN",
+            "type: infomaniak\naccess_token_env: TEST_DNS_TOKEN",
+            "type: porkbun\napi_key_env: TEST_DNS_TOKEN\nsecret_api_key_env: TEST_DNS_SECRET",
+            "type: rfc2136\nnameserver: 192.0.2.53\ntsig_key: acme-update\ntsig_secret_env: TEST_DNS_SECRET",
+            "type: rfc2136\nnameserver: ns.example.com:5353\ntsig_key: acme-update\ntsig_secret_env: TEST_DNS_SECRET\ntsig_algorithm: hmac-sha512\nzone: example.com",
+        ] {
+            let acme = dns01_from_yaml(yaml);
+            let resolver = match build_resolver(Some("dns"), &acme) {
+                Ok(Some(resolver)) => resolver,
+                Ok(None) => panic!("no resolver for {yaml}"),
+                Err(e) => panic!("{yaml}: {e}"),
+            };
+            assert!(resolver.supports_wildcard(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn rfc2136_rejects_an_unknown_algorithm() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[("TEST_DNS_SECRET", "c2VjcmV0LWtleS1mb3ItdHNpZw==")]);
+        let acme = dns01_from_yaml(
+            "type: rfc2136\nnameserver: 192.0.2.53\ntsig_key: acme-update\ntsig_secret_env: TEST_DNS_SECRET\ntsig_algorithm: hmac-md5",
+        );
+
+        let err = match build_resolver(Some("dns"), &acme) {
+            Ok(_) => panic!("expected an error for hmac-md5"),
+            Err(e) => e,
+        };
+
+        assert!(
+            err.to_string().contains("tsig_algorithm `hmac-md5`"),
+            "{err}"
+        );
     }
 
     #[test]
