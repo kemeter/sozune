@@ -674,6 +674,19 @@ pub struct TlsOptions {
     /// enabled — include the 1.3 suites you want too.
     #[serde(default)]
     pub ciphers: Option<Vec<String>>,
+    /// Certificates supplied as files rather than issued by ACME — a wildcard
+    /// from certbot, a purchased certificate, an internal PKI. Sōzu serves one
+    /// to every handshake whose SNI its names cover; ACME skips those names.
+    #[serde(default)]
+    pub certificates: Vec<CertificateFile>,
+}
+
+/// A certificate chain and its private key, both PEM files read at startup.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct CertificateFile {
+    /// Leaf certificate first, followed by its intermediates (`fullchain.pem`).
+    pub cert_file: String,
+    pub key_file: String,
 }
 
 /// HTTP/2 listener settings. Both fields default to `None`, which leaves

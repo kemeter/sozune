@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # TLS / HTTP-2 ALPN negotiation.
 #
-# We don't provision a valid certificate (sozune only loads certs via ACME),
-# so the TLS handshake will fail at certificate validation. But ALPN is
-# negotiated in the ServerHello *before* certificate verification, so
-# `curl -v` exposes "ALPN, server accepted: h2" regardless.
+# These requests carry no SNI, so no certificate matches them and the TLS
+# handshake fails at certificate validation. But ALPN is negotiated in the
+# ServerHello *before* certificate verification, so `curl -v` exposes
+# "ALPN, server accepted: h2" regardless.
 #
 # Sourced by run-all.sh.
 

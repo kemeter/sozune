@@ -236,13 +236,14 @@ Every TLS hostname is validated before it's used as a directory name. Names cont
 
 - **HTTP-01 and DNS-01.** DNS-01 is available through named resolvers (Cloudflare, OVH, Gandi, Scaleway), which also unlocks wildcard certificates. DNS-01 challenge solving is delegated to [cheti](https://github.com/kemeter/cheti).
 - **Let's Encrypt only.** The ACME directory URL is hardcoded. No support for custom ACME providers (ZeroSSL, Buypass, internal CA, Pebble for testing).
-- **No manual certificate path.** You cannot inject a cert managed externally (purchased, self-signed, internal PKI). ACME is the only source.
 - **No EAB.** No External Account Binding — incompatible with ACME providers that require it.
 - **Single account.** One ACME account is used for all certificates, stored at `certs_dir/account_credentials.json`. If the file is corrupt, Sōzune creates a new account on the next start.
 
 ## Troubleshooting
 
 **Certificate not issued, no error logged.** Check that `acme.enabled: true`. With it off, `tls=true` is silently a no-op.
+
+**No ACME order for a hostname.** A certificate from [`proxy.https.tls.certificates`](/documentation/tls/overview#certificates-from-files) covers it, so it is already served; ACME leaves such hostnames alone (logged at `debug`).
 
 **HTTP-01 challenge fails.** The challenge is served on `127.0.0.1:<challenge_port>` and routed by Sōzu through the public HTTP listener (port 80 by default). Make sure:
 - Port 80 is open and reachable from the public Internet.

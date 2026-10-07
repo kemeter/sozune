@@ -124,7 +124,8 @@ impl Backoff {
 
 /// Command sent from ACME manager to the proxy reload handler
 pub struct CertCommand {
-    pub hostname: String,
+    /// Names the certificate is served for.
+    pub names: Vec<String>,
     pub cert_pem: String,
     pub key_pem: String,
     pub chain: Vec<String>,
@@ -184,6 +185,11 @@ pub struct AcmeManager {
     /// not take, so the next pass sends the material again instead of reading
     /// the file and calling the hostname done.
     undelivered: Arc<Mutex<BTreeSet<String>>>,
+    /// Names covered by operator-supplied certificates
+    /// (`proxy.https.tls.certificates`). A hostname they cover is already
+    /// served, so ordering one from ACME would only spend rate limit — and
+    /// fail outright when its DNS does not point here.
+    manual_names: Vec<String>,
 }
 
 impl AcmeManager {
@@ -194,6 +200,7 @@ impl AcmeManager {
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
         cert_tx: mpsc::Sender<CertCommand>,
         notify: Arc<Notify>,
+        manual_names: Vec<String>,
     ) -> Self {
         let certs_dir = PathBuf::from(&config.certs_dir);
         Self {
@@ -206,6 +213,7 @@ impl AcmeManager {
             notify,
             backoff: Backoff::default(),
             undelivered: Arc::new(Mutex::new(BTreeSet::new())),
+            manual_names,
         }
     }
 
@@ -347,7 +355,8 @@ impl AcmeManager {
                 certs.push((hostname.clone(), resolver_name.clone()));
             }
         }
-        certs
+
+        retain_uncovered(certs, &self.manual_names)
     }
 
     /// Validate that a hostname is safe to use as a directory name (no path traversal).
@@ -487,7 +496,7 @@ impl AcmeManager {
         let (accepted_tx, accepted_rx) = oneshot::channel();
         self.cert_tx
             .send(CertCommand {
-                hostname: hostname.to_string(),
+                names: vec![hostname.to_string()],
                 cert_pem,
                 key_pem,
                 chain,
@@ -775,6 +784,16 @@ impl AcmeManager {
 
             let hostname = hostname_from_path(&dir_name);
 
+            // A cached ACME certificate for a name now served from a file
+            // would compete with it in the worker, and Sōzu could pick it.
+            if crate::manual_certs::covered(&self.manual_names, &hostname) {
+                debug!(
+                    "Not loading the ACME certificate for {}: proxy.https.tls.certificates covers it",
+                    hostname
+                );
+                continue;
+            }
+
             let cert_path = path.join("cert.pem");
             let key_path = path.join("key.pem");
 
@@ -808,7 +827,7 @@ impl AcmeManager {
             if let Err(e) = self
                 .cert_tx
                 .send(CertCommand {
-                    hostname: hostname.clone(),
+                    names: vec![hostname.clone()],
                     cert_pem: cert,
                     key_pem,
                     chain,
@@ -867,7 +886,7 @@ fn hostname_from_path(dir_name: &str) -> String {
 }
 
 /// Split a PEM chain into the leaf certificate and the rest of the chain
-fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
+pub(crate) fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
     let pem_blocks: Vec<&str> = pem_chain
         .split("-----END CERTIFICATE-----")
         .filter(|s| s.contains("-----BEGIN CERTIFICATE-----"))
@@ -950,6 +969,24 @@ fn collect_resolver_managed_domains(
             certs.push((hostname.clone(), Some(resolver_name.clone())));
         }
     }
+    certs
+}
+
+/// Drop the hostnames an operator-supplied certificate already covers.
+fn retain_uncovered(
+    mut certs: Vec<(String, Option<String>)>,
+    manual_names: &[String],
+) -> Vec<(String, Option<String>)> {
+    certs.retain(|(hostname, _)| {
+        let covered = crate::manual_certs::covered(manual_names, hostname);
+        if covered {
+            debug!(
+                "{} is covered by a certificate from proxy.https.tls.certificates, skipping ACME",
+                hostname
+            );
+        }
+        !covered
+    });
     certs
 }
 
@@ -1314,6 +1351,19 @@ mod tests {
             certs,
             vec![("*.kemeter.app".to_string(), Some("gandi".to_string()))]
         );
+    }
+
+    #[test]
+    fn hostnames_covered_by_a_manual_certificate_are_skipped() {
+        let certs = vec![
+            ("app.example.com".to_string(), None),
+            ("*.example.com".to_string(), Some("gandi".to_string())),
+            ("other.org".to_string(), None),
+        ];
+
+        let kept = retain_uncovered(certs, &["*.example.com".to_string()]);
+
+        assert_eq!(kept, vec![("other.org".to_string(), None)]);
     }
 
     #[test]

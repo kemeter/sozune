@@ -14,6 +14,10 @@ source "$E2E_DIR/lib.sh"
 AUTHELIA_CONFIG_DIR="$(mktemp -d -t sozune-authelia-XXXXXX)"
 export AUTHELIA_CONFIG_DIR
 
+# Holds the wildcard certificate served from proxy.https.tls.certificates.
+TLS_CERT_DIR="$(mktemp -d -t sozune-tls-XXXXXX)"
+export TLS_CERT_DIR
+
 cleanup() {
     log "Cleaning up..."
     if [[ -n "${SOZUNE_PID:-}" ]] && kill -0 "$SOZUNE_PID" 2>/dev/null; then
@@ -22,6 +26,7 @@ cleanup() {
     fi
     docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     rm -f "$COMPOSE_FILE" "$CONFIG_FILE"
+    rm -rf "$TLS_CERT_DIR"
     # Authelia runs as root inside the container, so cleanup needs the same.
     if [[ -d "$AUTHELIA_CONFIG_DIR" ]]; then
         docker run --rm -v "$AUTHELIA_CONFIG_DIR:/c" alpine:latest \
@@ -69,6 +74,10 @@ fi
 # -- Config files --
 log "Generating test config files..."
 
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=func-test.localhost" \
+    -addext "subjectAltName=DNS:*.func-test.localhost" \
+    -keyout "$TLS_CERT_DIR/privkey.pem" -out "$TLS_CERT_DIR/fullchain.pem" >/dev/null 2>&1
+
 cat > "$CONFIG_FILE" <<EOF
 providers:
   docker:
@@ -94,6 +103,9 @@ proxy:
     listen_address: $HTTPS_PORT
     tls:
       min_version: "1.3"
+      certificates:
+        - cert_file: $TLS_CERT_DIR/fullchain.pem
+          key_file: $TLS_CERT_DIR/privkey.pem
   tcp:
     - name: tcpecho
       listen: $TCP_ECHO_PORT
@@ -207,6 +219,14 @@ services:
     labels:
       - "sozune.enable=true"
       - "sozune.http.svcb.host=$HOST_B"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-tls:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.svctls.host=$HOST_TLS"
+      - "sozune.http.svctls.tls=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-auth:
