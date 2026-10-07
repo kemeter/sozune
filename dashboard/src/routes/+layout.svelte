@@ -28,6 +28,7 @@
     { path: '/diagnostics', label: 'Diagnostics', icon: 'warning' },
     { path: '/certificates', label: 'Certificates', icon: 'lock' },
     { path: '/health', label: 'Health', icon: 'pulse' },
+    { path: '/config', label: 'Config', icon: 'sliders' },
     { path: '/settings', label: 'Settings', icon: 'gear' }
   ];
 
@@ -154,6 +155,8 @@
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L1.5 13.5h13L8 2z"/><path d="M8 6.5v3.5"/><circle cx="8" cy="11.5" r="0.5" fill="currentColor"/></svg>
               {:else if item.icon === 'route'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="3.5" cy="3.5" r="1.5"/><circle cx="12.5" cy="12.5" r="1.5"/><path d="M5 3.5h4.5a2.5 2.5 0 0 1 0 5h-3a2.5 2.5 0 0 0 0 5H11"/></svg>
+              {:else if item.icon === 'sliders'}
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 4h7M12 4h2M2 12h3M8 12h6"/><circle cx="10.5" cy="4" r="1.5"/><circle cx="6.5" cy="12" r="1.5"/></svg>
               {:else if item.icon === 'plug'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1v3M10 1v3"/><rect x="4" y="4" width="8" height="5" rx="1"/><path d="M8 9v3a2 2 0 0 0 2 2h2"/></svg>
               {/if}
