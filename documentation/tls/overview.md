@@ -1,6 +1,6 @@
 # TLS overview
 
-Sōzune terminates TLS on its HTTPS listener. Certificates come from [ACME / Let's Encrypt](/documentation/tls/acme).
+Sōzune terminates TLS on its HTTPS listener. Certificates come from [ACME / Let's Encrypt](/documentation/tls/acme), or from [files you supply](#certificates-from-files).
 
 ## Enable TLS for a service
 
@@ -10,7 +10,7 @@ labels:
   - "sozune.http.app.tls=true"
 ```
 
-When `tls=true`, Sōzune:
+When `tls=true` and no [certificate from a file](#certificates-from-files) covers the hostname, Sōzune:
 
 1. Adds the hostname to the list of names needing a certificate.
 2. Triggers ACME provisioning for the hostname (HTTP-01 challenge).
@@ -55,6 +55,32 @@ The name serves two distinct purposes, depending on the entrypoint:
 
 Use the first when Sōzune should own the certificates, the second when the backend must.
 
+## Certificates from files
+
+A certificate issued outside Sōzune — a wildcard from certbot, a purchased certificate, an internal PKI — is declared under `proxy.https.tls.certificates`:
+
+```yaml
+proxy:
+  https:
+    tls:
+      certificates:
+        - cert_file: /etc/letsencrypt/live/example.com/fullchain.pem
+          key_file: /etc/letsencrypt/live/example.com/privkey.pem
+```
+
+| Field | Description |
+|---|---|
+| `cert_file` | PEM certificate, leaf first, followed by its intermediates (`fullchain.pem`). |
+| `key_file` | PEM private key of that certificate. |
+
+No route references a certificate: the handshake picks it by SNI, among the names it carries (its Subject Alternative Names, or its Common Name when it has none). A `tls=true` route on `app.example.com` is served with a `*.example.com` certificate, and ACME neither orders nor loads from its cache a certificate for a hostname such a certificate covers.
+
+Every file is checked at startup. A path that cannot be read, a key that does not belong to the certificate, an expired or not-yet-valid certificate, or one naming no host stops Sōzune with an error naming the file.
+
+**Read once, at startup.** Sōzune neither renews these certificates nor watches the files: restart it after replacing them (e.g. from a certbot `--deploy-hook`).
+
+**Docker.** Certbot's `live/` directory holds symlinks into `archive/`, so mount the whole `/etc/letsencrypt`, not `live/` alone. The files are readable by root only by default.
+
 ## HTTPS redirect
 
 Force HTTP traffic to HTTPS — see [Redirects](/documentation/middleware/redirects).
@@ -88,4 +114,4 @@ proxy:
 ## What's not configurable
 
 - Per-route TLS options — versions and ciphers are a property of the listener, not the route (see above).
-- Manual certificate injection — ACME is the only source. There is no path to provide a self-signed cert, a wildcard purchased elsewhere, or a cert managed by another tool.
+- Reloading [certificates from files](#certificates-from-files) without a restart.

@@ -20,6 +20,7 @@ mod dashboard;
 mod diagnostics;
 mod error_pages;
 mod labels;
+mod manual_certs;
 mod middleware;
 mod model;
 mod provider;
@@ -176,6 +177,15 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     };
     config.apply_env_overrides();
 
+    // Operator-supplied certificates are checked before anything starts: a
+    // wrong path or a key that does not match stops startup here instead of
+    // leaving the hostnames to fail their handshakes.
+    let manual_certs = manual_certs::load_all(&config.proxy.https.tls.certificates)?;
+    let manual_names: Vec<String> = manual_certs
+        .iter()
+        .flat_map(|cert| cert.names.clone())
+        .collect();
+
     // Create empty storage - providers will populate it
     let storage = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
     let storage_proxy = Arc::clone(&storage);
@@ -186,6 +196,21 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     // Create bounded channels to prevent memory exhaustion
     let (reload_tx, reload_rx) = mpsc::channel(64);
     let (cert_tx, cert_rx) = mpsc::channel(64);
+
+    let cert_tx_manual = cert_tx.clone();
+    tokio::spawn(async move {
+        for cert in manual_certs {
+            if cert_tx_manual.send(cert.to_command()).await.is_err() {
+                error!("Failed to send certificate {} to the proxy", cert.cert_file);
+                break;
+            }
+            info!(
+                "Loaded certificate {} for {}",
+                cert.cert_file,
+                cert.names.join(", ")
+            );
+        }
+    });
     let (metrics_poll_tx, metrics_poll_rx) = mpsc::channel::<()>(8);
 
     // Snapshot of the latest metrics polled from Sōzu workers, shared with
@@ -406,6 +431,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                     storage_acme,
                     cert_tx,
                     Arc::clone(&acme_notify),
+                    manual_names,
                 );
 
                 if let Err(e) = manager.run().await {
