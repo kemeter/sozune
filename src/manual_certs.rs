@@ -49,7 +49,7 @@ pub fn load_all(entries: &[CertificateFile]) -> anyhow::Result<Vec<ManualCertifi
     entries.iter().map(load).collect()
 }
 
-fn load(entry: &CertificateFile) -> anyhow::Result<ManualCertificate> {
+pub fn load(entry: &CertificateFile) -> anyhow::Result<ManualCertificate> {
     let cert_chain_pem = read(&entry.cert_file, "cert_file")?;
     let key_pem = read(&entry.key_file, "key_file")?;
 

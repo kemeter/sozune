@@ -456,6 +456,7 @@ mod tests {
             config: Arc::new(crate::config::AppConfig::default()),
             plugins: Arc::new(crate::middleware::PluginRegistry::new()),
             live_routes: Arc::new(RwLock::new(BTreeMap::new())),
+            file_certificates: Arc::new(Vec::new()),
         }
     }
 

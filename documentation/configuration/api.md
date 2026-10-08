@@ -236,7 +236,7 @@ The list always contains every known provider, even when not configured, so the 
 
 ### `GET /certificates`
 
-Lists the TLS certificates sōzune has on disk under `acme.certs_dir`, with the identity and expiry of each. Returns an empty list when ACME isn't configured (there is no cert store to scan). **Admin only.**
+Lists the TLS certificates sōzune serves, with the identity and expiry of each: those ACME stored under `acme.certs_dir` when ACME is enabled, and those [loaded from files](/documentation/tls/overview#certificates-from-files). An ACME certificate for a hostname a file certificate covers is left out, since it is not served. **Admin only.**
 
 ```bash
 curl -u admin:your-password http://localhost:3035/certificates
@@ -253,19 +253,25 @@ curl -u admin:your-password http://localhost:3035/certificates
       "not_after": 1757776000,
       "total_days": 90,
       "remaining_days": 47,
-      "status": "valid"
+      "status": "valid",
+      "source": "acme",
+      "file": null,
+      "file_replaced": false
     }
   ]
 }
 ```
 
-- `hostname`: the host the certificate is stored under (wildcards are restored from the on-disk directory name, e.g. `*.example.com`)
+- `hostname`: for ACME, the host the certificate is stored under (wildcards are restored from the on-disk directory name, e.g. `*.example.com`); for a file, the first name the certificate carries
 - `subject_cn`: the certificate's subject Common Name, or `null` if it has none
 - `sans`: the `dNSName` entries from the Subject Alternative Name extension
 - `not_before` / `not_after`: validity window as Unix epoch seconds
 - `total_days`: the certificate's full lifetime in whole days
 - `remaining_days`: whole days until expiry; negative once expired
 - `status`: lifecycle bucket — `valid`, `expiring`, or `expired`
+- `source`: `acme`, or `file` for a certificate from `proxy.https.tls.certificates`
+- `file`: the `cert_file` of a certificate from a file, `null` otherwise
+- `file_replaced`: `true` when `cert_file` no longer holds the certificate being served — renewed by certbot, or missing. Files are read at startup only: check them with `sozune doctor` first, since a missing or broken file stops startup, then restart sōzune to serve the new one
 
 The `status` is derived from the same lifetime-ratio rule that drives ACME renewal: a certificate is `expiring` once its remaining lifetime drops below one third of its total lifetime (capped at 30 days), so short-lived certificates (7-day, 45-day profiles) aren't flagged the moment they're issued, and the dashboard badge never disagrees with when sōzune actually renews.
 

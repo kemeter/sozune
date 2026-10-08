@@ -185,6 +185,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         .iter()
         .flat_map(|cert| cert.names.clone())
         .collect();
+    let file_certificates = Arc::new(manual_certs.clone());
 
     // Create empty storage - providers will populate it
     let storage = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
@@ -330,6 +331,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         config: Arc::new(config.clone()),
         plugins: api_plugins,
         live_routes,
+        file_certificates,
     };
     // Dedicated `/metrics` listener — independent of the API, so metrics can be
     // scraped without enabling/exposing the admin API. Reuses the same state and

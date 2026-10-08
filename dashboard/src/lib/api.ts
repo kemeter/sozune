@@ -178,7 +178,8 @@ export interface ProvidersResponse {
 export type CertStatus = 'valid' | 'expiring' | 'expired';
 
 export interface Certificate {
-  /** Hostname recovered from the cert store directory (wildcards restored). */
+  /** Hostname: the cert store directory for ACME (wildcards restored), the
+   *  first name of the certificate for a file. */
   hostname: string;
   /** Subject Common Name, if the certificate carries one. */
   subject_cn: string | null;
@@ -194,6 +195,13 @@ export interface Certificate {
   remaining_days: number;
   /** Lifecycle bucket derived from the lifetime ratio. */
   status: CertStatus;
+  /** Issued by ACME, or loaded from `proxy.https.tls.certificates`. */
+  source: 'acme' | 'file';
+  /** The `cert_file` of a certificate loaded from a file. */
+  file: string | null;
+  /** The file on disk no longer holds the served certificate: restart to
+   *  serve the new one. */
+  file_replaced: boolean;
 }
 
 export interface CertificatesResponse {

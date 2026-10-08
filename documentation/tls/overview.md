@@ -79,6 +79,8 @@ Every file is checked at startup. A path that cannot be read, a key that does no
 
 **Read once, at startup.** Sōzune neither renews these certificates nor watches the files: restart it after replacing them. [Certbot](/documentation/tls/certbot) walks through the whole setup, renewal included.
 
+The dashboard's Certificates page and [`GET /certificates`](/documentation/configuration/api#get-certificates) list these certificates with their expiry, and flag one whose file on disk has been replaced since startup. [`sozune doctor`](/documentation/advanced/debugging) checks each file and warns when a certificate is close to expiry.
+
 **Docker.** Certbot's `live/` directory holds symlinks into `archive/`, so mount the whole `/etc/letsencrypt`, not `live/` alone. The files are readable by root only by default.
 
 ## HTTPS redirect
