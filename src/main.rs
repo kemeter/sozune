@@ -229,6 +229,18 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     // proxy challenge port and for the API's `acme_enabled` flag below.
     let active_acme = config.acme.as_ref().filter(|a| a.enabled);
     let acme_enabled = active_acme.is_some();
+    // Not fatal: only the certificates ordered through a broken resolver
+    // fail, and they would retry with backoff. Said once, here, rather than
+    // discovered at each order.
+    for (name, e) in active_acme
+        .map(acme::resolver::unusable_resolvers)
+        .unwrap_or_default()
+    {
+        error!(
+            "ACME resolver `{}` cannot be used, certificates ordered through it will fail: {:#}",
+            name, e
+        );
+    }
     let acme_challenge_port = active_acme.map(|a| a.challenge_port);
     // The HTTPS listener only switches to the ALPN-aware gate when a
     // tls-alpn-01 resolver is actually configured — otherwise 443 stays a

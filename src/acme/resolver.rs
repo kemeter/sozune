@@ -40,6 +40,25 @@ pub fn build_resolver(name: Option<&str>, acme: &AcmeConfig) -> anyhow::Result<O
     }
 }
 
+/// Build every DNS-01 resolver once, and return those that cannot be built,
+/// sorted by name. A resolver is otherwise only built when a certificate is
+/// ordered through it: a missing env var or an invalid field would then fail
+/// each order in turn, long after startup. Building opens no connection.
+pub fn unusable_resolvers(acme: &AcmeConfig) -> Vec<(String, anyhow::Error)> {
+    let mut unusable: Vec<(String, anyhow::Error)> = acme
+        .resolvers
+        .iter()
+        .filter_map(|(name, cfg)| match cfg {
+            ResolverConfig::Dns01 { provider, .. } => {
+                build_provider(provider).err().map(|e| (name.clone(), e))
+            }
+            ResolverConfig::Http01 { .. } | ResolverConfig::TlsAlpn01 { .. } => None,
+        })
+        .collect();
+    unusable.sort_by(|a, b| a.0.cmp(&b.0));
+    unusable
+}
+
 fn build_provider(cfg: &ProviderConfig) -> anyhow::Result<Box<dyn DnsProvider>> {
     match cfg {
         ProviderConfig::Cloudflare { api_token_env } => {
@@ -208,6 +227,40 @@ mod tests {
             tls_alpn_port: 3038,
             resolvers: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn unusable_resolvers_names_each_broken_dns01_resolver() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[("TEST_DNS_TOKEN", "token")]);
+        let mut acme = empty_acme();
+        for (name, yaml) in [
+            ("good", "type: desec\ntoken_env: TEST_DNS_TOKEN"),
+            ("no-env", "type: hetzner\napi_token_env: TEST_DNS_UNSET_VAR"),
+            (
+                "bad-endpoint",
+                "type: ovh\nendpoint: ovh-asia\napplication_key_env: TEST_DNS_TOKEN\napplication_secret_env: TEST_DNS_TOKEN\nconsumer_key_env: TEST_DNS_TOKEN",
+            ),
+        ] {
+            acme.resolvers.insert(
+                name.to_string(),
+                ResolverConfig::Dns01 {
+                    provider: serde_yaml::from_str(yaml).unwrap(),
+                    domains: vec![],
+                    ca_server: None,
+                },
+            );
+        }
+        acme.resolvers.insert(
+            "http".to_string(),
+            ResolverConfig::Http01 { ca_server: None },
+        );
+
+        let unusable = unusable_resolvers(&acme);
+
+        let names: Vec<&str> = unusable.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["bad-endpoint", "no-env"]);
+        assert!(unusable[1].1.to_string().contains("TEST_DNS_UNSET_VAR"));
     }
 
     #[test]

@@ -123,6 +123,8 @@ acme:
 
 The server must accept TXT updates under the zone for that key (`update-policy` on BIND). Without `zone`, the zone is found with an SOA lookup through the system resolver, which cannot see a private or split-horizon zone: set `zone` for those.
 
+**Checked at startup.** Each DNS-01 resolver is built once when Sōzune starts. One whose env var is not set or whose fields are invalid (an unknown OVH `endpoint`, a bad `tsig_algorithm`…) is logged as an error naming the problem; Sōzune still starts, and only the certificates ordered through that resolver fail. [`sozune doctor`](/documentation/advanced/debugging) runs the same check.
+
 **Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
 
 **Wildcard on an HTTP-01 resolver:** the order will fail loudly with `wildcard hostname requires a DNS-01 resolver`. Wildcards always need DNS-01.
