@@ -48,6 +48,7 @@ All notable changes to this project will be documented in this file.
 
 - `POST /routes/resolve` — which route serves a request, and why, without sending it. Given a URL (plus method, headers and client address if they matter), it returns the route Sōzu picks, why each other route on the host loses (`shadowed` by a higher priority, `rejected` by its path, method or TLS setting, `refused` by Sōzu), what the route's middlewares decide (IP allow-list and match conditions are evaluated; rate limit, in-flight and forward auth are reported as applying), and the health of its backends. The answer comes from Sōzu's own router fed the frontends the workers hold, so it cannot drift from what the proxy does. Open to the `read-only` role. See [API docs](documentation/configuration/api.md#post-routesresolve).
 - `GET /config` also returns the TCP and UDP listeners, the TLS options of the HTTPS listener and the Ring provider. Read-only users could already read it; the documentation said admin only.
+- `GET /config` lists the env vars a DNS-01 resolver reads under the names the config gives them. It used to show made-up defaults such as `CLOUDFLARE_API_TOKEN (configurable)`, which these fields do not have.
 
 ### Dashboard
 

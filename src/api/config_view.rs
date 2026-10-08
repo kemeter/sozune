@@ -101,7 +101,9 @@ pub enum ResolverView {
     },
     Dns01 {
         provider: &'static str,
-        required_env: Vec<&'static str>,
+        /// The env vars the resolver reads its credentials from, as named
+        /// in the config. Their values never travel.
+        required_env: Vec<String>,
         domains: Vec<String>,
         ca_server: Option<String>,
     },
@@ -275,31 +277,38 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
             domains,
             ca_server,
         } => {
-            let (name, required_env) = match provider {
-                Cloudflare { .. } => ("cloudflare", vec!["CLOUDFLARE_API_TOKEN (configurable)"]),
-                Ovh { .. } => (
+            let (name, required_env): (&'static str, Vec<&String>) = match provider {
+                Cloudflare { api_token_env } => ("cloudflare", vec![api_token_env]),
+                Ovh {
+                    application_key_env,
+                    application_secret_env,
+                    consumer_key_env,
+                    ..
+                } => (
                     "ovh",
                     vec![
-                        "OVH_APPLICATION_KEY (configurable)",
-                        "OVH_APPLICATION_SECRET (configurable)",
-                        "OVH_CONSUMER_KEY (configurable)",
+                        application_key_env,
+                        application_secret_env,
+                        consumer_key_env,
                     ],
                 ),
-                Gandi { .. } => ("gandi", vec!["GANDI_PAT (configurable)"]),
-                Scaleway { .. } => ("scaleway", vec!["SCALEWAY_SECRET (configurable)"]),
-                Desec { .. } => ("desec", vec!["DESEC_TOKEN (configurable)"]),
-                DigitalOcean { .. } => ("digitalocean", vec!["DIGITALOCEAN_TOKEN (configurable)"]),
-                Hetzner { .. } => ("hetzner", vec!["HETZNER_API_TOKEN (configurable)"]),
-                Infomaniak { .. } => ("infomaniak", vec!["INFOMANIAK_ACCESS_TOKEN (configurable)"]),
-                Porkbun { .. } => (
-                    "porkbun",
-                    vec![
-                        "PORKBUN_API_KEY (configurable)",
-                        "PORKBUN_SECRET_API_KEY (configurable)",
-                    ],
-                ),
-                Rfc2136 { .. } => ("rfc2136", vec!["RFC2136_TSIG_SECRET (configurable)"]),
+                Gandi {
+                    personal_access_token_env,
+                } => ("gandi", vec![personal_access_token_env]),
+                Scaleway { secret_key_env } => ("scaleway", vec![secret_key_env]),
+                Desec { token_env } => ("desec", vec![token_env]),
+                DigitalOcean { token_env } => ("digitalocean", vec![token_env]),
+                Hetzner { api_token_env } => ("hetzner", vec![api_token_env]),
+                Infomaniak { access_token_env } => ("infomaniak", vec![access_token_env]),
+                Porkbun {
+                    api_key_env,
+                    secret_api_key_env,
+                } => ("porkbun", vec![api_key_env, secret_api_key_env]),
+                Rfc2136 {
+                    tsig_secret_env, ..
+                } => ("rfc2136", vec![tsig_secret_env]),
             };
+            let required_env = required_env.into_iter().cloned().collect();
             ResolverView::Dns01 {
                 provider: name,
                 required_env,
@@ -521,6 +530,30 @@ mod tests {
         assert_eq!(view.tls.certificates, vec!["/certs/fullchain.pem"]);
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("privkey.pem"));
+    }
+
+    #[test]
+    fn resolver_view_names_the_configured_env_vars() {
+        let resolver = ResolverConfig::Dns01 {
+            provider: ProviderConfig::Porkbun {
+                api_key_env: "PB_KEY".into(),
+                secret_api_key_env: "PB_SECRET".into(),
+            },
+            domains: vec![],
+            ca_server: None,
+        };
+
+        match resolver_view(&resolver) {
+            ResolverView::Dns01 {
+                provider,
+                required_env,
+                ..
+            } => {
+                assert_eq!(provider, "porkbun");
+                assert_eq!(required_env, vec!["PB_KEY", "PB_SECRET"]);
+            }
+            other => panic!("expected a DNS-01 view, got {other:?}"),
+        }
     }
 
     #[test]

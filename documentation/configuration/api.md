@@ -309,7 +309,7 @@ Sample response:
     "challenge_port": 8080,
     "resolvers": {
       "le-prod": { "challenge": "http-01" },
-      "le-cf":   { "challenge": "dns-01", "provider": "cloudflare", "required_env": ["CLOUDFLARE_API_TOKEN (configurable)"] }
+      "le-cf":   { "challenge": "dns-01", "provider": "cloudflare", "required_env": ["CF_DNS_API_TOKEN"] }
     }
   },
   "providers": {
@@ -332,7 +332,7 @@ Sample response:
 
 **Never exposed:**
 - `api.users` — neither the names nor the password hashes. Even hashed credentials enable offline brute-force attacks.
-- DNS-01 resolver secrets — only the *names* of the env vars referenced by ACME resolvers travel; their values stay on the process.
+- DNS-01 resolver secrets — only the *names* of the env vars referenced by ACME resolvers travel (`required_env`, as configured); their values stay on the process.
 - HTTP provider credentials — the URL's user name, password and query string are replaced by `***`, and `auth_value` is left out.
 - Private key paths of the TLS certificate files — only the certificate file is listed.
 
