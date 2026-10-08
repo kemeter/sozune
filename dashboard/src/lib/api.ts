@@ -224,12 +224,31 @@ export function health(): Promise<unknown> {
   return request<unknown>('/health');
 }
 
-/** Read-only snapshot of the running config (auth-protected, admin only).
+/** Read-only snapshot of the running config (auth-protected).
  *  Mirrors `ConfigView` on the server: listener ports, ACME, providers,
  *  dashboard listener, API listener. No user list. */
 export interface ConfigView {
   version: string;
-  listeners: { http: { port: number }; https: { port: number } };
+  listeners: {
+    http: { port: number };
+    https: { port: number };
+    tcp: {
+      name: string;
+      port: number;
+      ip_allow_list: string[];
+      rate_limit: { max_conns: number; per_seconds: number; exempt: string[] } | null;
+      idle_timeout: number | null;
+    }[];
+    udp: { name: string; port: number }[];
+  };
+  /** HTTPS listener TLS settings; `null` means Sōzu's default applies. */
+  tls: {
+    min_version: string | null;
+    max_version: string | null;
+    ciphers: string[] | null;
+    /** Certificate files supplied outside ACME. */
+    certificates: string[];
+  };
   acme: {
     enabled: boolean;
     email: string;
@@ -244,6 +263,7 @@ export interface ConfigView {
     kubernetes?: { enabled: boolean } | null;
     nomad?: { enabled: boolean } | null;
     consul?: { enabled: boolean } | null;
+    ring?: { enabled: boolean } | null;
     config_file?: { enabled: boolean; path: string; watch: boolean } | null;
     http?: { enabled: boolean; url: string; poll_interval: number } | null;
   };

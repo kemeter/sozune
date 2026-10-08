@@ -46,10 +46,11 @@ All notable changes to this project will be documented in this file.
 ### API
 
 - `POST /routes/resolve` — which route serves a request, and why, without sending it. Given a URL (plus method, headers and client address if they matter), it returns the route Sōzu picks, why each other route on the host loses (`shadowed` by a higher priority, `rejected` by its path, method or TLS setting, `refused` by Sōzu), what the route's middlewares decide (IP allow-list and match conditions are evaluated; rate limit, in-flight and forward auth are reported as applying), and the health of its backends. The answer comes from Sōzu's own router fed the frontends the workers hold, so it cannot drift from what the proxy does. Open to the `read-only` role. See [API docs](documentation/configuration/api.md#post-routesresolve).
+- `GET /config` also returns the TCP and UDP listeners, the TLS options of the HTTPS listener and the Ring provider. Read-only users could already read it; the documentation said admin only.
 
 ### Dashboard
 
-- Config page — the configuration the running instance loaded (listeners, API, dashboard, ACME and its resolvers, providers), from `GET /config`, with secrets masked. The page was documented but missing.
+- Config page — the configuration the running instance loaded (HTTP, HTTPS, TCP and UDP listeners, TLS options, API, dashboard, ACME and its resolvers, providers), from `GET /config`, with secrets masked. The page was documented but missing.
 - The diagnostics popover on the entrypoints list can be focused and closed with Escape.
 - The sidebar shows the version of the running instance, from `GET /config`, instead of a hardcoded `v0.13.0`.
 - The diagnostics badge in the sidebar updates after signing in; it used to wait for a page reload.
@@ -69,6 +70,7 @@ All notable changes to this project will be documented in this file.
 - Two routes on one hostname with different paths (e.g. `/api` and `/`) shared the middleware stack of whichever was stored last, so a rate limit, IP allow-list or forward auth on the other route could be skipped. Each request now runs the middleware of the route it matched: exact paths first, then the longest prefix, regex paths as declared.
 - The rate limiter keyed clients on `X-Forwarded-For` whatever sent it. It now trusts the header only from a trusted proxy, like the IP allow-list, and its per-client map is bounded.
 - Middlewares that act on the client address (`ipAllowList`, `matchClientIP`, `rateLimit`, `inFlightReq`) saw every client as `127.0.0.1`, the address Sōzu reaches them from. An allow-list naming `127.0.0.1` let every client in, any other allow-list refused them all, and all clients of a route shared one rate-limit bucket. They now see the address that connected to Sōzune, with `trusted_proxies` applied as documented.
+- `GET /config` returned the HTTP provider URL as configured, credentials included. Its user name, password and query string are now masked.
 
 ### Reliability
 
