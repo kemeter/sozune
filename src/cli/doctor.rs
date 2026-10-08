@@ -437,6 +437,7 @@ fn check_acme(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
     }
 
     check_certs_dir(&acme.certs_dir, results);
+    check_resolvers(acme, results);
 
     if acme.staging {
         results.push(
@@ -494,6 +495,30 @@ fn check_file_certificates(cfg: &AppConfig, running: bool, results: &mut Vec<Che
             "tls",
             "the running sozune serves these files as they were at its startup: restart it after a renewal (the dashboard's Certificates page flags a replaced file)",
         ));
+    }
+}
+
+/// A DNS-01 resolver reads its credentials from env vars and is built only
+/// when a certificate is ordered through it. Doctor builds each one, in the
+/// environment it runs in: run it with the env sozune gets.
+fn check_resolvers(acme: &crate::config::AcmeConfig, results: &mut Vec<CheckResult>) {
+    let unusable = crate::acme::resolver::unusable_resolvers(acme);
+    let mut names: Vec<&String> = acme
+        .resolvers
+        .iter()
+        .filter(|(_, r)| matches!(r, crate::config::ResolverConfig::Dns01 { .. }))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    for name in names {
+        let title = format!("ACME resolver `{name}`");
+        match unusable.iter().find(|(n, _)| n == name) {
+            Some((_, e)) => results.push(
+                CheckResult::fail("acme", title, format!("{e:#}"))
+                    .with_fix("certificates ordered through it fail until this is fixed"),
+            ),
+            None => results.push(CheckResult::ok("acme", title)),
+        }
     }
 }
 
@@ -939,6 +964,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config_with_certificate(dir.path(), 90, -1);
         assert!(matches!(file_certificate_status(&cfg), Status::Fail));
+    }
+
+    #[test]
+    fn dns01_resolver_without_its_env_var_fails() {
+        let mut acme = crate::config::AcmeConfig {
+            enabled: true,
+            email: String::new(),
+            certs_dir: String::new(),
+            staging: false,
+            challenge_port: 80,
+            tls_alpn_port: 3038,
+            resolvers: Default::default(),
+        };
+        acme.resolvers.insert(
+            "cf".to_string(),
+            crate::config::ResolverConfig::Dns01 {
+                provider: crate::config::ProviderConfig::Cloudflare {
+                    api_token_env: "SOZUNE_DOCTOR_TEST_UNSET_TOKEN".to_string(),
+                },
+                domains: vec![],
+                ca_server: None,
+            },
+        );
+        acme.resolvers.insert(
+            "http".to_string(),
+            crate::config::ResolverConfig::Http01 { ca_server: None },
+        );
+
+        let mut results = Vec::new();
+        check_resolvers(&acme, &mut results);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Fail);
+        assert!(
+            results[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("SOZUNE_DOCTOR_TEST_UNSET_TOKEN")
+        );
     }
 
     #[test]
