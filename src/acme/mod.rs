@@ -26,7 +26,7 @@ use self::tls_alpn_responder::TlsAlpnResponder;
 /// the ratio adapts to short-lived certs, and this floor stops a long-lived cert
 /// from being reissued months ahead of time. Set to 30 so the common 90-day
 /// Let's Encrypt profile keeps renewing at the 30-days-left mark.
-const RENEWAL_FLOOR_DAYS: u32 = 30;
+pub(crate) const RENEWAL_FLOOR_DAYS: u32 = 30;
 
 /// Per-hostname backoff schedule applied after a failed provisioning attempt,
 /// indexed by the count of consecutive failures (1st failure -> 60s, etc.).

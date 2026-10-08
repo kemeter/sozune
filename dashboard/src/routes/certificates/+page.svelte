@@ -121,10 +121,10 @@
     <tbody>
       {#if !loading && certs.length === 0}
         <tr>
-          <td colspan="4" class="empty">No certificates on disk.</td>
+          <td colspan="4" class="empty">No certificates.</td>
         </tr>
       {/if}
-      {#each certs as cert (cert.hostname)}
+      {#each certs as cert}
         {@const sans = extraSans(cert)}
         <tr class="row-{cert.status}">
           <td>
@@ -140,6 +140,14 @@
                 + {sans.length} SAN{sans.length > 1 ? 's' : ''} ·
                 <span class="mono">{sans.join(', ')}</span>
               </div>
+            {/if}
+            {#if cert.source === 'file'}
+              <div class="san">from file · <span class="mono">{cert.file}</span></div>
+              {#if cert.file_replaced}
+                <div class="replaced">
+                  The file changed on disk since startup: check it with <code>sozune doctor</code>, then restart sōzune to serve it.
+                </div>
+              {/if}
             {/if}
           </td>
           <td>
@@ -319,6 +327,11 @@
   .san {
     font-size: 0.72rem;
     color: var(--fg-2);
+    margin-top: 2px;
+  }
+  .replaced {
+    font-size: 0.72rem;
+    color: var(--warning);
     margin-top: 2px;
   }
   .meta {

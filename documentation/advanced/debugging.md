@@ -101,6 +101,7 @@ It exits, with or without `--json`, `0` when a route serves the request (proxied
 - the config file parses;
 - every port sozune binds is free: HTTP, HTTPS, TCP and UDP listeners, the middleware port, the ACME challenge and TLS-ALPN-01 ports, and the API, dashboard and metrics listeners when enabled. Two listeners configured on the same port are reported as a conflict;
 - ACME has a contact email and its `certs_dir` is writable (or can be created);
+- each certificate under `proxy.https.tls.certificates` loads, and is not close to expiry;
 - each enabled provider is reachable: Docker, Podman and Swarm sockets, Nomad, Consul, Ring and HTTP endpoints, the Kubernetes kubeconfig or in-cluster credentials, the `config_file` path.
 
 ```bash

@@ -43,6 +43,9 @@ pub struct AppState {
     pub plugins: Arc<crate::middleware::PluginRegistry>,
     /// The routes installed in Sōzu by the last reload, for the route resolver.
     pub live_routes: crate::proxy::backend::LiveRoutes,
+    /// Certificates loaded from `proxy.https.tls.certificates` at startup —
+    /// what the HTTPS worker serves, which the files may no longer hold.
+    pub file_certificates: Arc<Vec<crate::manual_certs::ManualCertificate>>,
 }
 
 /// Build the JSON payload for an entrypoint, augmenting it with the
@@ -618,16 +621,17 @@ async fn list_providers(State(state): State<AppState>) -> (StatusCode, Json<serd
     )
 }
 
-/// List the certificates Sōzune has on disk, with their identity (CN/SAN),
-/// validity window, and lifecycle status. Reads `acme.certs_dir`; returns an
-/// empty list when ACME isn't configured (no cert store to scan).
+/// List the certificates Sōzune serves, with their identity (CN/SAN),
+/// validity window, lifecycle status and source: the ACME certificates under
+/// `acme.certs_dir` (when ACME is enabled) and those loaded from files.
 async fn list_certificates(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let certs = match state.config.acme.as_ref() {
-        Some(acme) => {
-            crate::acme::inventory::scan_certificates(std::path::Path::new(&acme.certs_dir)).await
-        }
-        None => Vec::new(),
-    };
+    let certs_dir = state
+        .config
+        .acme
+        .as_ref()
+        .filter(|acme| acme.enabled)
+        .map(|acme| std::path::Path::new(&acme.certs_dir));
+    let certs = crate::acme::inventory::list_served(certs_dir, &state.file_certificates).await;
 
     (
         StatusCode::OK,
@@ -945,6 +949,7 @@ mod tests {
             config: Arc::new(crate::config::AppConfig::default()),
             plugins: Arc::new(crate::middleware::PluginRegistry::new()),
             live_routes: Arc::new(RwLock::new(BTreeMap::new())),
+            file_certificates: Arc::new(Vec::new()),
         }
     }
 

@@ -1,16 +1,19 @@
-//! Read-only inventory of the certificates Sōzune has on disk.
+//! Read-only inventory of the certificates Sōzune serves.
 //!
 //! Walks `certs_dir` (the same layout [`super::AcmeManager`] writes: one
 //! `{path_safe(hostname)}/cert.pem` per host) and reports identity and expiry
 //! metadata for each certificate, so the API can list them without the proxy
-//! having to track certs in memory.
+//! having to track certs in memory. Certificates loaded from files
+//! (`proxy.https.tls.certificates`) are listed next to them, from the material
+//! read at startup.
 
 use std::path::Path;
 
 use serde::Serialize;
 use tracing::warn;
 
-use super::{RENEWAL_FLOOR_DAYS, hostname_from_path};
+use super::{RENEWAL_FLOOR_DAYS, hostname_from_path, split_pem_chain};
+use crate::manual_certs::{ManualCertificate, covered};
 
 /// Lifecycle bucket for a certificate, mirroring the renewal decision so the
 /// dashboard's "expiring soon" badge and the ACME renewal trigger never
@@ -26,7 +29,17 @@ pub enum CertStatus {
     Expired,
 }
 
-/// One certificate on disk, with the metadata the API surfaces.
+/// Where a certificate comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CertSource {
+    /// Issued by ACME and stored under `certs_dir`.
+    Acme,
+    /// Supplied by the operator under `proxy.https.tls.certificates`.
+    File,
+}
+
+/// One certificate, with the metadata the API surfaces.
 ///
 /// `subject_cn` and `sans` come straight from the leaf certificate, so they
 /// reflect what the cert actually covers rather than the directory name.
@@ -49,6 +62,13 @@ pub struct CertificateInfo {
     pub remaining_days: i64,
     /// Lifecycle bucket derived from the lifetime ratio.
     pub status: CertStatus,
+    pub source: CertSource,
+    /// The `cert_file` of a certificate loaded from a file.
+    pub file: Option<String>,
+    /// The `cert_file` on disk no longer holds the certificate being served
+    /// — typically renewed by certbot. Files are read at startup only, so the
+    /// new one is served after a restart.
+    pub file_replaced: bool,
 }
 
 /// Scan `certs_dir` and return one [`CertificateInfo`] per readable
@@ -83,8 +103,9 @@ pub async fn scan_certificates(certs_dir: &Path) -> Vec<CertificateInfo> {
             None => continue,
         };
 
+        // Without its key the manager does not load it: nothing serves it.
         let cert_path = path.join("cert.pem");
-        if !cert_path.exists() {
+        if !cert_path.exists() || !path.join("key.pem").exists() {
             continue;
         }
 
@@ -96,7 +117,8 @@ pub async fn scan_certificates(certs_dir: &Path) -> Vec<CertificateInfo> {
             }
         };
 
-        if let Some(info) = certificate_info(&dir_name, &pem) {
+        let hostname = hostname_from_path(&dir_name);
+        if let Some(info) = certificate_info(hostname, &pem, CertSource::Acme) {
             certs.push(info);
         }
     }
@@ -105,18 +127,71 @@ pub async fn scan_certificates(certs_dir: &Path) -> Vec<CertificateInfo> {
     certs
 }
 
-/// Build a [`CertificateInfo`] from a storage directory name and its leaf PEM.
-/// Returns `None` (with a warning) if the PEM can't be parsed.
-fn certificate_info(dir_name: &str, pem: &str) -> Option<CertificateInfo> {
+/// List what the HTTPS worker serves: the certificates loaded from files at
+/// startup, and the ACME certificates under `certs_dir` (`None` when ACME is
+/// off)
+/// minus those a file certificate covers — ACME does not load those, so
+/// listing them would show a certificate nobody is served.
+pub async fn list_served(
+    certs_dir: Option<&Path>,
+    files: &[ManualCertificate],
+) -> Vec<CertificateInfo> {
+    let manual_names: Vec<String> = files.iter().flat_map(|c| c.names.clone()).collect();
+    let mut certs = match certs_dir {
+        Some(dir) => scan_certificates(dir).await,
+        None => Vec::new(),
+    };
+    certs.retain(|c| !covered(&manual_names, &c.hostname));
+
+    for file in files {
+        let Some(mut info) =
+            certificate_info(file.names[0].clone(), &file.cert_pem, CertSource::File)
+        else {
+            continue;
+        };
+        info.file = Some(file.cert_file.clone());
+        info.file_replaced = file_replaced(file).await;
+        certs.push(info);
+    }
+
+    certs.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    certs
+}
+
+/// Whether `cert_file` now holds another chain than the one being served —
+/// a new leaf, or the same leaf with other intermediates. An unreadable file
+/// counts as replaced: what is served is no longer on disk.
+async fn file_replaced(file: &ManualCertificate) -> bool {
+    let Ok(pem) = tokio::fs::read_to_string(&file.cert_file).await else {
+        return true;
+    };
+    let (leaf, chain) = split_pem_chain(&pem);
+    let trimmed = |pems: &[String]| {
+        pems.iter()
+            .map(|p| p.trim().to_string())
+            .collect::<Vec<_>>()
+    };
+    leaf.trim() != file.cert_pem.trim() || trimmed(&chain) != trimmed(&file.chain)
+}
+
+/// Build a [`CertificateInfo`] for `hostname` from its leaf PEM. Returns
+/// `None` (with a warning) if the PEM can't be parsed.
+fn certificate_info(hostname: String, pem: &str, source: CertSource) -> Option<CertificateInfo> {
     let life = match cheti::cert_lifetime(pem) {
         Ok(life) => life,
         Err(e) => {
-            warn!("Skipping unparseable certificate for {}: {}", dir_name, e);
+            warn!("Skipping unparseable certificate for {}: {}", hostname, e);
             return None;
         }
     };
 
-    let status = if life.remaining_days < 0 {
+    // Exact timestamps: `remaining_days` is truncated to whole days, so it
+    // still reads 0 for a certificate that expired hours ago.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let status = if life.not_after < now {
         CertStatus::Expired
     } else if cheti::needs_renewal_ratio(pem, RENEWAL_FLOOR_DAYS) {
         CertStatus::Expiring
@@ -125,7 +200,7 @@ fn certificate_info(dir_name: &str, pem: &str) -> Option<CertificateInfo> {
     };
 
     Some(CertificateInfo {
-        hostname: hostname_from_path(dir_name),
+        hostname,
         subject_cn: life.subject_cn,
         sans: life.sans,
         not_before: life.not_before,
@@ -133,6 +208,9 @@ fn certificate_info(dir_name: &str, pem: &str) -> Option<CertificateInfo> {
         total_days: life.total_days,
         remaining_days: life.remaining_days,
         status,
+        source,
+        file: None,
+        file_replaced: false,
     })
 }
 
@@ -173,6 +251,7 @@ mod tests {
         let host_dir: PathBuf = dir.join(cert_subdir);
         std::fs::create_dir_all(&host_dir).unwrap();
         std::fs::write(host_dir.join("cert.pem"), cert.pem()).unwrap();
+        std::fs::write(host_dir.join("key.pem"), key.serialize_pem()).unwrap();
     }
 
     #[tokio::test]
@@ -288,6 +367,134 @@ mod tests {
         assert_eq!(certs[0].hostname, "*.example.com");
     }
 
+    fn file_certificate(dir: &std::path::Path, names: &[&str]) -> ManualCertificate {
+        let key = KeyPair::generate().unwrap();
+        let params =
+            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        let pem = params.self_signed(&key).unwrap().pem();
+        let cert_file = dir.join("fullchain.pem");
+        std::fs::write(&cert_file, &pem).unwrap();
+        ManualCertificate {
+            cert_file: cert_file.to_string_lossy().into_owned(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            cert_pem: pem,
+            chain: vec![],
+            key_pem: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_certificates_are_listed_with_their_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = file_certificate(tmp.path(), &["*.example.com", "example.com"]);
+
+        let certs = list_served(None, std::slice::from_ref(&file)).await;
+
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].hostname, "*.example.com");
+        assert_eq!(certs[0].source, CertSource::File);
+        assert_eq!(certs[0].file.as_deref(), Some(file.cert_file.as_str()));
+        assert!(!certs[0].file_replaced);
+    }
+
+    #[tokio::test]
+    async fn acme_certificates_a_file_covers_are_not_listed() {
+        let acme_dir = tempfile::tempdir().unwrap();
+        write_cert(
+            acme_dir.path(),
+            "app.example.com",
+            "app.example.com",
+            &["app.example.com"],
+            90,
+            60,
+        );
+        write_cert(
+            acme_dir.path(),
+            "other.org",
+            "other.org",
+            &["other.org"],
+            90,
+            60,
+        );
+        let files_dir = tempfile::tempdir().unwrap();
+        let file = file_certificate(files_dir.path(), &["*.example.com"]);
+
+        let certs = list_served(Some(acme_dir.path()), &[file]).await;
+
+        let listed: Vec<_> = certs
+            .iter()
+            .map(|c| (c.hostname.as_str(), c.source))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("*.example.com", CertSource::File),
+                ("other.org", CertSource::Acme)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_renewed_on_disk_is_flagged_as_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let served = file_certificate(tmp.path(), &["example.com"]);
+        // certbot renews: same path, new certificate.
+        file_certificate(tmp.path(), &["example.com"]);
+
+        let certs = list_served(None, &[served]).await;
+
+        assert!(certs[0].file_replaced);
+    }
+
+    #[tokio::test]
+    async fn same_leaf_with_another_chain_is_flagged_as_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let served = file_certificate(tmp.path(), &["example.com"]);
+        let intermediate_dir = tempfile::tempdir().unwrap();
+        let intermediate = file_certificate(intermediate_dir.path(), &["ca.example"]);
+        std::fs::write(
+            &served.cert_file,
+            format!("{}{}", served.cert_pem, intermediate.cert_pem),
+        )
+        .unwrap();
+
+        let certs = list_served(None, &[served]).await;
+
+        assert!(certs[0].file_replaced);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_without_its_key_is_not_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cert(tmp.path(), "a.example", "a.example", &["a.example"], 90, 60);
+        std::fs::remove_file(tmp.path().join("a.example/key.pem")).unwrap();
+
+        assert!(scan_certificates(tmp.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_certificate_expired_hours_ago_is_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["late.example".to_string()]).unwrap();
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::days(90);
+        params.not_after = now - Duration::hours(2);
+        let dir = tmp.path().join("late.example");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cert.pem"),
+            params.self_signed(&key).unwrap().pem(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("key.pem"), key.serialize_pem()).unwrap();
+
+        let certs = scan_certificates(tmp.path()).await;
+
+        assert_eq!(certs[0].status, CertStatus::Expired);
+    }
+
     #[tokio::test]
     async fn unparseable_cert_is_skipped_not_fatal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -303,6 +510,7 @@ mod tests {
         let bad = tmp.path().join("bad.example");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("cert.pem"), "not a certificate").unwrap();
+        std::fs::write(bad.join("key.pem"), "key").unwrap();
 
         let certs = scan_certificates(tmp.path()).await;
         // The bad one is dropped; the good one still lists.

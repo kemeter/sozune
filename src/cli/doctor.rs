@@ -79,7 +79,8 @@ pub async fn run(args: DoctorArgs, config_path: &str) -> i32 {
     // a running instance holds every one of them.
     let listeners = collect_listeners(&config, &mut results);
     check_port_conflicts(&listeners, &mut results);
-    if sozune_is_running(&config).await {
+    let running = sozune_is_running(&config).await;
+    if running {
         results.push(CheckResult::ok(
             "instance",
             "sozune is running (the API answered /health), bind checks skipped",
@@ -90,8 +91,9 @@ pub async fn run(args: DoctorArgs, config_path: &str) -> i32 {
         }
     }
 
-    // 3. ACME
+    // 3. TLS: ACME, and the certificates loaded from files
     check_acme(&config, &mut results);
+    check_file_certificates(&config, running, &mut results);
 
     // 4. Providers (network checks, skipped in --offline)
     if !args.offline {
@@ -445,6 +447,53 @@ fn check_acme(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
             )
             .with_fix("set `acme.staging=false` for production"),
         );
+    }
+}
+
+/// Certificates from `proxy.https.tls.certificates` stop startup when they
+/// cannot be loaded, and are served until restart once loaded: a file renewed
+/// late, or never, expires in service with nothing else saying so.
+///
+/// Doctor reads the files, not what a running instance serves: that one kept
+/// the files as they were at its startup.
+fn check_file_certificates(cfg: &AppConfig, running: bool, results: &mut Vec<CheckResult>) {
+    let entries = &cfg.proxy.https.tls.certificates;
+    for entry in entries {
+        let title = format!("certificate file `{}`", entry.cert_file);
+        let cert = match crate::manual_certs::load(entry) {
+            Ok(cert) => cert,
+            Err(e) => {
+                results.push(CheckResult::fail("tls", title, format!("{e:#}")).with_fix(
+                    "fix the files in proxy.https.tls.certificates: sozune will not start",
+                ));
+                continue;
+            }
+        };
+        let remaining_days = cheti::cert_lifetime(&cert.cert_pem)
+            .map(|life| life.remaining_days)
+            .unwrap_or_default();
+        let names = cert.names.join(", ");
+        if cheti::needs_renewal_ratio(&cert.cert_pem, crate::acme::RENEWAL_FLOOR_DAYS) {
+            results.push(
+                CheckResult::warn(
+                    "tls",
+                    title,
+                    format!("{names}: expires in {remaining_days} days"),
+                )
+                .with_fix("renew it, then restart sozune: the files are read at startup only"),
+            );
+        } else {
+            results.push(CheckResult::ok(
+                "tls",
+                format!("{title} ({names}, {remaining_days} days left)"),
+            ));
+        }
+    }
+    if running && !entries.is_empty() {
+        results.push(CheckResult::ok(
+            "tls",
+            "the running sozune serves these files as they were at its startup: restart it after a renewal (the dashboard's Certificates page flags a replaced file)",
+        ));
     }
 }
 
@@ -829,6 +878,68 @@ fn exit_code(results: &[CheckResult]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_certificate(
+        dir: &std::path::Path,
+        lifetime_days: i64,
+        expires_in_days: i64,
+    ) -> AppConfig {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["example.com".to_string()]).unwrap();
+        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(expires_in_days);
+        params.not_after = not_after;
+        params.not_before = not_after - time::Duration::days(lifetime_days);
+        let cert = params.self_signed(&key).unwrap();
+        let cert_file = dir.join("fullchain.pem");
+        let key_file = dir.join("privkey.pem");
+        std::fs::write(&cert_file, cert.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.proxy.https.tls.certificates = vec![crate::config::CertificateFile {
+            cert_file: cert_file.to_string_lossy().into_owned(),
+            key_file: key_file.to_string_lossy().into_owned(),
+        }];
+        cfg
+    }
+
+    fn file_certificate_status(cfg: &AppConfig) -> Status {
+        let mut results = Vec::new();
+        check_file_certificates(cfg, false, &mut results);
+        assert_eq!(results.len(), 1);
+        results.remove(0).status
+    }
+
+    #[test]
+    fn running_instance_gets_a_restart_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with_certificate(dir.path(), 90, 80);
+        let mut results = Vec::new();
+        check_file_certificates(&cfg, true, &mut results);
+        assert_eq!(results.len(), 2);
+        assert!(results[1].title.contains("restart it after a renewal"));
+    }
+
+    #[test]
+    fn file_certificate_far_from_expiry_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with_certificate(dir.path(), 90, 80);
+        assert!(matches!(file_certificate_status(&cfg), Status::Ok));
+    }
+
+    #[test]
+    fn file_certificate_close_to_expiry_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with_certificate(dir.path(), 90, 10);
+        assert!(matches!(file_certificate_status(&cfg), Status::Warn));
+    }
+
+    #[test]
+    fn file_certificate_that_cannot_load_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with_certificate(dir.path(), 90, -1);
+        assert!(matches!(file_certificate_status(&cfg), Status::Fail));
+    }
 
     #[test]
     fn parse_listen_address_ipv4() {
