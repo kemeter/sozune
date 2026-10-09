@@ -13,7 +13,9 @@ labels:
 
 `backendTimeout=0` is **required** for any SSE endpoint. Without it, Sōzune cuts the connection after the default 30 s and your client reconnects on a loop without ever receiving the next event.
 
-See [Backend timeout](/documentation/middleware/backend-timeout) for the full semantics — `0` means *no timeout*, exactly what an idle SSE stream needs.
+See [Backend timeout](/documentation/middleware/backend-timeout) for the full semantics — `0` means *no timeout* on the route.
+
+The listener still closes a backend connection that sends nothing for 30 s ([`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy)). A stream that can stay quiet longer than that needs either a keep-alive comment from the backend (a `: ping` line every 15–20 s, which most SSE libraries can send) or a higher `backend_idle` and `client_idle`.
 
 ## How it works
 
