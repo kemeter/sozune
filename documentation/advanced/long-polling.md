@@ -10,13 +10,13 @@ This shows up in access logs as `H2::ResetFrame` or a 504 around the timeout bou
 
 ## The fix
 
-Raise `backendTimeout` past the longest poll your client will request, with a small safety margin:
+Raise `backendTimeout` (in milliseconds) past the longest poll your client will request, with a small safety margin:
 
 ```yaml
 labels:
   - "sozune.enable=true"
   - "sozune.http.app.host=app.example.com"
-  - "sozune.http.app.backendTimeout=60"
+  - "sozune.http.app.backendTimeout=60000"
 ```
 
 Or use the file provider if you can't add labels (e.g. existing containers you can't recreate):
@@ -35,16 +35,16 @@ entrypoints:
       tls: true
       strip_prefix: false
       priority: 0
-      backend_timeout: 60
+      backend_timeout: 60000
 ```
 
 You can also set `backendTimeout=0` (no timeout) if you don't want to think about it, but a finite cap is safer in production — a stuck backend won't pin a worker forever.
 
 ## Matrix / Synapse
 
-Matrix clients (Element, FluffyChat, etc.) call `GET /_matrix/client/v3/sync?timeout=30000` in a loop. Synapse holds the request for up to 30 s waiting for new events. With the default `backendTimeout=30`, the cut happens right around the same time the server is about to respond, so you get a continuous stream of resets and the user sees missed messages and reconnect spinners.
+Matrix clients (Element, FluffyChat, etc.) call `GET /_matrix/client/v3/sync?timeout=30000` in a loop. Synapse holds the request for up to 30 s waiting for new events. With the default 30 s backend timeout, the cut happens right around the same time the server is about to respond, so you get a continuous stream of resets and the user sees missed messages and reconnect spinners.
 
-Set `backendTimeout=60` (or `0`) on the Synapse entrypoint and the syncs land cleanly:
+Set `backendTimeout=60000` (60 s, or `0`) on the Synapse entrypoint and the syncs land cleanly:
 
 ```yaml
 labels:
@@ -52,7 +52,7 @@ labels:
   - "sozune.http.synapse.host=matrix.example.com"
   - "sozune.http.synapse.port=8008"
   - "sozune.http.synapse.tls=true"
-  - "sozune.http.synapse.backendTimeout=60"
+  - "sozune.http.synapse.backendTimeout=60000"
 ```
 
 The Element web client itself does not long-poll (it talks to Synapse, which does), so it works fine with the default. Only the Synapse entrypoint needs the higher timeout.
