@@ -129,7 +129,7 @@ The server must accept TXT updates under the zone for that key (`update-policy` 
 
 **Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
 
-**Unknown resolver:** a TLS route whose `acme.resolver` names a resolver that `acme.resolvers` does not declare gets diagnostic `W029`, in `sozune validate`, `GET /diagnostics` and the dashboard. A certificate ordered through it would fail.
+**Unknown resolver:** a TLS route whose `acme.resolver` names a resolver that `acme.resolvers` does not declare gets diagnostic `W029`, in `sozune validate`, `GET /diagnostics` and the dashboard. A certificate ordered through it would fail. A route whose hostnames are all covered by [certificates from files](/documentation/tls/overview#certificates-from-files) is left alone: ACME orders nothing for it.
 
 **Wildcard on an HTTP-01 resolver:** the order will fail loudly with `wildcard hostname requires a DNS-01 resolver`. Wildcards always need DNS-01.
 

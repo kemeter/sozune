@@ -124,9 +124,12 @@ pub fn lint_acme_without_tls(
 
 /// Flag each TLS route whose `acme.resolver` names a resolver that
 /// `acme.resolvers` does not declare. Only checked with ACME enabled: without
-/// it, no certificate is ever ordered and the label has no effect.
+/// it, no certificate is ever ordered and the label has no effect. Neither does
+/// it on a route whose hostnames are all covered by `file_names`, the names of
+/// the certificates loaded from files: ACME orders nothing for them.
 pub fn lint_unknown_resolvers(
     acme: Option<&AcmeConfig>,
+    file_names: &[String],
     entrypoints: &[(&str, &Entrypoint)],
 ) -> Vec<(String, Diagnostic)> {
     let Some(acme) = acme.filter(|a| a.enabled) else {
@@ -146,6 +149,12 @@ pub fn lint_unknown_resolvers(
     entrypoints
         .iter()
         .filter(|(_, ep)| ep.config.tls)
+        .filter(|(_, ep)| {
+            !ep.config
+                .hostnames
+                .iter()
+                .all(|host| crate::manual_certs::covered(file_names, host))
+        })
         .filter_map(|(id, ep)| {
             let name = &ep.config.acme.as_ref()?.resolver;
             if acme.resolvers.contains_key(name) {
@@ -356,7 +365,7 @@ mod tests {
         let a = with_resolver(ep("example.com", None, true, false), "letsencrpyt");
         let acme = acme_with(&["letsencrypt", "cloudflare"], true);
 
-        let out = lint_unknown_resolvers(Some(&acme), &[("cand-a", &a)]);
+        let out = lint_unknown_resolvers(Some(&acme), &[], &[("cand-a", &a)]);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "cand-a");
@@ -369,7 +378,7 @@ mod tests {
     fn declared_resolver_is_silent() {
         let a = with_resolver(ep("example.com", None, true, false), "letsencrypt");
         let acme = acme_with(&["letsencrypt"], true);
-        assert!(lint_unknown_resolvers(Some(&acme), &[("cand-a", &a)]).is_empty());
+        assert!(lint_unknown_resolvers(Some(&acme), &[], &[("cand-a", &a)]).is_empty());
     }
 
     #[test]
@@ -377,17 +386,31 @@ mod tests {
         let tls = with_resolver(ep("example.com", None, true, false), "missing");
         let plain = with_resolver(ep("example.com", None, false, false), "missing");
 
-        assert!(lint_unknown_resolvers(None, &[("cand-a", &tls)]).is_empty());
+        assert!(lint_unknown_resolvers(None, &[], &[("cand-a", &tls)]).is_empty());
         let disabled = acme_with(&[], false);
-        assert!(lint_unknown_resolvers(Some(&disabled), &[("cand-a", &tls)]).is_empty());
+        assert!(lint_unknown_resolvers(Some(&disabled), &[], &[("cand-a", &tls)]).is_empty());
         let enabled = acme_with(&[], true);
-        assert!(lint_unknown_resolvers(Some(&enabled), &[("cand-a", &plain)]).is_empty());
+        assert!(lint_unknown_resolvers(Some(&enabled), &[], &[("cand-a", &plain)]).is_empty());
+    }
+
+    #[test]
+    fn route_served_by_a_file_certificate_is_silent() {
+        let a = with_resolver(ep("app.example.com", None, true, false), "missing");
+        let acme = acme_with(&[], true);
+        let file_names = vec!["*.example.com".to_string()];
+
+        assert!(lint_unknown_resolvers(Some(&acme), &file_names, &[("cand-a", &a)]).is_empty());
+        let other = with_resolver(ep("app.example.org", None, true, false), "missing");
+        assert_eq!(
+            lint_unknown_resolvers(Some(&acme), &file_names, &[("cand-b", &other)]).len(),
+            1
+        );
     }
 
     #[test]
     fn route_without_resolver_is_silent() {
         let a = ep("example.com", None, true, false);
         let acme = acme_with(&[], true);
-        assert!(lint_unknown_resolvers(Some(&acme), &[("cand-a", &a)]).is_empty());
+        assert!(lint_unknown_resolvers(Some(&acme), &[], &[("cand-a", &a)]).is_empty());
     }
 }

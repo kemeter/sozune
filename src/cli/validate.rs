@@ -94,8 +94,19 @@ fn apply_collection_lints(report: &mut ValidationReport, config: &AppConfig) {
         .collect();
 
     let mut extra = crate::labels::lint::lint_collection(&pairs);
+    // A file that cannot be loaded serves nothing; `sozune doctor` says why.
+    let file_names: Vec<String> = config
+        .proxy
+        .https
+        .tls
+        .certificates
+        .iter()
+        .filter_map(|entry| crate::manual_certs::load(entry).ok())
+        .flat_map(|cert| cert.names)
+        .collect();
     extra.extend(crate::labels::lint::lint_unknown_resolvers(
         config.acme.as_ref(),
+        &file_names,
         &pairs,
     ));
 

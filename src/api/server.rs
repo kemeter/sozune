@@ -437,7 +437,7 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
         }
     };
     let diagnostics = read_diagnostics(&state);
-    let runtime = runtime_lints(&storage, state.config.acme.as_ref());
+    let runtime = runtime_lints(&storage, &state);
     let list: Vec<serde_json::Value> = storage
         .iter()
         .map(|(key, ep)| entrypoint_payload(ep, &unhealthy, &diagnostics, runtime.get(key)))
@@ -451,13 +451,22 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
 /// the parser diagnostics are stored under, so callers look these up apart.
 fn runtime_lints(
     storage: &BTreeMap<String, Entrypoint>,
-    acme: Option<&crate::config::AcmeConfig>,
+    state: &AppState,
 ) -> HashMap<String, Vec<Diagnostic>> {
     let pairs: Vec<(&str, &Entrypoint)> =
         storage.iter().map(|(id, ep)| (id.as_str(), ep)).collect();
+    let file_names: Vec<String> = state
+        .file_certificates
+        .iter()
+        .flat_map(|cert| cert.names.iter().cloned())
+        .collect();
     let lints = crate::labels::lint::lint_collection(&pairs)
         .into_iter()
-        .chain(crate::labels::lint::lint_unknown_resolvers(acme, &pairs));
+        .chain(crate::labels::lint::lint_unknown_resolvers(
+            state.config.acme.as_ref(),
+            &file_names,
+            &pairs,
+        ));
     let mut out: HashMap<String, Vec<Diagnostic>> = HashMap::new();
     for (key, diag) in lints {
         out.entry(key).or_default().push(diag);
@@ -488,7 +497,7 @@ async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<se
             .collect();
 
     if let Ok(storage) = state.storage.read() {
-        for (key, diags) in runtime_lints(&storage, state.config.acme.as_ref()) {
+        for (key, diags) in runtime_lints(&storage, &state) {
             grouped.entry(key).or_default().extend(diags);
         }
     }
@@ -678,7 +687,7 @@ async fn get_entrypoint(
     };
 
     let diagnostics = read_diagnostics(&state);
-    let runtime = runtime_lints(&storage, state.config.acme.as_ref());
+    let runtime = runtime_lints(&storage, &state);
 
     match storage.get(&id) {
         Some(entrypoint) => (
