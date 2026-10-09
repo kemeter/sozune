@@ -53,7 +53,7 @@ pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
     let candidates = collect_candidates(&config, args.provider.as_deref()).await?;
     let mut report = build_report(candidates);
 
-    apply_collection_lints(&mut report);
+    apply_collection_lints(&mut report, &config);
 
     if let Some(id) = &args.id {
         report
@@ -81,9 +81,9 @@ pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
     Ok(exit_code(&report))
 }
 
-/// Run cross-cutting lints (collisions) and attach the resulting diagnostics
-/// to the candidates that own the offending routes.
-fn apply_collection_lints(report: &mut ValidationReport) {
+/// Run cross-cutting lints (collisions, unknown ACME resolvers) and attach the
+/// resulting diagnostics to the candidates that own the offending routes.
+fn apply_collection_lints(report: &mut ValidationReport, config: &AppConfig) {
     let pairs: Vec<(&str, &Entrypoint)> = report
         .candidates
         .iter()
@@ -93,7 +93,11 @@ fn apply_collection_lints(report: &mut ValidationReport) {
         })
         .collect();
 
-    let extra = crate::labels::lint::lint_collection(&pairs);
+    let mut extra = crate::labels::lint::lint_collection(&pairs);
+    extra.extend(crate::labels::lint::lint_unknown_resolvers(
+        config.acme.as_ref(),
+        &pairs,
+    ));
 
     for (cand_id, diag) in extra {
         if let Some(c) = report.candidates.iter_mut().find(|c| c.id == cand_id) {

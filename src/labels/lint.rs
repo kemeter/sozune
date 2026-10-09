@@ -3,10 +3,11 @@
 //!
 //! - per-entrypoint checks: `lint_entrypoint`
 //! - cross-cutting checks (collisions, global state): `lint_collection`,
-//!   `lint_acme`
+//!   `lint_acme_without_tls`, `lint_unknown_resolvers`
 
 use std::collections::HashMap;
 
+use crate::config::AcmeConfig;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
 
@@ -121,11 +122,58 @@ pub fn lint_acme_without_tls(
     )
 }
 
+/// Flag each TLS route whose `acme.resolver` names a resolver that
+/// `acme.resolvers` does not declare. Only checked with ACME enabled: without
+/// it, no certificate is ever ordered and the label has no effect.
+pub fn lint_unknown_resolvers(
+    acme: Option<&AcmeConfig>,
+    entrypoints: &[(&str, &Entrypoint)],
+) -> Vec<(String, Diagnostic)> {
+    let Some(acme) = acme.filter(|a| a.enabled) else {
+        return Vec::new();
+    };
+    let mut declared: Vec<&str> = acme.resolvers.keys().map(String::as_str).collect();
+    declared.sort_unstable();
+    let hint = if declared.is_empty() {
+        "declare it under acme.resolvers in config.yaml, or remove the label to use HTTP-01 on challenge_port".to_string()
+    } else {
+        format!(
+            "use one of the declared resolvers ({}), or declare it under acme.resolvers",
+            declared.join(", ")
+        )
+    };
+
+    entrypoints
+        .iter()
+        .filter(|(_, ep)| ep.config.tls)
+        .filter_map(|(id, ep)| {
+            let name = &ep.config.acme.as_ref()?.resolver;
+            if acme.resolvers.contains_key(name) {
+                return None;
+            }
+            Some((
+                id.to_string(),
+                Diagnostic::new(
+                    DiagnosticCode::W029UnknownAcmeResolver,
+                    format!(
+                        "acme.resolver `{name}` is not declared under acme.resolvers; a certificate ordered through it fails"
+                    ),
+                )
+                .with_label("acme.resolver")
+                .with_value(name.clone())
+                .with_hint(hint.clone()),
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ResolverConfig;
     use crate::model::{
-        Backend, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, RateLimitConfig,
+        Backend, EntrypointAcmeConfig, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType,
+        RateLimitConfig,
     };
 
     fn ep(host: &str, path: Option<&str>, tls: bool, https_redirect: bool) -> Entrypoint {
@@ -280,5 +328,66 @@ mod tests {
         let a = ep("example.com", None, false, false);
         let b = ep("secure.example.com", None, true, false);
         assert!(lint_acme_without_tls(true, &[&a, &b]).is_none());
+    }
+    fn acme_with(resolvers: &[&str], enabled: bool) -> AcmeConfig {
+        AcmeConfig {
+            enabled,
+            email: String::new(),
+            certs_dir: String::from("/tmp"),
+            staging: true,
+            challenge_port: 80,
+            tls_alpn_port: 3038,
+            resolvers: resolvers
+                .iter()
+                .map(|name| (name.to_string(), ResolverConfig::Http01 { ca_server: None }))
+                .collect(),
+        }
+    }
+
+    fn with_resolver(mut ep: Entrypoint, resolver: &str) -> Entrypoint {
+        ep.config.acme = Some(EntrypointAcmeConfig {
+            resolver: resolver.into(),
+        });
+        ep
+    }
+
+    #[test]
+    fn unknown_resolver_emits_w029_with_the_declared_ones() {
+        let a = with_resolver(ep("example.com", None, true, false), "letsencrpyt");
+        let acme = acme_with(&["letsencrypt", "cloudflare"], true);
+
+        let out = lint_unknown_resolvers(Some(&acme), &[("cand-a", &a)]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "cand-a");
+        assert_eq!(out[0].1.code, DiagnosticCode::W029UnknownAcmeResolver);
+        let hint = out[0].1.hint.as_deref().unwrap();
+        assert!(hint.contains("cloudflare, letsencrypt"), "{hint}");
+    }
+
+    #[test]
+    fn declared_resolver_is_silent() {
+        let a = with_resolver(ep("example.com", None, true, false), "letsencrypt");
+        let acme = acme_with(&["letsencrypt"], true);
+        assert!(lint_unknown_resolvers(Some(&acme), &[("cand-a", &a)]).is_empty());
+    }
+
+    #[test]
+    fn unknown_resolver_is_ignored_without_acme_or_tls() {
+        let tls = with_resolver(ep("example.com", None, true, false), "missing");
+        let plain = with_resolver(ep("example.com", None, false, false), "missing");
+
+        assert!(lint_unknown_resolvers(None, &[("cand-a", &tls)]).is_empty());
+        let disabled = acme_with(&[], false);
+        assert!(lint_unknown_resolvers(Some(&disabled), &[("cand-a", &tls)]).is_empty());
+        let enabled = acme_with(&[], true);
+        assert!(lint_unknown_resolvers(Some(&enabled), &[("cand-a", &plain)]).is_empty());
+    }
+
+    #[test]
+    fn route_without_resolver_is_silent() {
+        let a = ep("example.com", None, true, false);
+        let acme = acme_with(&[], true);
+        assert!(lint_unknown_resolvers(Some(&acme), &[("cand-a", &a)]).is_empty());
     }
 }
