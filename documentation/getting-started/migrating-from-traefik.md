@@ -53,7 +53,8 @@ A Traefik rule becomes one label per matcher. All the matchers of a route must m
 |---|---|
 | ``Host(`a.example.com`)`` | `host=a.example.com` |
 | ``Host(`a.example.com`) \|\| Host(`b.example.com`)`` | `host=a.example.com,b.example.com` |
-| ``HostRegexp(`^[^.]+\.example\.com$`)`` | `host=*.example.com`. A wildcard covers exactly one label; other patterns need a [regex hostname](/documentation/routing/hostnames#regex), written label by label. |
+| ``HostRegexp(`^[^.]+\.example\.com$`)`` | `host=*.example.com` |
+| ``HostRegexp(`^cdn[0-9]+\.example\.com$`)`` | `host=/cdn[0-9]+/.example.com`: the regex goes between slashes, and the domain at the end stays written out. A regex that would match any domain is refused. See [Regex hostnames](/documentation/routing/hostnames#regex). |
 | ``PathPrefix(`/api`)`` | `path=/api`. Sōzune matches on segment boundaries: `/api` serves `/api/users` but not `/apiv2`, which Traefik's `PathPrefix` does. `pathRegex=^/api` keeps that broader match, but `stripPrefix` only applies to `path`. |
 | ``PathRegexp(`^/users/[0-9]+`)`` | `pathRegex=^/users/[0-9]+`. Keep the `^`: without it, the regex can match anywhere in the path. |
 | ``Path(`/exact`)`` | Exact paths are only available through the [HTTP provider and the API](/documentation/routing/path-matching) |
@@ -124,7 +125,7 @@ Not available yet: `chain`, `digestauth`, `buffering`, `redirectregex`, `replace
 |---|---|
 | A TCP entrypoint in the static config | A listener under [`proxy.tcp`](/documentation/routing/tcp) |
 | `tcp.routers.<r>.entrypoints=postgres` | `sozune.tcp.<svc>.entrypoint=postgres` |
-| ``tcp.routers.<r>.rule=HostSNI(`*`)`` | Nothing: the listener's single backend takes every connection. |
+| ``tcp.routers.<r>.rule=HostSNI(`*`)`` | Don't set `sni`: without it, the listener sends every connection to its service. |
 | ``tcp.routers.<r>.rule=HostSNI(`a.example.com`)`` + `tls.passthrough=true` | `sozune.tcp.<svc>.sni=a.example.com` |
 | `tcp.services.<s>.loadbalancer.server.port` | `sozune.tcp.<svc>.port` |
 
