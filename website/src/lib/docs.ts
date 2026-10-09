@@ -65,7 +65,7 @@ const FOLDER_ORDER = [
 
 // Per-folder page order. Pages not listed here fall back to alphabetical.
 const PAGE_ORDER: Record<string, string[]> = {
-  'getting-started': ['installation', 'quick-start'],
+  'getting-started': ['installation', 'quick-start', 'migrating-from-traefik'],
   routing: [
     'hostnames',
     'path-matching',
