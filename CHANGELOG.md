@@ -68,6 +68,7 @@ All notable changes to this project will be documented in this file.
 - `sozune doctor` checks everything sozune binds — UDP listeners, the ACME challenge and TLS-ALPN-01 ports, and the metrics listener are probed, and two listeners sharing a port are reported (each probed fine on its own, then the second failed at startup). Kubernetes, Consul and Ring providers are now checked. The middleware port is probed on loopback, where it actually binds, and IPv6 API/dashboard addresses no longer fail to parse.
 - `sozune doctor` no longer creates a missing ACME `certs_dir`; it reports whether sozune will be able to create it. The privileged-ports warning no longer shows for non-root users whose binds already passed.
 - `sozune explain` examples for `W003`, `W005` and `W006` used label names the parser does not know (`backend_timeout`, `redirect.policy`, `redirect.scheme`), so copying the fix yielded a `W013`. `E004`, `I002` and `W017` described the wrong cause or effect. Every example is now checked against the label catalog.
+- `sozune validate` counts a candidate as degraded when a lint across candidates warns about it (`W018` route collision, `W029` unknown ACME resolver). It used to show it as routed, with a success mark next to the warning.
 
 ### Security
 

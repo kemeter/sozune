@@ -101,7 +101,7 @@ fn apply_collection_lints(report: &mut ValidationReport, config: &AppConfig) {
 
     for (cand_id, diag) in extra {
         if let Some(c) = report.candidates.iter_mut().find(|c| c.id == cand_id) {
-            c.diagnostics.push(diag);
+            c.push_diagnostic(diag);
         }
     }
 }
