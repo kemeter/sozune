@@ -773,7 +773,13 @@ fn merge_or_insert_entrypoint(
         incoming.config.hostnames,
         incoming.config.path,
     );
-    dest.insert(alt_key, incoming);
+    // The id names the route everywhere the key does — API, route resolver,
+    // dashboard links — so it follows the key.
+    let entrypoint = Entrypoint {
+        id: alt_key.clone(),
+        ..incoming
+    };
+    dest.insert(alt_key, entrypoint);
 }
 
 /// Same as `merge_or_insert_entrypoint` but operates on a `BTreeMap` (the
@@ -812,6 +818,7 @@ fn merge_or_insert_entrypoint_btree(
         incoming.config.path,
     );
     let mut entrypoint = incoming;
+    entrypoint.id = alt_key.clone();
     entrypoint.source = Some(source_label.to_string());
     dest.insert(alt_key, entrypoint);
 }
@@ -1016,6 +1023,26 @@ pub(super) mod merge_tests {
     }
 
     #[test]
+    fn a_route_renamed_at_runtime_takes_its_key_as_id() {
+        let mut storage: BTreeMap<String, Entrypoint> = BTreeMap::new();
+        merge_or_insert_entrypoint_btree(
+            &mut storage,
+            "http_api".into(),
+            ep("a.example.com", None, "10.0.0.1"),
+            "container-aaaa",
+            "docker",
+        );
+        merge_or_insert_entrypoint_btree(
+            &mut storage,
+            "http_api".into(),
+            ep("b.example.com", None, "10.0.0.2"),
+            "container-bbbb",
+            "docker",
+        );
+        assert_eq!(storage["http_api_container-bb"].id, "http_api_container-bb");
+    }
+
+    #[test]
     fn collision_on_hostnames_creates_disambiguated_key() {
         let mut map: HashMap<String, Entrypoint> = HashMap::new();
         merge_or_insert_entrypoint(
@@ -1033,6 +1060,8 @@ pub(super) mod merge_tests {
         assert_eq!(map.len(), 2, "incompatible configs must not be merged");
         assert!(map.contains_key("http_api"));
         assert!(map.contains_key("http_api_container-bb"));
+        // The renamed route answers to its own id, not the first one's.
+        assert_eq!(map["http_api_container-bb"].id, "http_api_container-bb");
     }
 
     #[test]
