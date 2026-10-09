@@ -30,6 +30,7 @@ All notable changes to this project will be documented in this file.
 
 ### Middleware
 
+- A custom header now replaces a header of the same name sent by the client or the backend, as documented. Both used to reach the other side, e.g. a backend's `Server` next to the one set by `headers.response.Server`. This applies to labels, the HTTP provider, the API and Gateway API `set` / `add`.
 - WASM plugin execution policy — three operator-set fields on a plugin declaration in `config.yaml` control when it runs and how it fails. `skip_paths` (path globs like `*.js`, `*.css`, `/assets/*`) and `skip_methods` skip the plugin entirely for matching requests — no body buffering, no guest call — so an analytics plugin no longer buffers a multi-megabyte JS bundle on every hit just to ignore it. `fail_open` (default `true`) means a guest that errors lets the request continue to the backend untouched instead of returning `502`; set it `false` for a security plugin (WAF / bouncer) that must fail closed. Previously any guest error in the request phase returned `502`, so a plugin failing to reach its collector could take a site down. See [WASM plugins docs](documentation/middleware/wasm-plugins.md#execution-policy-skip_paths-skip_methods-fail_open).
 
 ### Kubernetes Gateway API

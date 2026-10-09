@@ -88,10 +88,10 @@ fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
 /// - `remove` → `HeaderConfig { name, value: "", direction }` (an empty
 ///   value deletes the header at the Sōzu frontend, HAProxy `del-header`
 ///   parity).
-/// - `add` → applied the same as `set`. Sōzu's native frontend header edit
-///   is a replace, not a true append, so we map `add` to a set and warn:
-///   refusing the route would 404 it, and set-semantics is what the vast
-///   majority of `add` users actually want.
+/// - `add` → applied the same as `set`. Every non-empty header edit reaches
+///   Sōzu as a replace (see `build_frontend_headers`), so we map `add` to a
+///   set and warn: refusing the route would 404 it, and set-semantics is
+///   what the vast majority of `add` users actually want.
 fn header_edits_from_modifier(
     set: Option<&[(String, String)]>,
     add: Option<&[(String, String)]>,
