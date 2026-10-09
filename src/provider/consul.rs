@@ -48,6 +48,7 @@ impl ConsulProvider {
                     continue;
                 };
                 if let Some(existing) = entrypoints.get_mut(&key) {
+                    existing.add_candidates(&entrypoint.candidates);
                     if !existing.backends.contains(&backend) {
                         existing.backends.push(backend);
                     }

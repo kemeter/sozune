@@ -12,14 +12,15 @@ use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
 
 /// Run per-entrypoint lints. Called immediately after parsing one candidate.
-pub fn lint_entrypoint(ep: &Entrypoint, diagnostics: &mut Vec<Diagnostic>) {
+/// `prefix` is `sozune.<protocol>.<service>.`, so labels name the full key.
+pub fn lint_entrypoint(ep: &Entrypoint, prefix: &str, diagnostics: &mut Vec<Diagnostic>) {
     if ep.config.https_redirect && !ep.config.tls {
         diagnostics.push(
             Diagnostic::new(
                 DiagnosticCode::W016HttpsRedirectWithoutTls,
                 "https_redirect=true but tls=false; clients will be redirected to a port that has no TLS listener for this hostname",
             )
-            .with_label("httpsRedirect")
+            .with_label(format!("{prefix}httpsRedirect"))
             .with_hint("either set tls=true (and configure a certificate or ACME) or remove httpsRedirect"),
         );
     }
@@ -35,7 +36,7 @@ pub fn lint_entrypoint(ep: &Entrypoint, diagnostics: &mut Vec<Diagnostic>) {
                     rl.burst, rl.average
                 ),
             )
-            .with_label("ratelimit.burst")
+            .with_label(format!("{prefix}ratelimit.burst"))
             .with_hint("burst should be >= average; a typical setup is burst = 2x average for short spikes"),
         );
     }
@@ -236,6 +237,7 @@ mod tests {
                 ip_allow_list: Vec::new(),
             },
             source: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -243,7 +245,7 @@ mod tests {
     fn https_redirect_without_tls_emits_w016() {
         let ep = ep("example.com", None, false, true);
         let mut diags = Vec::new();
-        lint_entrypoint(&ep, &mut diags);
+        lint_entrypoint(&ep, "sozune.http.svc.", &mut diags);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, DiagnosticCode::W016HttpsRedirectWithoutTls);
     }
@@ -252,7 +254,7 @@ mod tests {
     fn https_redirect_with_tls_is_silent() {
         let ep = ep("example.com", None, true, true);
         let mut diags = Vec::new();
-        lint_entrypoint(&ep, &mut diags);
+        lint_entrypoint(&ep, "sozune.http.svc.", &mut diags);
         assert!(diags.is_empty());
     }
 
@@ -264,7 +266,7 @@ mod tests {
             burst: 50,
         });
         let mut diags = Vec::new();
-        lint_entrypoint(&ep, &mut diags);
+        lint_entrypoint(&ep, "sozune.http.svc.", &mut diags);
         assert_eq!(diags.len(), 1);
         assert_eq!(
             diags[0].code,
@@ -280,7 +282,7 @@ mod tests {
             burst: 100,
         });
         let mut diags = Vec::new();
-        lint_entrypoint(&ep, &mut diags);
+        lint_entrypoint(&ep, "sozune.http.svc.", &mut diags);
         assert!(diags.is_empty());
     }
 

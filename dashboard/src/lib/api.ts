@@ -144,6 +144,8 @@ export interface Entrypoint {
   backends: Backend[];
   config: EntrypointConfig;
   source?: string | null;
+  /** Ids of the candidates whose labels produced the route; their diagnostics are grouped under them. */
+  candidates?: string[];
   /** Backends currently marked down by the health checker, with failure reason. */
   unhealthy_backends?: UnhealthyBackend[];
   /** Diagnostics produced for this entrypoint by the label parser. */

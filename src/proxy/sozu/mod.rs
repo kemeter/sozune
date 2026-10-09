@@ -3364,6 +3364,7 @@ mod tests {
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
             },
+            candidates: Vec::new(),
         }
     }
 

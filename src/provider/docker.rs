@@ -306,7 +306,12 @@ impl DockerProvider {
                                 };
                                 let mut keys_to_remove = Vec::new();
                                 for (key, entrypoint) in storage_write.iter_mut() {
-                                    drop_backends_of(entrypoint, &container_ip, self.name);
+                                    drop_backends_of(
+                                        entrypoint,
+                                        container_id,
+                                        &container_ip,
+                                        self.name,
+                                    );
                                     if entrypoint.backends.is_empty() {
                                         keys_to_remove.push(key.clone());
                                     }
@@ -357,7 +362,12 @@ impl DockerProvider {
                                 let mut keys_to_remove = Vec::new();
                                 for (key, entrypoint) in storage_write.iter_mut() {
                                     // Remove this container's IP from backends
-                                    drop_backends_of(entrypoint, &container_ip, self.name);
+                                    drop_backends_of(
+                                        entrypoint,
+                                        container_id,
+                                        &container_ip,
+                                        self.name,
+                                    );
 
                                     // If no backends left, mark for removal
                                     if entrypoint.backends.is_empty() {
@@ -404,7 +414,12 @@ impl DockerProvider {
                                     // Remove old entries for this container
                                     let mut keys_to_remove = Vec::new();
                                     for (key, entrypoint) in storage_write.iter_mut() {
-                                        drop_backends_of(entrypoint, &previous, self.name);
+                                        drop_backends_of(
+                                            entrypoint,
+                                            container_id,
+                                            &previous,
+                                            self.name,
+                                        );
                                         if entrypoint.backends.is_empty() {
                                             keys_to_remove.push(key.clone());
                                         }
@@ -740,6 +755,7 @@ fn merge_or_insert_entrypoint(
     };
 
     if entrypoints_are_replicas(existing, &incoming) {
+        existing.add_candidates(&incoming.candidates);
         for backend in incoming.backends {
             if !existing.backends.contains(&backend) {
                 existing.backends.push(backend);
@@ -777,6 +793,7 @@ fn merge_or_insert_entrypoint_btree(
     };
 
     if entrypoints_are_replicas(existing, &incoming) {
+        existing.add_candidates(&incoming.candidates);
         for backend in incoming.backends {
             if !existing.backends.contains(&backend) {
                 existing.backends.push(backend);
@@ -871,10 +888,19 @@ fn endpoints_of<'a>(entrypoints: impl Iterator<Item = &'a Entrypoint>) -> Vec<Ba
     endpoints
 }
 
-fn drop_backends_of(entrypoint: &mut Entrypoint, departing: &[Backend], provider: &str) {
+/// Take a departing container out of a route: its endpoints and its id among
+/// the route's candidates. A container that still serves the route after an
+/// update is merged back in afterwards.
+fn drop_backends_of(
+    entrypoint: &mut Entrypoint,
+    container_id: &str,
+    departing: &[Backend],
+    provider: &str,
+) {
     if entrypoint.source.as_deref() != Some(provider) {
         return;
     }
+    entrypoint.candidates.retain(|id| id != container_id);
     entrypoint.backends.retain(|b| {
         !departing
             .iter()
@@ -940,6 +966,7 @@ pub(super) mod merge_tests {
                 ip_allow_list: Vec::new(),
             },
             source: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -961,6 +988,31 @@ pub(super) mod merge_tests {
         assert_eq!(map.len(), 1);
         let merged = &map["http_web"];
         assert_eq!(merged.backends.len(), 2);
+    }
+
+    #[test]
+    fn merged_replicas_keep_every_candidate() {
+        let with_candidate = |ip: &str, id: &str| Entrypoint {
+            candidates: vec![id.to_string()],
+            ..ep("app.example.com", Some("/"), ip)
+        };
+        let mut map: HashMap<String, Entrypoint> = HashMap::new();
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_web".into(),
+            with_candidate("10.0.0.1", "container-aaaa"),
+            "container-aaaa",
+        );
+        merge_or_insert_entrypoint(
+            &mut map,
+            "http_web".into(),
+            with_candidate("10.0.0.2", "container-bbbb"),
+            "container-bbbb",
+        );
+        assert_eq!(
+            map["http_web"].candidates,
+            vec!["container-aaaa", "container-bbbb"]
+        );
     }
 
     #[test]
@@ -1032,6 +1084,7 @@ mod stop_cleanup_tests {
 
         drop_backends_of(
             &mut entrypoint,
+            "container-a",
             &[Backend::new("127.0.0.1", 8080)],
             "docker",
         );
@@ -1057,6 +1110,7 @@ mod stop_cleanup_tests {
 
         drop_backends_of(
             &mut entrypoint,
+            "container-a",
             &[
                 Backend::new("10.0.0.1", 8080),
                 Backend::new("10.0.0.1", 9090),
@@ -1077,7 +1131,12 @@ mod stop_cleanup_tests {
             vec![Backend::new("10.0.0.1", 80), Backend::new("10.0.0.2", 80)],
         );
 
-        drop_backends_of(&mut entrypoint, &[Backend::new("10.0.0.1", 80)], "docker");
+        drop_backends_of(
+            &mut entrypoint,
+            "container-a",
+            &[Backend::new("10.0.0.1", 80)],
+            "docker",
+        );
 
         assert_eq!(entrypoint.backends, vec![Backend::new("10.0.0.2", 80)]);
     }
@@ -1089,7 +1148,12 @@ mod stop_cleanup_tests {
     fn another_provider_s_entrypoint_is_left_alone() {
         let mut entrypoint = with(Some("file"), vec![Backend::new("127.0.0.1", 80)]);
 
-        drop_backends_of(&mut entrypoint, &[Backend::new("127.0.0.1", 80)], "docker");
+        drop_backends_of(
+            &mut entrypoint,
+            "container-a",
+            &[Backend::new("127.0.0.1", 80)],
+            "docker",
+        );
 
         assert_eq!(entrypoint.backends, vec![Backend::new("127.0.0.1", 80)]);
     }
@@ -1099,8 +1163,33 @@ mod stop_cleanup_tests {
     fn an_unsourced_entrypoint_is_left_alone() {
         let mut entrypoint = with(None, vec![Backend::new("10.0.0.1", 80)]);
 
-        drop_backends_of(&mut entrypoint, &[Backend::new("10.0.0.1", 80)], "docker");
+        drop_backends_of(
+            &mut entrypoint,
+            "container-a",
+            &[Backend::new("10.0.0.1", 80)],
+            "docker",
+        );
 
         assert_eq!(entrypoint.backends, vec![Backend::new("10.0.0.1", 80)]);
+    }
+
+    /// The container leaves the route's candidates with its endpoints, so its
+    /// diagnostics stop showing on a route it no longer serves.
+    #[test]
+    fn the_departing_container_leaves_the_candidates() {
+        let mut entrypoint = with(
+            Some("docker"),
+            vec![Backend::new("10.0.0.1", 80), Backend::new("10.0.0.2", 80)],
+        );
+        entrypoint.candidates = vec!["container-a".into(), "container-b".into()];
+
+        drop_backends_of(
+            &mut entrypoint,
+            "container-a",
+            &[Backend::new("10.0.0.1", 80)],
+            "docker",
+        );
+
+        assert_eq!(entrypoint.candidates, vec!["container-b"]);
     }
 }

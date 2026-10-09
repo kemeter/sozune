@@ -199,6 +199,7 @@ mod tests {
                 ip_allow_list: Vec::new(),
             },
             source: None,
+            candidates: Vec::new(),
         }])
         .unwrap()
     }

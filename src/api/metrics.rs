@@ -510,6 +510,7 @@ mod tests {
                 ip_allow_list: Vec::new(),
             },
             source: Some("api".to_string()),
+            candidates: Vec::new(),
         }
     }
 

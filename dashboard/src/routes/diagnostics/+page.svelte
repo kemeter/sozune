@@ -134,7 +134,10 @@
    *  unique source) or in `entrypoint.source` (when providers post-process). */
   function entrypointsFor(candidateId: string): Entrypoint[] {
     return entrypoints.filter(
-      (ep) => ep.id === candidateId || ep.source === candidateId
+      (ep) =>
+        ep.id === candidateId ||
+        ep.source === candidateId ||
+        (ep.candidates ?? []).includes(candidateId)
     );
   }
 

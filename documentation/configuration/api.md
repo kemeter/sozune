@@ -375,7 +375,7 @@ curl -u admin:your-password http://localhost:3035/diagnostics
 
 - `total`: number of diagnostics across `global` + every `items[*].diagnostics`
 - `global`: cross-cutting diagnostics not tied to a single candidate
-- `items`: per-candidate diagnostics, sorted by `candidate_id` for stable ordering
+- `items`: per-candidate diagnostics, sorted by `candidate_id` for stable ordering. A runtime lint (`W018`, `W029`) is listed under each candidate in the route's `candidates`, next to that candidate's own diagnostics
 
 The full diagnostic code reference is documented at [`sozune explain <CODE>`](/documentation/configuration/diagnostics).
 
@@ -438,6 +438,7 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
     { "address": "10.0.0.5", "port": 8080, "weight": 100 }
   ],
   "source": "api",                      // "api" | "docker" | "swarm" | "kubernetes" | "nomad" | "http" | "config"
+  "candidates": [],                     // read-only: ids of the containers/tasks/services whose labels produced the route
   "config": {
     "hostnames": ["api.example.com"],   // exact, wildcard (*.example.com), or regex (/[a-z]+.example.com/)
     "path": {                           // optional path matcher

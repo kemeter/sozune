@@ -58,10 +58,10 @@ pub struct AppState {
 /// since, last_checked }`. Breaking change vs. previous API where this field
 /// was a plain `string[]`.
 ///
-/// Parser diagnostics are looked up by `entrypoint.id` first (the cluster_id
-/// used at runtime), then by `entrypoint.source` which is set to the candidate
-/// id by most providers. The first non-empty match wins. `runtime_lints`, found
-/// by storage key, are appended to them.
+/// Parser diagnostics are read under each id in `entrypoint.candidates`, the
+/// candidates whose labels produced the route. A route from elsewhere has none:
+/// its diagnostics are looked up by `entrypoint.id`, then `entrypoint.source`.
+/// `runtime_lints`, found by storage key, are appended to them.
 fn entrypoint_payload(
     entrypoint: &Entrypoint,
     unhealthy: &UnhealthyMap,
@@ -85,16 +85,30 @@ fn entrypoint_payload(
         })
         .collect();
 
-    let mut diags_for_ep: Vec<Diagnostic> = diagnostics
-        .get(&entrypoint.id)
-        .or_else(|| {
+    let mut diags_for_ep: Vec<Diagnostic> = Vec::new();
+    if entrypoint.candidates.is_empty() {
+        if let Some(found) = diagnostics.get(&entrypoint.id).or_else(|| {
             entrypoint
                 .source
                 .as_ref()
                 .and_then(|s| diagnostics.get(s.as_str()))
-        })
-        .cloned()
-        .unwrap_or_default();
+        }) {
+            diags_for_ep.extend(found.iter().cloned());
+        }
+    } else {
+        // Replicas share their labels, so most of their diagnostics repeat.
+        for diag in entrypoint
+            .candidates
+            .iter()
+            .filter_map(|id| diagnostics.get(id))
+            .flatten()
+            .filter(|diag| concerns_route(diag, entrypoint))
+        {
+            if !diags_for_ep.contains(diag) {
+                diags_for_ep.push(diag.clone());
+            }
+        }
+    }
     diags_for_ep.extend(runtime_lints.into_iter().flatten().cloned());
 
     let mut value = serde_json::json!(entrypoint);
@@ -116,6 +130,34 @@ fn entrypoint_payload(
         obj.insert("diagnostics".to_string(), serde_json::json!(diags_for_ep));
     }
     value
+}
+
+/// Whether a parser diagnostic of one of the route's candidates is about this
+/// route. A candidate can declare several services: a diagnostic on
+/// `sozune.http.<other>.*` belongs to that other route. One on no service
+/// label (`sozune.enable`, the network, no label at all) concerns them all.
+fn concerns_route(diag: &Diagnostic, entrypoint: &Entrypoint) -> bool {
+    let Some(rest) = diag
+        .label
+        .as_deref()
+        .and_then(|label| label.strip_prefix("sozune."))
+    else {
+        return true;
+    };
+    // `sozune.http.api`, missing its field, still names the `api` route.
+    let mut parts = rest.splitn(3, '.');
+    let (Some(protocol), Some(service)) = (parts.next(), parts.next()) else {
+        return true;
+    };
+    let route_protocol = match entrypoint.protocol {
+        Protocol::Http => "http",
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+    };
+    if !["http", "tcp", "udp"].contains(&protocol) {
+        return true;
+    }
+    protocol == route_protocol && service == entrypoint.name
 }
 
 /// Replace every leaf value in a route's `plugin_config` with `"***"` while
@@ -497,8 +539,20 @@ async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<se
             .collect();
 
     if let Ok(storage) = state.storage.read() {
+        // Grouped with the parser diagnostics of the candidates that produced
+        // the route, so the dashboard links them to it.
         for (key, diags) in runtime_lints(&storage, &state) {
-            grouped.entry(key).or_default().extend(diags);
+            let owners = storage
+                .get(&key)
+                .map(|ep| ep.candidates.clone())
+                .filter(|candidates| !candidates.is_empty())
+                .unwrap_or_else(|| vec![key]);
+            for owner in owners {
+                grouped
+                    .entry(owner)
+                    .or_default()
+                    .extend(diags.iter().cloned());
+            }
         }
     }
 
@@ -748,6 +802,7 @@ async fn create_entrypoint(
         protocol: payload.protocol,
         config: payload.config,
         source: Some("api".to_string()),
+        candidates: Vec::new(),
     };
 
     {
@@ -829,6 +884,7 @@ async fn update_entrypoint(
             protocol: payload.protocol,
             config: payload.config,
             source: Some("api".to_string()),
+            candidates: Vec::new(),
         };
         storage.insert(id.clone(), entrypoint.clone());
         stored = entrypoint;
@@ -1447,6 +1503,7 @@ mod tests {
                         ip_allow_list: Vec::new(),
                     },
                     source: Some("docker".to_string()),
+                    candidates: Vec::new(),
                 },
             );
         }
@@ -2010,6 +2067,7 @@ mod tests {
                         ip_allow_list: Vec::new(),
                     },
                     source: Some("docker".to_string()),
+                    candidates: Vec::new(),
                 },
             );
         }
@@ -2121,6 +2179,7 @@ mod tests {
                         ip_allow_list: Vec::new(),
                     },
                     source: Some("docker".to_string()),
+                    candidates: Vec::new(),
                 },
             );
         }
@@ -2195,6 +2254,7 @@ mod tests {
                 ip_allow_list: Vec::new(),
             },
             source: source.map(|s| s.to_string()),
+            candidates: Vec::new(),
         }
     }
 
@@ -2385,6 +2445,60 @@ mod tests {
         // Under the route, not its `source`: that is the provider name.
         assert_eq!(items[0]["candidate_id"], "ep-tls");
         assert_eq!(items[0]["diagnostics"][0]["code"], "W029");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_endpoint_groups_runtime_lints_under_the_candidate() {
+        let mut state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        config.acme = Some(crate::config::AcmeConfig {
+            enabled: true,
+            email: String::new(),
+            certs_dir: String::from("/tmp"),
+            staging: true,
+            challenge_port: 80,
+            tls_alpn_port: 3038,
+            resolvers: HashMap::new(),
+        });
+        state.config = Arc::new(config);
+        let mut tls_ep = make_ep("http_app", "secure.example.com", None, Some("docker"));
+        tls_ep.config.tls = true;
+        tls_ep.config.acme = Some(crate::model::EntrypointAcmeConfig {
+            resolver: "missing".into(),
+        });
+        tls_ep.candidates = vec!["container-a".into()];
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("http_app".into(), tls_ep);
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "container-a",
+            vec![diag_w001("sozune.http.app.port", "abc")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["candidate_id"], "container-a");
+        let codes: Vec<&str> = items[0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, vec!["W001", "W029"]);
     }
 
     #[tokio::test]
@@ -2710,6 +2824,85 @@ mod tests {
         };
         assert_eq!(codes(0), vec!["W018"]);
         assert_eq!(codes(1), vec!["W001", "W018"]);
+    }
+
+    #[tokio::test]
+    async fn list_entrypoints_reads_diagnostics_of_every_candidate_once() {
+        // A Docker route: its id and source match no diagnostics key, its
+        // merged replicas' container ids do.
+        let state = test_state();
+        let mut ep = make_ep("web", "example.com", None, Some("docker"));
+        ep.candidates = vec!["container-a".into(), "container-b".into()];
+        state.storage.write().unwrap().insert("http_web".into(), ep);
+        let shared = diag_w001("sozune.http.web.port", "abc");
+        crate::diagnostics::set(&state.diagnostics, "container-a", vec![shared.clone()]);
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "container-b",
+            vec![shared, diag_w001("sozune.http.web.port", "xyz")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let values: Vec<&str> = json[0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["abc", "xyz"]);
+    }
+
+    #[tokio::test]
+    async fn list_entrypoints_keeps_each_service_s_diagnostics_on_its_route() {
+        // One container declaring two services: a fault on `api` is not one
+        // of `web`, while a container-wide diagnostic shows on both.
+        let state = test_state();
+        {
+            let mut storage = state.storage.write().unwrap();
+            for name in ["api", "web"] {
+                let mut ep = make_ep(name, &format!("{name}.example.com"), None, Some("docker"));
+                ep.candidates = vec!["container-a".into()];
+                storage.insert(format!("http_{name}"), ep);
+            }
+        }
+        let mut container_wide = diag_w001("sozune.http.api.port", "abc");
+        container_wide.label = None;
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "container-a",
+            vec![
+                diag_w001("sozune.http.api.port", "abc"),
+                diag_w001("sozune.http.api", "no field"),
+                container_wide,
+            ],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let count = |i: usize| json[i]["diagnostics"].as_array().unwrap().len();
+        assert_eq!(json[0]["name"], "api");
+        assert_eq!(count(0), 3);
+        assert_eq!(json[1]["name"], "web");
+        assert_eq!(count(1), 1);
     }
 
     #[tokio::test]

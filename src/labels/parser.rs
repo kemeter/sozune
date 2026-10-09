@@ -60,9 +60,19 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
             &backend_ip,
             &mut diagnostics,
         ) {
-            crate::labels::lint::lint_entrypoint(&entrypoint, &mut diagnostics);
+            crate::labels::lint::lint_entrypoint(
+                &entrypoint,
+                &format!("sozune.{protocol}.{service_name}."),
+                &mut diagnostics,
+            );
             let key = format!("{protocol}_{service_name}");
-            entrypoints.insert(key, entrypoint);
+            entrypoints.insert(
+                key,
+                Entrypoint {
+                    candidates: vec![candidate.id.clone()],
+                    ..entrypoint
+                },
+            );
         }
     }
 
@@ -287,6 +297,7 @@ fn build_entrypoint(
             ip_allow_list,
         },
         source: None,
+        candidates: Vec::new(),
     })
 }
 
@@ -441,6 +452,7 @@ fn build_l4_entrypoint(
             ip_allow_list: Vec::new(),
         },
         source: None,
+        candidates: Vec::new(),
     })
 }
 
@@ -701,6 +713,8 @@ mod tests {
             http.config.acme.as_ref().map(|a| a.resolver.as_str()),
             Some("cloudflare")
         );
+        // Ties the route to the diagnostics stored under the candidate.
+        assert_eq!(http.candidates, vec![c.id.clone()]);
         assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 

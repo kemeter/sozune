@@ -10,6 +10,23 @@ pub struct Entrypoint {
     pub config: EntrypointConfig,
     #[serde(default)]
     pub source: Option<String>,
+    /// Ids of the candidates (container, task, service…) whose labels produced
+    /// this route — several when replicas were merged into it. The parser
+    /// diagnostics are stored under these ids. Empty for routes that do not
+    /// come from labels.
+    #[serde(default)]
+    pub candidates: Vec<String>,
+}
+
+impl Entrypoint {
+    /// Record the candidates of a replica merged into this route.
+    pub fn add_candidates(&mut self, ids: &[String]) {
+        for id in ids {
+            if !self.candidates.contains(id) {
+                self.candidates.push(id.clone());
+            }
+        }
+    }
 }
 
 /// One backend instance: an address (IP or hostname), the port it listens

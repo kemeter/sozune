@@ -52,6 +52,7 @@ All notable changes to this project will be documented in this file.
 - `GET /config` also returns the TCP and UDP listeners, the TLS options of the HTTPS listener and the Ring provider. Read-only users could already read it; the documentation said admin only.
 - `GET /config` lists the env vars a DNS-01 resolver reads under the names the config gives them. It used to show made-up defaults such as `CLOUDFLARE_API_TOKEN (configurable)`, which these fields do not have.
 - `GET /entrypoints` and `GET /entrypoints/{id}` list a route's collision warning (`W018`) next to the diagnostics its labels produced. The warning used to replace them, and two routes sharing an id could show each other's.
+- An entrypoint lists in `candidates` the ids of the containers, tasks or services whose labels produced it. `GET /entrypoints` now returns the diagnostics of a route declared by labels or annotations, which it used to look up under the route id and never found. A container declaring several services shows each one's diagnostics on its own route; `W016` and `W017` now name the full label (`sozune.http.<svc>.httpsRedirect`) for that. `GET /diagnostics` lists a route's `W018` and `W029` under those candidates, and the Diagnostics page links them to the route.
 
 ### Dashboard
 
