@@ -6,16 +6,16 @@ Cap the time Sōzune waits for a backend response before giving up. Useful to av
 
 ```yaml
 labels:
-  - "sozune.http.<svc>.backendTimeout=<seconds>"
+  - "sozune.http.<svc>.backendTimeout=<milliseconds>"
 ```
 
 ## Defaults
 
 | Value | Behaviour |
 |---|---|
-| omitted | 30 seconds |
+| omitted | 30 seconds (`30000`) |
 | `0` | **No timeout** — wait indefinitely |
-| any positive integer | Timeout in seconds |
+| any positive integer | Timeout in milliseconds |
 
 ## Examples
 
@@ -24,7 +24,7 @@ Standard API, fail fast:
 ```yaml
 labels:
   - "sozune.http.api.host=api.example.com"
-  - "sozune.http.api.backendTimeout=10"
+  - "sozune.http.api.backendTimeout=10000"
 ```
 
 Server-Sent Events / long-lived stream:

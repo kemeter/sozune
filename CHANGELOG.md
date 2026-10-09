@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Upgrade notes
 
-- `backendTimeout` is now read in milliseconds, as it was always documented. It used to be applied as seconds, so a route that set `backendTimeout=30` meaning 30 seconds now times out after 30ms: multiply such values by 1000. Values written in milliseconds (e.g. `30000`) now behave as intended instead of lasting 1000 times longer. The default (30s) and `0` (no timeout) are unchanged.
+- `backendTimeout` is now read in milliseconds, as the API and the label diagnostics describe it. It used to be applied as seconds, so a route that set `backendTimeout=30` meaning 30 seconds now times out after 30ms: multiply such values by 1000. Values written in milliseconds (e.g. `30000`) now behave as intended instead of lasting 1000 times longer. The default (30s) and `0` (no timeout) are unchanged.
 - A path prefix now matches on segment boundaries, as documented: a route on `/api` serves `/api`, `/api/users` and `/api?page=2`, but no longer `/apidocs`, which Sōzu used to hand it by comparing bytes. A route relying on that has to declare the longer prefix (or `/`) itself.
 - A bare `*` hostname, and a regex hostname that does not stay inside a literal domain, are now refused, from labels (`E002`), the HTTP provider and the API (`400`): they could match the hosts of every other route. Exact names, `*.` wildcards and regexes such as `/cdn[0-9]+/.example.com` are still accepted. See [Regex hostnames](documentation/routing/hostnames.md#regex).
 
