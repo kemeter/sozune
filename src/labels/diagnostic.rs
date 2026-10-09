@@ -177,7 +177,7 @@ impl Serialize for DiagnosticCode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
     pub code: DiagnosticCode,
     pub label: Option<String>,

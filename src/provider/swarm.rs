@@ -249,6 +249,7 @@ impl SwarmProvider {
                     storage_read.get(id).is_none_or(|existing| {
                         existing.backends != ep.backends
                             || existing.config.hostnames != ep.config.hostnames
+                            || existing.candidates != ep.candidates
                     })
                 })
         };
@@ -395,6 +396,7 @@ impl SwarmProvider {
                     continue;
                 };
                 if let Some(existing) = entrypoints.get_mut(&key) {
+                    existing.add_candidates(&entrypoint.candidates);
                     if !existing.backends.contains(&backend) {
                         existing.backends.push(backend);
                     }

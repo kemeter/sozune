@@ -2223,6 +2223,7 @@ fn rule_to_entrypoints(
                     ip_allow_list: Vec::new(),
                 },
                 source: Some(id),
+                candidates: Vec::new(),
             }
         })
         .collect()
@@ -2551,6 +2552,7 @@ pub fn tcp_route_to_entrypoints(
                     ..tls_entrypoint_defaults()
                 },
                 source: Some(format!("{SOURCE_TAG}-tcp/{namespace}/{route_name}")),
+                candidates: Vec::new(),
             })
         })
         .collect()
@@ -2884,6 +2886,7 @@ pub fn udp_route_to_entrypoints(
                     ..tls_entrypoint_defaults()
                 },
                 source: Some(format!("{SOURCE_TAG}-udp/{namespace}/{route_name}")),
+                candidates: Vec::new(),
             })
         })
         .collect()
@@ -3270,6 +3273,7 @@ pub fn tls_route_to_entrypoints(
                             ..tls_entrypoint_defaults()
                         },
                         source: Some(format!("{SOURCE_TAG}-tls/{namespace}/{route_name}")),
+                        candidates: Vec::new(),
                     }
                 })
                 .collect::<Vec<_>>()

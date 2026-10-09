@@ -1032,6 +1032,7 @@ impl IngressParseCtx<'_> {
                 ip_allow_list: Vec::new(),
             },
             source: Some(self.provider.name.to_string()),
+            candidates: Vec::new(),
         };
 
         Some((key, entrypoint))
