@@ -136,7 +136,7 @@ Response: a JSON array of entrypoint objects (see [Entrypoint schema](#entrypoin
     - `message` — raw error message from the last probe attempt
     - `since` — Unix epoch (seconds) the backend was first marked down
     - `last_checked` — Unix epoch (seconds) of the last probe attempt
-- `diagnostics`: list of [Diagnostic objects](#diagnostic-schema) associated with this entrypoint, including runtime collision lints (W018)
+- `diagnostics`: list of [Diagnostic objects](#diagnostic-schema) associated with this entrypoint, including the runtime lints: route collisions (W018) and unknown ACME resolvers (W029)
 
 ### `GET /entrypoints/{id}`
 
@@ -338,7 +338,7 @@ Sample response:
 
 ### `GET /diagnostics`
 
-Snapshot of every diagnostic sōzune has computed: per-candidate diagnostics from the parser, plus global lints (e.g. `W015` ACME enabled but no `tls=true`) and runtime collision lints (`W018`). Available to both roles.
+Snapshot of every diagnostic sōzune has computed: per-candidate diagnostics from the parser, plus global lints (e.g. `W015` ACME enabled but no `tls=true`) and the runtime lints: route collisions (`W018`) and unknown ACME resolvers (`W029`). Available to both roles.
 
 ```bash
 curl -u admin:your-password http://localhost:3035/diagnostics

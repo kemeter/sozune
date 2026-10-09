@@ -66,6 +66,9 @@ pub enum DiagnosticCode {
     /// that does not read the ClientHello. The route falls back to the
     /// listener's catch-all behaviour.
     W028InvalidSni,
+    /// A TLS route names, in `acme.resolver`, a resolver that `acme.resolvers`
+    /// does not declare. Every certificate order for its hostnames fails.
+    W029UnknownAcmeResolver,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -108,6 +111,7 @@ impl DiagnosticCode {
             DiagnosticCode::W026InvalidPluginConfig => "W026",
             DiagnosticCode::W027InvalidWeight => "W027",
             DiagnosticCode::W028InvalidSni => "W028",
+            DiagnosticCode::W029UnknownAcmeResolver => "W029",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -160,6 +164,7 @@ impl DiagnosticCode {
             DiagnosticCode::W026InvalidPluginConfig,
             DiagnosticCode::W027InvalidWeight,
             DiagnosticCode::W028InvalidSni,
+            DiagnosticCode::W029UnknownAcmeResolver,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

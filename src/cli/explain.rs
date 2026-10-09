@@ -347,6 +347,14 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.tcp.db.entrypoint=postgres\nsozune.tcp.db.sni=db.example.com"),
     },
     Entry {
+        code: "W029",
+        title: "Unknown ACME resolver",
+        cause: "A TLS route sets `acme.resolver` to a name that `acme.resolvers` in `config.yaml` does not declare — a typo, or a resolver removed from the configuration.",
+        effect: "A certificate ordered for the route's hostnames through that name fails, and is retried with backoff: ACME issues no certificate for them. A hostname another route or a resolver's `domains` already claims is ordered through that resolver instead.",
+        fix: "Point `acme.resolver` at a resolver declared under `acme.resolvers`, or declare it there. Remove the label to fall back to HTTP-01 on `challenge_port`.",
+        example: Some("sozune.http.app.tls=true\nsozune.http.app.acme.resolver=letsencrypt"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

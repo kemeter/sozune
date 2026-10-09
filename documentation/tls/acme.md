@@ -62,6 +62,8 @@ acme:
       resolver: cloudflare-main
 ```
 
+With labels (Docker, Podman, Swarm, Nomad, Consul, Ring, or annotations on a Kubernetes Service), the same binding is `sozune.http.<svc>.acme.resolver=cloudflare-main`.
+
 Set `CF_API_TOKEN=...` in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
 
 ### Wildcard without an entrypoint (`domains`)
@@ -126,6 +128,8 @@ The server must accept TXT updates under the zone for that key (`update-policy` 
 **Checked at startup.** Each DNS-01 resolver is built once when Sōzune starts. One whose env var is not set or whose fields are invalid (an unknown OVH `endpoint`, a bad `tsig_algorithm`…) is logged as an error naming the problem; Sōzune still starts, and only the certificates ordered through that resolver fail. [`sozune doctor`](/documentation/advanced/debugging) runs the same check.
 
 **Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
+
+**Unknown resolver:** a TLS route whose `acme.resolver` names a resolver that `acme.resolvers` does not declare gets diagnostic `W029`, in `sozune validate`, `GET /diagnostics` and the dashboard. A certificate ordered through it would fail. A route whose hostnames are all covered by [certificates from files](/documentation/tls/overview#certificates-from-files) is left alone: ACME orders nothing for it.
 
 **Wildcard on an HTTP-01 resolver:** the order will fail loudly with `wildcard hostname requires a DNS-01 resolver`. Wildcards always need DNS-01.
 

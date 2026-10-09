@@ -20,6 +20,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "circuitBreaker.minRequests",
     "circuitBreaker.cooldown",
     "tls",
+    "acme.resolver",
     "stripPrefix",
     "addPrefix",
     "httpsRedirect",

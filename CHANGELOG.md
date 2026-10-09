@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
 
 ### TLS / ACME
 
+- The `sozune.http.<svc>.acme.resolver` label is now read. It was documented but ignored (reported as an unknown label `W013`), so a route set up through labels could not choose its resolver: its certificate went through HTTP-01, and a wildcard could not be issued.
+- A TLS route whose `acme.resolver` names a resolver that `acme.resolvers` does not declare now gets diagnostic `W029`, in `sozune validate`, `GET /diagnostics` and the dashboard. It used to show up only as failed certificate orders.
 - A DNS-01 resolver that cannot be built — an env var not set, an unknown OVH `endpoint`, an invalid RFC 2136 field — is reported at startup and by `sozune doctor`. It used to surface only when a certificate was ordered through it, failing each order in turn.
 - More DNS-01 providers — `desec`, `digitalocean`, `hetzner`, `infomaniak` and `porkbun`, plus `rfc2136` for a self-hosted authoritative server (BIND, Knot DNS, PowerDNS) through TSIG-signed dynamic updates. See [DNS-01 providers](documentation/tls/acme.md).
 - The `endpoint` of an OVH DNS-01 resolver is now applied. It used to be ignored, so `ovh-ca` and `ovh-us` accounts were sent to the European API, which rejects their credentials. An unknown value now fails with an error listing `ovh-eu`, `ovh-ca` and `ovh-us`.
@@ -49,6 +51,7 @@ All notable changes to this project will be documented in this file.
 - `POST /routes/resolve` — which route serves a request, and why, without sending it. Given a URL (plus method, headers and client address if they matter), it returns the route Sōzu picks, why each other route on the host loses (`shadowed` by a higher priority, `rejected` by its path, method or TLS setting, `refused` by Sōzu), what the route's middlewares decide (IP allow-list and match conditions are evaluated; rate limit, in-flight and forward auth are reported as applying), and the health of its backends. The answer comes from Sōzu's own router fed the frontends the workers hold, so it cannot drift from what the proxy does. Open to the `read-only` role. See [API docs](documentation/configuration/api.md#post-routesresolve).
 - `GET /config` also returns the TCP and UDP listeners, the TLS options of the HTTPS listener and the Ring provider. Read-only users could already read it; the documentation said admin only.
 - `GET /config` lists the env vars a DNS-01 resolver reads under the names the config gives them. It used to show made-up defaults such as `CLOUDFLARE_API_TOKEN (configurable)`, which these fields do not have.
+- `GET /entrypoints` and `GET /entrypoints/{id}` list a route's collision warning (`W018`) next to the diagnostics its labels produced. The warning used to replace them, and two routes sharing an id could show each other's.
 
 ### Dashboard
 
@@ -66,6 +69,7 @@ All notable changes to this project will be documented in this file.
 - `sozune doctor` checks everything sozune binds — UDP listeners, the ACME challenge and TLS-ALPN-01 ports, and the metrics listener are probed, and two listeners sharing a port are reported (each probed fine on its own, then the second failed at startup). Kubernetes, Consul and Ring providers are now checked. The middleware port is probed on loopback, where it actually binds, and IPv6 API/dashboard addresses no longer fail to parse.
 - `sozune doctor` no longer creates a missing ACME `certs_dir`; it reports whether sozune will be able to create it. The privileged-ports warning no longer shows for non-root users whose binds already passed.
 - `sozune explain` examples for `W003`, `W005` and `W006` used label names the parser does not know (`backend_timeout`, `redirect.policy`, `redirect.scheme`), so copying the fix yielded a `W013`. `E004`, `I002` and `W017` described the wrong cause or effect. Every example is now checked against the label catalog.
+- `sozune validate` counts a candidate as degraded when a lint across candidates warns about it (`W018` route collision, `W029` unknown ACME resolver). It used to show it as routed, with a success mark next to the warning.
 
 ### Security
 

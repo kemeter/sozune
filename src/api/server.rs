@@ -58,13 +58,15 @@ pub struct AppState {
 /// since, last_checked }`. Breaking change vs. previous API where this field
 /// was a plain `string[]`.
 ///
-/// Diagnostics are looked up by `entrypoint.id` first (the cluster_id used at
-/// runtime), then by `entrypoint.source` which is set to the candidate id by
-/// most providers. The first non-empty match wins.
+/// Parser diagnostics are looked up by `entrypoint.id` first (the cluster_id
+/// used at runtime), then by `entrypoint.source` which is set to the candidate
+/// id by most providers. The first non-empty match wins. `runtime_lints`, found
+/// by storage key, are appended to them.
 fn entrypoint_payload(
     entrypoint: &Entrypoint,
     unhealthy: &UnhealthyMap,
     diagnostics: &HashMap<String, Vec<Diagnostic>>,
+    runtime_lints: Option<&Vec<Diagnostic>>,
 ) -> serde_json::Value {
     let unhealthy_for_ep: Vec<serde_json::Value> = entrypoint
         .backends
@@ -83,7 +85,7 @@ fn entrypoint_payload(
         })
         .collect();
 
-    let diags_for_ep: Vec<Diagnostic> = diagnostics
+    let mut diags_for_ep: Vec<Diagnostic> = diagnostics
         .get(&entrypoint.id)
         .or_else(|| {
             entrypoint
@@ -93,6 +95,7 @@ fn entrypoint_payload(
         })
         .cloned()
         .unwrap_or_default();
+    diags_for_ep.extend(runtime_lints.into_iter().flatten().cloned());
 
     let mut value = serde_json::json!(entrypoint);
     if let Some(obj) = value.as_object_mut() {
@@ -433,28 +436,42 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
             HashMap::new()
         }
     };
-    let mut diagnostics = read_diagnostics(&state);
-    merge_collision_lints(&storage, &mut diagnostics);
+    let diagnostics = read_diagnostics(&state);
+    let runtime = runtime_lints(&storage, &state);
     let list: Vec<serde_json::Value> = storage
-        .values()
-        .map(|ep| entrypoint_payload(ep, &unhealthy, &diagnostics))
+        .iter()
+        .map(|(key, ep)| entrypoint_payload(ep, &unhealthy, &diagnostics, runtime.get(key)))
         .collect();
     (StatusCode::OK, Json(serde_json::json!(list)))
 }
 
-/// Compute W018 route-collision diagnostics on the live storage and append
-/// them to the diagnostics map under the entrypoint id so they show up next to
-/// the per-candidate diagnostics. Idempotent — duplicate codes are not
-/// deduplicated, callers should treat the map as additive.
-fn merge_collision_lints(
+/// Compute the lints that need the live storage — W018 route collisions and
+/// W029 unknown ACME resolvers — keyed by storage key. That key can differ
+/// from `entrypoint.id` (a disambiguated duplicate) and from the candidate id
+/// the parser diagnostics are stored under, so callers look these up apart.
+fn runtime_lints(
     storage: &BTreeMap<String, Entrypoint>,
-    diagnostics: &mut HashMap<String, Vec<Diagnostic>>,
-) {
+    state: &AppState,
+) -> HashMap<String, Vec<Diagnostic>> {
     let pairs: Vec<(&str, &Entrypoint)> =
         storage.iter().map(|(id, ep)| (id.as_str(), ep)).collect();
-    for (ep_id, diag) in crate::labels::lint::lint_collection(&pairs) {
-        diagnostics.entry(ep_id).or_default().push(diag);
+    let file_names: Vec<String> = state
+        .file_certificates
+        .iter()
+        .flat_map(|cert| cert.names.iter().cloned())
+        .collect();
+    let lints = crate::labels::lint::lint_collection(&pairs)
+        .into_iter()
+        .chain(crate::labels::lint::lint_unknown_resolvers(
+            state.config.acme.as_ref(),
+            &file_names,
+            &pairs,
+        ));
+    let mut out: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+    for (key, diag) in lints {
+        out.entry(key).or_default().push(diag);
     }
+    out
 }
 
 fn read_diagnostics(state: &AppState) -> HashMap<String, Vec<Diagnostic>> {
@@ -471,8 +488,8 @@ fn read_diagnostics(state: &AppState) -> HashMap<String, Vec<Diagnostic>> {
 }
 
 /// `GET /diagnostics` — snapshot of every per-entrypoint diagnostic plus
-/// recomputed global lints (e.g. ACME-without-TLS) and runtime collision
-/// lints (W018) that are not stored at parse time.
+/// recomputed global lints (e.g. ACME-without-TLS) and the runtime lints
+/// (W018 collisions, W029 unknown resolvers) that are not stored at parse time.
 async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let mut grouped: HashMap<String, Vec<Diagnostic>> =
         crate::diagnostics::snapshot(&state.diagnostics)
@@ -480,7 +497,9 @@ async fn list_diagnostics(State(state): State<AppState>) -> (StatusCode, Json<se
             .collect();
 
     if let Ok(storage) = state.storage.read() {
-        merge_collision_lints(&storage, &mut grouped);
+        for (key, diags) in runtime_lints(&storage, &state) {
+            grouped.entry(key).or_default().extend(diags);
+        }
     }
 
     let mut total: usize = grouped.values().map(|v| v.len()).sum();
@@ -667,13 +686,18 @@ async fn get_entrypoint(
         }
     };
 
-    let mut diagnostics = read_diagnostics(&state);
-    merge_collision_lints(&storage, &mut diagnostics);
+    let diagnostics = read_diagnostics(&state);
+    let runtime = runtime_lints(&storage, &state);
 
     match storage.get(&id) {
         Some(entrypoint) => (
             StatusCode::OK,
-            Json(entrypoint_payload(entrypoint, &unhealthy, &diagnostics)),
+            Json(entrypoint_payload(
+                entrypoint,
+                &unhealthy,
+                &diagnostics,
+                runtime.get(&id),
+            )),
         ),
         None => (
             StatusCode::NOT_FOUND,
@@ -2321,6 +2345,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnostics_endpoint_flags_an_unknown_acme_resolver() {
+        let mut state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        config.acme = Some(crate::config::AcmeConfig {
+            enabled: true,
+            email: String::new(),
+            certs_dir: String::from("/tmp"),
+            staging: true,
+            challenge_port: 80,
+            tls_alpn_port: 3038,
+            resolvers: HashMap::new(),
+        });
+        state.config = Arc::new(config);
+        let mut tls_ep = make_ep("ep-tls", "secure.example.com", None, Some("docker"));
+        tls_ep.config.tls = true;
+        tls_ep.config.acme = Some(crate::model::EntrypointAcmeConfig {
+            resolver: "missing".into(),
+        });
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("ep-tls".into(), tls_ep);
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        // Under the route, not its `source`: that is the provider name.
+        assert_eq!(items[0]["candidate_id"], "ep-tls");
+        assert_eq!(items[0]["diagnostics"][0]["code"], "W029");
+    }
+
+    #[tokio::test]
     async fn diagnostics_endpoint_surfaces_w018_collisions_on_runtime_storage() {
         let state = test_state();
         // Two entrypoints sharing the same (host, path).
@@ -2597,6 +2664,52 @@ mod tests {
             "diagnostic stored under source must be surfaced"
         );
         assert_eq!(diags[0]["code"], "W001");
+    }
+
+    #[tokio::test]
+    async fn list_entrypoints_keeps_runtime_lints_on_their_own_route() {
+        // Two routes sharing an id (a disambiguated duplicate) and a host+path:
+        // each gets its own W018, keyed by storage key, next to the parser
+        // diagnostics stored under its candidate id rather than in their place.
+        let state = test_state();
+        {
+            let mut storage = state.storage.write().unwrap();
+            storage.insert(
+                "http_web".into(),
+                make_ep("http_web", "example.com", None, Some("cand-a")),
+            );
+            storage.insert(
+                "http_web-2".into(),
+                make_ep("http_web", "example.com", None, Some("cand-b")),
+            );
+        }
+        crate::diagnostics::set(
+            &state.diagnostics,
+            "cand-b",
+            vec![diag_w001("sozune.http.web.port", "abc")],
+        );
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let codes = |i: usize| -> Vec<String> {
+            json[i]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["code"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(codes(0), vec!["W018"]);
+        assert_eq!(codes(1), vec!["W001", "W018"]);
     }
 
     #[tokio::test]
