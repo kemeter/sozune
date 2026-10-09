@@ -40,11 +40,24 @@ entrypoints:
 
 You can also set `backendTimeout=0` (no timeout) if you don't want to think about it, but a finite cap is safer in production — a stuck backend won't pin a worker forever.
 
+### Raise the listener timeouts too
+
+`backendTimeout` is not the only clock. The HTTP and HTTPS listeners close a backend connection that stays silent for 30 s, and a client connection that waits for 60 s, whatever the route sets. A poll held longer than that needs them raised in `config.yaml`:
+
+```yaml
+proxy:
+  timeouts:
+    backend_idle: 90   # seconds, past the longest poll
+    client_idle: 90
+```
+
+These apply to every route on the listener. See [Proxy configuration](/documentation/configuration/overview#proxy).
+
 ## Matrix / Synapse
 
 Matrix clients (Element, FluffyChat, etc.) call `GET /_matrix/client/v3/sync?timeout=30000` in a loop. Synapse holds the request for up to 30 s waiting for new events. With the default 30 s backend timeout, the cut happens right around the same time the server is about to respond, so you get a continuous stream of resets and the user sees missed messages and reconnect spinners.
 
-Set `backendTimeout=60000` (60 s, or `0`) on the Synapse entrypoint and the syncs land cleanly:
+Set `backendTimeout=60000` (60 s, or `0`) on the Synapse entrypoint, and `proxy.timeouts.backend_idle` above 30 s (e.g. `90`), and the syncs land cleanly:
 
 ```yaml
 labels:

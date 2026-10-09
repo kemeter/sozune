@@ -641,6 +641,31 @@ pub struct ProxyConfig {
     /// to /32 or /128) or CIDR blocks.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Connection timeouts of the HTTP and HTTPS listeners.
+    #[serde(default)]
+    pub timeouts: ProxyTimeouts,
+}
+
+/// Connection timeouts applied to both the HTTP and the HTTPS listener, in
+/// seconds. Sōzu sets them per listener, not per route. Each absent field
+/// keeps Sōzu's default; zero is refused, since Sōzu would close every
+/// connection as it opens.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProxyTimeouts {
+    /// How long a client connection may stay silent. Sōzu's default: 60s.
+    #[serde(default)]
+    pub client_idle: Option<u32>,
+    /// How long a backend connection may stay silent, waiting for the
+    /// response included. Sōzu's default: 30s.
+    #[serde(default)]
+    pub backend_idle: Option<u32>,
+    /// How long connecting to a backend may take. Sōzu's default: 3s.
+    #[serde(default)]
+    pub backend_connect: Option<u32>,
+    /// How long a client may take to send a complete request. Sōzu's
+    /// default: 10s.
+    #[serde(default)]
+    pub request: Option<u32>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1021,6 +1046,7 @@ impl Default for ProxyConfig {
             metrics_poll_timeout_ms: default_metrics_poll_timeout_ms(),
             command_buffer_max_bytes: default_command_buffer_max_bytes(),
             trusted_proxies: Vec::new(),
+            timeouts: ProxyTimeouts::default(),
         }
     }
 }
@@ -1836,6 +1862,18 @@ impl ProxyConfig {
         if let Some(v) = env_parse::<u64>("SOZUNE_PROXY_COMMAND_BUFFER_MAX_BYTES") {
             self.command_buffer_max_bytes = v;
         }
+        if let Some(v) = env_parse::<u32>("SOZUNE_PROXY_TIMEOUT_CLIENT_IDLE") {
+            self.timeouts.client_idle = Some(v);
+        }
+        if let Some(v) = env_parse::<u32>("SOZUNE_PROXY_TIMEOUT_BACKEND_IDLE") {
+            self.timeouts.backend_idle = Some(v);
+        }
+        if let Some(v) = env_parse::<u32>("SOZUNE_PROXY_TIMEOUT_BACKEND_CONNECT") {
+            self.timeouts.backend_connect = Some(v);
+        }
+        if let Some(v) = env_parse::<u32>("SOZUNE_PROXY_TIMEOUT_REQUEST") {
+            self.timeouts.request = Some(v);
+        }
     }
 }
 
@@ -2300,6 +2338,45 @@ tcp:
         assert_eq!(config.tcp[0].idle_timeout, Some(3600));
         // Absent idle_timeout stays None (Sōzu's defaults apply).
         assert!(config.tcp[1].idle_timeout.is_none());
+    }
+
+    #[test]
+    fn test_proxy_timeouts_deserialization() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+timeouts:
+  client_idle: 300
+  backend_idle: 120
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.timeouts.client_idle, Some(300));
+        assert_eq!(config.timeouts.backend_idle, Some(120));
+        // Absent fields stay None (Sōzu's defaults apply).
+        assert!(config.timeouts.backend_connect.is_none());
+        assert!(config.timeouts.request.is_none());
+    }
+
+    #[test]
+    fn test_proxy_timeouts_env_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut config = ProxyConfig::default();
+        config.timeouts.client_idle = Some(60);
+        unsafe {
+            std::env::set_var("SOZUNE_PROXY_TIMEOUT_CLIENT_IDLE", "300");
+            std::env::set_var("SOZUNE_PROXY_TIMEOUT_BACKEND_IDLE", "120");
+        }
+        config.apply_env_overrides();
+        unsafe {
+            std::env::remove_var("SOZUNE_PROXY_TIMEOUT_CLIENT_IDLE");
+            std::env::remove_var("SOZUNE_PROXY_TIMEOUT_BACKEND_IDLE");
+        }
+        assert_eq!(config.timeouts.client_idle, Some(300));
+        assert_eq!(config.timeouts.backend_idle, Some(120));
+        assert!(config.timeouts.request.is_none());
     }
 
     #[test]

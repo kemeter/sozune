@@ -4,7 +4,7 @@ mod builders;
 mod channel;
 mod worker;
 
-use crate::config::{ProxyConfig, TcpRateLimit};
+use crate::config::{ProxyConfig, ProxyTimeouts, TcpRateLimit};
 use crate::middleware::ip_allow_list::IpAllowList;
 use crate::middleware::rate_limit::{RateLimitResult, RateLimiter};
 use crate::middleware::{self, MiddlewareState};
@@ -511,6 +511,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         config.http.listen_address,
     ));
     apply_listener_error_pages(&mut http_builder, &config.http.error_pages, "HTTP");
+    apply_listener_timeouts(&mut http_builder, &config.timeouts)?;
     let http_listener = http_builder
         .to_http(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
@@ -532,6 +533,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         https_bind_port,
     ));
     apply_listener_error_pages(&mut https_builder, &config.https.error_pages, "HTTPS");
+    apply_listener_timeouts(&mut https_builder, &config.timeouts)?;
     apply_listener_http2(&mut https_builder, &config.https.http2);
     apply_listener_tls_options(&mut https_builder, &config.https.tls)
         .map_err(|e| anyhow::anyhow!("Invalid HTTPS TLS options: {e}"))?;
@@ -2719,6 +2721,33 @@ fn apply_listener_http2(builder: &mut ListenerBuilder, http2: &crate::config::Ht
     }
 }
 
+/// Apply `proxy.timeouts` onto an HTTP or HTTPS `ListenerBuilder`. Absent
+/// fields keep Sōzu's defaults. Zero is refused: Sōzu would arm a timer that
+/// fires on the next tick and close every connection as it opens.
+fn apply_listener_timeouts(
+    builder: &mut ListenerBuilder,
+    timeouts: &ProxyTimeouts,
+) -> anyhow::Result<()> {
+    for (name, value) in [
+        ("client_idle", timeouts.client_idle),
+        ("backend_idle", timeouts.backend_idle),
+        ("backend_connect", timeouts.backend_connect),
+        ("request", timeouts.request),
+    ] {
+        if value == Some(0) {
+            anyhow::bail!(
+                "`proxy.timeouts.{name}` must be greater than zero (there is no \"never\" value; use a large number of seconds instead)"
+            );
+        }
+    }
+    builder
+        .with_front_timeout(timeouts.client_idle)
+        .with_back_timeout(timeouts.backend_idle)
+        .with_connect_timeout(timeouts.backend_connect)
+        .with_request_timeout(timeouts.request);
+    Ok(())
+}
+
 /// Apply a TCP listener's `idle_timeout` onto a `ListenerBuilder`.
 ///
 /// Sōzu keeps two timers per TCP session, one per side, and a byte read on
@@ -2877,6 +2906,57 @@ mod tests {
     fn tcp_idle_timeout_zero_is_refused() {
         let err = tcp_listener_with_idle_timeout(Some(0)).unwrap_err();
         assert!(err.to_string().contains("greater than zero"), "{err}");
+    }
+
+    fn http_listener_with_timeouts(
+        timeouts: ProxyTimeouts,
+    ) -> anyhow::Result<sozu_command_lib::proto::command::HttpListenerConfig> {
+        let mut builder = ListenerBuilder::new_http(SocketAddress::new_v4(0, 0, 0, 0, 8080));
+        apply_listener_timeouts(&mut builder, &timeouts)?;
+        builder
+            .to_http(None)
+            .map_err(|e| anyhow::anyhow!("to_http: {e}"))
+    }
+
+    #[test]
+    fn proxy_timeouts_unset_keep_sozu_defaults() {
+        use sozu_command_lib::config::{
+            DEFAULT_BACK_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_FRONT_TIMEOUT,
+            DEFAULT_REQUEST_TIMEOUT,
+        };
+        let cfg = http_listener_with_timeouts(Default::default()).unwrap();
+        assert_eq!(cfg.front_timeout, DEFAULT_FRONT_TIMEOUT);
+        assert_eq!(cfg.back_timeout, DEFAULT_BACK_TIMEOUT);
+        assert_eq!(cfg.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(cfg.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn proxy_timeouts_reach_the_listener() {
+        let cfg = http_listener_with_timeouts(ProxyTimeouts {
+            client_idle: Some(300),
+            backend_idle: Some(120),
+            backend_connect: Some(5),
+            request: Some(20),
+        })
+        .unwrap();
+        assert_eq!(cfg.front_timeout, 300);
+        assert_eq!(cfg.back_timeout, 120);
+        assert_eq!(cfg.connect_timeout, 5);
+        assert_eq!(cfg.request_timeout, 20);
+    }
+
+    #[test]
+    fn a_zero_proxy_timeout_is_refused() {
+        let err = http_listener_with_timeouts(ProxyTimeouts {
+            backend_idle: Some(0),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("proxy.timeouts.backend_idle"),
+            "{err}"
+        );
     }
 
     #[test]

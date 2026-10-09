@@ -135,6 +135,14 @@
         <dd class="mono">:{config.listeners.http.port}</dd>
         <dt>HTTPS</dt>
         <dd class="mono">:{config.listeners.https.port}</dd>
+        <dt>client idle</dt>
+        <dd class="mono">{config.listeners.timeouts.client_idle}s</dd>
+        <dt>backend idle</dt>
+        <dd class="mono">{config.listeners.timeouts.backend_idle}s</dd>
+        <dt>backend connect</dt>
+        <dd class="mono">{config.listeners.timeouts.backend_connect}s</dd>
+        <dt>request</dt>
+        <dd class="mono">{config.listeners.timeouts.request}s</dd>
       </dl>
     </section>
 

@@ -83,6 +83,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- Listener timeouts — `proxy.timeouts` sets how long the HTTP and HTTPS listeners let a client (`client_idle`, 60s by default) or a backend (`backend_idle`, 30s) stay silent, how long connecting to a backend may take (`backend_connect`, 3s) and how long a client may take to send its request (`request`, 10s). They were fixed at Sōzu's defaults, so any response that kept the backend silent for 30s was cut with a `504`, whatever the route's `backendTimeout`: long-polling and quiet SSE streams could not be served. `GET /config` and the dashboard show the values in effect. See [Proxy](documentation/configuration/overview.md#proxy) and [Long-polling](documentation/advanced/long-polling.md).
 - A frontend, TCP/UDP route, or whole set of backends that Sōzu refused (typically during a rolling deploy, while the old and new containers claim the same hostname) was recorded as applied and never retried, leaving the hostname without a route until a restart. It is now retried on the next reload.
 - An exact path refused every request carrying a query: Sōzu compares the path rule against the path with its query, so `/login` did not match `/login?next=/`. Exact paths now match with or without a query.
 - `stripPrefix`, `addPrefix` and Gateway API `urlRewrite` on a path prefix did not match a query right after the prefix (`/api?x=1`), for the same reason. The query is now matched and passed on to the backend, including by `ReplaceFullPath`, which used to drop it.

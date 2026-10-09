@@ -18,7 +18,8 @@
 
 use crate::api::server::AppState;
 use crate::config::{
-    AcmeConfig, ApiConfig, AppConfig, ProvidersConfig, ProxyConfig, ResolverConfig, TlsOptions,
+    AcmeConfig, ApiConfig, AppConfig, ProvidersConfig, ProxyConfig, ProxyTimeouts, ResolverConfig,
+    TlsOptions,
 };
 use axum::Json;
 use axum::extract::State;
@@ -41,8 +42,19 @@ pub struct ConfigView {
 pub struct ListenersView {
     pub http: PortView,
     pub https: PortView,
+    /// Timeouts of the HTTP and HTTPS listeners, in seconds, Sōzu's defaults
+    /// filled in for the fields `proxy.timeouts` leaves out.
+    pub timeouts: TimeoutsView,
     pub tcp: Vec<TcpListenerView>,
     pub udp: Vec<UdpListenerView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TimeoutsView {
+    pub client_idle: u32,
+    pub backend_idle: u32,
+    pub backend_connect: u32,
+    pub request: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +204,7 @@ fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
         https: PortView {
             port: proxy.https.listen_address,
         },
+        timeouts: timeouts_view(&proxy.timeouts),
         tcp: proxy
             .tcp
             .iter()
@@ -215,6 +228,19 @@ fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
                 port: l.listen,
             })
             .collect(),
+    }
+}
+
+fn timeouts_view(timeouts: &ProxyTimeouts) -> TimeoutsView {
+    use sozu_command_lib::config::{
+        DEFAULT_BACK_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_FRONT_TIMEOUT,
+        DEFAULT_REQUEST_TIMEOUT,
+    };
+    TimeoutsView {
+        client_idle: timeouts.client_idle.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+        backend_idle: timeouts.backend_idle.unwrap_or(DEFAULT_BACK_TIMEOUT),
+        backend_connect: timeouts.backend_connect.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+        request: timeouts.request.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
     }
 }
 
@@ -511,6 +537,19 @@ mod tests {
         assert_eq!(rate_limit.exempt, vec!["172.16.0.0/12"]);
         assert_eq!(tcp.idle_timeout, Some(3600));
         assert_eq!(view.listeners.udp[0].port, 53);
+    }
+
+    #[test]
+    fn view_fills_unset_timeouts_with_sozu_defaults() {
+        let mut cfg = sample_app_config();
+        cfg.proxy.timeouts.backend_idle = Some(120);
+        let view = ConfigView::from_app_config(&cfg);
+        let timeouts = &view.listeners.timeouts;
+        assert_eq!(timeouts.backend_idle, 120);
+        assert_eq!(
+            timeouts.client_idle,
+            sozu_command_lib::config::DEFAULT_FRONT_TIMEOUT
+        );
     }
 
     #[test]

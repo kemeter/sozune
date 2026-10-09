@@ -132,6 +132,10 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 | `proxy.cluster_setup_delay_ms` | `500` | Delay between cluster setup commands |
 | `proxy.reload_debounce_ms` | `500` | Debounce window, in ms, applied to reload signals. A reload runs only after this many ms of silence, coalescing bursts of container start/stop events into one reload |
 | `proxy.metrics_poll_timeout_ms` | `200` | Per-worker deadline, in ms, for a metrics poll round-trip. Keep it short: the poll shares the loop that accepts traffic and applies certificates, so a slow or silent worker must not be allowed to block proxying |
+| `proxy.timeouts.client_idle` | `60` | Seconds a client connection may stay silent before it is closed, waiting for a slow response included |
+| `proxy.timeouts.backend_idle` | `30` | Seconds a backend connection may stay silent, waiting for the response included. Raise it for long-polling, slow reports or quiet SSE streams |
+| `proxy.timeouts.backend_connect` | `3` | Seconds allowed to connect to a backend |
+| `proxy.timeouts.request` | `10` | Seconds a client may take to send a complete request |
 | `proxy.command_buffer_max_bytes` | `65536` | Maximum size, in bytes, the Sōzu command channel back buffer may grow to. A single command or worker reply larger than this is rejected; raise it if you have a very large number of entrypoints |
 
 ## Middleware
@@ -159,6 +163,10 @@ Every field above can be overridden through an environment variable. The env var
 | `proxy.reload_debounce_ms` | `SOZUNE_PROXY_RELOAD_DEBOUNCE_MS` |
 | `proxy.metrics_poll_timeout_ms` | `SOZUNE_PROXY_METRICS_POLL_TIMEOUT_MS` |
 | `proxy.command_buffer_max_bytes` | `SOZUNE_PROXY_COMMAND_BUFFER_MAX_BYTES` |
+| `proxy.timeouts.client_idle` | `SOZUNE_PROXY_TIMEOUT_CLIENT_IDLE` |
+| `proxy.timeouts.backend_idle` | `SOZUNE_PROXY_TIMEOUT_BACKEND_IDLE` |
+| `proxy.timeouts.backend_connect` | `SOZUNE_PROXY_TIMEOUT_BACKEND_CONNECT` |
+| `proxy.timeouts.request` | `SOZUNE_PROXY_TIMEOUT_REQUEST` |
 | `api.enabled` | `SOZUNE_API_ENABLED` |
 | `api.listen_address` | `SOZUNE_API_LISTEN_ADDRESS` |
 | `dashboard.enabled` | `SOZUNE_DASHBOARD_ENABLED` |

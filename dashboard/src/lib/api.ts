@@ -242,6 +242,8 @@ export interface ConfigView {
   listeners: {
     http: { port: number };
     https: { port: number };
+    /** HTTP and HTTPS listener timeouts, in seconds (Sōzu's defaults filled in). */
+    timeouts: { client_idle: number; backend_idle: number; backend_connect: number; request: number };
     tcp: {
       name: string;
       port: number;
