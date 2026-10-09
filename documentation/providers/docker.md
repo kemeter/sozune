@@ -40,6 +40,7 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.priority` | `100` | Higher wins when multiple rules match (default `0`) |
 | `sozune.http.<svc>.methods` | `GET,POST` | Restrict the route to these HTTP methods (comma-separated; default: any) |
 | `sozune.http.<svc>.tls` | `true` | Enables TLS termination (provisions an ACME cert) |
+| `sozune.http.<svc>.acme.resolver` | `cloudflare` | Names the [ACME resolver](/documentation/tls/acme) that issues the certificate. Absent: HTTP-01 on `challenge_port` |
 
 ## Middleware
 

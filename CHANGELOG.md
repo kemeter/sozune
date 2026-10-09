@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 ### TLS / ACME
 
+- The `sozune.http.<svc>.acme.resolver` label is now read. It was documented but ignored (reported as an unknown label `W013`), so a route set up through labels could not choose its resolver: its certificate went through HTTP-01, and a wildcard could not be issued.
 - A DNS-01 resolver that cannot be built — an env var not set, an unknown OVH `endpoint`, an invalid RFC 2136 field — is reported at startup and by `sozune doctor`. It used to surface only when a certificate was ordered through it, failing each order in turn.
 - More DNS-01 providers — `desec`, `digitalocean`, `hetzner`, `infomaniak` and `porkbun`, plus `rfc2136` for a self-hosted authoritative server (BIND, Knot DNS, PowerDNS) through TSIG-signed dynamic updates. See [DNS-01 providers](documentation/tls/acme.md).
 - The `endpoint` of an OVH DNS-01 resolver is now applied. It used to be ignored, so `ovh-ca` and `ovh-us` accounts were sent to the European API, which rejects their credentials. An unknown value now fails with an error listing `ovh-eu`, `ovh-ca` and `ovh-us`.

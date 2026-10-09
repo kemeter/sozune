@@ -200,6 +200,7 @@ fn build_entrypoint(
     let in_flight_req = in_flight_req::parse_in_flight_req(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
+    let acme = core::parse_acme(labels, &prefix);
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
     let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
@@ -276,7 +277,7 @@ fn build_entrypoint(
             entrypoint: None,
             sni: None,
             methods,
-            acme: None,
+            acme,
             plugins,
             plugin_config,
             error_pages: parsed_error_pages,
@@ -681,6 +682,40 @@ mod tests {
         assert!(matches!(tcp.protocol, Protocol::Tcp));
         assert_eq!(tcp.config.entrypoint.as_deref(), Some("postgres"));
         assert_eq!(tcp.backends[0].port, 5432);
+    }
+
+    #[test]
+    fn acme_resolver_label_is_parsed() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.app.host", "app.example.com"),
+                ("sozune.http.app.tls", "true"),
+                ("sozune.http.app.acme.resolver", " cloudflare "),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let http = r.entrypoints.get("http_app").unwrap();
+        assert_eq!(
+            http.config.acme.as_ref().map(|a| a.resolver.as_str()),
+            Some("cloudflare")
+        );
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
+    }
+
+    #[test]
+    fn blank_acme_resolver_label_is_ignored() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.app.host", "app.example.com"),
+                ("sozune.http.app.acme.resolver", "  "),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        assert!(r.entrypoints.get("http_app").unwrap().config.acme.is_none());
     }
 
     #[test]

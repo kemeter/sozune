@@ -62,6 +62,8 @@ acme:
       resolver: cloudflare-main
 ```
 
+With labels (Docker, Podman, Swarm, Nomad, Consul, Ring, or annotations on a Kubernetes Service), the same binding is `sozune.http.<svc>.acme.resolver=cloudflare-main`.
+
 Set `CF_API_TOKEN=...` in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
 
 ### Wildcard without an entrypoint (`domains`)

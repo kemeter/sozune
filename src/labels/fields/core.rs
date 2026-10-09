@@ -1,6 +1,7 @@
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{
-    CircuitBreakerConfig, HealthCheckConfig, LoadBalancer, RetryConfig, SniRejection,
+    CircuitBreakerConfig, EntrypointAcmeConfig, HealthCheckConfig, LoadBalancer, RetryConfig,
+    SniRejection,
 };
 use std::collections::HashMap;
 
@@ -125,6 +126,20 @@ pub fn parse_backend_timeout(
 /// semantics.
 pub fn parse_bool(labels: &HashMap<String, String>, key: &str) -> bool {
     labels.get(key).is_some_and(|v| v == "true")
+}
+
+/// Parse `<prefix>acme.resolver`, the named ACME resolver that issues the
+/// route's certificates. Absent or blank leaves the route on HTTP-01 through
+/// `challenge_port`. Whether the name is declared is checked against the
+/// configuration later (`W029`), since labels are parsed without it.
+pub fn parse_acme(labels: &HashMap<String, String>, prefix: &str) -> Option<EntrypointAcmeConfig> {
+    let resolver = labels.get(&format!("{prefix}acme.resolver"))?.trim();
+    if resolver.is_empty() {
+        return None;
+    }
+    Some(EntrypointAcmeConfig {
+        resolver: resolver.to_string(),
+    })
 }
 
 /// Parse the HTTP health-check labels:
