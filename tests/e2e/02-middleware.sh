@@ -40,6 +40,18 @@ else
     fail "custom header X-Custom-Test NOT found in backend response"
 fi
 
+override_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_HEADERS" \
+    -H "X-Custom-Test: from-client" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
+if echo "$override_body" | grep -qi "X-Custom-Test: from-client"; then
+    fail "custom header X-Custom-Test kept the client value next to the label one"
+elif echo "$override_body" | grep -qi "X-Custom-Test: hello-sozune"; then
+    pass "custom header X-Custom-Test replaces the client value"
+else
+    fail "custom header X-Custom-Test missing when the client sends its own"
+fi
+
 log "[02] Middleware: response-side header injection"
 
 response_headers=$(curl -s -D - -o /dev/null --max-time 2 \

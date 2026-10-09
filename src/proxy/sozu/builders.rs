@@ -26,19 +26,32 @@ pub(super) fn methods_for_frontend(methods: &[String]) -> Vec<Option<String>> {
     }
 }
 
+/// Sōzu appends a header edit next to any header of the same name and reads
+/// an empty value as a delete, applying every delete of a batch before any
+/// insert. A set is therefore sent as a delete followed by the new value, so
+/// the label value replaces what the client or backend sent.
 pub(super) fn build_frontend_headers(edits: &[HeaderConfig]) -> Vec<Header> {
-    edits
-        .iter()
-        .map(|edit| Header {
-            position: match edit.direction {
-                HeaderDirection::Request => HeaderPosition::Request as i32,
-                HeaderDirection::Response => HeaderPosition::Response as i32,
-                HeaderDirection::Both => HeaderPosition::Both as i32,
-            },
+    let mut headers = Vec::with_capacity(edits.len() * 2);
+    for edit in edits {
+        let position = match edit.direction {
+            HeaderDirection::Request => HeaderPosition::Request as i32,
+            HeaderDirection::Response => HeaderPosition::Response as i32,
+            HeaderDirection::Both => HeaderPosition::Both as i32,
+        };
+        headers.push(Header {
+            position,
             key: edit.name.clone(),
-            val: edit.value.clone(),
-        })
-        .collect()
+            val: String::new(),
+        });
+        if !edit.value.is_empty() {
+            headers.push(Header {
+                position,
+                key: edit.name.clone(),
+                val: edit.value.clone(),
+            });
+        }
+    }
+    headers
 }
 
 pub(super) fn build_authorized_hashes(auth: &Option<AuthConfig>) -> Vec<String> {
@@ -406,6 +419,37 @@ fn build_replace_prefix_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header(name: &str, value: &str, direction: HeaderDirection) -> HeaderConfig {
+        HeaderConfig {
+            name: name.into(),
+            value: value.into(),
+            direction,
+        }
+    }
+
+    #[test]
+    fn a_header_value_replaces_the_existing_one() {
+        let built = build_frontend_headers(&[header("X-Foo", "bar", HeaderDirection::Response)]);
+        let edits: Vec<(i32, &str, &str)> = built
+            .iter()
+            .map(|h| (h.position, h.key.as_str(), h.val.as_str()))
+            .collect();
+        let response = HeaderPosition::Response as i32;
+        assert_eq!(
+            edits,
+            vec![(response, "X-Foo", ""), (response, "X-Foo", "bar")]
+        );
+    }
+
+    #[test]
+    fn an_empty_header_value_only_deletes() {
+        let built = build_frontend_headers(&[header("Server", "", HeaderDirection::Both)]);
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].position, HeaderPosition::Both as i32);
+        assert_eq!(built[0].key, "Server");
+        assert!(built[0].val.is_empty());
+    }
 
     #[test]
     fn add_prefix_without_path_matches_root_and_prepends() {
