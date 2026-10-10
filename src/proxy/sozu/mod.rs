@@ -560,7 +560,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         if let Err(e) =
             worker::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
         {
-            error!("HTTP server failed: {}", e);
+            error!("HTTP server failed: {:#}", e);
         }
     });
 
@@ -571,7 +571,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
             max_buffers,
             buffer_size,
         ) {
-            error!("HTTPS server failed: {}", e);
+            error!("HTTPS server failed: {:#}", e);
         }
     });
 

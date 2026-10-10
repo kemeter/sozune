@@ -418,7 +418,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                     if let Err(e) =
                         acme::challenge_server::serve(challenge_port, challenges_server).await
                     {
-                        error!("ACME challenge server failed: {}", e);
+                        error!("ACME challenge server failed: {:#}", e);
                     }
                 });
 
@@ -433,7 +433,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                     if let Err(e) =
                         acme::tls_alpn_responder::serve(tls_alpn_port, tls_alpn_server).await
                     {
-                        error!("TLS-ALPN-01 responder failed: {}", e);
+                        error!("TLS-ALPN-01 responder failed: {:#}", e);
                     }
                 });
 
@@ -449,7 +449,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 );
 
                 if let Err(e) = manager.run().await {
-                    error!("ACME manager failed: {}", e);
+                    error!("ACME manager failed: {:#}", e);
                 }
             }
 
@@ -504,7 +504,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 // already moved to loopback, so continuing would leave 443
                 // unserved while the process reports success.
                 Ok(Err(e)) => {
-                    error!("Proxy task failed: {}", e);
+                    error!("Proxy task failed: {:#}", e);
                     return Err(e);
                 }
                 Err(e) => {
@@ -519,37 +519,37 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
             match api_result {
                 Ok(_) => debug!("API task completed successfully"),
-                Err(e) => error!("API task failed: {}", e),
+                Err(e) => error!("API task failed: {:#}", e),
             }
 
             match metrics_result {
                 Ok(_) => debug!("Metrics task completed successfully"),
-                Err(e) => error!("Metrics task failed: {}", e),
+                Err(e) => error!("Metrics task failed: {:#}", e),
             }
 
             match dashboard_result {
                 Ok(_) => debug!("Dashboard task completed successfully"),
-                Err(e) => error!("Dashboard task failed: {}", e),
+                Err(e) => error!("Dashboard task failed: {:#}", e),
             }
 
             match provider_result {
                 Ok(_) => info!("Provider services completed successfully"),
-                Err(e) => error!("Provider services failed: {}", e),
+                Err(e) => error!("Provider services failed: {:#}", e),
             }
 
             match acme_result {
                 Ok(_) => debug!("ACME task completed successfully"),
-                Err(e) => error!("ACME task failed: {}", e),
+                Err(e) => error!("ACME task failed: {:#}", e),
             }
 
             match middleware_result {
                 Ok(_) => debug!("Middleware task completed successfully"),
-                Err(e) => error!("Middleware task failed: {}", e),
+                Err(e) => error!("Middleware task failed: {:#}", e),
             }
 
             match health_result {
                 Ok(_) => debug!("Health checker completed successfully"),
-                Err(e) => error!("Health checker failed: {}", e),
+                Err(e) => error!("Health checker failed: {:#}", e),
             }
         },
         _ = signal_task => {
