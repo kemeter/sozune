@@ -355,6 +355,14 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.http.app.tls=true\nsozune.http.app.acme.resolver=letsencrypt"),
     },
     Entry {
+        code: "W030",
+        title: "Backend timeout beyond the listener",
+        cause: "A route sets `backendTimeout` to `0` (no timeout) or to more than the HTTP and HTTPS listeners allow: `proxy.timeouts.backend_idle` (30s by default) closes a backend connection that sends nothing for that long, and `client_idle` (60s) a client connection left waiting.",
+        effect: "A request that waits longer than the shorter of the two for its response is cut with a `504`, before `backendTimeout` is reached. Long-polling and SSE streams without keep-alive fail this way.",
+        fix: "Raise `proxy.timeouts.backend_idle` and `client_idle` in `config.yaml` past the longest wait, or lower `backendTimeout` below them. For SSE, a keep-alive comment from the backend every 15-20s also keeps the connection active.",
+        example: Some("sozune.http.app.backendTimeout=20000"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

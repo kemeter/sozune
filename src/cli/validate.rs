@@ -109,6 +109,10 @@ fn apply_collection_lints(report: &mut ValidationReport, config: &AppConfig) {
         &file_names,
         &pairs,
     ));
+    extra.extend(crate::labels::lint::lint_backend_timeouts(
+        &config.proxy.timeouts,
+        &pairs,
+    ));
 
     for (cand_id, diag) in extra {
         if let Some(c) = report.candidates.iter_mut().find(|c| c.id == cand_id) {

@@ -487,8 +487,9 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
     (StatusCode::OK, Json(serde_json::json!(list)))
 }
 
-/// Compute the lints that need the live storage — W018 route collisions and
-/// W029 unknown ACME resolvers — keyed by storage key. That key can differ
+/// Compute the lints that need the live storage — W018 route collisions, W029
+/// unknown ACME resolvers and W030 backend timeouts the listener cuts short —
+/// keyed by storage key. That key can differ
 /// from `entrypoint.id` (a disambiguated duplicate) and from the candidate id
 /// the parser diagnostics are stored under, so callers look these up apart.
 fn runtime_lints(
@@ -507,6 +508,10 @@ fn runtime_lints(
         .chain(crate::labels::lint::lint_unknown_resolvers(
             state.config.acme.as_ref(),
             &file_names,
+            &pairs,
+        ))
+        .chain(crate::labels::lint::lint_backend_timeouts(
+            &state.config.proxy.timeouts,
             &pairs,
         ));
     let mut out: HashMap<String, Vec<Diagnostic>> = HashMap::new();
@@ -2445,6 +2450,37 @@ mod tests {
         // Under the route, not its `source`: that is the provider name.
         assert_eq!(items[0]["candidate_id"], "ep-tls");
         assert_eq!(items[0]["diagnostics"][0]["code"], "W029");
+    }
+
+    #[tokio::test]
+    async fn entrypoints_flag_a_backend_timeout_the_listener_cuts_short() {
+        let state = test_state();
+        let mut slow = make_ep("ep-slow", "slow.example.com", None, Some("docker"));
+        slow.config.backend_timeout = Some(60_000);
+        state
+            .storage
+            .write()
+            .unwrap()
+            .insert("ep-slow".into(), slow);
+
+        let app = test_app(state);
+        let response = app
+            .oneshot(
+                Request::get("/entrypoints")
+                    .header("authorization", admin_auth())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_to_json(response.into_body()).await;
+        let codes: Vec<&str> = json[0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["code"].as_str())
+            .collect();
+        assert!(codes.contains(&"W030"), "{codes:?}");
     }
 
     #[tokio::test]
