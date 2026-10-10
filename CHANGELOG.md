@@ -83,6 +83,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- The Ring provider found no backend with Ring 0.10.0 or later: Ring only returns the address of its instances when asked for them, and Sōzune did not ask, so every Ring route was discovered without a reachable instance. Sōzune now requests them.
 - A task that fails, such as an HTTPS worker that cannot build its listener, now logs the cause of the failure (an unreadable file, no usable cipher, …) and not only its last step, e.g. `Failed at adding the HTTPS listener`.
 - A route whose `backendTimeout` is `0` or longer than `proxy.timeouts.backend_idle` or `client_idle` now gets diagnostic `W030`, in `sozune validate`, `GET /diagnostics`, `GET /entrypoints` and the dashboard: the listener cuts a request left waiting that long first, whatever the route sets.
 - Listener timeouts — `proxy.timeouts` sets how long the HTTP and HTTPS listeners let a client (`client_idle`, 60s by default) or a backend (`backend_idle`, 30s) stay silent, how long connecting to a backend may take (`backend_connect`, 3s) and how long a client may take to send its request (`request`, 10s). They were fixed at Sōzu's defaults, so any response that kept the backend silent for 30s was cut with a `504`, whatever the route's `backendTimeout`: long-polling and quiet SSE streams could not be served. `GET /config` and the dashboard show the values in effect. See [Proxy](documentation/configuration/overview.md#proxy) and [Long-polling](documentation/advanced/long-polling.md).

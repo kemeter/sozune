@@ -34,6 +34,10 @@ use tracing::{debug, error, info, warn};
 const PROVIDER_NAME: &str = crate::provider::RING;
 const NETWORK_NAME: &str = "ring";
 
+/// Running deployments with the address of each instance. Sōzune routes to
+/// running deployments only, so Ring has no other to inspect.
+const DEPLOYMENTS_PATH: &str = "/deployments?status=running&instances=true";
+
 pub struct RingProvider {
     config: RingConfig,
     client: reqwest::Client,
@@ -91,8 +95,11 @@ impl RingProvider {
 
     /// Fetch every deployment Ring knows about. The token (a PAT scoped to
     /// `deployments:read`) is sent as a Bearer header when configured.
+    /// Ring resolves the instance addresses only when asked to: without
+    /// `instances=true`, every instance comes back without one and none of
+    /// them becomes a backend.
     async fn list_deployments(&self) -> anyhow::Result<Vec<RawDeployment>> {
-        let url = self.build_url("/deployments");
+        let url = self.build_url(DEPLOYMENTS_PATH);
         let mut req = self.client.get(&url).header("Accept", "application/json");
         if !self.config.token.is_empty() {
             req = req.bearer_auth(&self.config.token);
@@ -319,6 +326,14 @@ mod tests {
 
     fn provider() -> RingProvider {
         RingProvider::new(cfg()).unwrap()
+    }
+
+    #[test]
+    fn deployments_are_listed_with_their_instance_addresses() {
+        assert_eq!(
+            provider().build_url(DEPLOYMENTS_PATH),
+            "http://127.0.0.1:3030/deployments?status=running&instances=true"
+        );
     }
 
     #[test]
