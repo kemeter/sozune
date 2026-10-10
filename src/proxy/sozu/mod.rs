@@ -450,6 +450,7 @@ fn spawn_udp_workers(
                 address,
                 proxy: ListenerType::Udp.into(),
                 from_scm: false,
+                interface: None,
             }),
         )
         .map_err(|e| {

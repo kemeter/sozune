@@ -21,8 +21,8 @@ regex-syntax = "0.8"
 # Already in the tree through url; declared directly to decode the query of a
 # request before comparing it to a route's query conditions.
 percent-encoding = "2"
-sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.1" }
-sozu-lib = { git = "https://github.com/sozu-proxy/sozu", tag = "2.2.1" }
+sozu-command-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "eeffdc281b81a22e3ccc6c37ff1142804daf712c" }
+sozu-lib = { git = "https://github.com/sozu-proxy/sozu", rev = "eeffdc281b81a22e3ccc6c37ff1142804daf712c" }
 anyhow = "1.0.99"
 bollard = "0.20"
 async-trait = "0.1.89"

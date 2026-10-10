@@ -142,10 +142,7 @@ pub(super) fn build_path_and_rewrite(
     if !strip_prefix {
         let rule = match path_config.rule_type {
             PathRuleType::Prefix => segment_prefix_rule(&path_config.value),
-            PathRuleType::Regex => PathRule {
-                value: path_config.value.clone(),
-                kind: 1,
-            },
+            PathRuleType::Regex => user_regex_rule(&path_config.value),
             PathRuleType::Exact => exact_rule(&path_config.value),
         };
         return (rule, None);
@@ -165,13 +162,7 @@ pub(super) fn build_path_and_rewrite(
                 "strip_prefix on Regex path is not supported natively for {}; configure rewrite via Sozu directly if needed",
                 cluster_id
             );
-            (
-                PathRule {
-                    value: path_config.value.clone(),
-                    kind: 1,
-                },
-                None,
-            )
+            (user_regex_rule(&path_config.value), None)
         }
     }
 }
@@ -226,9 +217,26 @@ fn segment_prefix_rule(prefix: &str) -> PathRule {
         };
     }
     PathRule {
-        value: format!("^{}(?:[/?]|$)", regex_escape(trimmed)),
+        value: format!("^{}(?:[/?].*)?$", regex_escape(trimmed)),
         kind: 1,
     }
+}
+
+/// A `pathRegex` as written by the user, searched anywhere in what Sōzu
+/// matches: the path with its query, unless the user anchors it. Sōzu anchors
+/// a path regex at both ends, so the pattern goes between a lazy `.*?`, which
+/// keeps the first occurrence (the one a `$PATH[n]` rewrite captures), and
+/// `.*`. `^` and `$` written by the user keep their meaning, and its groups
+/// their numbers.
+fn user_regex_rule(value: &str) -> PathRule {
+    // A pattern that does not compile on its own goes as written, for Sōzu
+    // to refuse: the wrapping could otherwise balance it into a valid one.
+    let value = if regex::Regex::new(value).is_ok() {
+        format!(".*?(?:{value}).*")
+    } else {
+        value.to_string()
+    };
+    PathRule { value, kind: 1 }
 }
 
 fn normalize_add_prefix(prefix: &str) -> String {
@@ -283,10 +291,7 @@ fn build_add_prefix_rewrite(
                 Some(format!("{normalized}{}$PATH[1]", pc.value)),
             ),
             PathRuleType::Regex => (
-                PathRule {
-                    value: pc.value.clone(),
-                    kind: 1,
-                },
+                user_regex_rule(&pc.value),
                 Some(format!("{normalized}$PATH[1]")),
             ),
         },
@@ -344,13 +349,7 @@ fn build_replace_full_path(
                 keep_query,
             ),
             PathRuleType::Exact => (exact_rule_capturing_query(&pc.value), keep_query),
-            PathRuleType::Regex => (
-                PathRule {
-                    value: pc.value.clone(),
-                    kind: 1,
-                },
-                Some(new.to_string()),
-            ),
+            PathRuleType::Regex => (user_regex_rule(&pc.value), Some(new.to_string())),
         },
     }
 }
@@ -405,13 +404,7 @@ fn build_replace_prefix_match(
                 "urlRewrite ReplacePrefixMatch on a Regex path is not supported natively for {}; leaving the request path unchanged",
                 cluster_id
             );
-            (
-                PathRule {
-                    value: pc.value.clone(),
-                    kind: 1,
-                },
-                None,
-            )
+            (user_regex_rule(&pc.value), None)
         }
     }
 }
@@ -706,7 +699,7 @@ mod tests {
         let (path_rule, rewrite) =
             build_path_and_rewrite(Some(&path), false, None, Some(&rw), "test");
         assert_eq!(path_rule.kind, 1);
-        assert_eq!(path_rule.value, "^/api(?:[/?]|$)");
+        assert_eq!(path_rule.value, "^/api(?:[/?].*)?$");
         assert!(rewrite.is_none());
     }
 
@@ -819,5 +812,18 @@ mod tests {
         assert!(!matches("^/users/[0-9]+", "/v1/users/42"));
         assert!(!matches("^/users/[0-9]+", "/health?next=/users/42"));
         assert!(!matches("^/users/[0-9]+$", "/users/42?page=2"));
+    }
+
+    /// A rewrite captures the first occurrence, as an unanchored search does.
+    #[test]
+    fn a_path_regex_rewrite_captures_the_first_occurrence() {
+        let path_config = PathConfig {
+            rule_type: PathRuleType::Regex,
+            value: "/(a|b)".to_string(),
+        };
+        let (rule, _) = build_path_and_rewrite(Some(&path_config), false, Some("/p"), None, "test");
+        let regex = regex::Regex::new(&format!(r"\A(?:{})\z", rule.value)).unwrap();
+        let captures = regex.captures("/a/b").unwrap();
+        assert_eq!(captures.get(1).map(|m| m.as_str()), Some("a"));
     }
 }
