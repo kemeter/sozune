@@ -73,6 +73,9 @@ pub enum DiagnosticCode {
     /// `proxy.timeouts.backend_idle` or `client_idle`: the listener cuts a
     /// request that waits that long first.
     W030BackendTimeoutBeyondListener,
+    /// A `redirectHost` label is not a plain hostname, or the route's
+    /// `redirect` is not `permanent`. The label is ignored.
+    W031InvalidRedirectHost,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -117,6 +120,7 @@ impl DiagnosticCode {
             DiagnosticCode::W028InvalidSni => "W028",
             DiagnosticCode::W029UnknownAcmeResolver => "W029",
             DiagnosticCode::W030BackendTimeoutBeyondListener => "W030",
+            DiagnosticCode::W031InvalidRedirectHost => "W031",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -171,6 +175,7 @@ impl DiagnosticCode {
             DiagnosticCode::W028InvalidSni,
             DiagnosticCode::W029UnknownAcmeResolver,
             DiagnosticCode::W030BackendTimeoutBeyondListener,
+            DiagnosticCode::W031InvalidRedirectHost,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

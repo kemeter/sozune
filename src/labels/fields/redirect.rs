@@ -77,9 +77,84 @@ pub fn parse_https_redirect_port(
     }
 }
 
+/// Parse the `redirectHost` label: the host a permanent redirect sends the
+/// client to, path and query kept. Only a plain hostname is accepted (no
+/// wildcard, regex, port, scheme or path); anything else emits `W031` and the
+/// label is ignored.
+pub fn parse_redirect_host(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<String> {
+    let key = format!("{prefix}redirectHost");
+    let raw = labels.get(&key)?;
+    let host = raw.trim();
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if valid {
+        return Some(host.to_ascii_lowercase());
+    }
+    diagnostics.push(
+        Diagnostic::new(
+            DiagnosticCode::W031InvalidRedirectHost,
+            "redirectHost is not a plain hostname, ignoring",
+        )
+        .with_label(&key)
+        .with_value(raw)
+        .with_hint("write the bare host, e.g. www.example.com: no scheme, port, path or wildcard"),
+    );
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_host_accepts_a_plain_hostname() {
+        let mut d = Vec::new();
+        let host = parse_redirect_host(
+            &labels(&[("sozune.http.app.redirectHost", " WWW.Example.com ")]),
+            "sozune.http.app.",
+            &mut d,
+        );
+        assert_eq!(host.as_deref(), Some("www.example.com"));
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn redirect_host_refuses_anything_but_a_hostname() {
+        for value in [
+            "",
+            "https://example.com",
+            "example.com:8443",
+            "example.com/path",
+            "*.example.com",
+            "example..com",
+            "-example.com",
+            "example-.com",
+            &format!("{}.com", "a".repeat(64)),
+        ] {
+            let mut d = Vec::new();
+            let host = parse_redirect_host(
+                &labels(&[("sozune.http.app.redirectHost", value)]),
+                "sozune.http.app.",
+                &mut d,
+            );
+            assert!(host.is_none(), "{value}");
+            assert_eq!(
+                d[0].code,
+                DiagnosticCode::W031InvalidRedirectHost,
+                "{value}"
+            );
+        }
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

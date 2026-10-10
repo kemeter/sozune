@@ -197,6 +197,7 @@ fn build_entrypoint(
     let redirect = redirect::parse_redirect_policy(labels, &prefix, diagnostics);
     let redirect_scheme = redirect::parse_redirect_scheme(labels, &prefix, diagnostics);
     let redirect_template = labels.get(&format!("{prefix}redirectTemplate")).cloned();
+    let mut redirect_host = redirect::parse_redirect_host(labels, &prefix, diagnostics);
     let www_authenticate = labels.get(&format!("{prefix}wwwAuthenticate")).cloned();
     let priority = core::parse_priority(labels, &prefix, diagnostics);
     let backend_timeout = core::parse_backend_timeout(labels, &prefix, diagnostics);
@@ -228,6 +229,43 @@ fn build_entrypoint(
         "tcp" => Protocol::Tcp,
         "udp" => Protocol::Udp,
         _ => return None,
+    };
+
+    // A redirect host only makes sense on a permanent redirect, which it
+    // implies when `redirect` is absent. With `forward` it would silently
+    // rewrite the Host header sent to the backend instead.
+    // An unrecognised `redirect` value (W005) parses as absent: it must not
+    // turn into an implied permanent redirect.
+    let redirect_label_set = labels.contains_key(&format!("{prefix}redirect"));
+    let redirect = match (redirect, &redirect_host) {
+        (None, Some(_)) if !redirect_label_set => Some(RedirectPolicy::Permanent),
+        (None, Some(host)) => {
+            diagnostics.push(
+                crate::labels::diagnostic::Diagnostic::new(
+                    crate::labels::diagnostic::DiagnosticCode::W031InvalidRedirectHost,
+                    "redirectHost needs a permanent redirect, ignoring",
+                )
+                .with_label(format!("{prefix}redirectHost"))
+                .with_value(host)
+                .with_hint("fix the redirect label, or remove it"),
+            );
+            redirect_host = None;
+            None
+        }
+        (Some(policy @ (RedirectPolicy::Forward | RedirectPolicy::Unauthorized)), Some(host)) => {
+            diagnostics.push(
+                crate::labels::diagnostic::Diagnostic::new(
+                    crate::labels::diagnostic::DiagnosticCode::W031InvalidRedirectHost,
+                    "redirectHost needs a permanent redirect, ignoring",
+                )
+                .with_label(format!("{prefix}redirectHost"))
+                .with_value(host)
+                .with_hint("remove the redirect label, or set it to permanent"),
+            );
+            redirect_host = None;
+            Some(policy)
+        }
+        (policy, _) => policy,
     };
 
     // A permanent/unauthorized redirect answers at the frontend and never reaches
@@ -266,7 +304,7 @@ fn build_entrypoint(
             redirect,
             redirect_scheme,
             redirect_template,
-            rewrite_host: None,
+            rewrite_host: redirect_host,
             rewrite_path: None,
             rewrite: None,
             rewrite_port: None,
@@ -694,6 +732,61 @@ mod tests {
         assert!(matches!(tcp.protocol, Protocol::Tcp));
         assert_eq!(tcp.config.entrypoint.as_deref(), Some("postgres"));
         assert_eq!(tcp.backends[0].port, 5432);
+    }
+
+    #[test]
+    fn redirect_host_makes_a_permanent_redirect_to_that_host() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.old.host", "old.example.com"),
+                ("sozune.http.old.redirectHost", "new.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let http = r.entrypoints.get("http_old").unwrap();
+        assert_eq!(http.config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(http.config.rewrite_host.as_deref(), Some("new.example.com"));
+        assert!(http.backends.is_empty(), "a redirect reaches no backend");
+    }
+
+    #[test]
+    fn redirect_host_is_ignored_when_the_redirect_label_is_invalid() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.app.host", "app.example.com"),
+                ("sozune.http.app.redirect", "permanant"),
+                ("sozune.http.app.redirectHost", "other.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let http = r.entrypoints.get("http_app").unwrap();
+        assert_eq!(http.config.redirect, None);
+        assert_eq!(http.config.rewrite_host, None);
+    }
+
+    #[test]
+    fn redirect_host_is_ignored_on_a_forwarding_route() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.app.host", "app.example.com"),
+                ("sozune.http.app.redirect", "forward"),
+                ("sozune.http.app.redirectHost", "other.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let http = r.entrypoints.get("http_app").unwrap();
+        assert_eq!(http.config.rewrite_host, None);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code == DiagnosticCode::W031InvalidRedirectHost)
+        );
     }
 
     #[test]

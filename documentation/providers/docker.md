@@ -60,6 +60,7 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.redirect` | [Redirects](/documentation/middleware/redirects) |
 | `sozune.http.<svc>.redirectScheme` | [Redirects](/documentation/middleware/redirects) |
 | `sozune.http.<svc>.redirectTemplate` | [Redirects](/documentation/middleware/redirects) |
+| `sozune.http.<svc>.redirectHost` | [Redirects](/documentation/middleware/redirects) — permanent redirect to another host |
 | `sozune.http.<svc>.wwwAuthenticate` | [Basic auth](/documentation/middleware/auth) |
 | `sozune.http.<svc>.ratelimit.average` | [Rate limit](/documentation/middleware/rate-limit) |
 | `sozune.http.<svc>.ratelimit.burst` | [Rate limit](/documentation/middleware/rate-limit) |

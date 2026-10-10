@@ -9,6 +9,7 @@ Sōzune exposes a few flavors of HTTP redirect, all handled natively by Sōzu (n
 | Apply a permanent redirect (or block traffic) | `redirect=permanent` / `redirect=unauthorized` |
 | Force a specific scheme on the redirect target | `redirectScheme=use_http\|use_https\|use_same` |
 | Customise the `Location` header template | `redirectTemplate` |
+| Redirect to another host, path and query kept | `redirectHost` |
 
 ## HTTPS redirect
 
@@ -51,6 +52,22 @@ labels:
   - "sozune.http.legacy.redirect=permanent"
   - "sozune.http.legacy.redirectScheme=use_https"
 ```
+
+## `redirectHost`
+
+Send clients to another host with a permanent redirect, keeping the path and the query: an old domain, an alias, `www` to the bare domain.
+
+```yaml
+labels:
+  - "sozune.http.old.host=old.example.com,alias.example.com"
+  - "sozune.http.old.tls=true"
+  - "sozune.http.old.redirectHost=www.example.com"
+  - "sozune.http.old.redirectScheme=use_https"
+```
+
+`https://old.example.com/docs?page=2` answers `301` with `Location: https://www.example.com/docs?page=2`.
+
+`redirectHost` implies `redirect=permanent`, and the route needs no `port`: it never reaches a backend. The value is a bare hostname, without scheme, port or path; anything else, or a `redirect` set to `forward` or `unauthorized`, emits `W031` and the label is ignored. Without `redirectScheme`, the redirect keeps the request's scheme. With `stripPrefix` or `addPrefix`, the path in `Location` is rewritten the same way: `path=/blog` + `stripPrefix=true` sends `old.example.com/blog/post` to `www.example.com/post`.
 
 ## `redirectScheme`
 

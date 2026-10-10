@@ -363,6 +363,16 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.http.app.backendTimeout=20000"),
     },
     Entry {
+        code: "W031",
+        title: "Invalid redirect host",
+        cause: "A `redirectHost` label is not a plain hostname (it carries a scheme, a port, a path or a wildcard), or the route's `redirect` is `forward` or `unauthorized`.",
+        effect: "The label is ignored: the route does not redirect to that host.",
+        fix: "Write the bare host, e.g. `www.example.com`, and leave `redirect` unset or set it to `permanent`.",
+        example: Some(
+            "sozune.http.old.host=old.example.com\nsozune.http.old.redirectHost=www.example.com",
+        ),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

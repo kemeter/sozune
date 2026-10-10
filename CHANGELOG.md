@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Routing
+
+- Redirect to another host — `sozune.http.<svc>.redirectHost=www.example.com` answers with a permanent redirect to that host, keeping the path and the query: an old domain or an alias sent to the main one. A permanent redirect without it sends the client back to the host it asked for. An invalid value, or a route whose `redirect` is not `permanent`, emits `W031`. See [Redirects](documentation/middleware/redirects.md#redirecthost).
+
 ### Reliability
 
 - A Docker route that only redirects (`redirect=permanent` or `unauthorized`) was dropped when Sōzune started, and every one of them was dropped whenever any container stopped: such a route has no backend, which read as "nothing left to serve". It now stays as long as a container declares it. A container stopping also no longer removes routes of another provider.
