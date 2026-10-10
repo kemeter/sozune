@@ -4,11 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-10
+
 ### Upgrade notes
 
 - `backendTimeout` is now read in milliseconds, as the API and the label diagnostics describe it. It used to be applied as seconds, so a route that set `backendTimeout=30` meaning 30 seconds now times out after 30ms: multiply such values by 1000. Values written in milliseconds (e.g. `30000`) now behave as intended instead of lasting 1000 times longer. The default (30s) and `0` (no timeout) are unchanged.
 - A path prefix now matches on segment boundaries, as documented: a route on `/api` serves `/api`, `/api/users` and `/api?page=2`, but no longer `/apidocs`, which Sōzu used to hand it by comparing bytes. A route relying on that has to declare the longer prefix (or `/`) itself.
 - A bare `*` hostname, and a regex hostname that does not stay inside a literal domain, are now refused, from labels (`E002`), the HTTP provider and the API (`400`): they could match the hosts of every other route. Exact names, `*.` wildcards and regexes such as `/cdn[0-9]+/.example.com` are still accepted. See [Regex hostnames](documentation/routing/hostnames.md#regex).
+- A custom header (`headers.<name>`, `headers.response.<name>`, the HTTP provider, the API, Gateway API `set` / `add`) now replaces a header of the same name sent by the client or the backend, as documented, instead of being sent next to it.
+- A `backendTimeout` longer than 30 seconds never took effect: the HTTP and HTTPS listeners cut a request left waiting 30 seconds for its response first. Such routes now get diagnostic `W030`; to let them wait longer, raise `proxy.timeouts.backend_idle` (and `client_idle` past 60 seconds) in `config.yaml`. See [Proxy](documentation/configuration/overview.md#proxy).
 
 ### TLS / ACME
 
