@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### TLS / ACME
+
+- Client certificates (mutual TLS) — `proxy.https.tls.client_auth` asks HTTPS clients for a certificate (`mode: optional` or `required`) and accepts only those chaining to its `ca_files`, with revocation checked against `crl_files`. Listener-wide; the backend is not told which certificate was presented. With `mode: required`, a `tls=true` route redirects its plain HTTP requests to HTTPS instead of serving them without a certificate. An unreadable CA or CRL, or an expired CRL, fails startup. `GET /config` and the dashboard show the mode and files. See [Client certificates](documentation/tls/overview.md#client-certificates-mutual-tls).
+
 ## [0.15.0] - 2026-10-10
 
 ### Upgrade notes

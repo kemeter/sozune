@@ -416,6 +416,12 @@ async fn resolve_route(
     };
     let trusted_proxies =
         crate::middleware::ip_allow_list::TrustedProxies::new(&state.config.proxy.trusted_proxies);
+    // The routes as the proxy applies them, so a stored route compares equal
+    // to its live copy.
+    let storage = crate::proxy::sozu::require_https_for_client_certificates(
+        &storage,
+        crate::proxy::sozu::client_certificate_redirect_port(&state.config.proxy),
+    );
     let inputs = crate::proxy::resolve::ResolveInputs {
         storage: &storage,
         live: &live,

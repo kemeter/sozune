@@ -222,6 +222,16 @@
         <dd class="mono">
           {config.tls.certificates.length > 0 ? config.tls.certificates.join(', ') : 'none'}
         </dd>
+        <dt>client certificates</dt>
+        <dd class="mono">{config.tls.client_auth ? config.tls.client_auth.mode : 'none'}</dd>
+        {#if config.tls.client_auth && config.tls.client_auth.ca_files.length > 0}
+          <dt>client CAs</dt>
+          <dd class="mono">{config.tls.client_auth.ca_files.join(', ')}</dd>
+        {/if}
+        {#if config.tls.client_auth && config.tls.client_auth.crl_files.length > 0}
+          <dt>client CRLs</dt>
+          <dd class="mono">{config.tls.client_auth.crl_files.join(', ')}</dd>
+        {/if}
       </dl>
     </section>
 

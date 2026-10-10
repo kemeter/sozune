@@ -87,6 +87,16 @@ pub struct TlsView {
     pub max_version: Option<String>,
     pub ciphers: Option<Vec<String>>,
     pub certificates: Vec<String>,
+    /// Client certificate authentication; `None` when it is not configured.
+    pub client_auth: Option<ClientAuthView>,
+}
+
+/// CA and CRL files are public material, listed by path.
+#[derive(Debug, Serialize)]
+pub struct ClientAuthView {
+    pub mode: &'static str,
+    pub ca_files: Vec<String>,
+    pub crl_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +264,11 @@ fn tls_view(tls: &TlsOptions) -> TlsView {
             .iter()
             .map(|c| c.cert_file.clone())
             .collect(),
+        client_auth: tls.client_auth.as_ref().map(|c| ClientAuthView {
+            mode: c.mode.as_str(),
+            ca_files: c.ca_files.clone(),
+            crl_files: c.crl_files.clone(),
+        }),
     }
 }
 
@@ -553,6 +568,20 @@ mod tests {
     }
 
     #[test]
+    fn view_exposes_client_auth() {
+        let mut cfg = sample_app_config();
+        cfg.proxy.https.tls.client_auth = Some(ClientAuth {
+            mode: ClientAuthMode::Required,
+            ca_files: vec!["/certs/client-ca.pem".into()],
+            crl_files: Vec::new(),
+        });
+        let view = ConfigView::from_app_config(&cfg);
+        let client_auth = view.tls.client_auth.unwrap();
+        assert_eq!(client_auth.mode, "required");
+        assert_eq!(client_auth.ca_files, vec!["/certs/client-ca.pem"]);
+    }
+
+    #[test]
     fn view_exposes_tls_options_without_key_files() {
         let mut cfg = sample_app_config();
         cfg.proxy.https.tls = TlsOptions {
@@ -563,6 +592,7 @@ mod tests {
                 cert_file: "/certs/fullchain.pem".into(),
                 key_file: "/certs/privkey.pem".into(),
             }],
+            client_auth: None,
         };
         let view = ConfigView::from_app_config(&cfg);
         assert_eq!(view.tls.min_version.as_deref(), Some("1.3"));
