@@ -27,6 +27,15 @@ impl Entrypoint {
             }
         }
     }
+
+    /// Whether the route answers every request itself (a permanent redirect
+    /// or a 401) and so needs no backend.
+    pub fn answers_without_backend(&self) -> bool {
+        matches!(
+            self.config.redirect,
+            Some(RedirectPolicy::Permanent | RedirectPolicy::Unauthorized)
+        )
+    }
 }
 
 /// One backend instance: an address (IP or hostname), the port it listens
