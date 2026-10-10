@@ -40,7 +40,7 @@ labels:
 - The timer covers the full request: connecting to the backend, sending the request, and reading the response.
 - On timeout, the client receives `504 Gateway Timeout`.
 - WebSocket upgrades are handled outside of this timeout — see [WebSocket](/documentation/advanced/websocket).
-- The listener's own timeouts still apply. A backend that sends nothing for longer than [`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy) (30 s by default) is cut with a `504`, and so is a client left waiting longer than `proxy.timeouts.client_idle` (60 s), whatever `backendTimeout` says. They are listener-wide, not per route: raise them to let a route wait longer than that.
+- The listener's own timeouts still apply. A backend that sends nothing for longer than [`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy) (30 s by default) is cut with a `504`, and so is a client left waiting longer than `proxy.timeouts.client_idle` (60 s), whatever `backendTimeout` says. They are listener-wide, not per route: raise them to let a route wait longer than that. `sozune validate`, `GET /diagnostics` and the dashboard flag a route whose `backendTimeout` the listener cuts short with `W030`.
 
 ## When to set it
 

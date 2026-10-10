@@ -69,6 +69,10 @@ pub enum DiagnosticCode {
     /// A TLS route names, in `acme.resolver`, a resolver that `acme.resolvers`
     /// does not declare. Every certificate order for its hostnames fails.
     W029UnknownAcmeResolver,
+    /// A route's `backendTimeout` is `0` or longer than the listener's
+    /// `proxy.timeouts.backend_idle` or `client_idle`: the listener cuts a
+    /// request that waits that long first.
+    W030BackendTimeoutBeyondListener,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -112,6 +116,7 @@ impl DiagnosticCode {
             DiagnosticCode::W027InvalidWeight => "W027",
             DiagnosticCode::W028InvalidSni => "W028",
             DiagnosticCode::W029UnknownAcmeResolver => "W029",
+            DiagnosticCode::W030BackendTimeoutBeyondListener => "W030",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -165,6 +170,7 @@ impl DiagnosticCode {
             DiagnosticCode::W027InvalidWeight,
             DiagnosticCode::W028InvalidSni,
             DiagnosticCode::W029UnknownAcmeResolver,
+            DiagnosticCode::W030BackendTimeoutBeyondListener,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

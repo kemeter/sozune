@@ -136,7 +136,7 @@ Response: a JSON array of entrypoint objects (see [Entrypoint schema](#entrypoin
     - `message` — raw error message from the last probe attempt
     - `since` — Unix epoch (seconds) the backend was first marked down
     - `last_checked` — Unix epoch (seconds) of the last probe attempt
-- `diagnostics`: list of [Diagnostic objects](#diagnostic-schema) associated with this entrypoint, including the runtime lints: route collisions (W018) and unknown ACME resolvers (W029)
+- `diagnostics`: list of [Diagnostic objects](#diagnostic-schema) associated with this entrypoint, including the runtime lints: route collisions (W018), unknown ACME resolvers (W029) and backend timeouts the listener cuts short (W030)
 
 ### `GET /entrypoints/{id}`
 
@@ -339,7 +339,7 @@ Sample response:
 
 ### `GET /diagnostics`
 
-Snapshot of every diagnostic sōzune has computed: per-candidate diagnostics from the parser, plus global lints (e.g. `W015` ACME enabled but no `tls=true`) and the runtime lints: route collisions (`W018`) and unknown ACME resolvers (`W029`). Available to both roles.
+Snapshot of every diagnostic sōzune has computed: per-candidate diagnostics from the parser, plus global lints (e.g. `W015` ACME enabled but no `tls=true`) and the runtime lints: route collisions (`W018`), unknown ACME resolvers (`W029`) and backend timeouts the listener cuts short (`W030`). Available to both roles.
 
 ```bash
 curl -u admin:your-password http://localhost:3035/diagnostics
@@ -376,7 +376,7 @@ curl -u admin:your-password http://localhost:3035/diagnostics
 
 - `total`: number of diagnostics across `global` + every `items[*].diagnostics`
 - `global`: cross-cutting diagnostics not tied to a single candidate
-- `items`: per-candidate diagnostics, sorted by `candidate_id` for stable ordering. A runtime lint (`W018`, `W029`) is listed under each candidate in the route's `candidates`, next to that candidate's own diagnostics
+- `items`: per-candidate diagnostics, sorted by `candidate_id` for stable ordering. A runtime lint (`W018`, `W029`, `W030`) is listed under each candidate in the route's `candidates`, next to that candidate's own diagnostics
 
 The full diagnostic code reference is documented at [`sozune explain <CODE>`](/documentation/configuration/diagnostics).
 

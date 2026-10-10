@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::AcmeConfig;
+use crate::config::{AcmeConfig, ProxyTimeouts};
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
 
@@ -172,6 +172,55 @@ pub fn lint_unknown_resolvers(
                 .with_label("acme.resolver")
                 .with_value(name.clone())
                 .with_hint(hint.clone()),
+            ))
+        })
+        .collect()
+}
+
+/// Flag an HTTP route whose `backendTimeout` the listener cannot honour. The
+/// HTTP and HTTPS listeners close a backend connection silent for
+/// `proxy.timeouts.backend_idle` and a client connection silent for
+/// `client_idle`, whatever the route sets: a request that waits longer for
+/// its response is cut with a `504` before `backendTimeout` is reached.
+pub fn lint_backend_timeouts(
+    timeouts: &ProxyTimeouts,
+    entrypoints: &[(&str, &Entrypoint)],
+) -> Vec<(String, Diagnostic)> {
+    use sozu_command_lib::config::{DEFAULT_BACK_TIMEOUT, DEFAULT_FRONT_TIMEOUT};
+    let backend_idle = timeouts.backend_idle.unwrap_or(DEFAULT_BACK_TIMEOUT);
+    let client_idle = timeouts.client_idle.unwrap_or(DEFAULT_FRONT_TIMEOUT);
+    let (limit, field) = if backend_idle <= client_idle {
+        (backend_idle, "backend_idle")
+    } else {
+        (client_idle, "client_idle")
+    };
+
+    entrypoints
+        .iter()
+        .filter(|(_, ep)| ep.protocol == Protocol::Http)
+        .filter_map(|(id, ep)| {
+            let ms = ep.config.backend_timeout?;
+            if ms != 0 && ms <= u64::from(limit) * 1000 {
+                return None;
+            }
+            let asked = if ms == 0 {
+                "0 (no timeout)".to_string()
+            } else {
+                format!("{ms}ms")
+            };
+            Some((
+                id.to_string(),
+                Diagnostic::new(
+                    DiagnosticCode::W030BackendTimeoutBeyondListener,
+                    format!(
+                        "backendTimeout is {asked}, but proxy.timeouts.{field} cuts a request left waiting {limit}s for its response first"
+                    ),
+                )
+                .with_label("backendTimeout")
+                .with_value(ms.to_string())
+                .with_hint(
+                    "raise proxy.timeouts.backend_idle and client_idle in config.yaml past the longest wait, or keep backendTimeout below them",
+                ),
             ))
         })
         .collect()
@@ -414,5 +463,72 @@ mod tests {
         let a = ep("example.com", None, true, false);
         let acme = acme_with(&[], true);
         assert!(lint_unknown_resolvers(Some(&acme), &[], &[("cand-a", &a)]).is_empty());
+    }
+
+    fn with_backend_timeout(ms: u64) -> Entrypoint {
+        let mut e = ep("example.com", None, false, false);
+        e.config.backend_timeout = Some(ms);
+        e
+    }
+
+    fn timeouts(backend_idle: Option<u32>, client_idle: Option<u32>) -> ProxyTimeouts {
+        ProxyTimeouts {
+            backend_idle,
+            client_idle,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backend_timeout_within_the_listener_is_silent() {
+        let a = with_backend_timeout(20_000);
+        assert!(lint_backend_timeouts(&timeouts(None, None), &[("cand-a", &a)]).is_empty());
+        let unset = ep("example.com", None, false, false);
+        assert!(lint_backend_timeouts(&timeouts(None, None), &[("cand-a", &unset)]).is_empty());
+    }
+
+    #[test]
+    fn backend_timeout_beyond_backend_idle_is_flagged() {
+        let a = with_backend_timeout(60_000);
+        let out = lint_backend_timeouts(&timeouts(None, None), &[("cand-a", &a)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "cand-a");
+        assert_eq!(
+            out[0].1.code,
+            DiagnosticCode::W030BackendTimeoutBeyondListener
+        );
+        assert!(
+            out[0].1.message.contains("backend_idle"),
+            "{}",
+            out[0].1.message
+        );
+        assert!(out[0].1.message.contains("30s"), "{}", out[0].1.message);
+    }
+
+    #[test]
+    fn no_backend_timeout_is_flagged_too() {
+        let a = with_backend_timeout(0);
+        let out = lint_backend_timeouts(&timeouts(Some(3600), Some(3600)), &[("cand-a", &a)]);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].1.message.contains("no timeout"),
+            "{}",
+            out[0].1.message
+        );
+    }
+
+    #[test]
+    fn the_shorter_listener_timeout_is_named() {
+        let a = with_backend_timeout(90_000);
+        let out = lint_backend_timeouts(&timeouts(Some(120), None), &[("cand-a", &a)]);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].1.message.contains("client_idle"),
+            "{}",
+            out[0].1.message
+        );
+        assert!(
+            lint_backend_timeouts(&timeouts(Some(120), Some(120)), &[("cand-a", &a)]).is_empty()
+        );
     }
 }
