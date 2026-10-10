@@ -548,6 +548,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     let https_listener = https_builder
         .to_tls(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
+    check_client_crls_current(&https_listener, unix_now())?;
 
     // Create communication channels
     let command_buffer_max_bytes = config.command_buffer_max_bytes;
@@ -634,6 +635,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     // Start configuration reload handler
     let storage_reload = Arc::clone(&storage);
     let trusted_proxies_reload = Arc::clone(&trusted_proxies);
+    let client_certificate_redirect = client_certificate_redirect_port(config);
     let http_port = config.http.listen_address;
     // The port the HTTPS worker actually listens on: the loopback port behind
     // the gate, or the public 443. Certificates and HTTPS frontends attach to
@@ -842,6 +844,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     middleware_port,
                     &plugins,
                     &trusted_proxies_reload,
+                    client_certificate_redirect,
                 );
                 match live_routes.write() {
                     Ok(mut live) => *live = previous_snapshot.clone(),
@@ -895,6 +898,7 @@ fn handle_reload(
     middleware_port: u16,
     plugins: &middleware::PluginRegistry,
     trusted_proxies: &middleware::ip_allow_list::TrustedProxies,
+    client_certificate_redirect: Option<u16>,
 ) -> RoutingSnapshot {
     info!("Received configuration reload request");
     let storage_read = match storage.read() {
@@ -908,6 +912,8 @@ fn handle_reload(
         }
     };
 
+    let storage_read =
+        require_https_for_client_certificates(&storage_read, client_certificate_redirect);
     let mut current_snapshot = snapshot_from_storage(&storage_read);
 
     // Run the reload under a shared consecutive-timeout counter. A worker that
@@ -954,6 +960,41 @@ fn handle_reload(
     });
 
     current_snapshot
+}
+
+/// The public HTTPS port when client certificates are `required` on the
+/// HTTPS listener, `None` otherwise.
+pub(crate) fn client_certificate_redirect_port(config: &ProxyConfig) -> Option<u16> {
+    let client_auth = config.https.tls.client_auth.as_ref()?;
+    (client_auth.mode == crate::config::ClientAuthMode::Required)
+        .then_some(config.https.listen_address)
+}
+
+/// With client certificates `required` on the HTTPS listener (`https_port` is
+/// then its public port), a TLS route redirects its plain HTTP requests to
+/// HTTPS: served on both listeners, it would hand its backend to any client
+/// that skips the certificate by using port 80. A route that already
+/// redirects keeps its own port; routes without TLS are not served over HTTPS
+/// and stay as they are. The proxy and the route resolver both apply it, so
+/// they compare the same routes.
+pub(crate) fn require_https_for_client_certificates(
+    storage: &BTreeMap<String, Entrypoint>,
+    https_port: Option<u16>,
+) -> std::borrow::Cow<'_, BTreeMap<String, Entrypoint>> {
+    let Some(https_port) = https_port else {
+        return std::borrow::Cow::Borrowed(storage);
+    };
+    let mut routes = storage.clone();
+    for entrypoint in routes.values_mut() {
+        if entrypoint.protocol == Protocol::Http
+            && entrypoint.config.tls
+            && !entrypoint.config.https_redirect
+        {
+            entrypoint.config.https_redirect = true;
+            entrypoint.config.https_redirect_port = Some(https_port);
+        }
+    }
+    std::borrow::Cow::Owned(routes)
 }
 
 /// Rebuild the middleware route table from current storage
@@ -2749,6 +2790,24 @@ fn apply_listener_timeouts(
     Ok(())
 }
 
+/// Refuse to start on a client CRL already past its `nextUpdate`: the worker
+/// would build the listener and then reject every client the CRL covers.
+/// Sōzu's main process runs this check on a configuration it loads; Sōzune
+/// builds its listeners itself, so it runs it here.
+fn check_client_crls_current(
+    listener: &sozu_command_lib::proto::command::HttpsListenerConfig,
+    now: i64,
+) -> anyhow::Result<()> {
+    sozu_lib::https::HttpsListener::check_crls_current(&listener.client_ca_crls, now)
+        .map_err(|e| anyhow::anyhow!("Invalid `proxy.https.tls.client_auth.crl_files`: {e}"))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// Apply a TCP listener's `idle_timeout` onto a `ListenerBuilder`.
 ///
 /// Sōzu keeps two timers per TCP session, one per side, and a byte read on
@@ -2832,6 +2891,26 @@ fn apply_listener_tls_options(
     // so everything goes through this one call.
     if let Some(ciphers) = &tls.ciphers {
         builder.with_cipher_list(Some(ciphers.clone()));
+    }
+
+    // Sōzu reads the CA and CRL files itself when the listener is built and
+    // refuses to start on one it cannot read, rather than drop a CA or a CRL.
+    if let Some(client_auth) = &tls.client_auth {
+        use crate::config::ClientAuthMode;
+        use sozu_command_lib::config::ClientAuthConfig;
+        if client_auth.mode != ClientAuthMode::None && client_auth.ca_files.is_empty() {
+            anyhow::bail!(
+                "`proxy.https.tls.client_auth.ca_files` is empty: mode `{}` needs at least one CA to check client certificates against",
+                client_auth.mode.as_str()
+            );
+        }
+        builder.client_auth = Some(match client_auth.mode {
+            ClientAuthMode::None => ClientAuthConfig::None,
+            ClientAuthMode::Optional => ClientAuthConfig::Optional,
+            ClientAuthMode::Required => ClientAuthConfig::Required,
+        });
+        builder.client_ca_certificates = Some(client_auth.ca_files.clone());
+        builder.client_ca_crls = Some(client_auth.crl_files.clone());
     }
     Ok(())
 }
@@ -3032,6 +3111,91 @@ mod tests {
             cfg.cipher_list,
             vec!["TLS13_AES_256_GCM_SHA384".to_string()]
         );
+    }
+
+    fn client_auth_options(
+        mode: crate::config::ClientAuthMode,
+        ca_files: Vec<String>,
+    ) -> crate::config::TlsOptions {
+        crate::config::TlsOptions {
+            client_auth: Some(crate::config::ClientAuth {
+                mode,
+                ca_files,
+                crl_files: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn client_auth_reaches_the_listener_with_its_ca_inlined() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = rcgen::KeyPair::generate()
+            .and_then(|key| {
+                let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                params.self_signed(&key)
+            })
+            .unwrap()
+            .pem();
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::write(&ca_path, &ca).unwrap();
+
+        let tls = client_auth_options(
+            crate::config::ClientAuthMode::Required,
+            vec![ca_path.display().to_string()],
+        );
+        let cfg = tls_listener_with_options(&tls).unwrap();
+        assert_eq!(
+            cfg.client_auth,
+            Some(sozu_command_lib::proto::command::ClientAuthMode::ClientAuthRequired as i32)
+        );
+        assert_eq!(cfg.client_ca_certificates, vec![ca]);
+    }
+
+    #[test]
+    fn an_expired_client_crl_fails_the_listener() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::new(ca, key);
+        let crl = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2020, 1, 1),
+            next_update: rcgen::date_time_ymd(2021, 1, 1),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap()
+        .pem()
+        .unwrap();
+        let listener = sozu_command_lib::proto::command::HttpsListenerConfig {
+            client_ca_crls: vec![crl],
+            ..Default::default()
+        };
+
+        // 2020-06-01, before its nextUpdate.
+        assert!(check_client_crls_current(&listener, 1_590_969_600).is_ok());
+        let err = check_client_crls_current(&listener, unix_now()).unwrap_err();
+        assert!(err.to_string().contains("crl_files"), "{err}");
+    }
+
+    #[test]
+    fn client_auth_without_a_ca_is_refused() {
+        let tls = client_auth_options(crate::config::ClientAuthMode::Optional, Vec::new());
+        let err = tls_listener_with_options(&tls).unwrap_err();
+        assert!(err.to_string().contains("client_auth.ca_files"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_client_ca_fails_the_listener() {
+        let tls = client_auth_options(
+            crate::config::ClientAuthMode::Required,
+            vec!["/nonexistent/client-ca.pem".into()],
+        );
+        assert!(tls_listener_with_options(&tls).is_err());
     }
 
     #[test]
@@ -3518,6 +3682,22 @@ mod tests {
         new.config.hostnames = vec!["other.example.com".into()];
         assert!(!frontend_unchanged(&old, &new));
         assert!(!is_backends_only_change(&old, &new));
+    }
+
+    #[test]
+    fn required_client_certificates_redirect_tls_routes_to_https() {
+        let mut tls = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        tls.config.tls = true;
+        let plain = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+        let storage = BTreeMap::from([("tls".to_string(), tls), ("plain".to_string(), plain)]);
+
+        let required = require_https_for_client_certificates(&storage, Some(8443));
+        assert!(required["tls"].config.https_redirect);
+        assert_eq!(required["tls"].config.https_redirect_port, Some(8443));
+        assert!(!required["plain"].config.https_redirect);
+
+        let not_required = require_https_for_client_certificates(&storage, None);
+        assert!(!not_required["tls"].config.https_redirect);
     }
 
     #[test]

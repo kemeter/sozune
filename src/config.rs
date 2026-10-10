@@ -737,6 +737,46 @@ pub struct TlsOptions {
     /// to every handshake whose SNI its names cover; ACME skips those names.
     #[serde(default)]
     pub certificates: Vec<CertificateFile>,
+    /// Client certificate authentication (mutual TLS). Absent: clients are
+    /// not asked for a certificate.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// Mutual TLS on the HTTPS listener. Like the other TLS options it is
+/// listener-wide: every route on the HTTPS port shares it.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct ClientAuth {
+    pub mode: ClientAuthMode,
+    /// PEM files of the CAs a client certificate must chain to. Required
+    /// unless `mode` is `none`.
+    #[serde(default)]
+    pub ca_files: Vec<String>,
+    /// PEM certificate revocation lists, checked over the whole chain.
+    #[serde(default)]
+    pub crl_files: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuthMode {
+    /// No certificate is requested.
+    None,
+    /// A certificate is requested; a client without one is admitted, a
+    /// client with one must present a valid one.
+    Optional,
+    /// The handshake fails unless the client presents a valid certificate.
+    Required,
+}
+
+impl ClientAuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientAuthMode::None => "none",
+            ClientAuthMode::Optional => "optional",
+            ClientAuthMode::Required => "required",
+        }
+    }
 }
 
 /// A certificate chain and its private key, both PEM files read at startup.

@@ -113,7 +113,36 @@ proxy:
 
 **These are listener-wide.** Sōzu applies versions and ciphers at bind time, so every hostname served on the HTTPS port shares them — they cannot vary per route. An invalid version (unknown value, `max_version` below `min_version`) fails startup rather than being silently ignored.
 
+## Client certificates (mutual TLS)
+
+Ask clients for a certificate during the handshake, and accept only those signed by a CA you trust:
+
+```yaml
+proxy:
+  https:
+    tls:
+      client_auth:
+        mode: required                   # none | optional | required
+        ca_files:
+          - /etc/sozune/client-ca.pem
+        crl_files:                       # optional
+          - /etc/sozune/client-crl.pem
+```
+
+| Field | Description |
+|---|---|
+| `mode` | `none`: no certificate is asked for. `optional`: a client without a certificate is admitted, a client with one must present a valid one. `required`: the handshake fails unless the client presents a valid certificate. |
+| `ca_files` | PEM files of the CAs a client certificate must chain to. Required unless `mode` is `none`. |
+| `crl_files` | PEM certificate revocation lists. Revocation is checked over the whole chain, and a certificate whose status cannot be established is refused. |
+
+**Read once, at startup.** A CA or CRL file that cannot be read, holds no certificate or CRL, or a CRL past its `nextUpdate`, fails startup: Sōzune does not start with a weaker check than the one configured. Restart after replacing a file.
+
+**Plain HTTP is redirected.** With `mode: required`, a `tls=true` route answers its plain HTTP requests with a redirect to HTTPS, as with `httpsRedirect=true`: served on port 80 as well, it would reach the backend without any certificate. A route without `tls` is not served over HTTPS and is not covered by client certificates.
+
+**Listener-wide, and not an authorization.** Like versions and ciphers, it applies to every route on the HTTPS port. A valid certificate admits its client to all of them, and the backend does not learn which certificate the client presented: `optional` alone restricts nothing. Put routes that need different client policies behind different instances.
+
 ## What's not configurable
 
-- Per-route TLS options — versions and ciphers are a property of the listener, not the route (see above).
+- Per-route TLS options — versions, ciphers and client certificates are a property of the listener, not the route (see above).
+- Forwarding the client certificate, or its subject, to the backend.
 - Reloading [certificates from files](#certificates-from-files) without a restart.

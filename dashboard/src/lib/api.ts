@@ -265,6 +265,12 @@ export interface ConfigView {
     ciphers: string[] | null;
     /** Certificate files supplied outside ACME. */
     certificates: string[];
+    /** Client certificate authentication (mTLS); `null` when not configured. */
+    client_auth: {
+      mode: 'none' | 'optional' | 'required';
+      ca_files: string[];
+      crl_files: string[];
+    } | null;
   };
   acme: {
     enabled: boolean;
