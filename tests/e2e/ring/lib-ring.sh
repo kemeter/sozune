@@ -109,7 +109,7 @@ wait_for_ring_instances() {
     local expected="$1"
     for _ in $(seq 1 60); do
         local got
-        got=$(ring_api "/deployments" 2>/dev/null \
+        got=$(ring_api "/deployments?instances=true" 2>/dev/null \
               | jq --arg n "$DEPLOYMENT_NAME" \
                    '[.[] | select(.name == $n and .status == "running")
                           | .instances[] | select(.address != null)] | length' \
