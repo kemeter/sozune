@@ -56,7 +56,7 @@ A Traefik rule becomes one label per matcher. All the matchers of a route must m
 | ``HostRegexp(`^[^.]+\.example\.com$`)`` | `host=*.example.com` |
 | ``HostRegexp(`^cdn[0-9]+\.example\.com$`)`` | `host=/cdn[0-9]+/.example.com`: the regex goes between slashes, and the domain at the end stays written out. A regex that would match any domain is refused. See [Regex hostnames](/documentation/routing/hostnames#regex). |
 | ``PathPrefix(`/api`)`` | `path=/api`. Sōzune matches on segment boundaries: `/api` serves `/api/users` but not `/apiv2`, which Traefik's `PathPrefix` does. `pathRegex=^/api` keeps that broader match, but `stripPrefix` only applies to `path`. |
-| ``PathRegexp(`^/users/[0-9]+`)`` | `pathRegex=^/users/[0-9]+`. Keep the `^`: without it, the regex can match anywhere in the path. |
+| ``PathRegexp(`^/users/[0-9]+`)`` | `pathRegex=^/users/[0-9]+`. Keep the `^`: without it, the regex can match anywhere in the path or in its query string. |
 | ``Path(`/exact`)`` | Exact paths are only available through the [HTTP provider and the API](/documentation/routing/path-matching) |
 | ``Method(`GET`)`` | `methods=GET` (comma-separated for several) |
 | ``Header(`X-Api-Version`, `2`)`` | `matchHeaders=X-Api-Version:2` (see the note below) |

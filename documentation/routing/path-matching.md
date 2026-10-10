@@ -38,6 +38,8 @@ labels:
 
 `/users/42` matches; `/users/abc` does not. The regex is compiled once per route by Sōzu.
 
+The regex is searched anywhere in what Sōzu matches, which is the path **with its query string**. `/users/[0-9]+` therefore also matches `/v1/users/42`, `/users/42/profile` and `/health?next=/users/42`. Start it with `^` to match from the beginning of the path, which keeps the query out: `^/users/[0-9]+` matches `/users/42`, `/users/42/profile` and `/users/42?page=2`, but neither `/v1/users/42` nor `/health?next=/users/42`. Add `$` only if the route must refuse a query: `^/users/[0-9]+$` does not match `/users/42?page=2`.
+
 ## Exact
 
 There is no Docker label for exact path matches. Create the entrypoint through the [REST API](/documentation/configuration/api) with a `PathConfig` of `rule_type: Exact`.

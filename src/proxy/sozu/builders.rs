@@ -796,4 +796,28 @@ mod tests {
         assert!(matches("/a.b", "/a.b/c"));
         assert!(!matches("/a.b", "/axb/c"));
     }
+
+    /// Pins what the path matching docs say: Sōzu searches a `pathRegex`
+    /// in the path with its query, and a leading `^` keeps the query out.
+    #[test]
+    fn a_path_regex_is_searched_in_the_path_and_its_query_in_sozu() {
+        use sozu_lib::router::{PathRule as SozuPathRule, PathRuleResult};
+        let matches = |regex: &str, path: &str| {
+            let path_config = PathConfig {
+                rule_type: PathRuleType::Regex,
+                value: regex.to_string(),
+            };
+            let (rule, _) = build_path_and_rewrite(Some(&path_config), false, None, None, "test");
+            SozuPathRule::from_config(rule)
+                .is_some_and(|r| r.matches(path.as_bytes()) != PathRuleResult::None)
+        };
+
+        assert!(matches("/users/[0-9]+", "/v1/users/42"));
+        assert!(matches("/users/[0-9]+", "/health?next=/users/42"));
+        assert!(matches("^/users/[0-9]+", "/users/42/profile"));
+        assert!(matches("^/users/[0-9]+", "/users/42?page=2"));
+        assert!(!matches("^/users/[0-9]+", "/v1/users/42"));
+        assert!(!matches("^/users/[0-9]+", "/health?next=/users/42"));
+        assert!(!matches("^/users/[0-9]+$", "/users/42?page=2"));
+    }
 }
