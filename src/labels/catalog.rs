@@ -33,6 +33,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "redirect",
     "redirectScheme",
     "redirectTemplate",
+    "redirectHost",
     "wwwAuthenticate",
     "ratelimit.average",
     "ratelimit.burst",
