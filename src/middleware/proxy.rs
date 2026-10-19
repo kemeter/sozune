@@ -172,8 +172,21 @@ pub async fn handle_proxy(
             return resp;
         }
 
-        // Pick a backend using round-robin.
-        let (backend_host, backend_port) = match route.next_backend() {
+        let is_websocket = req
+            .headers()
+            .get("upgrade")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+
+        // The backends this request tries, in order; a WebSocket upgrade is
+        // never retried, but still fails over to the other backends.
+        let attempts = if is_websocket {
+            1
+        } else {
+            route.retry_attempts.max(1)
+        };
+        let mut plan = route.attempts(attempts);
+        let (backend_host, backend_port) = match plan.next() {
             Some(b) => b.clone(),
             None => {
                 error!("No backends configured for host '{}'", host);
@@ -207,19 +220,16 @@ pub async fn handle_proxy(
             target_uri
         );
 
-        // Check for WebSocket upgrade.
-        let is_websocket = req
-            .headers()
-            .get("upgrade")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-
         if is_websocket {
             // WebSocket tunnels live for the whole connection (minutes to hours),
             // so their duration is not a request latency — deliberately excluded
             // from the request-duration histogram to avoid skewing the distribution.
-            return handle_websocket(req, &backend_host, backend_port, &forwarded_path, &query)
-                .await;
+            let candidates: Vec<(String, u16)> =
+                std::iter::once((backend_host.clone(), backend_port))
+                    .chain(plan.cloned())
+                    .collect();
+            let timeout = backend_timeout(route.backend_timeout);
+            return handle_websocket(req, &candidates, &forwarded_path, &query, timeout).await;
         }
 
         // Build the forwarded request.
@@ -233,7 +243,7 @@ pub async fn handle_proxy(
             &mut parts.headers,
         );
 
-        parts.uri = match target_uri.parse::<Uri>() {
+        let primary_uri = match target_uri.parse::<Uri>() {
             Ok(uri) => uri,
             Err(e) => {
                 error!("Failed to parse target URI '{}': {}", target_uri, e);
@@ -251,7 +261,6 @@ pub async fn handle_proxy(
         // Buffer the request body up front so each retry can replay it. The
         // body has to be owned bytes — a streaming body can only be sent once.
         // With no retry (`attempts <= 1`) this is still a single send.
-        let attempts = route.retry_attempts.max(1);
         let body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
@@ -268,10 +277,25 @@ pub async fn handle_proxy(
         // (the backend produced no response). A response that arrives — even a
         // 5xx — is returned as-is and never retried, so a side effect is not
         // replayed.
+        //
+        // The backends come from `plan`, one per failed attempt: retries go to
+        // the backends this request has not tried, and a backup (weight 0)
+        // only takes over once every other backend failed.
+        let uri_of = |(host, port): &(String, u16)| {
+            format!("http://{host}:{port}{forwarded_path}{query}")
+                .parse::<Uri>()
+                .ok()
+        };
         let mut last_err = String::new();
         let mut last_was_timeout = false;
         let mut backend_response = None;
-        for attempt in 1..=attempts {
+        let mut target_uri = target_uri;
+        let mut tries = 0u32;
+        let mut uri = Some(primary_uri);
+        while let Some(current) = uri.take() {
+            tries += 1;
+            target_uri = current.to_string();
+            parts.uri = current;
             let forwarded_req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
             let response_future = state.http_client.request(forwarded_req);
 
@@ -291,15 +315,15 @@ pub async fn handle_proxy(
                     let body =
                         Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
                     backend_response = Some(Response::from_parts(parts, body));
-                    break;
                 }
                 Err((msg, is_timeout)) => {
                     last_err = msg;
                     last_was_timeout = is_timeout;
-                    if attempt < attempts {
+                    uri = plan.by_ref().find_map(uri_of);
+                    if uri.is_some() {
                         debug!(
-                            "Backend {} attempt {}/{} failed ({}); retrying",
-                            target_uri, attempt, attempts, last_err
+                            "Backend {} attempt {} failed ({}); retrying",
+                            target_uri, tries, last_err
                         );
                     }
                 }
@@ -311,7 +335,7 @@ pub async fn handle_proxy(
             None => {
                 error!(
                     "Failed to forward request to {} after {} attempt(s): {}",
-                    target_uri, attempts, last_err
+                    target_uri, tries, last_err
                 );
                 // All attempts failed: count it as a backend failure for the
                 // circuit breaker.
@@ -412,33 +436,44 @@ fn current_trace_id() -> std::borrow::Cow<'static, str> {
 }
 
 /// Handle WebSocket upgrade by establishing a TCP tunnel to the backend
+/// Connects to `backend_addr`, sends the upgrade and reads the first bytes of
+/// the answer into `buf`.
+async fn websocket_handshake(
+    backend_addr: &str,
+    upgrade_request: &str,
+    buf: &mut [u8],
+) -> Result<(tokio::net::TcpStream, usize), (String, bool)> {
+    let mut stream = tokio::net::TcpStream::connect(backend_addr)
+        .await
+        .map_err(|e| (format!("cannot connect to {backend_addr}: {e}"), false))?;
+    stream
+        .write_all(upgrade_request.as_bytes())
+        .await
+        .map_err(|e| {
+            (
+                format!("cannot send the upgrade to {backend_addr}: {e}"),
+                false,
+            )
+        })?;
+    match stream.read(buf).await {
+        Ok(n) if n > 0 => Ok((stream, n)),
+        _ => Err((
+            format!("{backend_addr} closed the connection without responding"),
+            false,
+        )),
+    }
+}
+
+/// Tunnels a WebSocket upgrade to the first of `backends` that accepts the
+/// connection: the picked backend, then the backups.
 async fn handle_websocket(
     req: Request<Body>,
-    backend_host: &str,
-    backend_port: u16,
+    backends: &[(String, u16)],
     path: &str,
     query: &str,
+    timeout: Option<std::time::Duration>,
 ) -> axum::response::Response {
-    debug!(
-        "WebSocket upgrade request to {}:{}{}",
-        backend_host, backend_port, path
-    );
-
-    // Connect to backend
-    let backend_addr = format!("{}:{}", backend_host, backend_port);
-    let mut backend_stream = match tokio::net::TcpStream::connect(&backend_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "Failed to connect to backend {} for WebSocket: {}",
-                backend_addr, e
-            );
-            return diag::backend_unreachable(&format!(
-                "websocket: cannot connect to {backend_addr}: {e}"
-            ))
-            .into_response();
-        }
-    };
+    debug!("WebSocket upgrade request to {:?}{}", backends, path);
 
     // Build the raw HTTP upgrade request to send to the backend
     let mut upgrade_request = format!("GET {}{} HTTP/1.1\r\n", path, query);
@@ -450,23 +485,52 @@ async fn handle_websocket(
     }
     upgrade_request.push_str("\r\n");
 
-    // Send upgrade request to backend
-    if let Err(e) = backend_stream.write_all(upgrade_request.as_bytes()).await {
-        error!("Failed to send WebSocket upgrade to backend: {}", e);
-        return diag::forwarding_failed("websocket-write-failed", &e.to_string()).into_response();
-    }
-
-    // Read the backend's response header
+    // Send the upgrade to each backend in turn until one answers it: a
+    // backend that refuses the connection, or closes it without a response,
+    // hands the upgrade to the next.
     let mut response_buf = vec![0u8; 4096];
-    let n = match backend_stream.read(&mut response_buf).await {
-        Ok(n) if n > 0 => n,
-        _ => {
-            error!("No response from backend for WebSocket upgrade");
-            return diag::backend_unreachable(
-                "websocket: backend closed connection without responding",
-            )
-            .into_response();
+    let mut answered = None;
+    let mut last_failure = String::from("no backend");
+    let mut last_timed_out = false;
+    for (backend_host, backend_port) in backends {
+        let backend_addr = format!("{}:{}", backend_host, backend_port);
+        // Bounded by the route's backend timeout, so a backend that accepts
+        // the connection and never answers does not hold the upgrade back
+        // from the next one.
+        let handshake = websocket_handshake(&backend_addr, &upgrade_request, &mut response_buf);
+        let outcome = match timeout {
+            Some(limit) => tokio::time::timeout(limit, handshake)
+                .await
+                .unwrap_or_else(|_| {
+                    Err((
+                        format!(
+                            "{backend_addr} did not answer within {}ms",
+                            limit.as_millis()
+                        ),
+                        true,
+                    ))
+                }),
+            None => handshake.await,
+        };
+        match outcome {
+            Ok((stream, n)) => {
+                answered = Some((stream, n));
+                break;
+            }
+            Err((failure, is_timeout)) => {
+                error!("WebSocket upgrade failed: {}", failure);
+                last_failure = failure;
+                last_timed_out = is_timeout;
+            }
         }
+    }
+    let Some((mut backend_stream, n)) = answered else {
+        // A 504 when the last backend tried timed out, as for a request.
+        return if last_timed_out {
+            diag::backend_timeout(&format!("websocket: {last_failure}"), timeout).into_response()
+        } else {
+            diag::backend_unreachable(&format!("websocket: {last_failure}")).into_response()
+        };
     };
 
     let response_str = String::from_utf8_lossy(&response_buf[..n]);

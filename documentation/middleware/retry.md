@@ -29,7 +29,7 @@ After all attempts fail, the client gets the usual error: `504` if the last fail
 ## Notes
 
 - The request body is buffered in memory so it can be replayed on each attempt. Keep that in mind for very large uploads on retried routes.
-- Each attempt re-runs backend selection, so with multiple backends a retry can land on a different (healthy) one.
+- A retry goes to the heaviest backend the request has not tried yet, so with multiple backends it lands on a different one; once every backend was tried, the balancer picks again. When every attempt fails on a route with [backup](/documentation/routing/load-balancing#weighted-load-balancing) backends (weight `0`), each backend not tried yet gets one more try, heaviest first, then each backup.
 - Retries are attempted back-to-back; there is no backoff delay between them yet.
 - Declaring `retry.attempts` routes the entrypoint through the Sōzune middleware layer (where the retry loop lives), like any other middleware.
 

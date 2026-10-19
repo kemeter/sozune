@@ -119,7 +119,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `errors.status` + `errors.service` | No equivalent for errors returned by the backend. `errorPages.<status>=<html>` only replaces the errors Sōzune answers itself (no route, backend down…), with an inline page. |
 | Traefik plugins | [WASM plugins](/documentation/middleware/wasm-plugins). Traefik's Yaegi plugins do not run as is. |
 
-Not available yet: `chain`, `digestauth`, `buffering`, `redirectregex`, `replacepath`, `replacepathregex`, mirroring and weighted services.
+Not available yet: `chain`, `digestauth`, `buffering`, `redirectregex`, `replacepath`, `replacepathregex`, mirroring and weighted services. A weighted split between two versions is written with a `weight` on the containers of one service instead: see [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing).
 
 ## TCP
 

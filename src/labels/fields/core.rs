@@ -286,9 +286,8 @@ pub fn parse_load_balancer(
 ///
 /// The weight is a relative share of traffic among the backends of a service:
 /// a backend with weight `90` receives roughly nine times the traffic of one
-/// with weight `10`. It is only honoured by weight-aware balancers (`random`);
-/// `round_robin` and the load-based algorithms ignore it. A weight of `0` keeps
-/// the backend wired but excludes it from selection.
+/// with weight `10`. Every balancer honours it. A weight of `0` makes the
+/// backend a backup, used only when no other backend can serve.
 ///
 /// Absent or empty → `None` (the backend keeps its default weight). A negative
 /// or non-integer value emits `W027` and falls back to `None`.
