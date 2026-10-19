@@ -70,3 +70,5 @@ For security, the following headers are dropped if injected from a Docker label 
 `host`, `transfer-encoding`, `content-length`, `connection`, `upgrade`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `x-real-ip`, `forwarded`, `cookie`, `authorization`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`
 
 This protects against request smuggling, host header attacks, and credential injection from a compromised label source.
+
+`Sozune-Route` is reserved on requests: on a route that goes through the Sōzune middleware (rate limit, compression, auth…), Sōzu uses it to tell the middleware which route it picked, replacing any value the client sent, and the middleware removes it before the backend. A request edit of it is ignored; a response edit applies as usual.

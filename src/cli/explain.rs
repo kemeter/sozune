@@ -257,9 +257,9 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W018",
         title: "Route collision (same host + path)",
-        cause: "Two or more candidates declare an entrypoint matching the same `(host, path)` pair.",
-        effect: "Only the highest-priority candidate is reachable; the others are shadowed and silently unreachable.",
-        fix: "Use distinct hostnames or paths. If the overlap is intentional, set `sozune.http.<svc>.priority=N` to make precedence explicit (higher wins).",
+        cause: "Two or more candidates declare an entrypoint matching the same `(host, path)` pair, and a request can match both: neither has header conditions Sōzu routes on, or both have such conditions a request can meet at once (`X-Env` present and `X-Env: prod`). A route with header conditions does not collide with one without: it is tried first, and the other serves the requests that fail those headers. Conditions on `Host` or `Cookie` do not count: Sōzu cannot route on them, so the route it picks answers 404 when they fail.",
+        effect: "Without header conditions Sōzu routes on, only the highest-priority candidate is reachable. With them, a request matching both is served by the highest-priority candidate.",
+        fix: "Use distinct hostnames or paths, or header conditions no request can meet for both (`X-Env: prod` and `X-Env: staging`). If the overlap is intentional, set `sozune.http.<svc>.priority=N` to make precedence explicit (higher wins).",
         example: Some("sozune.http.api.priority=10"),
     },
     Entry {

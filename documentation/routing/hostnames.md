@@ -71,6 +71,8 @@ For `admin.example.com`, the `specific` entrypoint wins. Other subdomains hit `c
 
 The default priority is `0`. Higher numbers win.
 
+One exception: a route whose [header conditions](/documentation/routing/header-query-matching) hold is tried before every route without header conditions, whatever their priority. This applies to conditions on any header but `Host` and `Cookie`, which Sōzu cannot route on. Priority still orders routes with header conditions among themselves.
+
 ## Notes
 
 - **Wildcard quirk**: due to an upstream issue ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)), wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds. Sōzune ships a patched build that guards against this.
