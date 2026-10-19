@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::config::{AcmeConfig, ProxyTimeouts};
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
+use crate::proxy::sozu::header_predicate;
 
 /// Run per-entrypoint lints. Called immediately after parsing one candidate.
 /// `prefix` is `sozune.<protocol>.<service>.`, so labels name the full key.
@@ -42,11 +43,20 @@ pub fn lint_entrypoint(ep: &Entrypoint, prefix: &str, diagnostics: &mut Vec<Diag
     }
 }
 
+/// A route's header conditions Sōzu routes on, as lowercase name and value.
+type HeaderConditions = Vec<(String, String)>;
+
 /// Run lints that need to look at the full set of routed entrypoints (e.g.
 /// host+path collisions across services).
+///
+/// Routes on one host and path collide when a request can match both and
+/// only one serves it. A route with header conditions does not collide with
+/// one without: Sōzu tries it first, and the other serves the requests it
+/// leaves. Two routes with header conditions collide unless one header
+/// requires different values on each, which no request can carry at once.
 pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diagnostic)> {
     let mut out = Vec::new();
-    let mut seen: HashMap<(String, String), Vec<&str>> = HashMap::new();
+    let mut routes: HashMap<(String, String), Vec<(&str, HeaderConditions)>> = HashMap::new();
 
     for (cand_id, ep) in entrypoints {
         if !matches!(ep.protocol, Protocol::Http) {
@@ -58,38 +68,50 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
             .as_ref()
             .map(|p| p.value.clone())
             .unwrap_or_else(|| "/".into());
+        // Only the conditions Sōzu routes on choose between routes; the others
+        // answer 404 from the route Sōzu picked.
+        let headers: HeaderConditions = ep
+            .config
+            .match_headers
+            .iter()
+            .filter(|c| header_predicate(c).is_some())
+            .map(|c| (c.key.to_ascii_lowercase(), c.value.clone()))
+            .collect();
         for host in &ep.config.hostnames {
-            seen.entry((host.clone(), path.clone()))
+            routes
+                .entry((host.clone(), path.clone()))
                 .or_default()
-                .push(cand_id);
+                .push((cand_id, headers.clone()));
         }
     }
 
-    for ((host, path), candidates) in seen {
-        if candidates.len() < 2 {
-            continue;
-        }
-        let mut sorted = candidates.clone();
-        sorted.sort();
-        sorted.dedup();
-        if sorted.len() < 2 {
-            continue;
-        }
-        for cand_id in &sorted {
-            let others: Vec<&&str> = sorted.iter().filter(|c| *c != cand_id).collect();
-            let others_str = others
+    for ((host, path), declared) in &routes {
+        for (cand_id, headers) in declared {
+            let mut others: Vec<&str> = declared
                 .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+                .filter(|(other, other_headers)| {
+                    other != cand_id && can_overlap(headers, other_headers)
+                })
+                .map(|(other, _)| *other)
+                .collect();
+            if others.is_empty() {
+                continue;
+            }
+            others.sort();
+            others.dedup();
+            let others_str = others.join(", ");
+            let message = if headers.is_empty() {
+                format!(
+                    "route ({host}{path}) is also defined by: {others_str}; only the highest-priority candidate is reachable"
+                )
+            } else {
+                format!(
+                    "route ({host}{path}) is also defined by: {others_str}, with header conditions a request can meet for both; the highest-priority candidate serves it"
+                )
+            };
             out.push((
                 cand_id.to_string(),
-                Diagnostic::new(
-                    DiagnosticCode::W018RouteCollision,
-                    format!(
-                        "route ({host}{path}) is also defined by: {others_str}; only the highest-priority candidate is reachable"
-                    ),
-                )
+                Diagnostic::new(DiagnosticCode::W018RouteCollision, message)
                 .with_label("host+path")
                 .with_value(format!("{host}{path}"))
                 .with_hint("set distinct hostnames or paths, or use `priority` to make the precedence explicit"),
@@ -98,6 +120,20 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
     }
 
     out
+}
+
+/// Whether one request can match both sets of header conditions, given that
+/// Sōzu serves a route with conditions before any route without.
+fn can_overlap(a: &[(String, String)], b: &[(String, String)]) -> bool {
+    if a.is_empty() != b.is_empty() {
+        return false;
+    }
+    !a.iter().any(|(key, value)| {
+        !value.is_empty()
+            && b.iter().any(|(other_key, other_value)| {
+                other_key == key && !other_value.is_empty() && other_value != value
+            })
+    })
 }
 
 /// Returns a diagnostic if ACME is enabled but no entrypoint actually requests TLS.
@@ -231,8 +267,8 @@ mod tests {
     use super::*;
     use crate::config::ResolverConfig;
     use crate::model::{
-        Backend, EntrypointAcmeConfig, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType,
-        RateLimitConfig,
+        Backend, EntrypointAcmeConfig, EntrypointConfig, LoadBalancer, MatchCondition, PathConfig,
+        PathRuleType, RateLimitConfig,
     };
 
     fn ep(host: &str, path: Option<&str>, tls: bool, https_redirect: bool) -> Entrypoint {
@@ -358,6 +394,68 @@ mod tests {
         let pairs = vec![("cand-a", &a), ("cand-b", &b)];
         let out = lint_collection(&pairs);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn distinct_header_conditions_do_not_collide() {
+        let a = ep("example.com", Some("/api"), false, false);
+        let mut b = ep("example.com", Some("/api"), false, false);
+        b.config.match_headers = vec![MatchCondition {
+            key: "X-Canary".into(),
+            value: String::new(),
+        }];
+        let pairs = vec![("cand-a", &a), ("cand-b", &b)];
+        assert!(lint_collection(&pairs).is_empty());
+
+        let mut c = b.clone();
+        c.config.match_headers[0].key = "x-canary".into();
+        let pairs = vec![("cand-b", &b), ("cand-c", &c)];
+        assert_eq!(lint_collection(&pairs).len(), 2);
+    }
+
+    /// A request can carry `X-Env: prod` and match both a route on that
+    /// value and one on the header's presence; it cannot carry two values.
+    #[test]
+    fn header_conditions_collide_when_one_request_can_match_both() {
+        let with = |value: &str| {
+            let mut e = ep("example.com", Some("/api"), false, false);
+            e.config.match_headers = vec![MatchCondition {
+                key: "X-Env".into(),
+                value: value.into(),
+            }];
+            e
+        };
+        let (any, prod, staging) = (with(""), with("prod"), with("staging"));
+
+        let out = lint_collection(&[("any", &any), ("prod", &prod), ("staging", &staging)]);
+        let mut owners: Vec<&str> = out.iter().map(|(c, _)| c.as_str()).collect();
+        owners.sort();
+        assert_eq!(owners, ["any", "prod", "staging"]);
+        let prod_message = &out.iter().find(|(c, _)| c == "prod").unwrap().1.message;
+        assert!(
+            prod_message.contains(
+                "also defined by: any, with header conditions a request can meet for both"
+            )
+        );
+
+        assert!(lint_collection(&[("prod", &prod), ("staging", &staging)]).is_empty());
+    }
+
+    /// Sōzu cannot route on a cookie, so it does not choose between the
+    /// routes: the one it picks answers 404 when the cookie is missing.
+    #[test]
+    fn a_cookie_condition_does_not_separate_routes() {
+        let plain = ep("example.com", Some("/api"), false, false);
+        let mut beta = ep("example.com", Some("/api"), false, false);
+        beta.config.match_headers = vec![MatchCondition {
+            key: "Cookie".into(),
+            value: "beta=1".into(),
+        }];
+
+        assert_eq!(
+            lint_collection(&[("plain", &plain), ("beta", &beta)]).len(),
+            2
+        );
     }
 
     #[test]

@@ -7,10 +7,12 @@ All notable changes to this project will be documented in this file.
 ### Routing
 
 - Redirect to another host — `sozune.http.<svc>.redirectHost=www.example.com` answers with a permanent redirect to that host, keeping the path and the query: an old domain or an alias sent to the main one. A permanent redirect without it sends the client back to the host it asked for. An invalid value, or a route whose `redirect` is not `permanent`, emits `W031`. See [Redirects](documentation/middleware/redirects.md#redirecthost).
+- Routing on headers — `matchHeaders` is now a routing condition checked by Sōzu: a request that fails it goes on to the next route instead of getting a `404` from this one. Two routes on the same host and path can differ only by a header, e.g. a canary on `X-Canary`, and `W018` reports them as a collision only when a request can match both (`X-Env` present and `X-Env: prod`, not `X-Env: prod` and `X-Env: staging`). A route whose header conditions hold is tried before every route without any, whatever their priority. A repeated header is compared on its first occurrence. A route matching only on headers no longer goes through the middleware. ACME HTTP-01 challenges still go to the challenge responder, whatever headers they carry. Conditions on `Host` or `Cookie`, and `matchQuery`, still answer `404` from the route. See [Header & query matching](documentation/routing/header-query-matching.md).
 
 ### Reliability
 
 - A Docker route that only redirects (`redirect=permanent` or `unauthorized`) was dropped when Sōzune started, and every one of them was dropped whenever any container stopped: such a route has no backend, which read as "nothing left to serve". It now stays as long as a container declares it. A container stopping also no longer removes routes of another provider.
+- Two routes on the same host and path that differ by their `methods`, each with a middleware (rate limit, compression, auth…), shared one middleware stack: the middleware found the route by host and path, and ran the first one for both. Sōzu now names the route it picked, and the middleware runs that route's stack. The `Sozune-Route` request header carries that name: a request header edit of it is ignored.
 - Sōzu upgraded to 2.3.2, a published release instead of a development revision. A frontend change a worker refuses is now rolled back instead of leaving the workers out of step, and backends stay tied to their cluster when routes are reloaded.
 
 ### TLS / ACME

@@ -8,15 +8,16 @@ use crate::config::{ProxyConfig, ProxyTimeouts, TcpRateLimit};
 use crate::middleware::ip_allow_list::IpAllowList;
 use crate::middleware::rate_limit::{RateLimitResult, RateLimiter};
 use crate::middleware::{self, MiddlewareState};
-use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
+use crate::model::{Backend, Entrypoint, HeaderConfig, HeaderDirection, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::metrics_snapshot;
 use crate::proxy::tls_alpn_gate;
 use acme::{add_certificate, register_acme_challenge_cluster};
 use addr::{l4_backend_id, parse_backend_address};
+pub(crate) use builders::header_predicate;
 use builders::{
-    build_authorized_hashes, build_frontend_headers, build_path_and_rewrite, map_redirect_policy,
-    map_redirect_scheme, methods_for_frontend,
+    build_authorized_hashes, build_frontend_headers, build_header_predicates,
+    build_path_and_rewrite, map_redirect_policy, map_redirect_scheme, methods_for_frontend,
 };
 use channel::{send_to_worker, wait_for_worker_ready, with_reload_budget};
 use sozu_command_lib::{
@@ -1225,6 +1226,19 @@ fn configure_sozu_routing(
                             );
                         }
                     }
+                    for twin in build_acme_twins(entrypoint, channels.http_port) {
+                        let hostname = twin.hostname.clone();
+                        if let Err(e) = send_to_worker(
+                            &mut channels.http,
+                            format!("add-frontend-acme-headers-{}-{}", cluster_id, hostname),
+                            RequestType::add_http_frontend(twin),
+                        ) {
+                            debug!(
+                                "Failed to add ACME frontend with header predicates for {} (may already exist): {}",
+                                hostname, e
+                            );
+                        }
+                    }
                 }
 
                 let https_addr = channels.https_addr();
@@ -1342,6 +1356,30 @@ pub(crate) fn build_acme_frontend(hostname: &str, http_port: u16) -> RequestHttp
     }
 }
 
+/// The ACME challenge frontends a route with header conditions needs on top
+/// of [`build_acme_frontend`]: Sōzu tries a frontend whose header predicates
+/// hold before every frontend without any, so the route would take the
+/// challenge requests that carry its headers. Each copy carries the route's
+/// predicates and is installed before it, which keeps the challenge first.
+pub(crate) fn build_acme_twins(
+    entrypoint: &Entrypoint,
+    http_port: u16,
+) -> Vec<RequestHttpFrontend> {
+    let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
+    if header_predicates.is_empty() {
+        return Vec::new();
+    }
+    entrypoint
+        .config
+        .hostnames
+        .iter()
+        .map(|hostname| RequestHttpFrontend {
+            header_predicates: header_predicates.clone(),
+            ..build_acme_frontend(hostname, http_port)
+        })
+        .collect()
+}
+
 /// The listener a frontend is installed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrontListener {
@@ -1374,7 +1412,35 @@ pub(crate) fn build_http_frontends(
             cluster_id,
         );
 
-        let frontend_headers = build_frontend_headers(&entrypoint.config.headers);
+        // `Sozune-Route` is reserved on requests: an edit of it could reach
+        // the middleware ahead of the route it names. Its response side stays.
+        let header_edits: Vec<HeaderConfig> = entrypoint
+            .config
+            .headers
+            .iter()
+            .filter_map(|edit| {
+                if !edit.name.eq_ignore_ascii_case(middleware::ROUTE_HEADER) {
+                    return Some(edit.clone());
+                }
+                match edit.direction {
+                    HeaderDirection::Request => None,
+                    HeaderDirection::Response | HeaderDirection::Both => Some(HeaderConfig {
+                        direction: HeaderDirection::Response,
+                        ..edit.clone()
+                    }),
+                }
+            })
+            .collect();
+        let mut frontend_headers = build_frontend_headers(&header_edits);
+        if middleware::needs_middleware(&entrypoint.config) {
+            // Names the route for the middleware, which cannot tell it from
+            // another one on the same host and path by itself.
+            frontend_headers.extend(build_frontend_headers(&[HeaderConfig {
+                name: middleware::ROUTE_HEADER.to_string(),
+                value: cluster_id.to_string(),
+                direction: HeaderDirection::Request,
+            }]));
+        }
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();
@@ -1399,6 +1465,7 @@ pub(crate) fn build_http_frontends(
                 .and_then(|r| r.hostname.clone())
         });
         let frontend_rewrite_port = entrypoint.config.rewrite_port.map(|p| p as u32);
+        let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
 
         for method in methods_for_frontend(&entrypoint.config.methods) {
             let front = RequestHttpFrontend {
@@ -1417,6 +1484,7 @@ pub(crate) fn build_http_frontends(
                 redirect: frontend_redirect,
                 redirect_scheme: frontend_redirect_scheme,
                 redirect_template: frontend_redirect_template.clone(),
+                header_predicates: header_predicates.clone(),
                 ..Default::default()
             };
             if entrypoint.config.tls {
@@ -1457,7 +1525,7 @@ fn add_http_frontends(
                         "add-frontend-http-{}-{}-{}",
                         cluster_id, hostname, method_tag
                     ),
-                    RequestType::AddHttpFrontend(front),
+                    RequestType::add_http_frontend(front),
                 ) {
                     debug!(
                         "Failed to add HTTP frontend for {} [{}] (may already exist): {}",
@@ -1477,7 +1545,7 @@ fn add_http_frontends(
                         "add-frontend-https-{}-{}-{}",
                         cluster_id, hostname, method_tag
                     ),
-                    RequestType::AddHttpsFrontend(front),
+                    RequestType::add_https_frontend(front),
                 ) {
                     Ok(_) => info!("HTTPS frontend added for {} [{}]", hostname, method_tag),
                     Err(e) => {
@@ -2117,6 +2185,7 @@ fn remove_http_frontends(
         cluster_id,
     );
 
+    let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
     for hostname in &entrypoint.config.hostnames {
         for method in methods_for_frontend(&entrypoint.config.methods) {
             let method_tag = method.as_deref().unwrap_or("any");
@@ -2128,6 +2197,7 @@ fn remove_http_frontends(
                 method: method.clone(),
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
+                header_predicates: header_predicates.clone(),
                 ..Default::default()
             };
 
@@ -2137,7 +2207,7 @@ fn remove_http_frontends(
                     "rm-frontend-http-{}-{}-{}",
                     cluster_id, hostname, method_tag
                 ),
-                RequestType::RemoveHttpFrontend(http_front),
+                RequestType::remove_http_frontend(http_front),
             ) {
                 debug!(
                     "Failed to remove HTTP frontend for {} [{}]: {}",
@@ -2154,6 +2224,7 @@ fn remove_http_frontends(
                     method: method.clone(),
                     position: RulePosition::Pre as i32,
                     tags: BTreeMap::new(),
+                    header_predicates: header_predicates.clone(),
                     ..Default::default()
                 };
 
@@ -2163,7 +2234,7 @@ fn remove_http_frontends(
                         "rm-frontend-https-{}-{}-{}",
                         cluster_id, hostname, method_tag
                     ),
-                    RequestType::RemoveHttpsFrontend(https_front),
+                    RequestType::remove_https_frontend(https_front),
                 ) {
                     debug!(
                         "Failed to remove HTTPS frontend for {} [{}]: {}",
@@ -2328,6 +2399,54 @@ fn remove_cluster(
         RequestType::RemoveCluster(cluster_id.to_string()),
     ) {
         debug!("Failed to remove HTTPS cluster {}: {}", cluster_id, e);
+    }
+}
+
+/// What identifies an ACME twin to Sōzu: its hostname and its predicates,
+/// whatever their order and the case of the header names.
+fn acme_twin_key(twin: &RequestHttpFrontend) -> (String, Vec<(String, i32, Option<String>)>) {
+    let mut predicates: Vec<_> = twin
+        .header_predicates
+        .iter()
+        .map(|p| (p.name.to_ascii_lowercase(), p.kind, p.value.clone()))
+        .collect();
+    predicates.sort();
+    predicates.dedup();
+    (twin.hostname.to_ascii_lowercase(), predicates)
+}
+
+/// The ACME twins of `entrypoint` no route in `still_needed` uses: two routes
+/// with the same hostname and header predicates share one.
+fn stale_acme_twins(
+    entrypoint: &Entrypoint,
+    http_port: u16,
+    still_needed: &[RequestHttpFrontend],
+) -> Vec<RequestHttpFrontend> {
+    let needed: HashSet<_> = still_needed.iter().map(acme_twin_key).collect();
+    build_acme_twins(entrypoint, http_port)
+        .into_iter()
+        .filter(|twin| !needed.contains(&acme_twin_key(twin)))
+        .collect()
+}
+
+fn remove_acme_twins(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    entrypoint: &Entrypoint,
+    http_port: u16,
+    still_needed: &[RequestHttpFrontend],
+) {
+    for twin in stale_acme_twins(entrypoint, http_port, still_needed) {
+        let hostname = twin.hostname.clone();
+        if let Err(e) = send_to_worker(
+            command_channel,
+            format!("rm-frontend-acme-headers-{}", hostname),
+            RequestType::remove_http_frontend(twin),
+        ) {
+            debug!(
+                "Failed to remove ACME frontend with header predicates for {}: {}",
+                hostname, e
+            );
+        }
     }
 }
 
@@ -2546,6 +2665,12 @@ fn apply_routing_diff(
     current: &RoutingSnapshot,
     channels: &mut Channels,
 ) {
+    let needed_twins: Vec<RequestHttpFrontend> = current
+        .values()
+        .filter(|entrypoint| entrypoint.protocol == Protocol::Http)
+        .flat_map(|entrypoint| build_acme_twins(entrypoint, channels.http_port))
+        .collect();
+
     // Handle removed clusters
     for (cluster_id, old) in previous {
         if !current.contains_key(cluster_id) {
@@ -2566,6 +2691,12 @@ fn apply_routing_diff(
                     remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
 
                     if channels.acme_challenge_port.is_some() {
+                        remove_acme_twins(
+                            &mut channels.http,
+                            old,
+                            channels.http_port,
+                            &needed_twins,
+                        );
                         remove_acme_frontends(
                             &mut channels.http,
                             &old.config.hostnames,
@@ -2616,6 +2747,14 @@ fn apply_routing_diff(
                     );
                     remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
 
+                    if channels.acme_challenge_port.is_some() {
+                        remove_acme_twins(
+                            &mut channels.http,
+                            old,
+                            channels.http_port,
+                            &needed_twins,
+                        );
+                    }
                     if channels.acme_challenge_port.is_some()
                         && old.config.hostnames != new.config.hostnames
                     {
@@ -3704,6 +3843,74 @@ mod tests {
 
         let not_required = require_https_for_client_certificates(&storage, None);
         assert!(!not_required["tls"].config.https_redirect);
+    }
+
+    /// A route with header conditions gets an ACME challenge frontend
+    /// carrying them; one shared with another route stays while that route
+    /// needs it.
+    #[test]
+    fn an_acme_twin_is_removed_only_when_no_route_needs_it() {
+        let mut a = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        assert!(build_acme_twins(&a, 80).is_empty());
+
+        a.config.match_headers = vec![crate::model::MatchCondition {
+            key: "X-Canary".into(),
+            value: String::new(),
+        }];
+        let twins = build_acme_twins(&a, 80);
+        assert_eq!(twins.len(), a.config.hostnames.len());
+        assert_eq!(twins[0].cluster_id.as_deref(), Some(ACME_CHALLENGE_CLUSTER));
+        assert_eq!(twins[0].header_predicates.len(), 1);
+
+        let mut b = a.clone();
+        b.config.match_headers[0].key = "x-canary".into();
+        assert!(stale_acme_twins(&a, 80, &build_acme_twins(&b, 80)).is_empty());
+        assert_eq!(stale_acme_twins(&a, 80, &[]), twins);
+    }
+
+    /// The middleware cannot tell apart two routes on one host and path, so
+    /// the frontend names the one Sōzu picked, replacing any client value.
+    #[test]
+    fn a_middleware_route_names_itself_to_the_middleware() {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let plain =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        assert!(
+            plain[0]
+                .1
+                .headers
+                .iter()
+                .all(|h| h.key != middleware::ROUTE_HEADER)
+        );
+
+        ep.config.compress = true;
+        ep.config.headers = vec![
+            HeaderConfig {
+                name: "Sozune-Route".into(),
+                value: "other".into(),
+                direction: HeaderDirection::Request,
+            },
+            HeaderConfig {
+                name: "Sozune-Route".into(),
+                value: "shown".into(),
+                direction: HeaderDirection::Both,
+            },
+        ];
+        let fronts =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        let route: Vec<_> = fronts[0]
+            .1
+            .headers
+            .iter()
+            .filter(|h| h.key.eq_ignore_ascii_case(middleware::ROUTE_HEADER))
+            .filter(|h| {
+                h.position == sozu_command_lib::proto::command::HeaderPosition::Request as i32
+            })
+            .map(|h| h.val.as_str())
+            .collect();
+        assert_eq!(route, ["", "http_web"]);
+        assert!(fronts[0].1.headers.iter().any(|h| h.val == "shown"
+            && h.position == sozu_command_lib::proto::command::HeaderPosition::Response as i32));
     }
 
     #[test]

@@ -419,6 +419,26 @@ services:
       - "sozune.http.svcmatch.matchQuery=version:2"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # Same host and path: the X-Canary header picks the second one.
+  svc-canary-stable:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: stable
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.canarystable.host=$HOST_CANARY"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-canary:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: canary
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.canary.host=$HOST_CANARY"
+      - "sozune.http.canary.matchHeaders=X-Canary"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-ipallow:
     image: traefik/whoami
     labels:

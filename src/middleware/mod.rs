@@ -18,7 +18,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::{error, info, warn};
 
-use crate::model::{Backend, EntrypointConfig};
+use crate::model::{Backend, EntrypointConfig, MatchCondition};
+use crate::proxy::sozu::header_predicate;
 use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
@@ -122,6 +123,11 @@ impl PathMatch {
     }
 }
 
+/// Request header carrying the id of the route Sōzu picked, set by the
+/// frontend of every route that goes through the middleware. Sōzu drops any
+/// value the client sent, and the middleware drops it before the backend.
+pub const ROUTE_HEADER: &str = "sozune-route";
+
 /// The routes one hostname carries, each with the path it was declared with.
 /// `None` is a route with no path: the catch-all for that hostname.
 type HostRoutes = Vec<(Option<PathMatch>, Arc<MiddlewareRoute>)>;
@@ -137,6 +143,9 @@ pub struct MiddlewareRouteTable {
     /// was sent to, not the pattern that matched it, so these are matched with
     /// Sozu's own `DomainRule`.
     patterns: Vec<(DomainRule, String)>,
+    /// Every route by the id of its entrypoint, for requests carrying
+    /// [`ROUTE_HEADER`].
+    by_cluster: std::collections::HashMap<String, Arc<MiddlewareRoute>>,
 }
 
 /// Middleware configuration for a single entrypoint.
@@ -225,6 +234,8 @@ impl MiddlewareRouteTable {
         path: Option<&crate::model::PathConfig>,
         route: Arc<MiddlewareRoute>,
     ) {
+        self.by_cluster
+            .insert(route.cluster_id.clone(), Arc::clone(&route));
         for hostname in hostnames {
             if is_host_pattern(hostname) && !self.patterns.iter().any(|(_, key)| key == hostname) {
                 match hostname.parse::<DomainRule>() {
@@ -247,6 +258,12 @@ impl MiddlewareRouteTable {
     pub fn clear(&mut self) {
         self.routes.clear();
         self.patterns.clear();
+        self.by_cluster.clear();
+    }
+
+    /// The route of the entrypoint `cluster_id`, as named by [`ROUTE_HEADER`].
+    pub fn route_for_cluster(&self, cluster_id: &str) -> Option<Arc<MiddlewareRoute>> {
+        self.by_cluster.get(cluster_id).cloned()
     }
 
     /// The route serving `host` and `request_path`: among the routes declared
@@ -361,6 +378,17 @@ pub fn build_plugin_registry(
     registry
 }
 
+/// The header conditions Sōzu cannot route on, left for the middleware to
+/// enforce. Sōzu takes every other one as a frontend predicate.
+pub fn middleware_header_conditions(config: &EntrypointConfig) -> Vec<MatchCondition> {
+    config
+        .match_headers
+        .iter()
+        .filter(|condition| header_predicate(condition).is_none())
+        .cloned()
+        .collect()
+}
+
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.backend_timeout.is_some()
@@ -369,7 +397,7 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.compress
         || config.forward_auth.is_some()
         || !config.plugins.is_empty()
-        || !config.match_headers.is_empty()
+        || !middleware_header_conditions(config).is_empty()
         || !config.match_query.is_empty()
         || !config.match_client_ip.is_empty()
         || !config.ip_allow_list.is_empty()
@@ -442,9 +470,10 @@ pub fn build_middleware_route(
             Some(list)
         }
     };
-    if !config.match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
+    let match_headers = middleware_header_conditions(config);
+    if !match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
         middlewares.push(Arc::new(RequestMatchMiddleware::new(
-            config.match_headers.clone(),
+            match_headers,
             config.match_query.clone(),
             client_ip,
             trusted_proxies.clone(),
@@ -635,6 +664,29 @@ mod route_key_tests {
         table
             .get_route(host, path)
             .map(|route| route.backends[0].0.clone())
+    }
+
+    /// The route named by the frontend wins over a host and path lookup,
+    /// which cannot tell two routes on the same host and path apart.
+    #[test]
+    fn a_route_is_found_by_the_id_sozu_names() {
+        let mut table = MiddlewareRouteTable::default();
+        table.update_routes_for_entrypoint(
+            &["app.example.com".to_string()],
+            None,
+            backend_named("a"),
+        );
+        table.update_routes_for_entrypoint(
+            &["app.example.com".to_string()],
+            None,
+            backend_named("b"),
+        );
+
+        assert_eq!(table.route_for_cluster("b").unwrap().cluster_id, "b");
+        assert!(table.route_for_cluster("c").is_none());
+
+        table.clear();
+        assert!(table.route_for_cluster("b").is_none());
     }
 
     /// Sozu matches a wildcard or regex hostname and forwards the request with

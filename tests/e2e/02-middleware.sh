@@ -201,6 +201,19 @@ else
     pass "gzip compression: no compression without Accept-Encoding"
 fi
 
+log "[02] Middleware: the route header stays between Sōzu and the middleware"
+
+# whoami echoes the request it receives. A client value must not reach the
+# backend either: Sōzu replaces it, and the middleware drops it.
+route_body=$(curl -s --max-time 2 \
+    -H "Host: $HOST_COMPRESS" -H "Sozune-Route: forged" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "")
+if [[ -n "$route_body" ]] && ! echo "$route_body" | grep -qi "^Sozune-Route:"; then
+    pass "the backend does not receive the Sozune-Route header"
+else
+    fail "the backend received a Sozune-Route header (or no answer)"
+fi
+
 log "[02] Middleware: brotli compression"
 
 br_only_encoding=$(curl -s -D - -o /dev/null --max-time 2 \

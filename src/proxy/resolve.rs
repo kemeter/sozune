@@ -15,10 +15,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
-use sozu_command_lib::proto::command::{RedirectPolicy, SocketAddress};
+use sozu_command_lib::proto::command::{RedirectPolicy, RequestHttpFrontend, SocketAddress};
 use sozu_lib::protocol::kawa_h1::parser::Method;
 use sozu_lib::router::{
-    DomainRule, MethodRule, MethodRuleResult, PathRule, PathRuleResult, Router,
+    DomainRule, MethodRule, MethodRuleResult, PathRule, PathRuleResult, RequestHeaders, Router,
 };
 
 use crate::middleware::chain::{Flow, Middleware, RequestCtx};
@@ -28,8 +28,8 @@ use crate::middleware::{self, MiddlewareRouteTable, PluginRegistry};
 use crate::model::{Entrypoint, PathRuleType, Protocol};
 use crate::proxy::health::UnhealthyMap;
 use crate::proxy::sozu::{
-    ACME_CHALLENGE_CLUSTER, FrontListener, build_acme_frontend, build_http_frontends,
-    fill_middleware_table, routing_order,
+    ACME_CHALLENGE_CLUSTER, FrontListener, build_acme_frontend, build_acme_twins,
+    build_http_frontends, fill_middleware_table, header_predicate, routing_order,
 };
 use crate::util::fuzzy::closest_match;
 
@@ -152,6 +152,18 @@ struct Target {
     /// Path alone, as the middleware server matches it.
     path: String,
     method: String,
+    headers: BTreeMap<String, String>,
+}
+
+/// The request's headers as Sōzu's router reads them for header predicates:
+/// by name, ignoring its case.
+impl RequestHeaders for Target {
+    fn header(&self, name: &[u8]) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.as_bytes().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_bytes())
+    }
 }
 
 impl Target {
@@ -183,6 +195,7 @@ impl Target {
             path_and_query,
             path,
             method,
+            headers: request.headers.clone(),
         })
     }
 }
@@ -257,7 +270,15 @@ pub async fn resolve(
     }
 
     let served_by = if middleware::needs_middleware(&entrypoint.config) {
-        match run_middleware(inputs, &target, request, &mut resolution.pipeline).await? {
+        match run_middleware(
+            inputs,
+            &cluster_id,
+            &target,
+            request,
+            &mut resolution.pipeline,
+        )
+        .await?
+        {
             MiddlewareResult::Continue(id) => id,
             MiddlewareResult::Stopped { status, summary } => {
                 resolution.outcome = Outcome::Rejected;
@@ -349,6 +370,11 @@ fn route_with_sozu(inputs: &ResolveInputs<'_>, target: &Target) -> SozuDecision 
                     let _ = router.add_http_front(&front);
                 }
             }
+            for twin in build_acme_twins(entrypoint, 0) {
+                if let Ok(front) = twin.to_frontend() {
+                    let _ = router.add_http_front(&front);
+                }
+            }
         }
 
         let mut added = Vec::new();
@@ -377,7 +403,7 @@ fn route_with_sozu(inputs: &ResolveInputs<'_>, target: &Target) -> SozuDecision 
     }
 
     let method = Method::new(target.method.as_bytes());
-    match router.lookup(&target.host, &target.path_and_query, &method) {
+    match router.lookup_with_headers(&target.host, &target.path_and_query, &method, target) {
         Ok(result) => SozuDecision {
             cluster_id: result.cluster_id.map(|id| id.to_string()),
             redirect: result.redirect,
@@ -452,16 +478,22 @@ fn explain_candidates(
             .map(|(_, front)| front)
             .filter(|front| host_matches(&front.hostname, &target.host))
             .collect();
-        let path_ok = |front: &sozu_command_lib::proto::command::RequestHttpFrontend| {
+        let path_ok = |front: &RequestHttpFrontend| {
             PathRule::from_config(front.path.clone()).is_some_and(|rule| {
                 rule.matches(target.path_and_query.as_bytes()) != PathRuleResult::None
             })
         };
-        let method_ok = |front: &sozu_command_lib::proto::command::RequestHttpFrontend| {
+        let method_ok = |front: &RequestHttpFrontend| {
             MethodRule::new(front.method.clone()).matches(&method) != MethodRuleResult::None
         };
 
-        if fronts.iter().any(|f| path_ok(f) && method_ok(f)) {
+        if let Some(reason) = fronts
+            .iter()
+            .filter(|f| path_ok(f) && method_ok(f))
+            .find_map(|f| failed_header_predicate(f, target))
+        {
+            candidates.push(candidate(Verdict::Rejected, reason));
+        } else if fronts.iter().any(|f| path_ok(f) && method_ok(f)) {
             let reason = match winner {
                 Some(winner) => shadowed_reason(winner, entrypoint),
                 None => "the ACME challenge path is served first".to_string(),
@@ -490,8 +522,40 @@ fn explain_candidates(
     candidates
 }
 
+/// Why the request fails a frontend's header predicates, or `None` when it
+/// satisfies them all.
+fn failed_header_predicate(front: &RequestHttpFrontend, target: &Target) -> Option<String> {
+    front.header_predicates.iter().find_map(|predicate| {
+        let name = predicate.name.as_str();
+        match (target.header(name.as_bytes()), predicate.value.as_deref()) {
+            (None, Some(value)) => {
+                Some(format!("header: {name} must be `{value}`, and is missing"))
+            }
+            (None, None) => Some(format!("header: {name} must be present, and is missing")),
+            (Some(sent), Some(value)) if sent != value.as_bytes() => Some(format!(
+                "header: {name} must be `{value}`, not `{}`",
+                String::from_utf8_lossy(sent)
+            )),
+            _ => None,
+        }
+    })
+}
+
 fn shadowed_reason(winner: &Entrypoint, loser: &Entrypoint) -> String {
-    if winner.config.priority > loser.config.priority {
+    let routes_on_headers = |entrypoint: &Entrypoint| {
+        entrypoint
+            .config
+            .match_headers
+            .iter()
+            .any(|c| header_predicate(c).is_some())
+    };
+    if routes_on_headers(winner) && !routes_on_headers(loser) {
+        format!(
+            "matches too, but `{}` matches on its headers, which Sōzu tries before \
+             routes without header conditions whatever their priority",
+            winner.name
+        )
+    } else if winner.config.priority > loser.config.priority {
         format!(
             "matches too, but `{}` has a higher priority ({} > {})",
             winner.name, winner.config.priority, loser.config.priority
@@ -606,6 +670,7 @@ const EVALUATED: [&str; 2] = ["ip-allow-list", "request-match"];
 /// Finds the route the middleware server would pick, and walks its chain.
 async fn run_middleware(
     inputs: &ResolveInputs<'_>,
+    cluster_id: &str,
     target: &Target,
     request: &ResolveRequest,
     pipeline: &mut Vec<Step>,
@@ -617,13 +682,11 @@ async fn run_middleware(
         inputs.plugins,
         inputs.trusted_proxies,
     );
-    let Some(route) = table.get_route(&target.host, &target.path) else {
+    let Some(route) = table.route_for_cluster(cluster_id) else {
         return Ok(MiddlewareResult::Stopped {
             status: 502,
             summary: format!(
-                "Sōzu sends the request to the middleware, which finds no route for \
-                 `{}` `{}`",
-                target.host, target.path
+                "Sōzu sends the request to the middleware, which has no route `{cluster_id}`"
             ),
         });
     };
@@ -655,12 +718,13 @@ async fn run_middleware(
         let partial =
             client_unknown && name == "request-match" && !config.match_client_ip.is_empty();
         let flow = if partial {
-            if config.match_headers.is_empty() && config.match_query.is_empty() {
+            let match_headers = middleware::middleware_header_conditions(config);
+            if match_headers.is_empty() && config.match_query.is_empty() {
                 pipeline.push(step(name, StepVerdict::NotEvaluated, Some(NEEDS_CLIENT_IP)));
                 continue;
             }
             RequestMatchMiddleware::new(
-                config.match_headers.clone(),
+                match_headers,
                 config.match_query.clone(),
                 None,
                 inputs.trusted_proxies.clone(),
@@ -1024,10 +1088,10 @@ mod tests {
         assert_eq!(resolution.status, Some(301));
     }
 
-    /// A header condition is checked after Sōzu picked the route: a request
-    /// without it gets a 404 from that route, not another route's answer.
+    /// Sōzu routes on header conditions itself: a request without the header
+    /// goes to the next route of the host instead of getting a 404.
     #[tokio::test]
-    async fn a_failed_header_condition_answers_404_without_trying_another_route() {
+    async fn a_failed_header_condition_falls_through_to_the_next_route() {
         let routes = || {
             vec![
                 route("web", &["app.example.com"], serde_json::json!({})),
@@ -1044,16 +1108,85 @@ mod tests {
 
         let with_header = resolve_in(
             routes(),
-            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Tenant": "acme" } }),
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "x-tenant": "acme" } }),
+        )
+        .await;
+        let other_value = resolve_in(
+            routes(),
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Tenant": "globex" } }),
         )
         .await;
         let without = resolve_in(routes(), get("http://app.example.com/")).await;
 
         assert_eq!(with_header.outcome, Outcome::Proxied);
         assert_eq!(served_by(&with_header), Some("tenant"));
+        assert_eq!(without.outcome, Outcome::Proxied);
+        assert_eq!(served_by(&without), Some("web"));
+        assert_eq!(without.candidates[0].verdict, Verdict::Rejected);
+        assert_eq!(
+            without.candidates[0].reason,
+            "header: X-Tenant must be `acme`, and is missing"
+        );
+        assert_eq!(served_by(&other_value), Some("web"));
+        assert_eq!(
+            other_value.candidates[0].reason,
+            "header: X-Tenant must be `acme`, not `globex`"
+        );
+    }
+
+    /// Sōzu tries a route whose header conditions hold before every route
+    /// without any, so a lower priority does not keep it from serving.
+    #[tokio::test]
+    async fn a_matching_header_condition_wins_over_a_higher_priority() {
+        let resolution = resolve_in(
+            vec![
+                route(
+                    "web",
+                    &["app.example.com"],
+                    serde_json::json!({ "priority": 10 }),
+                ),
+                route(
+                    "canary",
+                    &["app.example.com"],
+                    serde_json::json!({ "match_headers": [{ "key": "X-Canary", "value": "" }] }),
+                ),
+            ],
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Canary": "1" } }),
+        )
+        .await;
+
+        assert_eq!(served_by(&resolution), Some("canary"));
+        assert_eq!(resolution.candidates[0].verdict, Verdict::Shadowed);
+        assert!(
+            resolution.candidates[0]
+                .reason
+                .contains("matches on its headers")
+        );
+    }
+
+    /// Sōzu cannot route on `Cookie`: the middleware still checks it, after
+    /// the route is picked, and answers 404 when it fails.
+    #[tokio::test]
+    async fn a_cookie_condition_answers_404_from_the_route() {
+        let routes = || {
+            vec![
+                route("web", &["app.example.com"], serde_json::json!({})),
+                route(
+                    "beta",
+                    &["app.example.com"],
+                    serde_json::json!({
+                        "priority": 10,
+                        "match_headers": [{ "key": "Cookie", "value": "beta=1" }]
+                    }),
+                ),
+            ]
+        };
+
+        let without = resolve_in(routes(), get("http://app.example.com/")).await;
+
         assert_eq!(without.outcome, Outcome::Rejected);
         assert_eq!(without.status, Some(404));
-        assert_eq!(served_by(&without), Some("tenant"));
+        assert_eq!(served_by(&without), Some("beta"));
         assert!(
             without
                 .pipeline
@@ -1107,8 +1240,8 @@ mod tests {
     }
 
     /// Without `client_ip`, a route matching on client address *and* a
-    /// header still has its header checked: a request missing the header is
-    /// a 404 whatever its address.
+    /// header the middleware checks still has its header checked: a request
+    /// missing it is a 404 whatever its address.
     #[tokio::test]
     async fn header_conditions_are_checked_even_without_a_client_address() {
         let routes = || {
@@ -1116,7 +1249,7 @@ mod tests {
                 "tenant",
                 &["app.example.com"],
                 serde_json::json!({
-                    "match_headers": [{ "key": "X-Tenant", "value": "acme" }],
+                    "match_headers": [{ "key": "Cookie", "value": "tenant=acme" }],
                     "match_client_ip": ["10.0.0.0/8"]
                 }),
             )]
@@ -1125,7 +1258,7 @@ mod tests {
         let without_header = resolve_in(routes(), get("http://app.example.com/")).await;
         let with_header = resolve_in(
             routes(),
-            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Tenant": "acme" } }),
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "Cookie": "tenant=acme" } }),
         )
         .await;
 
@@ -1224,6 +1357,37 @@ mod tests {
         assert_eq!(served_by(&resolution), Some("web"));
         assert_eq!(resolution.candidates[0].id, "api");
         assert_eq!(resolution.candidates[0].verdict, Verdict::Refused);
+    }
+
+    /// Sōzu tries a route whose header predicates hold before the plain ACME
+    /// challenge frontend; the copy carrying those predicates keeps the
+    /// challenge with the responder.
+    #[tokio::test]
+    async fn a_header_route_does_not_take_the_acme_challenge() {
+        let storage = storage(vec![route(
+            "web",
+            &["app.example.com"],
+            serde_json::json!({ "match_headers": [{ "key": "User-Agent", "value": "" }] }),
+        )]);
+        let unhealthy = UnhealthyMap::new();
+        let trusted = TrustedProxies::default();
+        let inputs = ResolveInputs {
+            storage: &storage,
+            live: &storage,
+            unhealthy: &unhealthy,
+            acme_enabled: true,
+            trusted_proxies: &trusted,
+            plugins: &PluginRegistry::new(),
+        };
+        let request: ResolveRequest = serde_json::from_value(serde_json::json!({
+            "url": "http://app.example.com/.well-known/acme-challenge/token",
+            "headers": { "User-Agent": "acme-ca" }
+        }))
+        .unwrap();
+
+        let resolution = resolve(&inputs, &request).await.unwrap();
+
+        assert_eq!(resolution.outcome, Outcome::AcmeChallenge);
     }
 
     /// Until the next reload, Sōzu serves the route as it was installed: a
