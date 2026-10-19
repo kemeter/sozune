@@ -552,6 +552,16 @@ fn frontend_answer(
                 format!("route `{}` answers 401 to every request", entrypoint.name),
             ));
         }
+        RedirectPolicy::SilentClose => {
+            return Some((
+                Outcome::Rejected,
+                444,
+                format!(
+                    "route `{}` closes the connection without answering",
+                    entrypoint.name
+                ),
+            ));
+        }
         RedirectPolicy::Forward => {}
     }
     if entrypoint.config.https_redirect && target.listener == FrontListener::Http {
