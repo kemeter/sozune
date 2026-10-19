@@ -25,7 +25,20 @@ labels:
   - "sozune.http.api-v2.matchHeaders=X-Api-Version:2"
 ```
 
-`api.example.com` is served by this route only when the request carries `X-Api-Version: 2`. A request without that header (or with a different value) gets `404 Not Found`.
+`api.example.com` is served by this route only when the request carries `X-Api-Version: 2`. A request without that header (or with a different value) goes to the next route of `api.example.com`, or gets `404 Not Found` when there is none.
+
+### Canary on a header
+
+```yaml
+labels:
+  # v1
+  - "sozune.http.app.host=app.example.com"
+  # v2, on another container
+  - "sozune.http.app-canary.host=app.example.com"
+  - "sozune.http.app-canary.matchHeaders=X-Canary"
+```
+
+A request carrying `X-Canary` (any value) is served by `app-canary`; every other request by `app`. The two routes share their host and path: the header is what picks one.
 
 ```yaml
 labels:
@@ -37,14 +50,16 @@ labels:
 
 ## Behaviour
 
-- Header names are matched **case-insensitively**; values **exactly**.
+- Header names are matched **case-insensitively**; values **exactly**. When a request repeats a header, its first occurrence is the one compared.
 - Query keys and values are **percent-decoded** before being compared, so `version=%32` matches `version:2`. A `+` stays a literal `+`, as in any URL (only form bodies read it as a space).
 - All conditions are **AND**-combined: every header and every query condition must hold.
-- Sōzu routes on host/path/method only, so matching is enforced by a Sōzune middleware: the request is routed to the cluster, then rejected with `404 Not Found` if a condition fails — equivalent to the route not matching.
+- Header conditions are part of routing: Sōzu checks them when it picks the route, and a request that fails them goes on to the next route.
+- A route whose header conditions hold is tried **before every route without header conditions**, whatever their `priority`. Among routes with header conditions, or among routes without, `priority` decides as usual.
 
-## Limitation
+## Limitations
 
-Because the underlying Sōzu frontend keys on host + path + method, **two routes that share the same host and path but differ only by a header or query condition cannot be distinguished** — Sōzu sees a single frontend, and only one cluster is registered for it. Header/query matching can *filter* a route (serve it only when conditions hold) but cannot *select between* two otherwise-identical routes. Give such routes distinct paths if you need both live at once.
+- Query conditions, and header conditions on `Host` or `Cookie`, are checked by a Sōzune middleware once the route is picked: a request that fails them gets `404 Not Found` from that route, without trying another one. Two routes on the same host and path that differ only by a query parameter (or a cookie) cannot both be live: give them distinct paths.
+- `Host` is better matched with `host`, which routes on it.
 
 ## Other surfaces
 

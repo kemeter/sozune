@@ -7,11 +7,10 @@ use super::diag;
 use super::ip_allow_list::{IpAllowList, TrustedProxies, resolve_client_ip};
 use crate::model::MatchCondition;
 
-/// Enforces header / query / client-IP match conditions an entrypoint declares.
-/// Sōzu routes on host/path/method only, so when a route is additionally scoped
-/// to a header, query parameter, or client IP we let Sōzu route it, then this
-/// middleware rejects with `404 Not Found` if a condition is not met — as if the
-/// route didn't match.
+/// Enforces the match conditions Sōzu cannot route on: query parameters, the
+/// client IP, and headers it refuses as predicates (`Host`, `Cookie`). Sōzu
+/// routes the request first, then this middleware rejects with `404 Not Found`
+/// if a condition is not met — as if the route didn't match.
 ///
 /// `404` (not `403`) is deliberate: a failed match means "this route does not
 /// apply", which is a not-found, not a forbidden. The client-IP matcher is thus

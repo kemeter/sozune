@@ -18,7 +18,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::{error, info, warn};
 
-use crate::model::{Backend, EntrypointConfig};
+use crate::model::{Backend, EntrypointConfig, MatchCondition};
+use crate::proxy::sozu::header_predicate;
 use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
@@ -377,6 +378,17 @@ pub fn build_plugin_registry(
     registry
 }
 
+/// The header conditions Sōzu cannot route on, left for the middleware to
+/// enforce. Sōzu takes every other one as a frontend predicate.
+pub fn middleware_header_conditions(config: &EntrypointConfig) -> Vec<MatchCondition> {
+    config
+        .match_headers
+        .iter()
+        .filter(|condition| header_predicate(condition).is_none())
+        .cloned()
+        .collect()
+}
+
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.backend_timeout.is_some()
@@ -385,7 +397,7 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.compress
         || config.forward_auth.is_some()
         || !config.plugins.is_empty()
-        || !config.match_headers.is_empty()
+        || !middleware_header_conditions(config).is_empty()
         || !config.match_query.is_empty()
         || !config.match_client_ip.is_empty()
         || !config.ip_allow_list.is_empty()
@@ -458,9 +470,10 @@ pub fn build_middleware_route(
             Some(list)
         }
     };
-    if !config.match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
+    let match_headers = middleware_header_conditions(config);
+    if !match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
         middlewares.push(Arc::new(RequestMatchMiddleware::new(
-            config.match_headers.clone(),
+            match_headers,
             config.match_query.clone(),
             client_ip,
             trusted_proxies.clone(),

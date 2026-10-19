@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Header & query matching: the svc-match route requires header X-Env:prod AND
 # query version=2. A request meeting both conditions is served (200); missing
-# either is rejected with 404.
+# either is rejected with 404. Two routes on the canary host differ only by
+# the X-Canary header, which picks one.
 # Sourced by run-all.sh.
 
 log "[14] Header/query matching: both conditions met is served"
@@ -59,4 +60,23 @@ if [[ "$encoded_status" == "200" ]]; then
     pass "request with a percent-encoded matching query is served (200)"
 else
     fail "request with version=%32 returned $encoded_status, expected 200"
+fi
+
+log "[14] Header matching: a header picks between two routes on one host"
+
+wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_CANARY" "200" || true
+
+canary_name=$(curl -s --max-time 2 -H "Host: $HOST_CANARY" -H "X-Canary: 1" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | awk '/^Name:/ {print $2}')
+stable_name=$(curl -s --max-time 2 -H "Host: $HOST_CANARY" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | awk '/^Name:/ {print $2}')
+if [[ "$canary_name" == "canary" ]]; then
+    pass "a request with X-Canary is served by the canary route"
+else
+    fail "a request with X-Canary was served by '$canary_name', expected canary"
+fi
+if [[ "$stable_name" == "stable" ]]; then
+    pass "a request without X-Canary falls through to the stable route"
+else
+    fail "a request without X-Canary was served by '$stable_name', expected stable"
 fi

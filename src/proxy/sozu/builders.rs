@@ -5,12 +5,13 @@
 //! its lifecycle.
 
 use crate::model::{
-    AuthConfig, HeaderConfig, HeaderDirection, PathConfig, PathRewrite, PathRuleType,
-    RedirectPolicy, RedirectScheme, UrlRewrite,
+    AuthConfig, HeaderConfig, HeaderDirection, MatchCondition, PathConfig, PathRewrite,
+    PathRuleType, RedirectPolicy, RedirectScheme, UrlRewrite,
 };
+use sozu_command_lib::config::validate_header_predicate;
 use sozu_command_lib::proto::command::{
-    Header, HeaderPosition, PathRule, RedirectPolicy as SozuRedirectPolicy,
-    RedirectScheme as SozuRedirectScheme,
+    Header, HeaderMatchKind, HeaderPosition, HeaderPredicate, PathRule,
+    RedirectPolicy as SozuRedirectPolicy, RedirectScheme as SozuRedirectScheme,
 };
 use tracing::{debug, warn};
 
@@ -52,6 +53,33 @@ pub(super) fn build_frontend_headers(edits: &[HeaderConfig]) -> Vec<Header> {
         }
     }
     headers
+}
+
+/// The Sōzu predicate for a header condition, or `None` when Sōzu cannot route
+/// on it: `Host`, `Cookie` and a name that is not a header token. Those stay
+/// with the middleware, which answers 404 when they fail; a predicate instead
+/// lets the request fall through to the next route.
+pub(crate) fn header_predicate(condition: &MatchCondition) -> Option<HeaderPredicate> {
+    let predicate = if condition.value.is_empty() {
+        HeaderPredicate {
+            name: condition.key.clone(),
+            kind: HeaderMatchKind::Present as i32,
+            value: None,
+        }
+    } else {
+        HeaderPredicate {
+            name: condition.key.clone(),
+            kind: HeaderMatchKind::Exact as i32,
+            value: Some(condition.value.clone()),
+        }
+    };
+    validate_header_predicate(&predicate)
+        .ok()
+        .map(|_| predicate)
+}
+
+pub(super) fn build_header_predicates(conditions: &[MatchCondition]) -> Vec<HeaderPredicate> {
+    conditions.iter().filter_map(header_predicate).collect()
 }
 
 pub(super) fn build_authorized_hashes(auth: &Option<AuthConfig>) -> Vec<String> {
@@ -412,6 +440,40 @@ fn build_replace_prefix_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn condition(key: &str, value: &str) -> MatchCondition {
+        MatchCondition {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn a_header_condition_with_a_value_must_equal_it() {
+        let predicate = header_predicate(&condition("X-Env", "prod")).unwrap();
+        assert_eq!(predicate.name, "X-Env");
+        assert_eq!(predicate.kind, HeaderMatchKind::Exact as i32);
+        assert_eq!(predicate.value.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn a_header_condition_without_a_value_asks_for_presence() {
+        let predicate = header_predicate(&condition("X-Debug", "")).unwrap();
+        assert_eq!(predicate.kind, HeaderMatchKind::Present as i32);
+        assert_eq!(predicate.value, None);
+    }
+
+    /// Sōzu refuses these names; the middleware keeps checking them.
+    #[test]
+    fn host_cookie_and_invalid_names_are_not_routed_by_sozu() {
+        for key in ["Host", "cookie", "X Env", ""] {
+            assert!(header_predicate(&condition(key, "v")).is_none(), "{key}");
+        }
+        let predicates =
+            build_header_predicates(&[condition("Cookie", "beta=1"), condition("X-Env", "prod")]);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].name, "X-Env");
+    }
 
     fn header(name: &str, value: &str, direction: HeaderDirection) -> HeaderConfig {
         HeaderConfig {
