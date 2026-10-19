@@ -78,6 +78,13 @@ pub async fn handle_proxy(
     // active otel subscriber, i.e. tracing disabled) — harmless to ignore.
     let _ = span.set_parent(crate::tracing_otel::extract_parent(req.headers()));
 
+    // Taken off the request so the backend never sees it. Read as UTF-8: a
+    // route id is not limited to ASCII, which `to_str` would require.
+    let picked = req
+        .headers_mut()
+        .remove(super::ROUTE_HEADER)
+        .and_then(|v| String::from_utf8(v.as_bytes().to_vec()).ok());
+
     let fut = async move {
         let (route, known_hosts) = {
             let table = match state.route_table.read() {
@@ -90,7 +97,14 @@ pub async fn handle_proxy(
                     return diag::internal_error("middleware-routing-corrupted").into_response();
                 }
             };
-            (table.get_route(&host, &path), table.known_hosts())
+            // The route Sōzu picked, which the host and path alone cannot tell
+            // apart from another route on them that differs by its method or
+            // headers. Looked up by host and path when the header is missing.
+            let route = picked
+                .as_deref()
+                .and_then(|id| table.route_for_cluster(id))
+                .or_else(|| table.get_route(&host, &path));
+            (route, table.known_hosts())
         };
 
         let route = match route {

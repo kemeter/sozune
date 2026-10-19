@@ -8,7 +8,7 @@ use crate::config::{ProxyConfig, ProxyTimeouts, TcpRateLimit};
 use crate::middleware::ip_allow_list::IpAllowList;
 use crate::middleware::rate_limit::{RateLimitResult, RateLimiter};
 use crate::middleware::{self, MiddlewareState};
-use crate::model::{Backend, Entrypoint, LoadBalancer, Protocol};
+use crate::model::{Backend, Entrypoint, HeaderConfig, HeaderDirection, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::metrics_snapshot;
 use crate::proxy::tls_alpn_gate;
@@ -1374,7 +1374,35 @@ pub(crate) fn build_http_frontends(
             cluster_id,
         );
 
-        let frontend_headers = build_frontend_headers(&entrypoint.config.headers);
+        // `Sozune-Route` is reserved on requests: an edit of it could reach
+        // the middleware ahead of the route it names. Its response side stays.
+        let header_edits: Vec<HeaderConfig> = entrypoint
+            .config
+            .headers
+            .iter()
+            .filter_map(|edit| {
+                if !edit.name.eq_ignore_ascii_case(middleware::ROUTE_HEADER) {
+                    return Some(edit.clone());
+                }
+                match edit.direction {
+                    HeaderDirection::Request => None,
+                    HeaderDirection::Response | HeaderDirection::Both => Some(HeaderConfig {
+                        direction: HeaderDirection::Response,
+                        ..edit.clone()
+                    }),
+                }
+            })
+            .collect();
+        let mut frontend_headers = build_frontend_headers(&header_edits);
+        if middleware::needs_middleware(&entrypoint.config) {
+            // Names the route for the middleware, which cannot tell it from
+            // another one on the same host and path by itself.
+            frontend_headers.extend(build_frontend_headers(&[HeaderConfig {
+                name: middleware::ROUTE_HEADER.to_string(),
+                value: cluster_id.to_string(),
+                direction: HeaderDirection::Request,
+            }]));
+        }
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();
@@ -3704,6 +3732,51 @@ mod tests {
 
         let not_required = require_https_for_client_certificates(&storage, None);
         assert!(!not_required["tls"].config.https_redirect);
+    }
+
+    /// The middleware cannot tell apart two routes on one host and path, so
+    /// the frontend names the one Sōzu picked, replacing any client value.
+    #[test]
+    fn a_middleware_route_names_itself_to_the_middleware() {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let plain =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        assert!(
+            plain[0]
+                .1
+                .headers
+                .iter()
+                .all(|h| h.key != middleware::ROUTE_HEADER)
+        );
+
+        ep.config.compress = true;
+        ep.config.headers = vec![
+            HeaderConfig {
+                name: "Sozune-Route".into(),
+                value: "other".into(),
+                direction: HeaderDirection::Request,
+            },
+            HeaderConfig {
+                name: "Sozune-Route".into(),
+                value: "shown".into(),
+                direction: HeaderDirection::Both,
+            },
+        ];
+        let fronts =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        let route: Vec<_> = fronts[0]
+            .1
+            .headers
+            .iter()
+            .filter(|h| h.key.eq_ignore_ascii_case(middleware::ROUTE_HEADER))
+            .filter(|h| {
+                h.position == sozu_command_lib::proto::command::HeaderPosition::Request as i32
+            })
+            .map(|h| h.val.as_str())
+            .collect();
+        assert_eq!(route, ["", "http_web"]);
+        assert!(fronts[0].1.headers.iter().any(|h| h.val == "shown"
+            && h.position == sozu_command_lib::proto::command::HeaderPosition::Response as i32));
     }
 
     #[test]

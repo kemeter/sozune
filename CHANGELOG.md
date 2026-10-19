@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### Reliability
 
 - A Docker route that only redirects (`redirect=permanent` or `unauthorized`) was dropped when Sōzune started, and every one of them was dropped whenever any container stopped: such a route has no backend, which read as "nothing left to serve". It now stays as long as a container declares it. A container stopping also no longer removes routes of another provider.
+- Two routes on the same host and path that differ by their `methods`, each with a middleware (rate limit, compression, auth…), shared one middleware stack: the middleware found the route by host and path, and ran the first one for both. Sōzu now names the route it picked, and the middleware runs that route's stack. The `Sozune-Route` request header carries that name: a request header edit of it is ignored.
 - Sōzu upgraded to 2.3.2, a published release instead of a development revision. A frontend change a worker refuses is now rolled back instead of leaving the workers out of step, and backends stay tied to their cluster when routes are reloaded.
 
 ### TLS / ACME

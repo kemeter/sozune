@@ -257,7 +257,15 @@ pub async fn resolve(
     }
 
     let served_by = if middleware::needs_middleware(&entrypoint.config) {
-        match run_middleware(inputs, &target, request, &mut resolution.pipeline).await? {
+        match run_middleware(
+            inputs,
+            &cluster_id,
+            &target,
+            request,
+            &mut resolution.pipeline,
+        )
+        .await?
+        {
             MiddlewareResult::Continue(id) => id,
             MiddlewareResult::Stopped { status, summary } => {
                 resolution.outcome = Outcome::Rejected;
@@ -606,6 +614,7 @@ const EVALUATED: [&str; 2] = ["ip-allow-list", "request-match"];
 /// Finds the route the middleware server would pick, and walks its chain.
 async fn run_middleware(
     inputs: &ResolveInputs<'_>,
+    cluster_id: &str,
     target: &Target,
     request: &ResolveRequest,
     pipeline: &mut Vec<Step>,
@@ -617,13 +626,11 @@ async fn run_middleware(
         inputs.plugins,
         inputs.trusted_proxies,
     );
-    let Some(route) = table.get_route(&target.host, &target.path) else {
+    let Some(route) = table.route_for_cluster(cluster_id) else {
         return Ok(MiddlewareResult::Stopped {
             status: 502,
             summary: format!(
-                "Sōzu sends the request to the middleware, which finds no route for \
-                 `{}` `{}`",
-                target.host, target.path
+                "Sōzu sends the request to the middleware, which has no route `{cluster_id}`"
             ),
         });
     };
