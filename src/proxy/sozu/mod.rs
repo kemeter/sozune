@@ -1589,6 +1589,7 @@ fn configure_http_entrypoint(
             load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
             sticky_id: None,
             backup: None,
+            unix_path: None,
         };
 
         let mut rejected = 0usize;
@@ -1638,6 +1639,7 @@ fn configure_http_entrypoint(
                 load_balancing_parameters: Some(LoadBalancingParams { weight }),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             };
 
             debug!("Adding backend {}: {}", backend.backend_id, backend_entry);
@@ -1798,6 +1800,7 @@ fn configure_tcp_entrypoint(
             load_balancing_parameters: Some(LoadBalancingParams { weight }),
             sticky_id: None,
             backup: None,
+            unix_path: None,
         };
         if let Err(e) = send_to_worker(
             channel,
@@ -1927,6 +1930,7 @@ fn configure_udp_entrypoint(
             load_balancing_parameters: Some(LoadBalancingParams { weight }),
             sticky_id: None,
             backup: None,
+            unix_path: None,
         };
         if let Err(e) = send_to_worker(
             channel,
@@ -2199,6 +2203,7 @@ fn add_backends(
             }),
             sticky_id: None,
             backup: None,
+            unix_path: None,
         };
         if let Err(e) = send_to_worker(
             command_channel,
@@ -2504,6 +2509,7 @@ fn l4_diff_backends_in_place(
             }),
             sticky_id: None,
             backup: None,
+            unix_path: None,
         };
         if let Err(e) = send_to_worker(
             channel,

@@ -44,6 +44,7 @@ pub(super) fn register_acme_challenge_cluster(
         load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
         sticky_id: None,
         backup: None,
+        unix_path: None,
     };
 
     send_to_worker(
