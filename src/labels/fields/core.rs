@@ -3,7 +3,7 @@ use crate::model::{
     CircuitBreakerConfig, EntrypointAcmeConfig, HealthCheckConfig, LoadBalancer, RetryConfig,
     SniRejection,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Parse a port label, falling back to the protocol default when absent or
 /// non-numeric. Emits diagnostics describing the fallback so callers can
@@ -142,76 +142,183 @@ pub fn parse_acme(labels: &HashMap<String, String>, prefix: &str) -> Option<Entr
     })
 }
 
-/// Parse the HTTP health-check labels:
+/// Parse the health-check labels (`<prefix>healthCheck.*`):
 ///
-/// - `<prefix>healthCheck.path` — when present and non-empty, enables the HTTP
-///   probe. A leading `/` is added if missing.
-/// - `<prefix>healthCheck.status` — optional exact status code; `None` accepts
-///   any 2xx/3xx. An invalid value emits `W021` and is dropped (the check stays
-///   on the 2xx/3xx default rather than being disabled).
+/// - `path` — enables the HTTP probe. A leading `/` is added if missing.
+/// - `status` — exact status code the HTTP probe accepts; any 2xx/3xx without.
+/// - `timeout` — per-probe timeout, in milliseconds.
+/// - `interval` — milliseconds between two probes.
+/// - `port` — port the probe dials instead of the backend's.
+/// - `headers.<Name>` — request header of the HTTP probe.
+/// - `unhealthyThreshold` / `healthyThreshold` — consecutive failures before
+///   the backend is unhealthy, successes before it is healthy again.
 ///
-/// Returns `None` when no `healthCheck.path` is set — the backend keeps the
-/// plain TCP probe.
+/// An invalid value emits `W021` and is dropped, so the check keeps its
+/// default for that setting rather than being disabled. `status` and
+/// `headers` only apply to the HTTP probe: without a `path` they emit `W021`.
+///
+/// Returns `None` when no setting is given — the backend keeps the default
+/// TCP probe.
 pub fn parse_health_check(
     labels: &HashMap<String, String>,
     prefix: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<HealthCheckConfig> {
-    let path_key = format!("{prefix}healthCheck.path");
-    let raw_path = labels
-        .get(&path_key)
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())?;
-    let path = if raw_path.starts_with('/') {
-        raw_path.to_string()
-    } else {
-        format!("/{raw_path}")
+    let key = |field: &str| format!("{prefix}healthCheck.{field}");
+    let value = |field: &str| {
+        labels
+            .get(&key(field))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
     };
-
-    let status_key = format!("{prefix}healthCheck.status");
-    let status = match labels.get(&status_key).map(|s| s.trim()) {
-        None | Some("") => None,
-        Some(raw) => match raw.parse::<u16>() {
-            Ok(code) if (100..=599).contains(&code) => Some(code),
-            _ => {
-                diagnostics.push(
-                    Diagnostic::new(
-                        DiagnosticCode::W021InvalidHealthCheck,
-                        "healthCheck.status is not a valid HTTP status code; falling back to the 2xx/3xx default",
-                    )
-                    .with_label(&status_key)
+    let invalid =
+        |diagnostics: &mut Vec<Diagnostic>, field: &str, raw: &str, message: &str, hint: &str| {
+            diagnostics.push(
+                Diagnostic::new(DiagnosticCode::W021InvalidHealthCheck, message)
+                    .with_label(key(field))
                     .with_value(raw)
-                    .with_hint("expected an integer between 100 and 599, e.g. 200"),
-                );
+                    .with_hint(hint),
+            );
+        };
+
+    let path = value("path").map(|raw| {
+        if raw.starts_with('/') {
+            raw.to_string()
+        } else {
+            format!("/{raw}")
+        }
+    });
+
+    let status = value("status").and_then(|raw| match raw.parse::<u16>() {
+        Ok(code) if (100..=599).contains(&code) => Some(code),
+        _ => {
+            invalid(
+                diagnostics,
+                "status",
+                raw,
+                "healthCheck.status is not a valid HTTP status code; falling back to the 2xx/3xx default",
+                "expected an integer between 100 and 599, e.g. 200",
+            );
+            None
+        }
+    });
+
+    let positive = |diagnostics: &mut Vec<Diagnostic>,
+                    field: &str,
+                    message: &str,
+                    hint: &str|
+     -> Option<u64> {
+        let raw = value(field)?;
+        match raw.parse::<u64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                invalid(diagnostics, field, raw, message, hint);
                 None
             }
-        },
+        }
     };
+    let timeout_ms = positive(
+        diagnostics,
+        "timeout",
+        "healthCheck.timeout is not a positive integer; falling back to the default timeout",
+        "expected milliseconds as a positive integer, e.g. 2000",
+    );
+    let interval_ms = positive(
+        diagnostics,
+        "interval",
+        "healthCheck.interval is not a positive integer; falling back to the default interval",
+        "expected milliseconds as a positive integer, e.g. 5000",
+    );
+    let unhealthy_threshold = positive(
+        diagnostics,
+        "unhealthyThreshold",
+        "healthCheck.unhealthyThreshold is not a positive integer; falling back to 1",
+        "expected a count of consecutive failed probes, e.g. 3",
+    )
+    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    let healthy_threshold = positive(
+        diagnostics,
+        "healthyThreshold",
+        "healthCheck.healthyThreshold is not a positive integer; falling back to 1",
+        "expected a count of consecutive successful probes, e.g. 2",
+    )
+    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
 
-    let timeout_key = format!("{prefix}healthCheck.timeout");
-    let timeout_ms = match labels.get(&timeout_key).map(|s| s.trim()) {
-        None | Some("") => None,
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(ms) if ms > 0 => Some(ms),
-            _ => {
-                diagnostics.push(
-                    Diagnostic::new(
-                        DiagnosticCode::W021InvalidHealthCheck,
-                        "healthCheck.timeout is not a positive integer; falling back to the default timeout",
-                    )
-                    .with_label(&timeout_key)
-                    .with_value(raw)
-                    .with_hint("expected milliseconds as a positive integer, e.g. 2000"),
-                );
-                None
-            }
-        },
-    };
+    let port = value("port").and_then(|raw| match raw.parse::<u16>() {
+        Ok(port) if port > 0 => Some(port),
+        _ => {
+            invalid(
+                diagnostics,
+                "port",
+                raw,
+                "healthCheck.port is not a valid port; probing the backend's own port",
+                "expected a port between 1 and 65535, e.g. 8081",
+            );
+            None
+        }
+    });
 
-    Some(HealthCheckConfig {
+    let header_prefix = key("headers.");
+    let mut headers = BTreeMap::new();
+    for (label, raw) in labels {
+        let Some(name) = label.strip_prefix(&header_prefix) else {
+            continue;
+        };
+        let valid = reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && reqwest::header::HeaderValue::from_str(raw.trim()).is_ok();
+        if valid {
+            headers.insert(name.to_string(), raw.trim().to_string());
+        } else {
+            // The value is left out of the diagnostic: it is often a secret.
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W021InvalidHealthCheck,
+                    "health check header name or value is not valid; ignoring it",
+                )
+                .with_label(label.as_str())
+                .with_hint("a header name is a token such as Authorization; a value has no line break or control character"),
+            );
+        }
+    }
+
+    if path.is_none() {
+        if let Some(raw) = value("status") {
+            invalid(
+                diagnostics,
+                "status",
+                raw,
+                "healthCheck.status needs healthCheck.path: the TCP probe has no status",
+                "set healthCheck.path, e.g. /health",
+            );
+        }
+        if !headers.is_empty() {
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W021InvalidHealthCheck,
+                    "healthCheck.headers need healthCheck.path: the TCP probe sends no request",
+                )
+                .with_label(header_prefix.trim_end_matches('.'))
+                .with_hint("set healthCheck.path, e.g. /health"),
+            );
+            headers.clear();
+        }
+    }
+
+    let configured = path.is_some()
+        || timeout_ms.is_some()
+        || interval_ms.is_some()
+        || port.is_some()
+        || unhealthy_threshold.is_some()
+        || healthy_threshold.is_some();
+    configured.then(|| HealthCheckConfig {
+        status: path.as_ref().and(status),
         path,
-        status,
         timeout_ms,
+        interval_ms,
+        port,
+        headers,
+        unhealthy_threshold,
+        healthy_threshold,
     })
 }
 
@@ -669,7 +776,7 @@ mod tests {
             &mut d,
         )
         .expect("path enables the check");
-        assert_eq!(hc.path, "/health");
+        assert_eq!(hc.path.as_deref(), Some("/health"));
         assert_eq!(hc.status, None);
         assert_eq!(hc.timeout_ms, None);
         assert!(d.is_empty());
@@ -684,7 +791,7 @@ mod tests {
             &mut d,
         )
         .unwrap();
-        assert_eq!(hc.path, "/health");
+        assert_eq!(hc.path.as_deref(), Some("/health"));
     }
 
     #[test]
@@ -703,6 +810,83 @@ mod tests {
         assert_eq!(hc.status, Some(204));
         assert_eq!(hc.timeout_ms, Some(2000));
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn health_check_parses_interval_port_thresholds_and_headers() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.web.healthCheck.path", "/health"),
+                ("sozune.http.web.healthCheck.interval", "5000"),
+                ("sozune.http.web.healthCheck.port", "8081"),
+                ("sozune.http.web.healthCheck.unhealthyThreshold", "3"),
+                ("sozune.http.web.healthCheck.healthyThreshold", "2"),
+                (
+                    "sozune.http.web.healthCheck.headers.Authorization",
+                    "Bearer abc",
+                ),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(hc.interval_ms, Some(5000));
+        assert_eq!(hc.port, Some(8081));
+        assert_eq!(hc.unhealthy_threshold, Some(3));
+        assert_eq!(hc.healthy_threshold, Some(2));
+        assert_eq!(hc.headers["Authorization"], "Bearer abc");
+        assert!(d.is_empty());
+    }
+
+    /// Without a path the probe is a TCP connect: a port or an interval
+    /// alone configure it, and HTTP-only settings warn instead of applying.
+    #[test]
+    fn health_check_without_path_is_a_tcp_probe() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.web.healthCheck.port", "9000"),
+                ("sozune.http.web.healthCheck.status", "200"),
+                ("sozune.http.web.healthCheck.headers.X-Token", "t"),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .expect("a port configures the check");
+        assert_eq!(hc.path, None);
+        assert_eq!(hc.port, Some(9000));
+        assert_eq!(hc.status, None);
+        assert!(hc.headers.is_empty());
+        assert_eq!(d.len(), 2);
+        assert!(
+            d.iter()
+                .all(|d| d.code == DiagnosticCode::W021InvalidHealthCheck)
+        );
+    }
+
+    /// A header the probe cannot send is dropped, without its value in the
+    /// diagnostic: values are often secrets.
+    #[test]
+    fn health_check_invalid_header_warns_without_its_value() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.web.healthCheck.path", "/health"),
+                ("sozune.http.web.healthCheck.headers.Bad Name", "secret"),
+                ("sozune.http.web.healthCheck.port", "0"),
+            ]),
+            "sozune.http.web.",
+            &mut d,
+        )
+        .unwrap();
+        assert!(hc.headers.is_empty());
+        assert_eq!(hc.port, None);
+        let header = d
+            .iter()
+            .find(|d| d.label.as_deref().is_some_and(|l| l.contains("headers")))
+            .unwrap();
+        assert_eq!(header.value, None);
     }
 
     #[test]

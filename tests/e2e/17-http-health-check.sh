@@ -20,10 +20,11 @@ log "[17] Sōzune HTTP health check"
 HOST_HCOK="hcok.func-test.localhost"
 HOST_HCBAD="hcbad.func-test.localhost"
 HOST_HCPAIR="hcpair.func-test.localhost"
+HOST_HCPORT="hcport.func-test.localhost"
 NETWORK="${COMPOSE_PROJECT}_default"
 
 cleanup_http_hc_containers() {
-    docker rm -f sozune-hcok sozune-hcbad sozune-hcpair-a sozune-hcpair-b >/dev/null 2>&1 || true
+    docker rm -f sozune-hcok sozune-hcbad sozune-hcpair-a sozune-hcpair-b sozune-hcport >/dev/null 2>&1 || true
 }
 # No `trap ... EXIT`: this file is sourced, so it would replace the cleanup
 # trap run-all.sh relies on. Clearing up front removes an aborted run's
@@ -53,6 +54,8 @@ docker run -d --rm --name sozune-hcpair-a --hostname hcpair-a \
     -l sozune.enable=true \
     -l "sozune.http.hcpair.host=$HOST_HCPAIR" \
     -l "sozune.http.hcpair.healthCheck.path=/health" \
+    -l "sozune.http.hcpair.healthCheck.interval=2000" \
+    -l "sozune.http.hcpair.healthCheck.unhealthyThreshold=2" \
     -l "sozune.network=$NETWORK" \
     traefik/whoami >/dev/null
 docker run -d --rm --name sozune-hcpair-b --hostname hcpair-b \
@@ -60,6 +63,8 @@ docker run -d --rm --name sozune-hcpair-b --hostname hcpair-b \
     -l sozune.enable=true \
     -l "sozune.http.hcpair.host=$HOST_HCPAIR" \
     -l "sozune.http.hcpair.healthCheck.path=/health" \
+    -l "sozune.http.hcpair.healthCheck.interval=2000" \
+    -l "sozune.http.hcpair.healthCheck.unhealthyThreshold=2" \
     -l "sozune.network=$NETWORK" \
     traefik/whoami >/dev/null
 HCPAIR_B=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}" sozune-hcpair-b)
@@ -73,9 +78,18 @@ hcpair_served_by() {
 }
 
 wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_HCPAIR" "200" || true
-# Both serve first, so a later run of a alone means b left.
-names=$(hcpair_served_by)
-if grep -q '^hcpair-b$' <<<"$names"; then
+# Both serve first, so a later run of a alone means b left. b joins the
+# route when its own container start is seen, which can follow a's.
+b_served=false
+for _ in $(seq 1 20); do
+    names=$(hcpair_served_by)
+    if grep -q '^hcpair-b$' <<<"$names"; then
+        b_served=true
+        break
+    fi
+    sleep 1
+done
+if [[ "$b_served" == "true" ]]; then
     pass "both backends of the pair serve while healthy"
 else
     fail "backend b never served while healthy: $(tr '\n' ' ' <<<"$names")"
@@ -88,7 +102,7 @@ else
     fail "backend b's health endpoint answers $b_health, expected 503"
 fi
 
-# Probes run every 10s: wait for b to leave the rotation.
+# Probes run every 2s and take b out after 2 failures in a row.
 only_a=false
 for _ in $(seq 1 30); do
     names=$(hcpair_served_by)
@@ -156,6 +170,30 @@ if [[ "$bad_status" == "200" ]]; then
     pass "a route whose every backend is unhealthy still serves"
 else
     fail "a route whose every backend is unhealthy answered $bad_status"
+fi
+
+# -- Case 4: the probe dials healthCheck.port, where nothing listens --
+docker run -d --rm --name sozune-hcport \
+    --network "$NETWORK" \
+    -l sozune.enable=true \
+    -l "sozune.http.hcport.host=$HOST_HCPORT" \
+    -l "sozune.http.hcport.healthCheck.port=81" \
+    -l "sozune.http.hcport.healthCheck.interval=2000" \
+    -l "sozune.network=$NETWORK" \
+    traefik/whoami >/dev/null
+refused=""
+for _ in $(seq 1 30); do
+    refused=$(curl -s --max-time 2 \
+        -H "Authorization: Basic $API_BASIC_AUTH" \
+        "http://127.0.0.1:$API_PORT/entrypoints" 2>/dev/null \
+        | grep -o '{[^{}]*"kind":"connection_refused"[^{}]*}' | grep ':81: ' | head -1 || true)
+    [[ -n "$refused" ]] && break
+    sleep 1
+done
+if [[ -n "$refused" ]]; then
+    pass "the probe dials healthCheck.port instead of the traffic port"
+else
+    fail "no connection_refused reported for the probe on healthCheck.port"
 fi
 
 cleanup_http_hc_containers

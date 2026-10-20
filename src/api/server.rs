@@ -129,18 +129,8 @@ fn entrypoint_payload(
     }
     diags_for_ep.extend(runtime_lints.into_iter().flatten().cloned());
 
-    let mut value = serde_json::json!(entrypoint);
+    let mut value = redacted_entrypoint(entrypoint);
     if let Some(obj) = value.as_object_mut() {
-        // Per-route plugin config can hold tenant secrets (e.g. a CrowdSec
-        // `lapi_key`); never serialize the values. The key shape is kept so an
-        // operator can still see *which* plugins a route configures.
-        if let Some(plugin_config) = obj
-            .get_mut("config")
-            .and_then(|c| c.as_object_mut())
-            .and_then(|c| c.get_mut("plugin_config"))
-        {
-            redact_plugin_config(plugin_config);
-        }
         obj.insert(
             "unhealthy_backends".to_string(),
             serde_json::json!(unhealthy_for_ep),
@@ -181,6 +171,27 @@ fn concerns_route(diag: &Diagnostic, entrypoint: &Entrypoint) -> bool {
 /// Replace every leaf value in a route's `plugin_config` with `"***"` while
 /// preserving the key structure, so the API never leaks tenant-supplied plugin
 /// secrets but still reports which keys a route sets.
+/// An entrypoint as the API shows it: without the secrets a route can carry.
+/// Per-route plugin config can hold tenant secrets (e.g. a CrowdSec
+/// `lapi_key`), and health check headers credentials (`Authorization`): their
+/// values are masked, their keys kept, so an operator still sees *which*
+/// plugins and headers a route configures.
+fn redacted_entrypoint(entrypoint: &Entrypoint) -> serde_json::Value {
+    let mut value = serde_json::json!(entrypoint);
+    if let Some(config) = value.get_mut("config").and_then(|c| c.as_object_mut()) {
+        if let Some(plugin_config) = config.get_mut("plugin_config") {
+            redact_plugin_config(plugin_config);
+        }
+        if let Some(headers) = config
+            .get_mut("health_check")
+            .and_then(|hc| hc.get_mut("headers"))
+        {
+            redact_plugin_config(headers);
+        }
+    }
+    value
+}
+
 fn redact_plugin_config(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -896,7 +907,7 @@ async fn create_entrypoint(
     }
 
     info!("Created entrypoint: {}", entrypoint.id);
-    (StatusCode::CREATED, Json(serde_json::json!(entrypoint)))
+    (StatusCode::CREATED, Json(redacted_entrypoint(&entrypoint)))
 }
 
 async fn update_entrypoint(
@@ -968,7 +979,7 @@ async fn update_entrypoint(
     // DELETE can empty the entry in between — indexing it would panic and
     // poison the store for every later request.
     info!("Updated entrypoint: {}", id);
-    (StatusCode::OK, Json(serde_json::json!(stored)))
+    (StatusCode::OK, Json(redacted_entrypoint(&stored)))
 }
 
 async fn delete_entrypoint(
@@ -1035,6 +1046,27 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use sha2::Digest;
+
+    /// A health check header is often a credential: the API shows its name,
+    /// never its value.
+    #[test]
+    fn health_check_header_values_are_masked() {
+        let mut json = sample_entrypoint_json();
+        json["id"] = serde_json::json!("web");
+        json["config"]["health_check"] = serde_json::json!({
+            "path": "/health",
+            "headers": { "Authorization": "Bearer secret" }
+        });
+        let entrypoint: Entrypoint = serde_json::from_value(json).unwrap();
+
+        let shown = redacted_entrypoint(&entrypoint);
+
+        assert_eq!(
+            shown["config"]["health_check"]["headers"],
+            serde_json::json!({ "Authorization": "***" })
+        );
+        assert_eq!(shown["config"]["health_check"]["path"], "/health");
+    }
 
     #[test]
     fn redact_plugin_config_masks_all_leaf_values() {
