@@ -9,7 +9,7 @@ The header is **always** set on routing failures, regardless of `SOZUNE_DEBUG`. 
 | Value | Meaning |
 |---|---|
 | `no-route-for-host` | No entrypoint matches the request's `Host` header |
-| `no-healthy-backend` | A route matched but no backend is currently available |
+| `no-healthy-backend` | A route matched but no backend is currently available (`503`) |
 
 The header is opaque on purpose — it tells operators *why* without exposing topology. Grep for it in CDN/proxy access logs to spot misrouted traffic without turning on debug mode.
 

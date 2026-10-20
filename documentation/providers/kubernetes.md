@@ -241,7 +241,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. A request that fails a query or method condition, or a header match on `Host` or `Cookie` (which Sōzu cannot route on), gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below).
-- `backendRef.weight` — propagated to the load balancer.
+- `backendRef.weight` — the Service's share of the rule's traffic, as the spec defines it: `weight / Σ weights`, however many pods each Service runs (a Service of 3 pods weighted 90 against one of 1 pod weighted 10 is a 90/10 split). An unset weight is `1`; a weight of `0` sends the Service no traffic, and a rule whose backendRefs all weigh `0` forwards nothing (`503`). Each pod carries an integer weight of at most 2³¹−1, so a Service cannot outweigh another by more than 2³¹−1 times the other's pod count: a ratio past that is capped.
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — Sōzune writes standard conditions back onto the resources it owns, visible via `kubectl describe` / `kubectl get`:
@@ -307,6 +307,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 - Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`.
+- A `backendRef` that is invalid (an unsupported kind, a cross-namespace ref with no `ReferenceGrant`) is left out of the rule, and its share of the traffic goes to the other backends. The spec asks for that share to be answered with `500`.
 
 ### HTTPRoute filters
 
@@ -473,7 +474,7 @@ A `TLSRoute` whose listener port has no matching entry is tracked but not served
 | `tls.mode` | `Passthrough` only. `Terminate` means the Gateway decrypts, which is what HTTPS entrypoints do — such a listener is ignored here. |
 | `hostnames` | Each becomes one SNI route. Exact names and a single leading `*.` wildcard label, per spec. A route with no hostname serves nothing: there is no name to match a ClientHello against. |
 | Listener `hostname` | Intersected with the route's hostnames, exactly as for HTTPRoute. |
-| `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is honoured. |
+| `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
 | `parentRefs` | `sectionName` and `port` select a listener, as for HTTPRoute. A route may bind listeners on several ports; each serves only the names its own `hostname` admits. |
 | Invalid hostnames | A name Sōzu could not route (a wildcard beyond one leading `*.` label, `/`, an empty label, non-ASCII) is dropped with a warning; the route's other names still serve. |
 | Unmatched SNI | Dropped. Once a listener carries SNI routes there is no catch-all — declare a route for every name you serve. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough). |
@@ -529,7 +530,7 @@ proxy:
 |---|---|
 | Listener | `protocol: TCP` only. A `TLS` or `HTTP` listener is ignored by TCPRoutes. |
 | Routing | None — the whole port goes to the backend. One rule → one entrypoint. No hostnames, matches, or filters (a TCPRoute has none). |
-| `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is honoured. |
+| `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
 | `parentRefs` | `sectionName` and `port` select a listener. A route may bind listeners on several ports; each gets its own entrypoint. |
 
 ## Gateway API (UDPRoute)

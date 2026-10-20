@@ -1731,6 +1731,123 @@ pub async fn httproute_crd_installed(client: &Client) -> bool {
     false
 }
 
+/// One backendRef, resolved: its weight, its Service's ready pods and the
+/// port to reach them on.
+struct ResolvedRef {
+    weight: Option<i32>,
+    pods: Vec<String>,
+    port: u16,
+}
+
+/// The largest weight Sōzu takes for a backend.
+const MAX_POD_WEIGHT: u128 = i32::MAX as u128;
+
+/// The backends of a rule's backendRefs: each Service's pods, sharing its
+/// weight.
+///
+/// Gateway API weighs a backendRef, not each of its pods: a Service of 3 pods
+/// weighted 90 counts for 90, not 270. A pod of a Service of weight `w` and
+/// `n` pods gets `w × L / n`, `L` being the least common multiple of the pod
+/// counts, so every Service's share is exact; the weights are then divided by
+/// their greatest common divisor. When that multiple is too large, each pod's
+/// `w / n` is scaled to Sōzu's maximum instead, exact to within one unit per
+/// pod. Only when a weight is still past what Sōzu takes are they scaled
+/// down, a pod keeping at least 1: a Service's share cannot exceed `i32::MAX`
+/// times another's pod count, whatever its weight asks.
+///
+/// An unset weight is 1; a weight of 0 gets no traffic, so its pods are left
+/// out. A rule whose backendRefs all weigh 0 forwards nothing: `Some` with no
+/// backend. `None` when the rule has no backendRef, or no ready pod behind a
+/// backendRef that has a weight.
+fn weigh_backend_refs(refs: Vec<ResolvedRef>) -> Option<Vec<Backend>> {
+    if refs.is_empty() {
+        return None;
+    }
+    let weighted: Vec<(u128, ResolvedRef)> = refs
+        .into_iter()
+        .filter_map(|r| {
+            let weight = u128::try_from(r.weight.unwrap_or(1)).unwrap_or(0);
+            (weight > 0).then_some((weight, r))
+        })
+        .collect();
+    if weighted.is_empty() {
+        return Some(Vec::new());
+    }
+    let weighted: Vec<(u128, ResolvedRef)> = weighted
+        .into_iter()
+        .filter(|(_, r)| !r.pods.is_empty())
+        .collect();
+    if weighted.is_empty() {
+        return None;
+    }
+
+    let mut per_pod = match least_common_multiple(&weighted) {
+        Some(multiple) => {
+            let mut per_pod: Vec<u128> = weighted
+                .iter()
+                .map(|(weight, r)| weight * multiple / r.pods.len() as u128)
+                .collect();
+            let divisor = per_pod.iter().copied().fold(0, gcd);
+            per_pod.iter_mut().for_each(|w| *w /= divisor);
+            per_pod
+        }
+        // Too many distinct pod counts for an exact multiple: each pod's
+        // `weight / pods` is scaled so the largest lands on Sōzu's maximum,
+        // which keeps every share to within one unit per pod.
+        None => {
+            let (top_weight, top_pods) = weighted
+                .iter()
+                .map(|(weight, r)| (*weight, r.pods.len() as u128))
+                .max_by(|(wa, na), (wb, nb)| (wa * nb).cmp(&(wb * na)))
+                .unwrap_or((1, 1));
+            weighted
+                .iter()
+                .map(|(weight, r)| {
+                    weight * MAX_POD_WEIGHT * top_pods / (r.pods.len() as u128 * top_weight)
+                })
+                .collect()
+        }
+    };
+    let largest = per_pod.iter().copied().max().unwrap_or(1);
+    if largest > MAX_POD_WEIGHT {
+        per_pod
+            .iter_mut()
+            .for_each(|w| *w = *w * MAX_POD_WEIGHT / largest);
+    }
+    per_pod.iter_mut().for_each(|w| *w = (*w).max(1));
+
+    Some(
+        weighted
+            .into_iter()
+            .zip(per_pod)
+            .flat_map(|((_, r), weight)| {
+                let port = r.port;
+                r.pods.into_iter().map(move |address| Backend {
+                    address,
+                    port,
+                    weight: weight as u32,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The least common multiple of the rule's pod counts, when it stays within
+/// 2^64: past that, the weights it would give no longer fit together.
+fn least_common_multiple(weighted: &[(u128, ResolvedRef)]) -> Option<u128> {
+    weighted
+        .iter()
+        .try_fold(1u128, |acc, (_, r)| {
+            let pods = r.pods.len() as u128;
+            (acc / gcd(acc, pods)).checked_mul(pods)
+        })
+        .filter(|multiple| *multiple <= u128::from(u64::MAX))
+}
+
+fn gcd(a: u128, b: u128) -> u128 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// Resolves a `(namespace, service_name)` to the list of ready pod IPs the
 /// Service points to. Implemented by the Kubernetes provider's EndpointSlice
 /// cache; the watcher uses it to inflate Service references into concrete
@@ -2078,22 +2195,17 @@ fn rule_to_entrypoints(
     let Some(backend_refs) = rule.backend_refs.as_ref() else {
         return Vec::new();
     };
-    let backends: Vec<Backend> = backend_refs
+    let resolved: Vec<ResolvedRef> = backend_refs
         .iter()
-        .flat_map(|b| {
-            let Some(port_i32) = b.port else {
-                return Vec::new();
-            };
-            let Ok(port) = u16::try_from(port_i32) else {
-                return Vec::new();
-            };
+        .filter_map(|b| {
+            let port = u16::try_from(b.port?).ok()?;
             // Service-typed backends only for v1. group/kind defaulting to
             // empty/Service per Gateway API spec is what we accept; anything
             // else (e.g. an external resource) is out of scope.
             let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
             let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
             if !kind_ok || !group_ok {
-                return Vec::new();
+                return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
             // Cross-namespace backendRefs require a ReferenceGrant in the
@@ -2106,24 +2218,18 @@ fn rule_to_entrypoints(
                     "Gateway API: HTTPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
                 );
-                return Vec::new();
+                return None;
             }
-            let weight = b.weight.unwrap_or(100).max(0) as u32;
-            resolver
-                .pod_ips(target_ns, &b.name)
-                .into_iter()
-                .map(|address| Backend {
-                    address,
-                    port,
-                    weight,
-                })
-                .collect()
+            Some(ResolvedRef {
+                weight: b.weight,
+                pods: resolver.pod_ips(target_ns, &b.name),
+                port,
+            })
         })
         .collect();
-
-    if backends.is_empty() {
+    let Some(backends) = weigh_backend_refs(resolved) else {
         return Vec::new();
-    }
+    };
 
     // Gateway API: matches inside a rule are OR'd. Emit one entrypoint
     // per match. A rule with no matches at all is "match anything" —
@@ -2534,10 +2640,7 @@ pub fn tcp_route_to_entrypoints(
         .iter()
         .enumerate()
         .filter_map(|(rule_index, rule)| {
-            let backends = tcp_rule_backends(rule, namespace, route_name, resolver, grants);
-            if backends.is_empty() {
-                return None;
-            }
+            let backends = tcp_rule_backends(rule, namespace, route_name, resolver, grants)?;
             Some(Entrypoint {
                 // `/`-joined and port-scoped for the same injectivity reasons as
                 // the TLS path (see `tls_route_to_entrypoints`).
@@ -2568,23 +2671,16 @@ fn tcp_rule_backends(
     route_name: &str,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
-) -> Vec<Backend> {
-    let Some(backend_refs) = rule.backend_refs.as_ref() else {
-        return Vec::new();
-    };
-    backend_refs
+) -> Option<Vec<Backend>> {
+    let backend_refs = rule.backend_refs.as_ref()?;
+    let resolved: Vec<ResolvedRef> = backend_refs
         .iter()
-        .flat_map(|b| {
-            let Some(port_i32) = b.port else {
-                return Vec::new();
-            };
-            let Ok(port) = u16::try_from(port_i32) else {
-                return Vec::new();
-            };
+        .filter_map(|b| {
+            let port = u16::try_from(b.port?).ok()?;
             let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
             let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
             if !kind_ok || !group_ok {
-                return Vec::new();
+                return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
             if !grants.allows(namespace, target_ns) {
@@ -2592,20 +2688,16 @@ fn tcp_rule_backends(
                     "Gateway API: TCPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
                 );
-                return Vec::new();
+                return None;
             }
-            let weight = b.weight.unwrap_or(100).max(0) as u32;
-            resolver
-                .pod_ips(target_ns, &b.name)
-                .into_iter()
-                .map(|address| Backend {
-                    address,
-                    port,
-                    weight,
-                })
-                .collect()
+            Some(ResolvedRef {
+                weight: b.weight,
+                pods: resolver.pod_ips(target_ns, &b.name),
+                port,
+            })
         })
-        .collect()
+        .collect();
+    weigh_backend_refs(resolved)
 }
 
 /// Resolve a TCPRoute to its entrypoints and swap them into storage. Mirrors
@@ -2872,10 +2964,7 @@ pub fn udp_route_to_entrypoints(
         .iter()
         .enumerate()
         .filter_map(|(rule_index, rule)| {
-            let backends = udp_rule_backends(rule, namespace, route_name, resolver, grants);
-            if backends.is_empty() {
-                return None;
-            }
+            let backends = udp_rule_backends(rule, namespace, route_name, resolver, grants)?;
             Some(Entrypoint {
                 id: format!("{SOURCE_TAG}-udp/{namespace}/{route_name}/{port}/{rule_index}"),
                 name: format!("{route_name}-{port}-{rule_index}"),
@@ -2900,23 +2989,16 @@ fn udp_rule_backends(
     route_name: &str,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
-) -> Vec<Backend> {
-    let Some(backend_refs) = rule.backend_refs.as_ref() else {
-        return Vec::new();
-    };
-    backend_refs
+) -> Option<Vec<Backend>> {
+    let backend_refs = rule.backend_refs.as_ref()?;
+    let resolved: Vec<ResolvedRef> = backend_refs
         .iter()
-        .flat_map(|b| {
-            let Some(port_i32) = b.port else {
-                return Vec::new();
-            };
-            let Ok(port) = u16::try_from(port_i32) else {
-                return Vec::new();
-            };
+        .filter_map(|b| {
+            let port = u16::try_from(b.port?).ok()?;
             let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
             let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
             if !kind_ok || !group_ok {
-                return Vec::new();
+                return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
             if !grants.allows(namespace, target_ns) {
@@ -2924,20 +3006,16 @@ fn udp_rule_backends(
                     "Gateway API: UDPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
                 );
-                return Vec::new();
+                return None;
             }
-            let weight = b.weight.unwrap_or(100).max(0) as u32;
-            resolver
-                .pod_ips(target_ns, &b.name)
-                .into_iter()
-                .map(|address| Backend {
-                    address,
-                    port,
-                    weight,
-                })
-                .collect()
+            Some(ResolvedRef {
+                weight: b.weight,
+                pods: resolver.pod_ips(target_ns, &b.name),
+                port,
+            })
         })
-        .collect()
+        .collect();
+    weigh_backend_refs(resolved)
 }
 
 fn apply_udp_route(
@@ -3233,10 +3311,10 @@ pub fn tls_route_to_entrypoints(
         .iter()
         .enumerate()
         .flat_map(|(rule_index, rule)| {
-            let backends = tls_rule_backends(rule, namespace, route_name, resolver, grants);
-            if backends.is_empty() {
+            let Some(backends) = tls_rule_backends(rule, namespace, route_name, resolver, grants)
+            else {
                 return Vec::new();
-            }
+            };
 
             hostnames
                 .iter()
@@ -3290,23 +3368,16 @@ fn tls_rule_backends(
     route_name: &str,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
-) -> Vec<Backend> {
-    let Some(backend_refs) = rule.backend_refs.as_ref() else {
-        return Vec::new();
-    };
-    backend_refs
+) -> Option<Vec<Backend>> {
+    let backend_refs = rule.backend_refs.as_ref()?;
+    let resolved: Vec<ResolvedRef> = backend_refs
         .iter()
-        .flat_map(|b| {
-            let Some(port_i32) = b.port else {
-                return Vec::new();
-            };
-            let Ok(port) = u16::try_from(port_i32) else {
-                return Vec::new();
-            };
+        .filter_map(|b| {
+            let port = u16::try_from(b.port?).ok()?;
             let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
             let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
             if !kind_ok || !group_ok {
-                return Vec::new();
+                return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
             if !grants.allows(namespace, target_ns) {
@@ -3314,20 +3385,16 @@ fn tls_rule_backends(
                     "Gateway API: TLSRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
                 );
-                return Vec::new();
+                return None;
             }
-            let weight = b.weight.unwrap_or(100).max(0) as u32;
-            resolver
-                .pod_ips(target_ns, &b.name)
-                .into_iter()
-                .map(|address| Backend {
-                    address,
-                    port,
-                    weight,
-                })
-                .collect()
+            Some(ResolvedRef {
+                weight: b.weight,
+                pods: resolver.pod_ips(target_ns, &b.name),
+                port,
+            })
         })
-        .collect()
+        .collect();
+    weigh_backend_refs(resolved)
 }
 
 /// `EntrypointConfig` defaults for a passthrough TCP entrypoint. Everything
@@ -4383,7 +4450,6 @@ mod tests {
         assert_eq!(ep.backends.len(), 1);
         assert_eq!(ep.backends[0].address, "10.0.0.1");
         assert_eq!(ep.backends[0].port, 8080);
-        assert_eq!(ep.backends[0].weight, 100);
         assert!(matches!(ep.protocol, Protocol::Http));
     }
 
@@ -4983,7 +5049,141 @@ mod tests {
         b.weight = Some(42);
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
-        assert_eq!(eps[0].backends[0].weight, 42);
+        // A lone backendRef takes every request, whatever its weight.
+        assert_eq!(eps[0].backends.len(), 1);
+        assert!(eps[0].backends[0].weight >= 1);
+    }
+
+    fn resolved(weight: Option<i32>, pods: usize) -> ResolvedRef {
+        ResolvedRef {
+            weight,
+            pods: (0..pods)
+                .map(|i| format!("10.{}.{}.{}", pods % 256, i / 256, i % 256))
+                .collect(),
+            port: 80,
+        }
+    }
+
+    /// Each Service's total weight, in the order the refs were given.
+    fn service_shares(refs: Vec<ResolvedRef>) -> Vec<u64> {
+        let mut by_service: Vec<(String, u64)> = Vec::new();
+        for backend in weigh_backend_refs(refs).unwrap() {
+            let service = backend.address.split('.').nth(1).unwrap().to_string();
+            match by_service.iter_mut().find(|(s, _)| *s == service) {
+                Some((_, total)) => *total += u64::from(backend.weight),
+                None => by_service.push((service, u64::from(backend.weight))),
+            }
+        }
+        by_service.into_iter().map(|(_, total)| total).collect()
+    }
+
+    /// A backendRef's weight is the Service's share, whatever its number of
+    /// pods: 3 pods weighted 90 against 1 pod weighted 10 is a 90/10 split.
+    #[test]
+    fn a_backend_ref_weight_is_shared_by_its_pods() {
+        let shares = service_shares(vec![resolved(Some(90), 3), resolved(Some(10), 1)]);
+        assert_eq!(shares[0] * 10, shares[1] * 90);
+    }
+
+    /// The ratio holds with thousands of pods, where a fixed scale would
+    /// floor each pod at 1 and let the big Service outweigh its weight.
+    #[test]
+    fn the_ratio_holds_for_large_services() {
+        let shares = service_shares(vec![resolved(Some(1), 5000), resolved(Some(1), 1)]);
+        assert_eq!(shares[0], shares[1]);
+        let shares = service_shares(vec![resolved(Some(1_000_000), 3), resolved(Some(1), 7)]);
+        assert_eq!(shares[0], shares[1] * 1_000_000);
+    }
+
+    /// Gateway API: an unset weight is 1, and a weight of 0 gets no traffic.
+    #[test]
+    fn an_unset_weight_is_one_and_zero_gets_no_traffic() {
+        let shares = service_shares(vec![resolved(None, 1), resolved(Some(1), 2)]);
+        assert_eq!(shares[0], shares[1]);
+        let backends =
+            weigh_backend_refs(vec![resolved(Some(0), 1), resolved(Some(2), 1)]).unwrap();
+        assert_eq!(backends.len(), 1);
+        assert!(
+            weigh_backend_refs(vec![resolved(Some(-3), 1), resolved(Some(1), 1)])
+                .unwrap()
+                .len()
+                == 1
+        );
+    }
+
+    /// No ready pod at all is "not found"; pods that all weigh 0 are a rule
+    /// that forwards nothing.
+    #[test]
+    fn an_all_zero_rule_is_not_a_missing_backend() {
+        assert!(weigh_backend_refs(vec![resolved(Some(1), 0)]).is_none());
+        assert!(weigh_backend_refs(Vec::new()).is_none());
+        assert_eq!(
+            weigh_backend_refs(vec![resolved(Some(0), 2)]),
+            Some(Vec::new())
+        );
+        // Decided by the weights, whether or not the pods are ready.
+        assert_eq!(
+            weigh_backend_refs(vec![resolved(Some(0), 0)]),
+            Some(Vec::new())
+        );
+    }
+
+    /// A share past what integer weights can express is kept as close as
+    /// they allow: the big Service at Sōzu's maximum, each pod of the other
+    /// at 1.
+    #[test]
+    fn a_share_too_large_for_sozu_is_capped() {
+        let backends =
+            weigh_backend_refs(vec![resolved(Some(1_000_000), 1), resolved(Some(1), 2500)])
+                .unwrap();
+        assert_eq!(backends[0].weight, i32::MAX as u32);
+        assert!(backends[1..].iter().all(|b| b.weight == 1));
+    }
+
+    /// Pod counts too varied for an exact multiple still give equal weights
+    /// equal shares.
+    #[test]
+    fn varied_pod_counts_keep_equal_shares() {
+        let counts = [101, 103, 107, 109, 113, 127, 131, 137, 139, 149];
+        let shares = service_shares(counts.iter().map(|&n| resolved(Some(1), n)).collect());
+        let (low, high) = (*shares.iter().min().unwrap(), *shares.iter().max().unwrap());
+        assert!(high - low <= 149, "shares {shares:?}");
+        assert!(low > 1_000_000);
+    }
+
+    /// Exact shares are reduced to their smallest weights.
+    #[test]
+    fn exact_shares_use_the_smallest_weights() {
+        let backends =
+            weigh_backend_refs(vec![resolved(Some(3), 3), resolved(Some(2), 2)]).unwrap();
+        assert!(backends.iter().all(|b| b.weight == 1));
+    }
+
+    /// Every weight fits what Sōzu takes.
+    #[test]
+    fn weights_stay_within_what_sozu_takes() {
+        let backends =
+            weigh_backend_refs(vec![resolved(Some(i32::MAX), 1), resolved(Some(1), 3)]).unwrap();
+        assert!(
+            backends
+                .iter()
+                .all(|b| b.weight >= 1 && b.weight <= i32::MAX as u32)
+        );
+    }
+
+    /// The route keeps the backendRefs with a weight and drops one at 0.
+    #[test]
+    fn a_zero_weight_backend_ref_is_left_out_of_the_route() {
+        let mut on = backend("api", 80);
+        on.weight = Some(1);
+        let mut off = backend("api", 80);
+        off.weight = Some(0);
+        let r = route_with(
+            vec![rule(None, vec![on, off])],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps[0].backends.len(), 1);
     }
 
     // ---------- Filters & multi-match tests ----------

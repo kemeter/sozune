@@ -168,7 +168,8 @@ fn no_healthy_backend_inner(
         String::new()
     };
 
-    build(StatusCode::BAD_GATEWAY, "no-healthy-backend", body)
+    // 503, as Sōzu answers a route that has no backend.
+    build(StatusCode::SERVICE_UNAVAILABLE, "no-healthy-backend", body)
 }
 
 fn suggest_host(host: &str, known_hosts: &[String]) -> Option<String> {
@@ -241,6 +242,7 @@ mod tests {
     #[tokio::test]
     async fn no_backend_diag_without_debug_is_opaque() {
         let resp = no_healthy_backend_inner("example.com", &[], false);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let (_, header, body) = into_parts(resp).await;
         assert_eq!(header, "no-healthy-backend");
         assert!(body.is_empty());

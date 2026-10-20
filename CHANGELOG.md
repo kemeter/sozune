@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 - A retry (`retry.attempts`) went to the backend that had just failed, though the documentation said each attempt runs backend selection again. It now does, so a retry can land on another backend.
 - Two routes on the same host and path that differ by their `methods`, each with a middleware (rate limit, compression, auth…), shared one middleware stack: the middleware found the route by host and path, and ran the first one for both. Sōzu now names the route it picked, and the middleware runs that route's stack. The `Sozune-Route` request header carries that name: a request header edit of it is ignored.
 - Sōzu upgraded to 2.3.2, a published release instead of a development revision. A frontend change a worker refuses is now rolled back instead of leaving the workers out of step, and backends stay tied to their cluster when routes are reloaded.
+- A route with no backend answered `502` when it went through the middleware and `503` when it did not. It answers `503` both ways.
+- Gateway API `backendRef` weights now follow the spec: a weight is the Service's share, so a Service running 3 pods no longer weighs 3 times its `weight`; an unset weight is `1`, not `100`, so it no longer outweighs an explicit `weight: 1` a hundredfold; and `weight: 0` sends no traffic. A rule whose backendRefs all weigh `0` answers `503` instead of being reported as `BackendNotFound`.
 
 ### TLS / ACME
 
