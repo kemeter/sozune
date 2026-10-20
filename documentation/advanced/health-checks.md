@@ -1,6 +1,8 @@
 # Backend health checks
 
-Sōzune actively probes every backend in the background and reconfigures Sōzu when their status changes. This runs automatically — no configuration needed.
+Sōzune actively probes every backend in the background and reports their status. This runs automatically — no configuration needed.
+
+> **Health is reported, not acted on.** An unhealthy backend shows up in `GET /entrypoints`, the dashboard and `sozune route resolve`, but it stays in the load-balancing rotation: Sōzu keeps sending it its share of traffic, and only skips it while it refuses connections. To take a container out of rotation when it fails, give it a Docker `HEALTHCHECK` — see [Readiness](/documentation/providers/docker#readiness--docker-healthcheck).
 
 ## How it works
 
@@ -14,7 +16,7 @@ Every **10 seconds**, Sōzune probes each backend. By default this is a **TCP co
 | Timeout | Backend marked unhealthy |
 | HTTP status not accepted | Backend marked unhealthy (`bad_status`) |
 
-When a backend transitions between healthy and unhealthy, Sōzune triggers a Sōzu reload. Unhealthy backends are removed from rotation; they come back as soon as the probe succeeds again.
+A backend's status changes as soon as a probe gives a different result, and is visible right away.
 
 ## HTTP health checks
 
@@ -40,7 +42,8 @@ Without `healthCheck.path`, the backend keeps the plain TCP probe — fully back
 ## What it does not do
 
 - **No per-service interval.** The probe interval (10s) is global and hardcoded; only the per-check HTTP `timeout` is configurable so far.
-- **No threshold logic.** A single failed probe marks the backend unhealthy. There is no "fail N times before evicting" debouncing.
+- **No eviction.** An unhealthy backend keeps receiving traffic (see the note above).
+- **No threshold logic.** A single failed probe marks the backend unhealthy. There is no "fail N times" debouncing.
 - **No gRPC / custom method / custom headers** on the HTTP probe yet — it is a plain `GET`.
 
 ## Combined with Docker
