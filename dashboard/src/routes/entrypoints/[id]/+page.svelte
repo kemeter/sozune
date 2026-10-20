@@ -75,10 +75,10 @@
   function backendDownReason(
     ep: Entrypoint,
     backend: Backend
-  ): { kind: string; message: string } | null {
+  ): { kind: string; message: string; inRotation: boolean } | null {
     const key = backendKey(backend);
     const u = (ep.unhealthy_backends ?? []).find((x) => x.address === key);
-    return u ? { kind: u.kind, message: u.message } : null;
+    return u ? { kind: u.kind, message: u.message, inRotation: u.in_rotation } : null;
   }
 
   async function load(silent = false) {
@@ -260,6 +260,11 @@
                   <div class="status-stack">
                     <span class="status-pill down">
                       down · {reason.kind.replaceAll('_', ' ')}
+                    </span>
+                    <span class="status-reason">
+                      {reason.inRotation
+                        ? 'kept in rotation: every backend is down'
+                        : 'out of rotation'}
                     </span>
                     <span class="status-reason mono">{reason.message}</span>
                   </div>

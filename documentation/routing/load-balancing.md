@@ -113,7 +113,7 @@ A route that goes through the Sōzune middleware (rate limit, compression, auth,
 
 ## When a backend leaves
 
-When a backend leaves a route — its container stops, the service scales down, a rollout replaces it, or the route itself goes away — Sōzune removes it, then closes the connections still tied to it, so clients reconnect to a backend that is still there:
+When a backend leaves a route — its container stops, the service scales down, a rollout replaces it, its [health check](/documentation/advanced/health-checks) fails, or the route itself goes away — Sōzune removes it, then closes the connections still tied to it, so clients reconnect to a backend that is still there:
 
 - an HTTP/1.1 request in flight finishes first, and the connection closes after its response;
 - an HTTP/2 connection is told to stop (`GOAWAY`), finishes its open streams and closes;

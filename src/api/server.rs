@@ -55,8 +55,8 @@ pub struct AppState {
 /// none).
 ///
 /// Each entry in `unhealthy_backends` is an object: `{ address, kind, message,
-/// since, last_checked }`. Breaking change vs. previous API where this field
-/// was a plain `string[]`.
+/// since, last_checked, in_rotation }`. Breaking change vs. previous API where
+/// this field was a plain `string[]`.
 ///
 /// Parser diagnostics are read under each id in `entrypoint.candidates`, the
 /// candidates whose labels produced the route. A route from elsewhere has none:
@@ -64,22 +64,40 @@ pub struct AppState {
 /// `runtime_lints`, found by storage key, are appended to them.
 fn entrypoint_payload(
     entrypoint: &Entrypoint,
+    live: Option<&Entrypoint>,
     unhealthy: &UnhealthyMap,
     diagnostics: &HashMap<String, Vec<Diagnostic>>,
     runtime_lints: Option<&Vec<Diagnostic>>,
 ) -> serde_json::Value {
+    // In rotation is what Sōzu was given on the last reload, which the health
+    // checker can be ahead of. A route not live yet gets the rule that reload
+    // will apply.
+    let in_rotation: Box<dyn Fn(&crate::model::Backend) -> bool> = match live {
+        Some(live) => Box::new(|b| {
+            live.backends
+                .iter()
+                .any(|l| l.address == b.address && l.port == b.port)
+        }),
+        None => {
+            let evicted = crate::proxy::sozu::evicted_backends(entrypoint, unhealthy);
+            Box::new(move |b| !evicted.contains(b))
+        }
+    };
     let unhealthy_for_ep: Vec<serde_json::Value> = entrypoint
         .backends
         .iter()
         .filter_map(|b| {
-            let key = b.to_string();
+            let key = crate::proxy::health::probe_key(b, entrypoint.config.health_check.as_ref());
             unhealthy.get(&key).map(|reason| {
                 serde_json::json!({
-                    "address": key,
+                    "address": b.to_string(),
                     "kind": reason.kind,
                     "message": reason.message,
                     "since": reason.since,
                     "last_checked": reason.last_checked,
+                    // False once the backend is out of rotation; true when
+                    // every backend of the route is unhealthy, so all stay.
+                    "in_rotation": in_rotation(b),
                 })
             })
         })
@@ -418,14 +436,25 @@ async fn resolve_route(
         crate::middleware::ip_allow_list::TrustedProxies::new(&state.config.proxy.trusted_proxies);
     // The routes as the proxy applies them, so a stored route compares equal
     // to its live copy.
-    let storage = crate::proxy::sozu::require_https_for_client_certificates(
-        &storage,
-        crate::proxy::sozu::client_certificate_redirect_port(&state.config.proxy),
+    let client_certificate_port =
+        crate::proxy::sozu::client_certificate_redirect_port(&state.config.proxy);
+    let storage_raw = storage;
+    let (storage, _) =
+        crate::proxy::sozu::routes_as_applied(&storage_raw, client_certificate_port, &unhealthy);
+    // Out of rotation is what the last reload left out, whatever the health
+    // checker found since.
+    let evicted = crate::proxy::sozu::evicted_from_live(
+        &crate::proxy::sozu::require_https_for_client_certificates(
+            &storage_raw,
+            client_certificate_port,
+        ),
+        &live,
     );
     let inputs = crate::proxy::resolve::ResolveInputs {
         storage: &storage,
         live: &live,
         unhealthy: &unhealthy,
+        evicted: &evicted,
         acme_enabled: state.acme_enabled,
         trusted_proxies: &trusted_proxies,
         plugins: &state.plugins,
@@ -484,13 +513,37 @@ async fn list_entrypoints(State(state): State<AppState>) -> (StatusCode, Json<se
             HashMap::new()
         }
     };
+    let live = read_live_routes(&state);
     let diagnostics = read_diagnostics(&state);
     let runtime = runtime_lints(&storage, &state);
     let list: Vec<serde_json::Value> = storage
         .iter()
-        .map(|(key, ep)| entrypoint_payload(ep, &unhealthy, &diagnostics, runtime.get(key)))
+        .map(|(key, ep)| {
+            entrypoint_payload(
+                ep,
+                live.get(key),
+                &unhealthy,
+                &diagnostics,
+                runtime.get(key),
+            )
+        })
         .collect();
     (StatusCode::OK, Json(serde_json::json!(list)))
+}
+
+/// The routes the last reload installed, copied out of their lock. Empty when
+/// it is poisoned: every route then reads as not live yet.
+fn read_live_routes(state: &AppState) -> BTreeMap<String, Entrypoint> {
+    match state.live_routes.read() {
+        Ok(live) => live.clone(),
+        Err(e) => {
+            error!(
+                "internal state corrupted (live routes), restart required: {}",
+                e
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 /// Compute the lints that need the live storage — W018 route collisions, W029
@@ -751,6 +804,7 @@ async fn get_entrypoint(
         }
     };
 
+    let live = read_live_routes(&state);
     let diagnostics = read_diagnostics(&state);
     let runtime = runtime_lints(&storage, &state);
 
@@ -759,6 +813,7 @@ async fn get_entrypoint(
             StatusCode::OK,
             Json(entrypoint_payload(
                 entrypoint,
+                live.get(&id),
                 &unhealthy,
                 &diagnostics,
                 runtime.get(&id),
@@ -1980,6 +2035,42 @@ mod tests {
         assert_eq!(entry["message"], "Connection refused (os error 111)");
         assert_eq!(entry["since"], 1000);
         assert_eq!(entry["last_checked"], 1000);
+        // Its only backend: it stays in rotation rather than leave none.
+        assert_eq!(entry["in_rotation"], true);
+    }
+
+    /// In rotation is what the last reload gave Sōzu, which the health
+    /// checker can be ahead of.
+    #[test]
+    fn rotation_is_read_from_the_live_route() {
+        let mut json = sample_entrypoint_json();
+        json["id"] = serde_json::json!("web");
+        let stored: Entrypoint = serde_json::from_value(json).unwrap();
+        let mut two = stored.clone();
+        two.backends
+            .push(crate::model::Backend::new("127.0.0.2", 3000));
+        let mut unhealthy = UnhealthyMap::new();
+        unhealthy.insert(
+            "127.0.0.2:3000".to_string(),
+            crate::proxy::health::UnhealthyReason {
+                kind: crate::proxy::health::UnhealthyKind::ConnectionRefused,
+                message: "refused".to_string(),
+                since: 0,
+                last_checked: 0,
+            },
+        );
+        let in_rotation = |live: Option<&Entrypoint>| {
+            entrypoint_payload(&two, live, &unhealthy, &HashMap::new(), None)["unhealthy_backends"]
+                [0]["in_rotation"]
+                .clone()
+        };
+
+        // Not reloaded yet: Sōzu still has both.
+        assert_eq!(in_rotation(Some(&two)), true);
+        // Reloaded without it.
+        assert_eq!(in_rotation(Some(&stored)), false);
+        // Not live at all: the rule the reload will apply.
+        assert_eq!(in_rotation(None), false);
     }
 
     #[tokio::test]

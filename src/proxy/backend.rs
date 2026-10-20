@@ -34,6 +34,9 @@ pub struct ProxyInputs {
     pub middleware_port: u16,
     /// Written after every reload, read by the route resolver.
     pub live_routes: LiveRoutes,
+    /// Backends the health checker found unhealthy: each reload leaves them
+    /// out of their routes.
+    pub unhealthy_backends: Arc<RwLock<crate::proxy::health::UnhealthyMap>>,
     /// Compiled WASM plugins, keyed by declared name. Built once at startup.
     pub plugins: PluginRegistry,
     pub handle: tokio::runtime::Handle,

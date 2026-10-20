@@ -10,6 +10,7 @@ use crate::middleware::rate_limit::{RateLimitResult, RateLimiter};
 use crate::middleware::{self, MiddlewareState};
 use crate::model::{Backend, Entrypoint, HeaderConfig, HeaderDirection, LoadBalancer, Protocol};
 use crate::proxy::backend::ProxyInputs;
+use crate::proxy::health::{UnhealthyMap, probe_key};
 use crate::proxy::metrics_snapshot;
 use crate::proxy::tls_alpn_gate;
 use acme::{add_certificate, register_acme_challenge_cluster};
@@ -500,6 +501,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         middleware_state,
         middleware_port,
         live_routes,
+        unhealthy_backends,
         plugins,
         handle,
     } = inputs;
@@ -857,6 +859,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     &plugins,
                     &trusted_proxies_reload,
                     client_certificate_redirect,
+                    &unhealthy_backends,
                 );
                 match live_routes.write() {
                     Ok(mut live) => *live = previous_snapshot.clone(),
@@ -911,8 +914,12 @@ fn handle_reload(
     plugins: &middleware::PluginRegistry,
     trusted_proxies: &middleware::ip_allow_list::TrustedProxies,
     client_certificate_redirect: Option<u16>,
+    unhealthy: &RwLock<UnhealthyMap>,
 ) -> RoutingSnapshot {
     info!("Received configuration reload request");
+    // A poisoned lock leaves every backend in rotation, as before health
+    // checks took any out.
+    let unhealthy = unhealthy.read().map(|u| u.clone()).unwrap_or_default();
     let storage_read = match storage.read() {
         Ok(guard) => guard,
         Err(e) => {
@@ -924,8 +931,8 @@ fn handle_reload(
         }
     };
 
-    let storage_read =
-        require_https_for_client_certificates(&storage_read, client_certificate_redirect);
+    let (storage_read, _) =
+        routes_as_applied(&storage_read, client_certificate_redirect, &unhealthy);
     let mut current_snapshot = snapshot_from_storage(&storage_read);
 
     // Run the reload under a shared consecutive-timeout counter. A worker that
@@ -1012,6 +1019,106 @@ pub(crate) fn require_https_for_client_certificates(
         }
     }
     std::borrow::Cow::Owned(routes)
+}
+
+/// The backends a health check took out of their routes, by route id.
+pub(crate) type Evicted = BTreeMap<String, Vec<Backend>>;
+
+/// `storage` without the backends the health checker found unhealthy, and
+/// those backends by route. A route whose backends are all unhealthy keeps
+/// them all: one with nothing left would refuse every request, and a probe
+/// can be wrong. Backups (weight 0) stay when they are healthy, so they take
+/// over primaries that are not.
+pub(crate) fn without_unhealthy_backends(
+    storage: &BTreeMap<String, Entrypoint>,
+    unhealthy: &UnhealthyMap,
+) -> (BTreeMap<String, Entrypoint>, Evicted) {
+    let mut routes = storage.clone();
+    let mut evicted = Evicted::new();
+    if unhealthy.is_empty() {
+        return (routes, evicted);
+    }
+    for (id, entrypoint) in routes.iter_mut() {
+        let down = evicted_backends(entrypoint, unhealthy);
+        if down.is_empty() {
+            if entrypoint.backends.iter().any(|b| {
+                unhealthy.contains_key(&probe_key(b, entrypoint.config.health_check.as_ref()))
+            }) {
+                warn!(
+                    "every backend of route `{}` is failing its health check; keeping them all",
+                    entrypoint.name
+                );
+            }
+            continue;
+        }
+        entrypoint.backends.retain(|b| !down.contains(b));
+        evicted.insert(id.clone(), down);
+    }
+    (routes, evicted)
+}
+
+/// The backends of `entrypoint` its health check takes out of rotation: the
+/// unhealthy ones, unless every backend is (then none, see
+/// [`without_unhealthy_backends`]). UDP backends are not probed.
+pub(crate) fn evicted_backends(entrypoint: &Entrypoint, unhealthy: &UnhealthyMap) -> Vec<Backend> {
+    if entrypoint.protocol == Protocol::Udp {
+        return Vec::new();
+    }
+    let down: Vec<Backend> = entrypoint
+        .backends
+        .iter()
+        .filter(|backend| {
+            unhealthy.contains_key(&probe_key(backend, entrypoint.config.health_check.as_ref()))
+        })
+        .cloned()
+        .collect();
+    if down.len() == entrypoint.backends.len() {
+        return Vec::new();
+    }
+    down
+}
+
+/// The backends of each live route that its stored version has and Sōzu was
+/// not given: those the last reload took out of rotation. Read from what was
+/// applied, not from the health checker, whose state can be newer.
+pub(crate) fn evicted_from_live(
+    stored: &BTreeMap<String, Entrypoint>,
+    live: &BTreeMap<String, Entrypoint>,
+) -> Evicted {
+    live.iter()
+        .filter_map(|(id, applied)| {
+            let missing: Vec<Backend> = stored
+                .get(id)?
+                .backends
+                .iter()
+                // By address: a weight the reload has not applied yet is not
+                // an eviction.
+                .filter(|b| {
+                    !applied
+                        .backends
+                        .iter()
+                        .any(|a| a.address == b.address && a.port == b.port)
+                })
+                .cloned()
+                .collect();
+            (!missing.is_empty()).then(|| (id.clone(), missing))
+        })
+        .collect()
+}
+
+/// The routes as the proxy applies them: TLS routes redirected to HTTPS when
+/// client certificates are required, without their unhealthy backends. The
+/// reload and the route resolver both build them here, so they compare the
+/// same routes.
+pub(crate) fn routes_as_applied(
+    storage: &BTreeMap<String, Entrypoint>,
+    client_certificate_https_port: Option<u16>,
+    unhealthy: &UnhealthyMap,
+) -> (BTreeMap<String, Entrypoint>, Evicted) {
+    without_unhealthy_backends(
+        &require_https_for_client_certificates(storage, client_certificate_https_port),
+        unhealthy,
+    )
 }
 
 /// Rebuild the middleware route table from current storage
@@ -4255,6 +4362,109 @@ mod tests {
         let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
         new.config.compress = true;
         assert!(!frontend_unchanged(&old, &new));
+    }
+
+    fn down(addresses: &[&str]) -> UnhealthyMap {
+        addresses
+            .iter()
+            .map(|address| {
+                (
+                    address.to_string(),
+                    crate::proxy::health::UnhealthyReason {
+                        kind: crate::proxy::health::UnhealthyKind::ConnectionRefused,
+                        message: "refused".to_string(),
+                        since: 0,
+                        last_checked: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// An unhealthy backend leaves its route; the healthy ones stay.
+    #[test]
+    fn an_unhealthy_backend_is_taken_out_of_rotation() {
+        let ep = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+        ]);
+        let storage = BTreeMap::from([("web".to_string(), ep)]);
+
+        let (routed, evicted) = without_unhealthy_backends(&storage, &down(&["10.0.0.2:80"]));
+
+        assert_eq!(routed["web"].backends, [Backend::new("10.0.0.1", 80)]);
+        assert_eq!(evicted["web"], [Backend::new("10.0.0.2", 80)]);
+    }
+
+    /// With every backend unhealthy, none is taken out: a probe can be wrong,
+    /// and a route with nothing left would refuse every request.
+    #[test]
+    fn a_route_keeps_its_backends_when_all_are_unhealthy() {
+        let ep = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+        ]);
+        let storage = BTreeMap::from([("web".to_string(), ep.clone())]);
+
+        let (routed, evicted) =
+            without_unhealthy_backends(&storage, &down(&["10.0.0.1:80", "10.0.0.2:80"]));
+
+        assert_eq!(routed["web"], ep);
+        assert!(evicted.is_empty());
+    }
+
+    /// Primaries down, a healthy backup left: the backup serves.
+    #[test]
+    fn a_healthy_backup_takes_over_unhealthy_primaries() {
+        let ep = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.9", 80).with_weight(0),
+        ]);
+        let storage = BTreeMap::from([("web".to_string(), ep)]);
+
+        let (routed, _) = without_unhealthy_backends(&storage, &down(&["10.0.0.1:80"]));
+
+        assert_eq!(
+            routed["web"].backends,
+            [Backend::new("10.0.0.9", 80).with_weight(0)]
+        );
+    }
+
+    /// Out of rotation is what Sōzu was not given, read from the live routes.
+    #[test]
+    fn evicted_backends_are_those_the_live_route_lacks() {
+        let stored = BTreeMap::from([(
+            "web".to_string(),
+            base_ep(vec![
+                Backend::new("10.0.0.1", 80),
+                Backend::new("10.0.0.2", 80),
+            ]),
+        )]);
+        let live = BTreeMap::from([(
+            "web".to_string(),
+            base_ep(vec![Backend::new("10.0.0.1", 80)]),
+        )]);
+
+        let evicted = evicted_from_live(&stored, &live);
+
+        assert_eq!(evicted["web"], [Backend::new("10.0.0.2", 80)]);
+        assert!(evicted_from_live(&stored, &stored).is_empty());
+
+        // A weight the reload has not applied yet is not an eviction.
+        let mut reweighted = stored.clone();
+        reweighted.get_mut("web").unwrap().backends[0].weight = 5;
+        assert!(evicted_from_live(&reweighted, &stored).is_empty());
+    }
+
+    /// UDP backends are not probed, whatever the map says about the address.
+    #[test]
+    fn udp_backends_are_never_taken_out() {
+        let mut ep = base_ep(vec![
+            Backend::new("10.0.0.1", 53),
+            Backend::new("10.0.0.2", 53),
+        ]);
+        ep.protocol = Protocol::Udp;
+        assert!(evicted_backends(&ep, &down(&["10.0.0.1:53"])).is_empty());
     }
 
     /// A route the reload did not install again keeps its sessions; one that

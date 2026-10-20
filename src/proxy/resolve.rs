@@ -25,7 +25,7 @@ use crate::middleware::chain::{Flow, Middleware, RequestCtx};
 use crate::middleware::ip_allow_list::TrustedProxies;
 use crate::middleware::request_match::RequestMatchMiddleware;
 use crate::middleware::{self, MiddlewareRouteTable, PluginRegistry};
-use crate::model::{Entrypoint, PathRuleType, Protocol};
+use crate::model::{Backend, Entrypoint, PathRuleType, Protocol};
 use crate::proxy::health::UnhealthyMap;
 use crate::proxy::sozu::{
     ACME_CHALLENGE_CLUSTER, FrontListener, build_acme_frontend, build_acme_twins,
@@ -127,6 +127,15 @@ pub struct BackendState {
     pub address: String,
     pub healthy: bool,
     pub reason: Option<String>,
+    /// Whether the backend takes requests: an unhealthy one is out of
+    /// rotation, unless every backend of the route is unhealthy. Absent from
+    /// a server that took no backend out, so in rotation.
+    #[serde(default = "in_rotation_by_default")]
+    pub in_rotation: bool,
+}
+
+fn in_rotation_by_default() -> bool {
+    true
 }
 
 /// What the resolver reads: the same state the proxy routes from.
@@ -136,6 +145,9 @@ pub struct ResolveInputs<'a> {
     /// The routes the last reload installed in Sōzu: what Sōzu routes on.
     pub live: &'a BTreeMap<String, Entrypoint>,
     pub unhealthy: &'a UnhealthyMap,
+    /// The backends the health checks took out of their routes, by route id:
+    /// the routes above no longer list them.
+    pub evicted: &'a crate::proxy::sozu::Evicted,
     pub acme_enabled: bool,
     pub trusted_proxies: &'a TrustedProxies,
     /// The WASM plugins the proxy loaded: a route's chain holds them at their
@@ -320,16 +332,26 @@ pub async fn resolve(
     if credentials_unchecked {
         resolution.summary = format!("{} if the credentials are valid", resolution.summary);
     }
-    resolution.backends = backend_states(served, inputs.unhealthy);
-    if resolution.backends.is_empty() {
+    let evicted = inputs
+        .evicted
+        .get(&served.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    resolution.backends = backend_states(served, inputs.unhealthy, evicted);
+    if served.backends.is_empty() {
         // Sōzu and the middleware server both answer 503 for a route with
         // nothing behind it.
         resolution.outcome = Outcome::Rejected;
         resolution.status = Some(503);
         resolution.summary = format!("route `{}` has no backend", served.name);
     } else if resolution.backends.iter().all(|b| !b.healthy) {
+        let kept = if resolution.backends.iter().all(|b| b.in_rotation) {
+            " (all kept in rotation)"
+        } else {
+            ""
+        };
         resolution.summary = format!(
-            "{}, but every backend is failing its health check",
+            "{}, but every backend is failing its health check{kept}",
             resolution.summary
         );
     }
@@ -838,19 +860,33 @@ fn synthetic_request(
     Ok((ctx, synthetic))
 }
 
-fn backend_states(entrypoint: &Entrypoint, unhealthy: &UnhealthyMap) -> Vec<BackendState> {
+/// The backends of the route that serves the request: those in rotation,
+/// then those its health check took out.
+fn backend_states(
+    entrypoint: &Entrypoint,
+    unhealthy: &UnhealthyMap,
+    evicted: &[Backend],
+) -> Vec<BackendState> {
+    let state = |backend: &Backend, in_rotation: bool| {
+        let address = backend.to_string();
+        let reason = unhealthy
+            .get(&crate::proxy::health::probe_key(
+                backend,
+                entrypoint.config.health_check.as_ref(),
+            ))
+            .map(|r| r.message.clone());
+        BackendState {
+            healthy: reason.is_none(),
+            address,
+            reason,
+            in_rotation,
+        }
+    };
     entrypoint
         .backends
         .iter()
-        .map(|backend| {
-            let address = backend.to_string();
-            let reason = unhealthy.get(&address).map(|r| r.message.clone());
-            BackendState {
-                healthy: reason.is_none(),
-                address,
-                reason,
-            }
-        })
+        .map(|backend| state(backend, true))
+        .chain(evicted.iter().map(|backend| state(backend, false)))
         .collect()
 }
 
@@ -932,6 +968,7 @@ mod tests {
             storage: &storage,
             live: &storage,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
@@ -1359,6 +1396,7 @@ mod tests {
             storage: &storage,
             live: &live,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
@@ -1389,6 +1427,7 @@ mod tests {
             storage: &storage,
             live: &storage,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: true,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
@@ -1421,6 +1460,7 @@ mod tests {
             storage: &stored,
             live: &live,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
@@ -1448,6 +1488,7 @@ mod tests {
             storage: &storage,
             live: &storage,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
@@ -1508,6 +1549,7 @@ mod tests {
             storage: &storage,
             live: &storage,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
@@ -1522,6 +1564,62 @@ mod tests {
             resolution.backends[0].reason.as_deref(),
             Some("connection refused")
         );
+        // The route's only backend stays in rotation.
+        assert!(resolution.backends[0].in_rotation);
+        assert!(resolution.summary.contains("all kept in rotation"));
+    }
+
+    /// The health checks took a backend out: it is listed after those in
+    /// rotation, with why it is out.
+    #[tokio::test]
+    async fn an_evicted_backend_is_listed_out_of_rotation() {
+        let stored = storage(vec![route(
+            "web",
+            &["app.example.com"],
+            serde_json::json!({}),
+        )]);
+        let mut with_two = stored.clone();
+        with_two
+            .get_mut("web")
+            .unwrap()
+            .backends
+            .push(crate::model::Backend::new("10.0.0.2", 80));
+        let mut unhealthy = UnhealthyMap::new();
+        unhealthy.insert(
+            "10.0.0.2:80".to_string(),
+            crate::proxy::health::UnhealthyReason {
+                kind: crate::proxy::health::UnhealthyKind::BadStatus,
+                message: "status 503".to_string(),
+                since: 0,
+                last_checked: 0,
+            },
+        );
+        let (routed, evicted) = crate::proxy::sozu::routes_as_applied(&with_two, None, &unhealthy);
+        let trusted = TrustedProxies::default();
+        let inputs = ResolveInputs {
+            storage: &routed,
+            live: &routed,
+            unhealthy: &unhealthy,
+            evicted: &evicted,
+            acme_enabled: false,
+            trusted_proxies: &trusted,
+            plugins: &PluginRegistry::new(),
+        };
+        let request: ResolveRequest =
+            serde_json::from_value(get("http://app.example.com/")).unwrap();
+
+        let resolution = resolve(&inputs, &request).await.unwrap();
+
+        assert_eq!(resolution.outcome, Outcome::Proxied);
+        let states: Vec<(&str, bool, bool)> = resolution
+            .backends
+            .iter()
+            .map(|b| (b.address.as_str(), b.healthy, b.in_rotation))
+            .collect();
+        assert_eq!(
+            states,
+            [("10.0.0.1:80", true, true), ("10.0.0.2:80", false, false)]
+        );
     }
 
     #[tokio::test]
@@ -1533,6 +1631,7 @@ mod tests {
             storage: &storage,
             live: &storage,
             unhealthy: &unhealthy,
+            evicted: &BTreeMap::new(),
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),

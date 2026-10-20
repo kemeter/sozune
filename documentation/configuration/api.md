@@ -132,10 +132,11 @@ Response: a JSON array of entrypoint objects (see [Entrypoint schema](#entrypoin
 
 - `unhealthy_backends`: array of objects describing the backends the health checker has marked unhealthy for this entrypoint. Each object has:
     - `address` — `"<host>:<port>"` of the failing backend
-    - `kind` — failure classification: `connection_refused`, `no_route_to_host`, `network_unreachable`, `host_unreachable`, `timeout`, `dns_failure`, or `other`
+    - `kind` — failure classification: `connection_refused`, `no_route_to_host`, `network_unreachable`, `host_unreachable`, `timeout`, `dns_failure`, `bad_status` (the HTTP probe got a status it does not accept), `http_error` (the HTTP probe got no response), or `other`
     - `message` — raw error message from the last probe attempt
     - `since` — Unix epoch (seconds) the backend was first marked down
     - `last_checked` — Unix epoch (seconds) of the last probe attempt
+    - `in_rotation` — whether the backend takes requests, as of the last reload: `false` once it is out of rotation, `true` until the reload that takes it out, and when every backend of the route is unhealthy, so none is taken out ([Health checks](/documentation/advanced/health-checks))
 - `diagnostics`: list of [Diagnostic objects](#diagnostic-schema) associated with this entrypoint, including the runtime lints: route collisions (W018), unknown ACME resolvers (W029) and backend timeouts the listener cuts short (W030)
 
 ### `GET /entrypoints/{id}`
@@ -420,7 +421,7 @@ Only `url` is required. `method` defaults to `GET`. Without `client_ip`, rules o
 - `status`: the status sōzune answers with itself; `null` when a backend answers, or when the route closes the connection without answering (`redirect: close`).
 - `candidates`: the other routes whose hostname matches, each with a `verdict` — `shadowed` (would match, but a route tried before it matches first), `rejected` (its path, method or TLS setting does not match), or `refused` (Sōzu refused it, so it is not live).
 - `pipeline`: the route's middlewares in the order they run. `pass` and `blocked` are decided on the request; `applies` depends on live state (rate-limit buckets, in-flight requests, the forward-auth server) and is not decided; `not_evaluated` needs `client_ip`, comes after a blocking step, or is `basic-auth`: credentials are never checked by this endpoint, so a route protected by basic auth is reported as proxied *if the credentials are valid*, and as a `401` when the request carries none.
-- `backends`: the route's backends and their health-check state.
+- `backends`: the route's backends and their health-check state: `address`, `healthy`, `reason` (why it is unhealthy) and `in_rotation` (`false` for a backend the last reload left out). Those in rotation come first.
 
 The answer reflects the routes the last reload installed in Sōzu. While a reload is being applied, a route that just started answering can still be missing from it for a moment.
 

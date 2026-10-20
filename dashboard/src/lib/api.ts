@@ -135,6 +135,9 @@ export interface UnhealthyBackend {
   since: number;
   /** Unix epoch (seconds) of the last probe attempt. */
   last_checked: number;
+  /** False once the backend is out of rotation; true when every backend of
+   *  the route is down, so all stay. */
+  in_rotation: boolean;
 }
 
 export interface Entrypoint {
@@ -376,6 +379,9 @@ export interface ResolveBackend {
   address: string;
   healthy: boolean;
   reason: string | null;
+  /** Whether the backend takes requests: an unhealthy one is out of
+   *  rotation, unless every backend of the route is unhealthy. */
+  in_rotation: boolean;
 }
 
 /** Which route serves the request and why, as `POST /routes/resolve` answers. */

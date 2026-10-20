@@ -264,6 +264,9 @@
             {#if b.reason}
               <div class="item-detail">{b.reason}</div>
             {/if}
+            {#if !b.in_rotation}
+              <div class="item-detail">out of rotation: takes no request</div>
+            {/if}
           </div>
         {/each}
       </div>
