@@ -111,6 +111,16 @@ A weight of `0` makes the backend a **backup**: it takes no traffic while anothe
 
 A route that goes through the Sōzune middleware (rate limit, compression, auth, retry…) is balanced by the middleware with the weighted round robin above, whatever `loadBalancer` says. There, a backup takes over a request no backend gave a response to: once the [retries](/documentation/middleware/retry) are spent, each backend the request has not tried yet gets one try, heaviest first, then each backup. A WebSocket upgrade, which is not retried, goes through the same order when its backend refuses it.
 
+## When a backend leaves
+
+When a backend leaves a route — its container stops, the service scales down, a rollout replaces it, or the route itself goes away — Sōzune removes it, then closes the connections still tied to it, so clients reconnect to a backend that is still there:
+
+- an HTTP/1.1 request in flight finishes first, and the connection closes after its response;
+- an HTTP/2 connection is told to stop (`GOAWAY`), finishes its open streams and closes;
+- a WebSocket or TCP connection closes at once, and the client reconnects.
+
+A route change that keeps a backend (another header, another weight) leaves its connections open, and so does a change Sōzune could not apply: the route keeps what it had. When a route is changed, its connections are closed once its new version is in place, so a client that reconnects at once is served. On a route that goes through the Sōzune middleware, connections are closed this way only when the whole route goes away: a WebSocket tunnel the middleware opened to a backend that left stays open until one side closes it.
+
 ## Sticky sessions
 
 Pin a client to the same backend for the duration of its session:

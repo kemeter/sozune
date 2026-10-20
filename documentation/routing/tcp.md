@@ -151,6 +151,7 @@ Both share one public port; the name decides where each connection lands. Use th
 ## Limitations
 
 - **No TLS termination.** Sōzu's TCP path is pure passthrough — TLS bytes flow as-is. For client-side STARTTLS protocols (PostgreSQL, MySQL) this is fine; for terminating TLS, use an HTTPS entrypoint instead. Passthrough can still *route* by name without decrypting — see [Route by SNI](#route-by-sni-tls-passthrough).
+- **Connections follow their backend out.** When a backend leaves the route, its open connections are closed and clients reconnect to the backends that are left — see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves).
 - **No half-close.** Sōzu treats a client `FIN` as a full disconnect, so protocols that rely on half-closing one direction to signal end-of-stream may misbehave. Most request/response and long-lived stream protocols are unaffected.
 - **The allow-list and rate limit are filtered after `accept()`**, not before the handshake — see the firewall note above for pre-handshake dropping.
 - **The rate limit resets on restart.** Token buckets are in-memory per process; a Sōzune restart clears them. Listeners (and their limits) are static config, applied at boot.
