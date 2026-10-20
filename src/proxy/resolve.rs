@@ -322,15 +322,10 @@ pub async fn resolve(
     }
     resolution.backends = backend_states(served, inputs.unhealthy);
     if resolution.backends.is_empty() {
-        // Sōzu answers 503 for a cluster with nothing behind it; the
-        // middleware server answers 502 when its route has no backend.
-        let status = if middleware::needs_middleware(&served.config) {
-            502
-        } else {
-            503
-        };
+        // Sōzu and the middleware server both answer 503 for a route with
+        // nothing behind it.
         resolution.outcome = Outcome::Rejected;
-        resolution.status = Some(status);
+        resolution.status = Some(503);
         resolution.summary = format!("route `{}` has no backend", served.name);
     } else if resolution.backends.iter().all(|b| !b.healthy) {
         resolution.summary = format!(
@@ -1447,10 +1442,10 @@ mod tests {
         assert!(resolve(&inputs, &request).await.is_err());
     }
 
-    /// A route with no backend is answered by whoever holds it: Sōzu with a
-    /// 503, the middleware server with a 502.
+    /// A route with no backend gets a 503, from Sōzu or from the middleware
+    /// server alike.
     #[tokio::test]
-    async fn a_route_without_backends_gets_the_status_of_whoever_answers() {
+    async fn a_route_without_backends_gets_a_503_whoever_answers() {
         let empty = |config: serde_json::Value| {
             let mut ep = route("web", &["app.example.com"], config);
             ep.backends.clear();
@@ -1469,7 +1464,7 @@ mod tests {
         .await;
 
         assert_eq!(direct.status, Some(503));
-        assert_eq!(through_middleware.status, Some(502));
+        assert_eq!(through_middleware.status, Some(503));
     }
 
     #[tokio::test]
