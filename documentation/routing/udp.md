@@ -24,7 +24,7 @@ proxy:
 
 | Field | Description |
 |---|---|
-| `name` | Identifier referenced by service labels. Must be unique across `proxy.udp`. |
+| `name` | Identifier referenced by service labels. Must be unique across `proxy.udp`. `gateway:udp:<port>` is reserved for the listeners Kubernetes Gateways open. |
 | `listen` | UDP port to bind on `0.0.0.0`. |
 
 ## Attach a backend with Docker labels

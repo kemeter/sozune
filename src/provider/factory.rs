@@ -25,6 +25,9 @@ pub async fn start_services(
     reload_tx: mpsc::Sender<()>,
     acme_notify: Arc<Notify>,
     diagnostics: DiagnosticsStore,
+    unopened_gateway_ports: tokio::sync::watch::Receiver<
+        crate::proxy::backend::UnopenedGatewayPorts,
+    >,
 ) -> anyhow::Result<()> {
     info!("Loading initial entrypoints and starting provider services");
 
@@ -224,6 +227,7 @@ pub async fn start_services(
         // waiting for the periodic tick.
         let tcp_listeners_for_gateway = config.proxy.tcp.clone();
         let udp_listeners_for_gateway = config.proxy.udp.clone();
+        let gateway_ports_for_gateway = config.proxy.gateway_ports.clone();
         let served_ports_for_gateway = gateway::ServedPorts::from_config(&config.proxy);
         tokio::spawn(async move {
             let client = match kubernetes_provider_for_gateway.build_client().await {
@@ -250,6 +254,14 @@ pub async fn start_services(
             // status channel.
             let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
             scope.configure_status(served_ports_for_gateway, status_tx.clone());
+            let ports_scope = scope.clone();
+            let mut unopened_gateway_ports = unopened_gateway_ports;
+            tokio::spawn(async move {
+                while unopened_gateway_ports.changed().await.is_ok() {
+                    let ports = unopened_gateway_ports.borrow_and_update().clone();
+                    ports_scope.set_unopened_ports(ports).await;
+                }
+            });
             let status_client = client.clone();
             let status_scope = scope.clone();
             tokio::spawn(async move {
@@ -287,14 +299,15 @@ pub async fn start_services(
             });
 
             // TLSRoute serves passthrough on a real TCP listener, so it needs
-            // the port → `proxy.tcp` name table: Sōzune binds those ports at
-            // startup and will not open one from a Gateway alone.
+            // the port → listener table: a `proxy.tcp` entry, or the listener
+            // Sōzune opens on a port of `proxy.gateway_ports.tcp`.
             let tls_client = client.clone();
             let tls_storage = Arc::clone(&storage_for_gateway);
             let tls_reload_tx = reload_tx_for_gateway.clone();
             let tls_resolver = Arc::clone(&resolver);
             let tls_scope = scope.clone();
-            let tls_listener_ports = gateway::tcp_listener_ports(&tcp_listeners_for_gateway);
+            let tls_listener_ports =
+                gateway::tcp_listener_ports(&tcp_listeners_for_gateway, &gateway_ports_for_gateway);
             tokio::spawn(async move {
                 if let Err(e) = gateway::run_tlsroute_watcher(
                     tls_client,
@@ -310,14 +323,15 @@ pub async fn start_services(
                 }
             });
 
-            // TCPRoute: raw TCP forwarding of a whole listener port, same
-            // static-port requirement as TLSRoute.
+            // TCPRoute: raw TCP forwarding of a whole listener port, served
+            // on the same listeners as TLSRoute.
             let tcp_client = client.clone();
             let tcp_storage = Arc::clone(&storage_for_gateway);
             let tcp_reload_tx = reload_tx_for_gateway.clone();
             let tcp_resolver = Arc::clone(&resolver);
             let tcp_scope = scope.clone();
-            let tcp_listener_ports = gateway::tcp_listener_ports(&tcp_listeners_for_gateway);
+            let tcp_listener_ports =
+                gateway::tcp_listener_ports(&tcp_listeners_for_gateway, &gateway_ports_for_gateway);
             tokio::spawn(async move {
                 if let Err(e) = gateway::run_tcproute_watcher(
                     tcp_client,
@@ -340,7 +354,8 @@ pub async fn start_services(
             let udp_reload_tx = reload_tx_for_gateway.clone();
             let udp_resolver = Arc::clone(&resolver);
             let udp_scope = scope.clone();
-            let udp_listener_ports = gateway::udp_listener_ports(&udp_listeners_for_gateway);
+            let udp_listener_ports =
+                gateway::udp_listener_ports(&udp_listeners_for_gateway, &gateway_ports_for_gateway);
             tokio::spawn(async move {
                 if let Err(e) = gateway::run_udproute_watcher(
                     udp_client,

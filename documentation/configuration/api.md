@@ -278,7 +278,7 @@ The `status` is derived from the same lifetime-ratio rule that drives ACME renew
 
 ### `GET /config`
 
-Read-only snapshot of the running configuration: listeners (HTTP, HTTPS, TCP, UDP), TLS options, ACME settings, providers, the dashboard listener, and the API listener (without the user list). Available to both roles.
+Read-only snapshot of the running configuration: listeners (HTTP, HTTPS, TCP, UDP, and the ports Gateways may open), TLS options, ACME settings, providers, the dashboard listener, and the API listener (without the user list). Available to both roles.
 
 ```bash
 curl -u admin:your-password http://localhost:3035/config
@@ -296,7 +296,8 @@ Sample response:
     "tcp": [
       { "name": "postgres", "port": 5432, "ip_allow_list": ["10.0.0.0/8"], "rate_limit": { "max_conns": 20, "per_seconds": 1, "exempt": [] }, "idle_timeout": 3600 }
     ],
-    "udp": [{ "name": "dns", "port": 53 }]
+    "udp": [{ "name": "dns", "port": 53 }],
+    "gateway_ports": { "tcp": ["9000-9099"], "udp": [] }
   },
   "tls": {
     "min_version": "1.3",

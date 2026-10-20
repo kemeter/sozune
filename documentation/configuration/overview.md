@@ -126,6 +126,9 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 | `proxy.http.listen_address` | `80` | Port for the HTTP listener |
 | `proxy.https.listen_address` | `443` | Port for the HTTPS listener |
 | `proxy.tcp` | `[]` | List of TCP listeners. Each entry has `name` (referenced by labels) and `listen` (port). See [TCP routing](/documentation/routing/tcp). |
+| `proxy.udp` | `[]` | List of UDP listeners, shaped like `proxy.tcp` entries (`name`, `listen`). See [UDP routing](/documentation/routing/udp). |
+| `proxy.gateway_ports.tcp` | `[]` | Ports a Kubernetes Gateway `TLS` or `TCP` listener may open when no `proxy.tcp` entry declares them: ports (`5432`) or inclusive ranges (`"9000-9099"`). Opened while a route is served on them. See [Kubernetes](/documentation/providers/kubernetes#which-ports-a-gateway-is-served-on). |
+| `proxy.gateway_ports.udp` | `[]` | The same, for `UDP` listeners and `proxy.udp`. |
 | `proxy.max_buffers` | `500` | Max number of buffers in the Sōzu pool |
 | `proxy.buffer_size` | `16384` | Buffer size, in bytes |
 | `proxy.startup_delay_ms` | `1000` | Delay before applying the initial config (gives Sōzu workers time to boot) |

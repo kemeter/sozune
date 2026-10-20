@@ -273,6 +273,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let health_checker = proxy::health::HealthChecker::new(Arc::clone(&storage), reload_tx.clone());
     let unhealthy_backends = health_checker.unhealthy_backends();
     let unhealthy_backends_proxy = Arc::clone(&unhealthy_backends);
+    let (unopened_gateway_ports_tx, unopened_gateway_ports) =
+        tokio::sync::watch::channel(proxy::backend::UnopenedGatewayPorts::default());
     let metrics_store_proxy = Arc::clone(&metrics_store);
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
@@ -289,6 +291,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 middleware_port,
                 live_routes: live_routes_proxy,
                 unhealthy_backends: unhealthy_backends_proxy,
+                unopened_gateway_ports: unopened_gateway_ports_tx,
                 plugins,
                 handle,
             },
@@ -325,6 +328,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 reload_tx_providers,
                 acme_notify_providers,
                 diagnostics_providers,
+                unopened_gateway_ports,
             )
             .await
         }

@@ -2,6 +2,7 @@ mod acme;
 mod addr;
 mod builders;
 mod channel;
+mod gateway_listeners;
 mod worker;
 
 use crate::config::{ProxyConfig, ProxyTimeouts, TcpRateLimit};
@@ -21,11 +22,12 @@ use builders::{
     build_path_and_rewrite, map_redirect_policy, map_redirect_scheme, methods_for_frontend,
 };
 use channel::{send_to_worker, wait_for_worker_ready, with_reload_budget};
+use gateway_listeners::{GatewayListeners, close_unused_gateway_listeners, open_gateway_listeners};
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddBackend, CloseSessions, Cluster, ListenerType,
+        ActivateListener, AddBackend, CloseSessions, Cluster, HardStop, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, PathRule, QueryMetricsOptions, RemoveBackend,
         Request, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, ResponseStatus,
         RulePosition, SocketAddress, TlsVersion, UdpClusterConfig, WorkerRequest, WorkerResponse,
@@ -188,6 +190,9 @@ struct Channels {
     /// Loopback port serving the ACME HTTP-01 challenge responder, when
     /// ACME is enabled. `None` disables every ACME-specific code path.
     acme_challenge_port: Option<u16>,
+    /// The TCP and UDP listeners opened for Gateways, whose workers are in
+    /// `tcp` and `udp` alongside the declared ones.
+    gateway: GatewayListeners,
 }
 
 impl Channels {
@@ -233,6 +238,21 @@ fn pick_loopback_port() -> anyhow::Result<u16> {
 /// whose peer IP is not in the allow-list (empty list = allow all), and splice
 /// accepted ones to the loopback Sōzu worker with `copy_bidirectional`.
 async fn run_tcp_forwarder(spec: TcpForwarderSpec) {
+    let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, spec.public_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(
+                "TCP forwarder `{}` failed to bind 0.0.0.0:{}: {}",
+                spec.name, spec.public_port, e
+            );
+            return;
+        }
+    };
+    serve_tcp_forwarder(spec, &listener).await;
+}
+
+/// The accept loop of [`run_tcp_forwarder`], on a public port already bound.
+async fn serve_tcp_forwarder(spec: TcpForwarderSpec, listener: &TcpListener) {
     let allow = IpAllowList::new(&spec.allow_list);
     // Anti-flood: a token-bucket conn-rate limiter, plus an exempt list of
     // source ranges that are never limited (e.g. internal Docker ranges that
@@ -243,16 +263,6 @@ async fn run_tcp_forwarder(spec: TcpForwarderSpec) {
             IpAllowList::new(&rl.exempt),
         ),
         None => (None, IpAllowList::new(&[])),
-    };
-    let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, spec.public_port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(
-                "TCP forwarder `{}` failed to bind 0.0.0.0:{}: {}",
-                spec.name, spec.public_port, e
-            );
-            return;
-        }
     };
     info!(
         "TCP forwarder `{}` listening on 0.0.0.0:{} → 127.0.0.1:{}",
@@ -312,6 +322,27 @@ async fn run_tcp_forwarder(spec: TcpForwarderSpec) {
     }
 }
 
+/// What starting one more L4 worker takes, at startup or when a Gateway opens
+/// a port of `proxy.gateway_ports`.
+#[derive(Clone, Copy)]
+struct WorkerSettings {
+    max_buffers: usize,
+    buffer_size: usize,
+    startup_timeout: Duration,
+    command_buffer_max_bytes: u64,
+}
+
+impl WorkerSettings {
+    fn from_config(config: &ProxyConfig) -> Self {
+        Self {
+            max_buffers: config.max_buffers,
+            buffer_size: config.buffer_size,
+            startup_timeout: Duration::from_millis(config.startup_delay_ms),
+            command_buffer_max_bytes: config.command_buffer_max_bytes,
+        }
+    }
+}
+
 fn spawn_tcp_workers(
     config: &ProxyConfig,
 ) -> anyhow::Result<(
@@ -322,9 +353,7 @@ fn spawn_tcp_workers(
     let mut channels: L4Channels = HashMap::new();
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut forwarders: Vec<TcpForwarderSpec> = Vec::new();
-    let max_buffers = config.max_buffers;
-    let buffer_size = config.buffer_size;
-    let timeout = Duration::from_millis(config.startup_delay_ms);
+    let settings = WorkerSettings::from_config(config);
 
     for tcp_cfg in &config.tcp {
         if channels.contains_key(&tcp_cfg.name) {
@@ -333,69 +362,93 @@ fn spawn_tcp_workers(
                 tcp_cfg.name
             );
         }
+        if crate::config::gateway_tcp_port(&tcp_cfg.name).is_some() {
+            anyhow::bail!(
+                "TCP listener name `{}` in proxy.tcp is reserved for the listeners Gateways open",
+                tcp_cfg.name
+            );
+        }
+        let (channel, handle, forwarder) = spawn_tcp_worker(tcp_cfg, settings)?;
+        channels.insert(tcp_cfg.name.clone(), channel);
+        forwarders.push(forwarder);
+        handles.push(handle);
+    }
 
-        // Sōzu binds a private loopback port; Sōzune owns the public port via
-        // the pre-accept forwarder. The TCP frontend therefore targets the
-        // loopback port — stored as `L4ListenerChannel.port`, which
-        // configure_tcp_entrypoint already uses to build the frontend address.
-        let loopback_port = pick_loopback_port()?;
-        let mut builder =
-            ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, loopback_port));
-        // Bounds on the SNI preread, only consulted once an SNI-scoped frontend
-        // targets this listener. Set directly: `ListenerBuilder` exposes these
-        // as public fields with no `with_…` methods. `None` leaves Sōzu's
-        // defaults (5s / 16 KiB) in place.
-        builder.sni_preread_timeout = tcp_cfg.sni_preread_timeout;
-        builder.sni_preread_max_bytes = tcp_cfg.sni_preread_max_bytes;
-        apply_tcp_listener_idle_timeout(&mut builder, tcp_cfg.idle_timeout)
-            .map_err(|e| anyhow::anyhow!("TCP listener `{}`: {}", tcp_cfg.name, e))?;
-        let listener_config = builder.to_tcp(None).map_err(|e| {
-            anyhow::anyhow!(
-                "Could not create TCP listener `{}` on 127.0.0.1:{}: {}",
-                tcp_cfg.name,
-                loopback_port,
-                e
-            )
+    Ok((channels, handles, forwarders))
+}
+
+/// Start the Sōzu worker of one TCP listener, on a loopback port. The returned
+/// forwarder spec is what owns the public port once spawned.
+fn spawn_tcp_worker(
+    tcp_cfg: &crate::config::TcpListenerConfig,
+    settings: WorkerSettings,
+) -> anyhow::Result<(L4ListenerChannel, thread::JoinHandle<()>, TcpForwarderSpec)> {
+    // Sōzu binds a private loopback port; Sōzune owns the public port via
+    // the pre-accept forwarder. The TCP frontend therefore targets the
+    // loopback port — stored as `L4ListenerChannel.port`, which
+    // configure_tcp_entrypoint already uses to build the frontend address.
+    let loopback_port = pick_loopback_port()?;
+    let mut builder = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, loopback_port));
+    // Bounds on the SNI preread, only consulted once an SNI-scoped frontend
+    // targets this listener. Set directly: `ListenerBuilder` exposes these
+    // as public fields with no `with_…` methods. `None` leaves Sōzu's
+    // defaults (5s / 16 KiB) in place.
+    builder.sni_preread_timeout = tcp_cfg.sni_preread_timeout;
+    builder.sni_preread_max_bytes = tcp_cfg.sni_preread_max_bytes;
+    apply_tcp_listener_idle_timeout(&mut builder, tcp_cfg.idle_timeout)
+        .map_err(|e| anyhow::anyhow!("TCP listener `{}`: {}", tcp_cfg.name, e))?;
+    let listener_config = builder.to_tcp(None).map_err(|e| {
+        anyhow::anyhow!(
+            "Could not create TCP listener `{}` on 127.0.0.1:{}: {}",
+            tcp_cfg.name,
+            loopback_port,
+            e
+        )
+    })?;
+
+    let (mut command, proxy_chan) = Channel::generate(1000, settings.command_buffer_max_bytes)
+        .map_err(|e| {
+            anyhow::anyhow!("Could not create TCP channel for `{}`: {}", tcp_cfg.name, e)
         })?;
 
-        let (mut command, proxy_chan) = Channel::generate(1000, config.command_buffer_max_bytes)
-            .map_err(|e| {
-                anyhow::anyhow!("Could not create TCP channel for `{}`: {}", tcp_cfg.name, e)
-            })?;
+    let listener_name = tcp_cfg.name.clone();
+    let WorkerSettings {
+        max_buffers,
+        buffer_size,
+        ..
+    } = settings;
+    let handle = thread::spawn(move || {
+        if let Err(e) =
+            worker::start_tcp_worker(listener_config, max_buffers, buffer_size, proxy_chan)
+        {
+            error!("TCP worker `{}` failed: {}", listener_name, e);
+        }
+    });
 
-        let listener_name = tcp_cfg.name.clone();
-        let handle = thread::spawn(move || {
-            if let Err(e) =
-                worker::start_tcp_worker(listener_config, max_buffers, buffer_size, proxy_chan)
-            {
-                error!("TCP worker `{}` failed: {}", listener_name, e);
-            }
-        });
+    wait_for_worker_ready(
+        &mut command,
+        &format!("TCP[{}]", tcp_cfg.name),
+        settings.startup_timeout,
+    )?;
+    info!(
+        "Sōzu TCP worker `{}` running on 127.0.0.1:{} (public :{})",
+        tcp_cfg.name, loopback_port, tcp_cfg.listen
+    );
 
-        wait_for_worker_ready(&mut command, &format!("TCP[{}]", tcp_cfg.name), timeout)?;
-        info!(
-            "Sōzu TCP worker `{}` running on 127.0.0.1:{} (public :{})",
-            tcp_cfg.name, loopback_port, tcp_cfg.listen
-        );
-
-        channels.insert(
-            tcp_cfg.name.clone(),
-            L4ListenerChannel {
-                port: loopback_port,
-                channel: command,
-            },
-        );
-        forwarders.push(TcpForwarderSpec {
+    Ok((
+        L4ListenerChannel {
+            port: loopback_port,
+            channel: command,
+        },
+        handle,
+        TcpForwarderSpec {
             name: tcp_cfg.name.clone(),
             public_port: tcp_cfg.listen,
             loopback_port,
             allow_list: tcp_cfg.ip_allow_list.clone(),
             rate_limit: tcp_cfg.rate_limit.clone(),
-        });
-        handles.push(handle);
-    }
-
-    Ok((channels, handles, forwarders))
+        },
+    ))
 }
 
 fn spawn_udp_workers(
@@ -403,9 +456,7 @@ fn spawn_udp_workers(
 ) -> anyhow::Result<(L4Channels, Vec<thread::JoinHandle<()>>)> {
     let mut channels: L4Channels = HashMap::new();
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
-    let max_buffers = config.max_buffers;
-    let buffer_size = config.buffer_size;
-    let timeout = Duration::from_millis(config.startup_delay_ms);
+    let settings = WorkerSettings::from_config(config);
 
     for udp_cfg in &config.udp {
         if channels.contains_key(&udp_cfg.name) {
@@ -414,51 +465,77 @@ fn spawn_udp_workers(
                 udp_cfg.name
             );
         }
+        if crate::config::gateway_udp_port(&udp_cfg.name).is_some() {
+            anyhow::bail!(
+                "UDP listener name `{}` in proxy.udp is reserved for the listeners Gateways open",
+                udp_cfg.name
+            );
+        }
+        let (channel, handle) = spawn_udp_worker(&udp_cfg.name, udp_cfg.listen, settings)?;
+        channels.insert(udp_cfg.name.clone(), channel);
+        handles.push(handle);
+    }
 
-        // Build the listener config up front so a bad address fails before we
-        // spawn the worker thread.
-        let listener_config =
-            ListenerBuilder::new_udp(SocketAddress::new_v4(0, 0, 0, 0, udp_cfg.listen))
-                .to_udp(None)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Could not create UDP listener `{}` on :{}: {}",
-                        udp_cfg.name,
-                        udp_cfg.listen,
-                        e
-                    )
-                })?;
+    Ok((channels, handles))
+}
 
-        let (mut command, proxy_chan) = Channel::generate(1000, config.command_buffer_max_bytes)
-            .map_err(|e| {
-                anyhow::anyhow!("Could not create UDP channel for `{}`: {}", udp_cfg.name, e)
-            })?;
+/// Start the Sōzu worker of one UDP listener, bound to `port` on every
+/// interface. A worker whose listener cannot be bound is stopped again.
+fn spawn_udp_worker(
+    name: &str,
+    port: u16,
+    settings: WorkerSettings,
+) -> anyhow::Result<(L4ListenerChannel, thread::JoinHandle<()>)> {
+    // Build the listener config up front so a bad address fails before we
+    // spawn the worker thread.
+    let listener_config = ListenerBuilder::new_udp(SocketAddress::new_v4(0, 0, 0, 0, port))
+        .to_udp(None)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Could not create UDP listener `{}` on :{}: {}",
+                name,
+                port,
+                e
+            )
+        })?;
 
-        let listener_name = udp_cfg.name.clone();
-        let listener_port = udp_cfg.listen;
-        // Unlike TCP/HTTP/HTTPS, `start_udp_worker` takes no listener to
-        // pre-activate (Sōzu builds the `UdpProxy` internally). The bare worker
-        // starts here; we install the listener over the channel below.
-        let handle = thread::spawn(move || {
-            if let Err(e) = worker::start_udp_worker(proxy_chan, max_buffers, buffer_size) {
-                error!("UDP worker `{}` failed: {}", listener_name, e);
-            }
-        });
+    let (mut command, proxy_chan) = Channel::generate(1000, settings.command_buffer_max_bytes)
+        .map_err(|e| anyhow::anyhow!("Could not create UDP channel for `{}`: {}", name, e))?;
 
-        wait_for_worker_ready(&mut command, &format!("UDP[{}]", udp_cfg.name), timeout)?;
+    let listener_name = name.to_string();
+    let WorkerSettings {
+        max_buffers,
+        buffer_size,
+        ..
+    } = settings;
+    // Unlike TCP/HTTP/HTTPS, `start_udp_worker` takes no listener to
+    // pre-activate (Sōzu builds the `UdpProxy` internally). The bare worker
+    // starts here; we install the listener over the channel below.
+    let handle = thread::spawn(move || {
+        if let Err(e) = worker::start_udp_worker(proxy_chan, max_buffers, buffer_size) {
+            error!("UDP worker `{}` failed: {}", listener_name, e);
+        }
+    });
 
-        // Register then bind the listener (AddUdpListener records it, the socket
-        // is bound by ActivateListener), the same two-step Sōzu uses natively.
-        let address = SocketAddress::new_v4(0, 0, 0, 0, listener_port);
+    wait_for_worker_ready(
+        &mut command,
+        &format!("UDP[{}]", name),
+        settings.startup_timeout,
+    )?;
+
+    // Register then bind the listener (AddUdpListener records it, the socket
+    // is bound by ActivateListener), the same two-step Sōzu uses natively.
+    let address = SocketAddress::new_v4(0, 0, 0, 0, port);
+    let installed = send_to_worker(
+        &mut command,
+        format!("add-udp-listener-{}", name),
+        RequestType::AddUdpListener(listener_config),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to add UDP listener `{}`: {}", name, e))
+    .and_then(|()| {
         send_to_worker(
             &mut command,
-            format!("add-udp-listener-{}", udp_cfg.name),
-            RequestType::AddUdpListener(listener_config),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to add UDP listener `{}`: {}", udp_cfg.name, e))?;
-        send_to_worker(
-            &mut command,
-            format!("activate-udp-listener-{}", udp_cfg.name),
+            format!("activate-udp-listener-{}", name),
             RequestType::ActivateListener(ActivateListener {
                 address,
                 proxy: ListenerType::Udp.into(),
@@ -466,26 +543,36 @@ fn spawn_udp_workers(
                 interface: None,
             }),
         )
-        .map_err(|e| {
-            anyhow::anyhow!("Failed to activate UDP listener `{}`: {}", udp_cfg.name, e)
-        })?;
-
-        info!(
-            "Sōzu UDP worker `{}` running on 0.0.0.0:{}",
-            udp_cfg.name, listener_port
-        );
-
-        channels.insert(
-            udp_cfg.name.clone(),
-            L4ListenerChannel {
-                port: listener_port,
-                channel: command,
-            },
-        );
-        handles.push(handle);
+        .map_err(|e| anyhow::anyhow!("Failed to activate UDP listener `{}`: {}", name, e))
+    });
+    if let Err(e) = installed {
+        // The worker runs with nothing to serve: stop it rather than leave a
+        // thread behind.
+        stop_worker(&mut command, name);
+        return Err(e);
     }
 
-    Ok((channels, handles))
+    info!("Sōzu UDP worker `{}` running on 0.0.0.0:{}", name, port);
+
+    Ok((
+        L4ListenerChannel {
+            port,
+            channel: command,
+        },
+        handle,
+    ))
+}
+
+/// Stop a worker for good: it answers, then leaves its event loop, closing its
+/// listener.
+fn stop_worker(channel: &mut Channel<WorkerRequest, WorkerResponse>, name: &str) {
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("stop-{}", name),
+        RequestType::HardStop(HardStop {}),
+    ) {
+        warn!("Could not stop the worker of listener `{}`: {}", name, e);
+    }
 }
 
 pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Result<()> {
@@ -502,6 +589,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         middleware_port,
         live_routes,
         unhealthy_backends,
+        unopened_gateway_ports,
         plugins,
         handle,
     } = inputs;
@@ -673,6 +761,11 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         https_port,
         https_ip: https_bind_ip.octets(),
         acme_challenge_port,
+        gateway: GatewayListeners::new(
+            config.gateway_ports.clone(),
+            WorkerSettings::from_config(config),
+            unopened_gateway_ports,
+        ),
     };
 
     let reload_handle = thread::spawn(move || {
@@ -934,6 +1027,8 @@ fn handle_reload(
     let (storage_read, _) =
         routes_as_applied(&storage_read, client_certificate_redirect, &unhealthy);
     let mut current_snapshot = snapshot_from_storage(&storage_read);
+    // Before any route is installed on them.
+    let wanted_gateway_listeners = open_gateway_listeners(channels, &current_snapshot);
 
     // Run the reload under a shared consecutive-timeout counter. A worker that
     // goes silent is given up on after a few failed acks, so it can't stall the
@@ -982,6 +1077,7 @@ fn handle_reload(
             }
         }
     });
+    close_unused_gateway_listeners(channels, &wanted_gateway_listeners);
 
     current_snapshot
 }
@@ -1897,8 +1993,27 @@ fn configure_tcp_entrypoint(
         }
     };
 
+    if crate::config::gateway_tcp_port(listener_name).is_some()
+        && !crate::provider::kubernetes::gateway::is_gateway_route(entrypoint)
+    {
+        error!(
+            "TCP entrypoint `{}` references listener `{}`, which is reserved for Gateway routes, skipping",
+            entrypoint.name, listener_name
+        );
+        // Misconfiguration, as for an undeclared listener.
+        return FrontendOutcome::Installed;
+    }
     let listener = match tcp_channels.get_mut(listener_name) {
         Some(c) => c,
+        // A Gateway listener that could not be opened: a later reload opens
+        // it and retries the route.
+        None if crate::config::gateway_tcp_port(listener_name).is_some() => {
+            warn!(
+                "TCP entrypoint `{}` is served on Gateway listener `{}`, which is not open, skipping",
+                entrypoint.name, listener_name
+            );
+            return FrontendOutcome::Rejected;
+        }
         None => {
             error!(
                 "TCP entrypoint `{}` references undeclared listener `{}`, skipping. \
@@ -2032,8 +2147,27 @@ fn configure_udp_entrypoint(
         }
     };
 
+    if crate::config::gateway_udp_port(listener_name).is_some()
+        && !crate::provider::kubernetes::gateway::is_gateway_route(entrypoint)
+    {
+        error!(
+            "UDP entrypoint `{}` references listener `{}`, which is reserved for Gateway routes, skipping",
+            entrypoint.name, listener_name
+        );
+        // Misconfiguration, as for an undeclared listener.
+        return FrontendOutcome::Installed;
+    }
     let listener = match udp_channels.get_mut(listener_name) {
         Some(c) => c,
+        // A Gateway listener that could not be opened: a later reload opens
+        // it and retries the route.
+        None if crate::config::gateway_udp_port(listener_name).is_some() => {
+            warn!(
+                "UDP entrypoint `{}` is served on Gateway listener `{}`, which is not open, skipping",
+                entrypoint.name, listener_name
+            );
+            return FrontendOutcome::Rejected;
+        }
         None => {
             error!(
                 "UDP entrypoint `{}` references undeclared listener `{}`, skipping. \
@@ -3480,6 +3614,32 @@ mod tests {
         assert!(err.to_string().contains("greater than zero"), "{err}");
     }
 
+    /// A declared listener cannot take the name of one a Gateway opens, or a
+    /// Gateway route would be installed on it, whatever its port.
+    #[test]
+    fn gateway_listener_names_are_reserved() {
+        let mut config = ProxyConfig::default();
+        config.tcp = vec![crate::config::TcpListenerConfig {
+            name: crate::config::gateway_tcp_listener(9000),
+            listen: 7000,
+            ip_allow_list: Vec::new(),
+            rate_limit: None,
+            sni_preread_timeout: None,
+            sni_preread_max_bytes: None,
+            idle_timeout: None,
+        }];
+        let err = spawn_tcp_workers(&config).err().unwrap();
+        assert!(err.to_string().contains("reserved"), "{err}");
+
+        let mut config = ProxyConfig::default();
+        config.udp = vec![crate::config::UdpListenerConfig {
+            name: crate::config::gateway_udp_listener(53),
+            listen: 5300,
+        }];
+        let err = spawn_udp_workers(&config).err().unwrap();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
     fn http_listener_with_timeouts(
         timeouts: ProxyTimeouts,
     ) -> anyhow::Result<sozu_command_lib::proto::command::HttpListenerConfig> {
@@ -3713,7 +3873,7 @@ mod tests {
     }
 
     /// A TCP entrypoint on `listener`, SNI-routed when `sni` is `Some`.
-    fn tcp_ep(name: &str, listener: &str, sni: Option<&str>) -> Entrypoint {
+    pub(super) fn tcp_ep(name: &str, listener: &str, sni: Option<&str>) -> Entrypoint {
         let mut ep = base_ep(vec![Backend::new("10.0.0.1", 5432)]);
         ep.id = name.into();
         ep.name = name.into();
