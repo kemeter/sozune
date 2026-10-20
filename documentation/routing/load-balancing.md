@@ -4,7 +4,7 @@ Sōzune balances traffic across multiple backends. Round-robin is the default; o
 
 ## Default — round-robin
 
-Sōzu spreads requests evenly across all healthy backends of a cluster. No configuration needed; this is always on.
+Sōzu spreads requests across all healthy backends of a cluster, evenly unless the backends carry different [weights](#weighted-load-balancing). No configuration needed; this is always on.
 
 ## Choosing the algorithm
 
@@ -18,10 +18,10 @@ labels:
 
 | Value | Behaviour |
 |---|---|
-| `round_robin` (default) | Cycle through backends in order. |
-| `least_connections` | Send to the backend with the fewest active connections — good for uneven request durations. |
-| `power_of_two` | Sample two backends at random, pick the less loaded. Cheaper than full least-connections at scale, nearly as good. |
-| `random` | Pick a backend at random. |
+| `round_robin` (default) | Cycle through backends in order, each in proportion to its weight. |
+| `least_connections` | Send to the backend with the fewest active connections per unit of weight — good for uneven request durations. |
+| `power_of_two` | Sample two backends at random, pick the one less loaded per unit of weight. Cheaper than full least-connections at scale, nearly as good. |
+| `random` | Pick a backend at random, weighted by its weight. |
 
 Values are case-insensitive and accept hyphens or underscores (`least-connections` == `least_connections`); common aliases work too (`leastconn`, `rr`, `p2c`). An unrecognised value falls back to round-robin and raises a `W022` diagnostic. The setting applies to both HTTP and TCP entrypoints, and is also available as `load_balancer` on the REST/YAML entrypoint payload.
 
@@ -88,7 +88,6 @@ services:
       - "sozune.enable=true"
       - "sozune.http.app.host=app.example.com"
       - "sozune.http.app.weight=90"
-      - "sozune.http.app.loadBalancer=random"
 
   app-canary:
     image: my-app:canary
@@ -96,12 +95,21 @@ services:
       - "sozune.enable=true"
       - "sozune.http.app.host=app.example.com"
       - "sozune.http.app.weight=10"
-      - "sozune.http.app.loadBalancer=random"
 ```
 
-The two containers join the same `app` service, so `app.example.com` is split roughly 90% / 10% between them — a simple canary.
+The two containers join the same `app` service, so `app.example.com` is split 90% / 10% between them — a simple canary.
 
-> **Only `random` honours the weight.** `round_robin` (the default) and the load-based algorithms ignore it, so set `loadBalancer=random` on the service when you rely on weights. The split is statistical, not an exact ratio. A weight of `0` keeps the backend wired but excludes it from selection; a negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
+Every algorithm honours the weight:
+
+- `round_robin` gives a backend of weight `w` exactly `w` requests out of every `Σw`, interleaved: weights `5`, `1`, `1` serve `a a b a c a a`, not `a a a a a b c`.
+- `least_connections` and `power_of_two` compare each backend's load divided by its weight.
+- `random` draws in proportion to the weights, so the split is statistical.
+
+The weight belongs to a backend, not to a service: three replicas of `app-stable` labelled `weight=90` carry 270 shares between them.
+
+A weight of `0` makes the backend a **backup**: it takes no traffic while another backend can serve, and takes over when none can. A negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
+
+A route that goes through the Sōzune middleware (rate limit, compression, auth, retry…) is balanced by the middleware with the weighted round robin above, whatever `loadBalancer` says. There, a backup takes over a request no backend gave a response to: once the [retries](/documentation/middleware/retry) are spent, each backend the request has not tried yet gets one try, heaviest first, then each backup. A WebSocket upgrade, which is not retried, goes through the same order when its backend refuses it.
 
 ## Sticky sessions
 
@@ -120,4 +128,3 @@ Sticky sessions are best-effort affinity, not absolute pinning.
 ## What's not supported
 
 - **Custom hashing** (consistent hashing, IP hash) — not exposed by Sōzu.
-- **Deterministic weighted round-robin** — weights are honoured only by the `random` balancer, so the split is statistical, not an exact request-by-request ratio.

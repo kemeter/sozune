@@ -10,8 +10,7 @@ pub mod rate_limit;
 pub(crate) mod request_match;
 mod wasm;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::{Router, routing::any};
 use hyper_util::client::legacy::Client;
@@ -157,7 +156,11 @@ pub struct MiddlewareRoute {
     /// The entrypoint (Sōzu cluster) this route was built from.
     pub cluster_id: String,
     pub backends: Vec<(String, u16)>,
-    pub backend_counter: AtomicUsize,
+    /// Picks among `backends` in proportion to their weights.
+    pub balancer: WeightedRoundRobin,
+    /// Indexes into `backends` of the backups: weight 0 next to backends that
+    /// have a weight. Tried when the picked backend gives no response.
+    pub backups: Vec<usize>,
     pub backend_timeout: Option<u64>,
     /// Total forward attempts (first try + retries) on a connection-level
     /// failure or timeout. `1` (or `0`) means no retry — the default.
@@ -291,14 +294,151 @@ impl MiddlewareRouteTable {
 }
 
 impl MiddlewareRoute {
-    /// Pick the next backend using round-robin
-    pub fn next_backend(&self) -> Option<&(String, u16)> {
-        if self.backends.is_empty() {
-            return None;
+    /// The backends one request tries, in order, until one answers. See
+    /// [`BackendAttempts`]. `attempts` is the route's retry budget; a
+    /// WebSocket upgrade, which is never retried, passes 1.
+    pub fn attempts(&self, attempts: u32) -> BackendAttempts<'_> {
+        BackendAttempts {
+            route: self,
+            attempts: attempts.max(1) as usize,
+            tried: Vec::new(),
+            fallback: None,
         }
-        let index = self.backend_counter.fetch_add(1, Ordering::Relaxed) % self.backends.len();
-        self.backends.get(index)
     }
+
+    fn is_backup(&self, index: usize) -> bool {
+        self.backups.contains(&index)
+    }
+}
+
+/// The backends one request tries, in order, until one answers:
+///
+/// 1. the balancer's pick, by weight;
+/// 2. up to `attempts - 1` retries, each on the heaviest backend the request
+///    has not tried; once it has tried them all, the balancer picks again;
+/// 3. when the route has backups and every attempt failed, each backend the
+///    request has not tried, heaviest first, then each backup in turn.
+///
+/// A backup is tried only once every other backend has been. Backends are
+/// picked one at a time, as attempts fail, so a request that does not retry
+/// moves the balancer once.
+pub struct BackendAttempts<'a> {
+    route: &'a MiddlewareRoute,
+    attempts: usize,
+    tried: Vec<usize>,
+    fallback: Option<std::collections::VecDeque<usize>>,
+}
+
+impl BackendAttempts<'_> {
+    /// The backends that are not backups and that this request has not
+    /// tried, heaviest first, then in declaration order.
+    fn untried_primaries(&self) -> Vec<usize> {
+        let route = self.route;
+        let mut untried: Vec<usize> = (0..route.backends.len())
+            .filter(|index| !route.is_backup(*index) && !self.tried.contains(index))
+            .collect();
+        untried.sort_by_key(|&index| std::cmp::Reverse(route.balancer.weights[index]));
+        untried
+    }
+}
+
+impl<'a> Iterator for BackendAttempts<'a> {
+    type Item = &'a (String, u16);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let route = self.route;
+        let index = if self.tried.is_empty() {
+            route.balancer.next()
+        } else if self.tried.len() < self.attempts {
+            self.untried_primaries()
+                .first()
+                .copied()
+                .or_else(|| route.balancer.next())
+        } else {
+            if self.fallback.is_none() {
+                let fallback = if route.backups.is_empty() {
+                    Default::default()
+                } else {
+                    self.untried_primaries()
+                        .into_iter()
+                        .chain(route.backups.iter().copied())
+                        .collect()
+                };
+                self.fallback = Some(fallback);
+            }
+            self.fallback.as_mut().and_then(|queue| queue.pop_front())
+        }?;
+        self.tried.push(index);
+        route.backends.get(index)
+    }
+}
+
+/// Smooth weighted round robin, as Sōzu runs it: a backend of weight `w`
+/// serves `w` requests out of every `Σw`, and the picks interleave (weights
+/// `5, 1, 1` give `a a b a c a a`). Equal weights give a plain rotation.
+///
+/// A backend of weight 0 is never picked, unless every backend has weight 0:
+/// then they share the traffic equally.
+#[derive(Debug)]
+pub struct WeightedRoundRobin {
+    weights: Vec<i64>,
+    total: i64,
+    current: Mutex<Vec<i64>>,
+}
+
+impl WeightedRoundRobin {
+    pub fn new(weights: &[u32]) -> Self {
+        // Capped as Sōzu caps them, so a route splits its traffic the same
+        // way with or without the middleware.
+        let mut weights: Vec<i64> = weights
+            .iter()
+            .map(|&w| i64::from(w.min(i32::MAX as u32)))
+            .collect();
+        if weights.iter().all(|&w| w == 0) {
+            weights.iter_mut().for_each(|w| *w = 1);
+        }
+        let total = weights.iter().sum();
+        Self {
+            current: Mutex::new(vec![0; weights.len()]),
+            weights,
+            total,
+        }
+    }
+
+    pub fn next(&self) -> Option<usize> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut picked: Option<usize> = None;
+        for (index, &weight) in self.weights.iter().enumerate() {
+            if weight == 0 {
+                continue;
+            }
+            current[index] += weight;
+            if picked.is_none_or(|p| current[index] > current[p]) {
+                picked = Some(index);
+            }
+        }
+        if let Some(index) = picked {
+            current[index] -= self.total;
+        }
+        picked
+    }
+}
+
+/// Indexes of the backups among `weights`: the weight-0 backends, when another
+/// backend has a weight.
+fn backup_indexes(weights: &[u32]) -> Vec<usize> {
+    if weights.iter().all(|&w| w == 0) {
+        return Vec::new();
+    }
+    weights
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w == 0)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// Compiled WASM plugins keyed by their declared name. Each plugin is compiled
@@ -523,13 +663,15 @@ pub fn build_middleware_route(
         .circuit_breaker
         .map(|cfg| Arc::new(circuit_breaker::CircuitBreaker::new(cfg)));
 
+    let weights: Vec<u32> = backends.iter().map(|b| b.weight).collect();
     Arc::new(MiddlewareRoute {
         cluster_id: cluster_id.to_string(),
         backends: backends
             .iter()
             .map(|b| (b.address.clone(), b.port))
             .collect(),
-        backend_counter: AtomicUsize::new(0),
+        balancer: WeightedRoundRobin::new(&weights),
+        backups: backup_indexes(&weights),
         backend_timeout: config.backend_timeout,
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
         circuit_breaker,
@@ -569,6 +711,109 @@ pub async fn serve(
 #[cfg(test)]
 mod route_key_tests {
     use super::*;
+
+    /// A route over backends `b0`, `b1`… with these weights.
+    fn weighted_route(weights: &[u32]) -> MiddlewareRoute {
+        MiddlewareRoute {
+            cluster_id: "web".to_string(),
+            backends: (0..weights.len()).map(|i| (format!("b{i}"), 80)).collect(),
+            balancer: WeightedRoundRobin::new(weights),
+            backups: backup_indexes(weights),
+            backend_timeout: None,
+            retry_attempts: 1,
+            circuit_breaker: None,
+            middlewares: Vec::new(),
+        }
+    }
+
+    /// The backends a request tries when every one of them fails.
+    fn tried(route: &MiddlewareRoute, attempts: u32) -> Vec<String> {
+        route
+            .attempts(attempts)
+            .take(10)
+            .map(|(host, _)| host.clone())
+            .collect()
+    }
+
+    #[test]
+    fn without_retry_or_backup_a_request_tries_one_backend() {
+        assert_eq!(tried(&weighted_route(&[100, 100]), 1), ["b0"]);
+        assert!(tried(&weighted_route(&[]), 3).is_empty());
+    }
+
+    /// A heavy backend that is down must not take every retry.
+    #[test]
+    fn a_retry_goes_to_a_backend_not_tried_yet() {
+        assert_eq!(tried(&weighted_route(&[100, 1]), 2), ["b0", "b1"]);
+        assert_eq!(tried(&weighted_route(&[1, 100, 50]), 3), ["b1", "b2", "b0"]);
+    }
+
+    /// Once every backend was tried, the balancer picks again.
+    #[test]
+    fn retries_beyond_the_backends_go_back_to_the_balancer() {
+        assert_eq!(
+            tried(&weighted_route(&[100, 100]), 4),
+            ["b0", "b1", "b1", "b0"]
+        );
+    }
+
+    /// A backup serves only once every other backend failed, retry or not.
+    #[test]
+    fn backups_come_after_every_other_backend() {
+        let route = weighted_route(&[100, 0, 50, 0]);
+        assert_eq!(tried(&route, 1), ["b0", "b2", "b1", "b3"]);
+        assert_eq!(tried(&route, 2), ["b2", "b0", "b1", "b3"]);
+        assert_eq!(tried(&route, 3), ["b0", "b2", "b0", "b1", "b3"]);
+    }
+
+    /// With every weight at 0 there is no backup: they share the traffic.
+    #[test]
+    fn all_zero_weights_are_plain_backends() {
+        assert_eq!(tried(&weighted_route(&[0, 0]), 1), ["b0"]);
+        assert_eq!(tried(&weighted_route(&[0, 0]), 2), ["b0", "b1"]);
+    }
+
+    fn picks(weights: &[u32], count: usize) -> Vec<usize> {
+        let balancer = WeightedRoundRobin::new(weights);
+        (0..count).filter_map(|_| balancer.next()).collect()
+    }
+
+    /// Sōzu's smooth weighted round robin: shares follow the weights and the
+    /// picks interleave instead of bunching.
+    #[test]
+    fn backends_take_requests_in_proportion_to_their_weight() {
+        assert_eq!(picks(&[5, 1, 1], 7), [0, 0, 1, 0, 2, 0, 0]);
+        assert_eq!(
+            picks(&[90, 10], 100).iter().filter(|&&i| i == 1).count(),
+            10
+        );
+        assert_eq!(picks(&[100, 100, 100], 6), [0, 1, 2, 0, 1, 2]);
+        assert!(picks(&[], 3).is_empty());
+    }
+
+    /// Weights past `i32::MAX` are capped there, as Sōzu caps them.
+    #[test]
+    fn weights_are_capped_as_sozu_caps_them() {
+        assert_eq!(picks(&[u32::MAX, u32::MAX / 2 + 1], 4), [0, 1, 0, 1]);
+    }
+
+    /// Large weights keep their exact ratio.
+    #[test]
+    fn large_weights_keep_their_ratio() {
+        let light = picks(&[100_000, 1], 200_002)
+            .iter()
+            .filter(|&&i| i == 1)
+            .count();
+        assert_eq!(light, 2);
+    }
+
+    #[test]
+    fn a_zero_weight_is_a_backup_unless_all_are_zero() {
+        assert_eq!(picks(&[0, 100], 3), [1, 1, 1]);
+        assert_eq!(backup_indexes(&[0, 100]), [0]);
+        assert_eq!(picks(&[0, 0], 4), [0, 1, 0, 1]);
+        assert!(backup_indexes(&[0, 0]).is_empty());
+    }
 
     /// Sozu routes on host *and* path and hands the request to the middleware
     /// server, which used to resolve it by host alone. Two entrypoints on one
@@ -652,7 +897,8 @@ mod route_key_tests {
         Arc::new(MiddlewareRoute {
             cluster_id: name.to_string(),
             backends: vec![(name.to_string(), 80)],
-            backend_counter: AtomicUsize::new(0),
+            balancer: WeightedRoundRobin::new(&[100]),
+            backups: Vec::new(),
             backend_timeout: None,
             retry_attempts: 1,
             circuit_breaker: None,

@@ -335,8 +335,8 @@ const ENTRIES: &[Entry] = &[
         title: "Invalid backend weight",
         cause: "A `weight` label was not a valid non-negative integer (it was negative or non-integer).",
         effect: "The backend keeps its default weight (100) and stays in rotation; the intended traffic share is not applied.",
-        fix: "Set `weight` to a non-negative integer. Only the `random` balancer honours it; a weight of 0 keeps the backend wired but excludes it from selection.",
-        example: Some("sozune.http.app.weight=90\nsozune.http.app.loadBalancer=random"),
+        fix: "Set `weight` to a non-negative integer. Every load balancer honours it; a weight of 0 makes the backend a backup, used only when no other backend can serve.",
+        example: Some("sozune.http.app.weight=90"),
     },
     Entry {
         code: "W028",

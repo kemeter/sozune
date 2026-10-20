@@ -112,6 +112,17 @@ fn backend_id(cluster_id: &str, _index: usize, backend: &Backend) -> String {
     format!("{cluster_id}-backend-{}-{}", backend.address, backend.port)
 }
 
+/// A backend's weight and backup flag as Sōzu takes them. Sōzu counts a
+/// weight of 0 as 1 under every policy but `random`, so such a backend is sent
+/// as a backup instead: it serves only when no other backend can.
+fn sozu_weight(backend: &Backend) -> (Option<LoadBalancingParams>, Option<bool>) {
+    if backend.weight == 0 {
+        return (Some(LoadBalancingParams { weight: 1 }), Some(true));
+    }
+    let weight = i32::try_from(backend.weight).unwrap_or(i32::MAX);
+    (Some(LoadBalancingParams { weight }), None)
+}
+
 /// Whether a cluster's backends leave it able to serve.
 ///
 /// A frontend is all-or-nothing, but backends are not: losing one of three
@@ -1698,15 +1709,15 @@ fn configure_http_entrypoint(
         let mut rejected = 0usize;
         for (backend_index, backend_entry) in entrypoint.backends.iter().enumerate() {
             let address = parse_backend_address(backend_entry)?;
-            let weight = backend_entry.weight as i32;
+            let (load_balancing_parameters, backup) = sozu_weight(backend_entry);
 
             let backend = AddBackend {
                 cluster_id: cluster_id.to_string(),
                 backend_id: backend_id(cluster_id, backend_index, backend_entry),
                 address,
-                load_balancing_parameters: Some(LoadBalancingParams { weight }),
+                load_balancing_parameters,
                 sticky_id: None,
-                backup: None,
+                backup,
                 unix_path: None,
             };
 
@@ -1859,15 +1870,15 @@ fn configure_tcp_entrypoint(
                 continue;
             }
         };
-        let weight = backend_entry.weight as i32;
+        let (load_balancing_parameters, backup) = sozu_weight(backend_entry);
         let backend_id = l4_backend_id(cluster_id, backend_entry);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
             address,
-            load_balancing_parameters: Some(LoadBalancingParams { weight }),
+            load_balancing_parameters,
             sticky_id: None,
-            backup: None,
+            backup,
             unix_path: None,
         };
         if let Err(e) = send_to_worker(
@@ -1989,15 +2000,15 @@ fn configure_udp_entrypoint(
                 continue;
             }
         };
-        let weight = backend_entry.weight as i32;
+        let (load_balancing_parameters, backup) = sozu_weight(backend_entry);
         let backend_id = l4_backend_id(cluster_id, backend_entry);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
             address,
-            load_balancing_parameters: Some(LoadBalancingParams { weight }),
+            load_balancing_parameters,
             sticky_id: None,
-            backup: None,
+            backup,
             unix_path: None,
         };
         if let Err(e) = send_to_worker(
@@ -2265,15 +2276,14 @@ fn add_backends(
             }
         };
         let backend_id = backend_id(cluster_id, 0, backend_entry);
+        let (load_balancing_parameters, backup) = sozu_weight(backend_entry);
         let add = AddBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
             address,
-            load_balancing_parameters: Some(LoadBalancingParams {
-                weight: backend_entry.weight as i32,
-            }),
+            load_balancing_parameters,
             sticky_id: None,
-            backup: None,
+            backup,
             unix_path: None,
         };
         if let Err(e) = send_to_worker(
@@ -2619,15 +2629,14 @@ fn l4_diff_backends_in_place(
             }
         };
         let backend_id = l4_backend_id(cluster_id, backend_entry);
+        let (load_balancing_parameters, backup) = sozu_weight(backend_entry);
         let add = AddBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: backend_id.clone(),
             address,
-            load_balancing_parameters: Some(LoadBalancingParams {
-                weight: backend_entry.weight as i32,
-            }),
+            load_balancing_parameters,
             sticky_id: None,
-            backup: None,
+            backup,
             unix_path: None,
         };
         if let Err(e) = send_to_worker(
@@ -3793,6 +3802,21 @@ mod tests {
 
     /// Two backends of one cluster must never collide, including the same host
     /// on two ports.
+    /// Sōzu would count a weight of 0 as 1; it is sent as a backup instead.
+    #[test]
+    fn a_zero_weight_backend_is_a_backup() {
+        let (params, backup) = sozu_weight(&Backend::new("10.0.0.1", 80).with_weight(0));
+        assert_eq!(params.unwrap().weight, 1);
+        assert_eq!(backup, Some(true));
+
+        let (params, backup) = sozu_weight(&Backend::new("10.0.0.1", 80).with_weight(30));
+        assert_eq!(params.unwrap().weight, 30);
+        assert_eq!(backup, None);
+
+        let (params, _) = sozu_weight(&Backend::new("10.0.0.1", 80).with_weight(u32::MAX));
+        assert_eq!(params.unwrap().weight, i32::MAX);
+    }
+
     #[test]
     fn two_backends_of_a_cluster_get_distinct_ids() {
         let a = Backend::new("10.0.0.1", 80);

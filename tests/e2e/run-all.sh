@@ -471,6 +471,112 @@ services:
       - "sozune.http.svcclientipdeny.matchClientIP=10.0.0.0/8"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  svc-weight-heavy:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: heavy
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.weighted.host=$HOST_WEIGHT"
+      - "sozune.http.weighted.weight=3"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-weight-light:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: light
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.weighted.host=$HOST_WEIGHT"
+      - "sozune.http.weighted.weight=1"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-weight-mwheavy:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: mwheavy
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.weightedmw.host=$HOST_WEIGHT_MW"
+      - "sozune.http.weightedmw.weight=3"
+      - "sozune.http.weightedmw.compress=true"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-weight-mwlight:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: mwlight
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.weightedmw.host=$HOST_WEIGHT_MW"
+      - "sozune.http.weightedmw.weight=1"
+      - "sozune.http.weightedmw.compress=true"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-weight-primary:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: primary
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.withbackup.host=$HOST_BACKUP"
+      - "sozune.http.withbackup.weight=100"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-weight-backup:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: backup
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.withbackup.host=$HOST_BACKUP"
+      - "sozune.http.withbackup.weight=0"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-failover-dead:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: dead
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.failover.host=$HOST_FAILOVER"
+      # Nothing listens on 81: every connection is refused.
+      - "sozune.http.failover.port=81"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-failover-spare:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: spare
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.failover.host=$HOST_FAILOVER"
+      - "sozune.http.failover.weight=0"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-failovermw-dead:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: dead
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.failovermw.host=$HOST_FAILOVER_MW"
+      # Nothing listens on 81: every connection is refused.
+      - "sozune.http.failovermw.port=81"
+      - "sozune.http.failovermw.compress=true"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-failovermw-spare:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: spare
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.failovermw.host=$HOST_FAILOVER_MW"
+      - "sozune.http.failovermw.weight=0"
+      - "sozune.http.failovermw.compress=true"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-lb:
     image: traefik/whoami
     labels:

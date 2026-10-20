@@ -518,7 +518,7 @@ POST and PUT accept the same body shape — the four required top-level fields:
 | Field | Type | Description |
 |---|---|---|
 | `name` | string | Logical service name. Becomes part of the generated `id`. |
-| `backends` | array of `Backend` | At least one backend; each has `address` (IPv4, IPv6, or hostname), `port`, and optional `weight` (defaults to `100`) |
+| `backends` | array of `Backend` | At least one backend; each has `address` (IPv4, IPv6, or hostname), `port`, and optional `weight` (defaults to `100`; `0` makes it a backup, see [Load balancing](/documentation/routing/load-balancing#weighted-load-balancing)) |
 | `protocol` | `"Http"` \| `"Tcp"` \| `"Udp"` | Routing protocol. UDP is parsed but not yet wired in. |
 | `config` | `EntrypointConfig` | All routing options. See [Entrypoint schema](#entrypoint-schema). Every field except `hostnames` and `priority` is optional and defaults to its zero value. |
 
