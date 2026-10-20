@@ -100,6 +100,7 @@ pub(super) fn map_redirect_policy(policy: RedirectPolicy) -> i32 {
         RedirectPolicy::Forward => SozuRedirectPolicy::Forward as i32,
         RedirectPolicy::Permanent => SozuRedirectPolicy::Permanent as i32,
         RedirectPolicy::Unauthorized => SozuRedirectPolicy::Unauthorized as i32,
+        RedirectPolicy::Close => SozuRedirectPolicy::SilentClose as i32,
     }
 }
 

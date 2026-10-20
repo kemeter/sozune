@@ -6,7 +6,7 @@ Sōzune exposes a few flavors of HTTP redirect, all handled natively by Sōzu (n
 |---|---|
 | Force HTTP → HTTPS | `httpsRedirect=true` |
 | Override the port in the redirect target | `httpsRedirectPort` |
-| Apply a permanent redirect (or block traffic) | `redirect=permanent` / `redirect=unauthorized` |
+| Apply a permanent redirect (or block traffic) | `redirect=permanent` / `redirect=unauthorized` / `redirect=close` |
 | Force a specific scheme on the redirect target | `redirectScheme=use_http\|use_https\|use_same` |
 | Customise the `Location` header template | `redirectTemplate` |
 | Redirect to another host, path and query kept | `redirectHost` |
@@ -38,19 +38,30 @@ A request to `http://app.example.com/` returns `Location: https://app.example.co
 
 ## `redirect` policy
 
-The `redirect` label sets the per-frontend redirect policy. It accepts one of three values:
+The `redirect` label sets the per-frontend redirect policy. It accepts one of four values:
 
 | Value | Behaviour |
 |---|---|
 | `forward` | Default. Forward the request to the backend. |
 | `permanent` | Always answer `301 Moved Permanently`. The `Location` header follows `redirectScheme` and `redirectTemplate`. |
 | `unauthorized` | Always answer `401 Unauthorized` without contacting the backend. Useful to gate a route while keeping it declared. |
+| `close` | Close the connection without answering anything, like nginx's `444`. Useful against scanners and bots: they get no status, no header and no body to learn from. |
 
 ```yaml
 labels:
   - "sozune.http.legacy.host=legacy.example.com"
   - "sozune.http.legacy.redirect=permanent"
   - "sozune.http.legacy.redirectScheme=use_https"
+```
+
+`permanent`, `unauthorized` and `close` answer without reaching a backend, so such a route needs no `port`. To close the connections a scanner opens on a path, give the path a route of its own, with a priority above the application's route on the same host:
+
+```yaml
+labels:
+  - "sozune.http.wp.host=app.example.com"
+  - "sozune.http.wp.path=/wp-login.php"
+  - "sozune.http.wp.redirect=close"
+  - "sozune.http.wp.priority=10"
 ```
 
 ## `redirectHost`
@@ -67,7 +78,7 @@ labels:
 
 `https://old.example.com/docs?page=2` answers `301` with `Location: https://www.example.com/docs?page=2`.
 
-`redirectHost` implies `redirect=permanent`, and the route needs no `port`: it never reaches a backend. The value is a bare hostname, without scheme, port or path; anything else, or a `redirect` set to `forward` or `unauthorized`, emits `W031` and the label is ignored. Without `redirectScheme`, the redirect keeps the request's scheme. With `stripPrefix` or `addPrefix`, the path in `Location` is rewritten the same way: `path=/blog` + `stripPrefix=true` sends `old.example.com/blog/post` to `www.example.com/post`.
+`redirectHost` implies `redirect=permanent`, and the route needs no `port`: it never reaches a backend. The value is a bare hostname, without scheme, port or path; anything else, or a `redirect` set to `forward`, `unauthorized` or `close`, emits `W031` and the label is ignored. Without `redirectScheme`, the redirect keeps the request's scheme. With `stripPrefix` or `addPrefix`, the path in `Location` is rewritten the same way: `path=/blog` + `stripPrefix=true` sends `old.example.com/blog/post` to `www.example.com/post`.
 
 ## `redirectScheme`
 

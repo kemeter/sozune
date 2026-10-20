@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Middleware: basic auth, header injection, strip prefix, HTTPS redirect,
+# Middleware: basic auth, header injection, strip prefix, HTTPS redirect, close,
 # rate limiting, gzip compression, backend timeout.
 # Sourced by run-all.sh.
 
@@ -159,6 +159,24 @@ if [[ "$redirect_status" == "301" ]]; then
     pass "HTTPS redirect returns 301"
 else
     fail "HTTPS redirect returned $redirect_status instead of 301"
+fi
+
+log "[02] Middleware: redirect=close answers nothing"
+
+# curl exits 52 on an empty reply: the connection closed without a status
+# line. Until the route is installed, Sōzu answers 404 instead.
+close_exit=0
+for _ in $(seq 1 20); do
+    close_exit=0
+    curl -s -o /dev/null --max-time 2 -H "Host: $HOST_CLOSE" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null \
+        || close_exit=$?
+    [[ "$close_exit" == "52" ]] && break
+    sleep 0.5
+done
+if [[ "$close_exit" == "52" ]]; then
+    pass "redirect=close closes the connection without a response"
+else
+    fail "redirect=close: curl exited $close_exit, expected 52 (empty reply)"
 fi
 
 log "[02] Middleware: rate limiting"

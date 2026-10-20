@@ -417,7 +417,7 @@ Only `url` is required. `method` defaults to `GET`. Without `client_ip`, rules o
 ```
 
 - `outcome`: `proxied` (sent to a backend), `redirected`, `rejected` (a route matched but sōzune answers with an error, see `status`), `acme_challenge`, or `no_route`.
-- `status`: the status sōzune answers with itself; `null` when a backend answers.
+- `status`: the status sōzune answers with itself; `null` when a backend answers, or when the route closes the connection without answering (`redirect: close`).
 - `candidates`: the other routes whose hostname matches, each with a `verdict` — `shadowed` (would match, but a route tried before it matches first), `rejected` (its path, method or TLS setting does not match), or `refused` (Sōzu refused it, so it is not live).
 - `pipeline`: the route's middlewares in the order they run. `pass` and `blocked` are decided on the request; `applies` depends on live state (rate-limit buckets, in-flight requests, the forward-auth server) and is not decided; `not_evaluated` needs `client_ip`, comes after a blocking step, or is `basic-auth`: credentials are never checked by this endpoint, so a route protected by basic auth is reported as proxied *if the credentials are valid*, and as a `401` when the request carries none.
 - `backends`: the route's backends and their health-check state.
@@ -451,7 +451,7 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
     "add_prefix": null,                 // string, mutually exclusive with strip_prefix
     "https_redirect": true,
     "https_redirect_port": null,        // override 443
-    "redirect": null,                   // "forward" | "permanent" | "unauthorized"
+    "redirect": null,                   // "forward" | "permanent" | "unauthorized" | "close"
     "redirect_scheme": null,            // "use_same" | "use_http" | "use_https"
     "redirect_template": null,
     "www_authenticate": null,

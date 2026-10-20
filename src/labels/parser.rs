@@ -252,7 +252,14 @@ fn build_entrypoint(
             redirect_host = None;
             None
         }
-        (Some(policy @ (RedirectPolicy::Forward | RedirectPolicy::Unauthorized)), Some(host)) => {
+        (
+            Some(
+                policy @ (RedirectPolicy::Forward
+                | RedirectPolicy::Unauthorized
+                | RedirectPolicy::Close),
+            ),
+            Some(host),
+        ) => {
             diagnostics.push(
                 crate::labels::diagnostic::Diagnostic::new(
                     crate::labels::diagnostic::DiagnosticCode::W031InvalidRedirectHost,
@@ -268,16 +275,13 @@ fn build_entrypoint(
         (policy, _) => policy,
     };
 
-    // A permanent/unauthorized redirect answers at the frontend and never reaches
+    // A permanent/unauthorized/close policy answers at the frontend and never reaches
     // a backend (see proxy::sozu — "a permanent redirect never [reaches the]
     // backend"). Attaching one anyway registers a phantom backend that the health
     // checker probes forever (e.g. an alias host with no `.port` falls back to
     // `:80`, which nothing listens on) and pollutes the cluster's backend set.
     // Forwarding redirects still proxy, so they keep their backend.
-    let is_pure_redirect = matches!(
-        redirect,
-        Some(RedirectPolicy::Permanent | RedirectPolicy::Unauthorized)
-    );
+    let is_pure_redirect = redirect.is_some_and(RedirectPolicy::answers_without_backend);
     let backends = if is_pure_redirect {
         Vec::new()
     } else {
@@ -749,6 +753,49 @@ mod tests {
         assert_eq!(http.config.redirect, Some(RedirectPolicy::Permanent));
         assert_eq!(http.config.rewrite_host.as_deref(), Some("new.example.com"));
         assert!(http.backends.is_empty(), "a redirect reaches no backend");
+    }
+
+    /// A route that closes every connection reaches no backend, so it needs
+    /// no port and registers none for the health checker to probe.
+    #[test]
+    fn a_close_route_has_no_backend() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.bots.host", "app.example.com"),
+                ("sozune.http.bots.path", "/wp-login.php"),
+                ("sozune.http.bots.redirect", "close"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let http = r.entrypoints.get("http_bots").unwrap();
+        assert_eq!(http.config.redirect, Some(RedirectPolicy::Close));
+        assert!(http.backends.is_empty());
+        assert!(http.answers_without_backend());
+    }
+
+    #[test]
+    fn redirect_host_is_ignored_on_a_close_route() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.app.host", "app.example.com"),
+                ("sozune.http.app.redirect", "close"),
+                ("sozune.http.app.redirectHost", "other.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let http = r.entrypoints.get("http_app").unwrap();
+        assert_eq!(http.config.redirect, Some(RedirectPolicy::Close));
+        assert_eq!(http.config.rewrite_host, None);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code
+                    == crate::labels::diagnostic::DiagnosticCode::W031InvalidRedirectHost)
+        );
     }
 
     #[test]
