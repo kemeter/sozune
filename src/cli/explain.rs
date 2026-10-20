@@ -281,9 +281,9 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W021",
         title: "Invalid healthCheck field",
-        cause: "`healthCheck.status` was not an HTTP status in 100–599, or `healthCheck.timeout` was not a positive integer.",
-        effect: "The offending field falls back to its default (2xx/3xx expected status, default timeout); the health check still runs.",
-        fix: "Set `healthCheck.status` to an integer between 100 and 599, and `healthCheck.timeout` to milliseconds as a positive integer.",
+        cause: "A `healthCheck` setting has an invalid value: `status` outside 100–599, `timeout`, `interval`, `unhealthyThreshold` or `healthyThreshold` not a positive integer, `port` outside 1–65535, or a `headers.<Name>` the probe cannot send. Or `status` or `headers` are set without `path`: the TCP probe sends no request.",
+        effect: "The setting falls back to its default (2xx/3xx expected status, 5s timeout, 10s interval, thresholds of 1, the backend's port) or is ignored; the health check still runs.",
+        fix: "Give `status` an integer between 100 and 599, `timeout` and `interval` milliseconds, the thresholds positive counts, `port` a port, and a header a token name and a single-line value. Set `healthCheck.path` for `status` and `headers`.",
         example: Some(
             "sozune.http.web.healthCheck.status=200\nsozune.http.web.healthCheck.timeout=2000",
         ),

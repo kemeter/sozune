@@ -465,7 +465,8 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
     "sticky_session": false,
     "compress": false,                  // zstd/br/gzip negotiated via Accept-Encoding
     "entrypoint": null,                 // TCP listener name (required for protocol=Tcp)
-    "methods": []                       // ["GET", "POST", ...]; empty = any method
+    "methods": [],                      // ["GET", "POST", ...]; empty = any method
+    "health_check": null                // see below
   },
   "unhealthy_backends": [],             // only on GET responses (array of objects, see "GET /entrypoints")
   "diagnostics": []                     // only on GET responses
@@ -511,6 +512,23 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
 ```
 
 `average` is requests per second; `burst` is the bucket size. `burst < average` disables the burst window.
+
+`health_check` (how the backends are probed; see [Health checks](/documentation/advanced/health-checks)):
+
+```jsonc
+{
+  "path": "/health",                    // HTTP probe; null = TCP connect
+  "status": null,                       // exact status accepted; null = any 2xx/3xx
+  "timeout_ms": null,                   // default 5000
+  "interval_ms": null,                  // default 10000
+  "port": null,                         // probe port; null = the backend's
+  "headers": { "Authorization": "***" },// HTTP probe headers; values masked in responses
+  "unhealthy_threshold": null,          // failures in a row before out of rotation; default 1
+  "healthy_threshold": null             // successes in a row before back; default 1
+}
+```
+
+Every field is optional. The values of `headers` and of `plugin_config` are masked (`***`) in every response, `POST` and `PUT` included.
 
 ## `CreateEntrypointRequest` schema
 

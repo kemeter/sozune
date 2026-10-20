@@ -13,6 +13,10 @@ const SERVICE_FIELDS: &[&str] = &[
     "healthCheck.path",
     "healthCheck.status",
     "healthCheck.timeout",
+    "healthCheck.interval",
+    "healthCheck.port",
+    "healthCheck.unhealthyThreshold",
+    "healthCheck.healthyThreshold",
     "loadBalancer",
     "weight",
     "retry.attempts",
@@ -55,7 +59,12 @@ const SERVICE_FIELDS: &[&str] = &[
 /// Field suffixes that accept arbitrary sub-keys (e.g. `headers.X-Foo`,
 /// `plugins.umami.websiteId`). Anything beginning with one of these is
 /// considered known.
-const SERVICE_FIELD_PREFIXES: &[&str] = &["headers.", "errorPages.", "plugins."];
+const SERVICE_FIELD_PREFIXES: &[&str] = &[
+    "headers.",
+    "errorPages.",
+    "plugins.",
+    "healthCheck.headers.",
+];
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];
 
@@ -71,13 +80,13 @@ pub fn detect_unknown_labels(labels: &HashMap<String, String>, diagnostics: &mut
     unknown.sort();
 
     for key in unknown {
-        let value = &labels[key];
+        // No value: a misspelt label can carry a secret (a header token, a
+        // key), and the diagnostic reaches the logs and the API.
         let mut diag = Diagnostic::new(
             DiagnosticCode::W013UnknownLabel,
             format!("unknown label '{key}', ignored"),
         )
-        .with_label(key)
-        .with_value(value);
+        .with_label(key);
         if let Some(suggestion) = suggest(key) {
             diag = diag.with_hint(format!("did you mean `{suggestion}`?"));
         } else {
@@ -161,6 +170,20 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// A misspelt label is reported without its value, which can be a
+    /// secret.
+    #[test]
+    fn an_unknown_label_is_reported_without_its_value() {
+        let labels = HashMap::from([(
+            "sozune.http.web.healthCheck.header.Authorization".to_string(),
+            "Bearer secret".to_string(),
+        )]);
+        let mut diags = Vec::new();
+        detect_unknown_labels(&labels, &mut diags);
+        assert_eq!(diags[0].code, DiagnosticCode::W013UnknownLabel);
+        assert_eq!(diags[0].value, None);
     }
 
     #[test]

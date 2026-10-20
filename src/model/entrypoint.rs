@@ -255,25 +255,46 @@ pub enum LoadBalancer {
     Maglev,
 }
 
-/// Active HTTP health-check parameters for an entrypoint's backends.
+/// Health-check parameters for an entrypoint's backends.
 ///
-/// When present, the health checker sends `GET <path>` to each backend (over
-/// plain HTTP to `host:port`) and considers it healthy when the response status
-/// is accepted. With `status = None`, any `2xx`/`3xx` is healthy (the Traefik
-/// default); with `status = Some(code)`, only that exact code is.
+/// With a `path`, the health checker sends `GET <path>` to each backend (over
+/// plain HTTP) and considers it healthy when the response status is accepted:
+/// with `status = None`, any `2xx`/`3xx` (the Traefik default); with
+/// `status = Some(code)`, only that exact code. Without one, it checks that the
+/// backend accepts a TCP connection.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct HealthCheckConfig {
-    /// Request path, e.g. `/health`. Leading slash recommended; the checker
-    /// prefixes one if missing.
-    pub path: String,
+    /// Request path, e.g. `/health`, of the HTTP probe. `None` probes with a
+    /// TCP connect.
+    #[serde(default)]
+    pub path: Option<String>,
     /// Exact status code required for "healthy". `None` accepts any 2xx/3xx.
     #[serde(default)]
     pub status: Option<u16>,
-    /// Per-check request timeout in milliseconds. `None` falls back to the
-    /// checker's global default (5s). Lets a deliberately slow `/health`
-    /// endpoint avoid being marked down at the global cutoff.
+    /// Per-check timeout in milliseconds. `None` falls back to the checker's
+    /// default (5s). Lets a deliberately slow `/health` endpoint avoid being
+    /// marked down at the default cutoff.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Milliseconds between two probes of a backend. `None` is the checker's
+    /// default (10s).
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+    /// Port the probe dials instead of the backend's, e.g. an admin port that
+    /// serves `/health`.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Request headers of the HTTP probe, e.g. `Authorization`. Their values
+    /// are masked in the API.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Consecutive failed probes before the backend is unhealthy. `None` is 1.
+    #[serde(default)]
+    pub unhealthy_threshold: Option<u32>,
+    /// Consecutive successful probes before an unhealthy backend is healthy
+    /// again. `None` is 1.
+    #[serde(default)]
+    pub healthy_threshold: Option<u32>,
 }
 
 /// Retry policy for forwarding a request to a backend.

@@ -4,7 +4,7 @@ Sōzune actively probes every backend in the background, takes the unhealthy one
 
 ## How it works
 
-Every **10 seconds**, Sōzune probes each backend. By default this is a **TCP connect** to `<backend-host>:<backend-port>` with a **5-second timeout**; declaring a health-check path upgrades that backend to an **HTTP probe** (see below).
+Every **10 seconds** by default, Sōzune probes each backend. Without a health-check path this is a **TCP connect** to `<backend-host>:<backend-port>` with a **5-second timeout**; declaring a path upgrades it to an **HTTP probe** (see below). The interval, the timeout, the port and how many probes it takes to change a backend's status can be set per route — see [Settings](#settings).
 
 | Result | Action |
 |---|---|
@@ -23,6 +23,26 @@ When a backend turns unhealthy, Sōzune takes it out of its route: Sōzu and the
 
 The unhealthy backends show up in `GET /entrypoints` (`unhealthy_backends`, with `in_rotation` telling whether each is out), the dashboard and `sozune route resolve`.
 
+## Settings
+
+```yaml
+labels:
+  - "sozune.http.api.healthCheck.interval=5000"          # probe every 5s
+  - "sozune.http.api.healthCheck.unhealthyThreshold=3"   # out after 3 failures in a row
+  - "sozune.http.api.healthCheck.healthyThreshold=2"     # back after 2 successes in a row
+  - "sozune.http.api.healthCheck.port=8081"              # probe an admin port
+```
+
+| Label | Description |
+|---|---|
+| `healthCheck.interval` | Milliseconds between two probes of a backend. Default `10000`. The checker runs every second, so shorter is not faster. |
+| `healthCheck.timeout` | Per-probe timeout in milliseconds, TCP or HTTP. Default `5000`. |
+| `healthCheck.port` | Port the probe dials instead of the backend's, for an application that serves its health on an admin port. |
+| `healthCheck.unhealthyThreshold` | Failed probes in a row before the backend leaves the rotation. Default `1`: one failure is enough. Raise it so a single slow probe does not take a backend out. |
+| `healthCheck.healthyThreshold` | Successful probes in a row before an unhealthy backend comes back. Default `1`. |
+
+Each of these works with the TCP probe as well as the HTTP one: setting any of them without `healthCheck.path` keeps the TCP connect, on the port and at the pace given. An invalid value emits `W021` and falls back to the default.
+
 ## HTTP health checks
 
 A bare TCP connect only proves the port is open — a backend that accepts connections but returns `503` to every request still looks healthy. To check at the application layer, point the health check at a path:
@@ -32,6 +52,7 @@ labels:
   - "sozune.http.api.healthCheck.path=/health"     # enables the HTTP probe
   - "sozune.http.api.healthCheck.status=200"       # optional: exact status required
   - "sozune.http.api.healthCheck.timeout=2000"     # optional: per-check timeout (ms)
+  - "sozune.http.api.healthCheck.headers.Authorization=Bearer s3cr3t"  # optional: request header
 ```
 
 | Label | Description |
@@ -39,16 +60,16 @@ labels:
 | `healthCheck.path` | Request path. Presence enables the HTTP probe. A leading `/` is added if missing. |
 | `healthCheck.status` | Exact status code required for "healthy". **Omit to accept any `2xx`/`3xx`** (the Traefik default). |
 | `healthCheck.timeout` | Per-check request timeout in milliseconds. Falls back to the global 5s when unset — useful for a deliberately slow `/health`. |
+| `healthCheck.headers.<Name>` | A request header the probe sends, e.g. `Authorization` for a protected `/health`. One label per header. The API shows its name, never its value. |
 
-The probe sends `GET http://<backend-host>:<backend-port><path>` and does **not** follow redirects (a `3xx` is judged as-is). A backend that fails the status check is marked unhealthy with kind `bad_status`; a transport failure is `http_error`. Both surface in `GET /entrypoints` and the dashboard like any other failure reason.
+The probe sends `GET http://<backend-host>:<port><path>`, `<port>` being `healthCheck.port` or the backend's, and does **not** follow redirects (a `3xx` is judged as-is). A backend that fails the status check is marked unhealthy with kind `bad_status`; a transport failure is `http_error`. Both surface in `GET /entrypoints` and the dashboard like any other failure reason.
 
-Without `healthCheck.path`, the backend keeps the plain TCP probe — fully backward compatible.
+Without `healthCheck.path`, the backend keeps the plain TCP probe — fully backward compatible. `healthCheck.status` and `healthCheck.headers.*` need a path: without one they emit `W021` and are ignored.
 
 ## What it does not do
 
-- **No per-service interval.** The probe interval (10s) is global and hardcoded; only the per-check HTTP `timeout` is configurable so far.
-- **No threshold logic.** A single failed probe marks the backend unhealthy. There is no "fail N times" debouncing.
-- **No gRPC / custom method / custom headers** on the HTTP probe yet — it is a plain `GET`.
+- **No status ranges.** `healthCheck.status` accepts one exact code; without it, any `2xx`/`3xx` is healthy.
+- **No gRPC / custom method / HTTPS** on the HTTP probe yet — it is a plain-HTTP `GET`.
 
 ## Combined with Docker
 

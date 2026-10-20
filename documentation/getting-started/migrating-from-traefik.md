@@ -90,6 +90,10 @@ A rule that mixes `||` across different matcher types has no single-route equiva
 | `services.<s>.loadbalancer.sticky.cookie=true` | `stickySession=true` |
 | `services.<s>.loadbalancer.healthcheck.path` | `healthCheck.path`. A backend that fails it leaves the rotation, unless every backend of the route does. See [Health checks](/documentation/advanced/health-checks). |
 | `services.<s>.loadbalancer.healthcheck.timeout=2s` | `healthCheck.timeout=2000` (milliseconds) |
+| `services.<s>.loadbalancer.healthcheck.interval=5s` | `healthCheck.interval=5000` (milliseconds) |
+| `services.<s>.loadbalancer.healthcheck.port` | `healthCheck.port` |
+| `services.<s>.loadbalancer.healthcheck.headers.<Name>` | `healthCheck.headers.<Name>` |
+| `services.<s>.loadbalancer.healthcheck.unhealthyInterval`, `followRedirects`, `scheme`, `hostname`, `method` | No equivalent. Thresholds instead: `healthCheck.unhealthyThreshold` / `healthyThreshold`. |
 | `serverstransport.forwardingtimeouts.responseheadertimeout=2s` | `backendTimeout=2000` (milliseconds). It caps the whole response, not only the wait for its headers: leave room for a long or streamed body. |
 
 Containers that declare the same `<svc>` name with the same hosts and paths are merged as backends of one route, like replicas of a Traefik service. If their hosts or paths differ, the later container gets a route of its own instead.
