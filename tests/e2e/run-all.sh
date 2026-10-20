@@ -303,6 +303,9 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcredirect.host=$HOST_REDIRECT"
       - "sozune.http.svcredirect.httpsRedirect=true"
+      # Same container, a second route that closes every connection.
+      - "sozune.http.svcclose.host=$HOST_CLOSE"
+      - "sozune.http.svcclose.redirect=close"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-ratelimit:

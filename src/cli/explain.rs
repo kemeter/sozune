@@ -155,7 +155,7 @@ const ENTRIES: &[Entry] = &[
         title: "Invalid redirect policy",
         cause: "The redirect policy value is not one of the accepted options.",
         effect: "The redirect rule is dropped.",
-        fix: "Use one of: `forward`, `permanent`, `unauthorized`.",
+        fix: "Use one of: `forward`, `permanent`, `unauthorized`, `close`.",
         example: Some("sozune.http.web.redirect=permanent"),
     },
     Entry {
@@ -365,7 +365,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         code: "W031",
         title: "Invalid redirect host",
-        cause: "A `redirectHost` label is not a plain hostname (it carries a scheme, a port, a path or a wildcard), or the route's `redirect` is `forward` or `unauthorized`.",
+        cause: "A `redirectHost` label is not a plain hostname (it carries a scheme, a port, a path or a wildcard), or the route's `redirect` is `forward`, `unauthorized` or `close`.",
         effect: "The label is ignored: the route does not redirect to that host.",
         fix: "Write the bare host, e.g. `www.example.com`, and leave `redirect` unset or set it to `permanent`.",
         example: Some(

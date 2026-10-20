@@ -13,6 +13,7 @@ pub fn parse_redirect_policy(
         "forward" => Some(RedirectPolicy::Forward),
         "permanent" => Some(RedirectPolicy::Permanent),
         "unauthorized" => Some(RedirectPolicy::Unauthorized),
+        "close" => Some(RedirectPolicy::Close),
         _ => {
             diagnostics.push(
                 Diagnostic::new(
@@ -21,7 +22,7 @@ pub fn parse_redirect_policy(
                 )
                 .with_label(&key)
                 .with_value(raw)
-                .with_hint("expected one of: forward | permanent | unauthorized"),
+                .with_hint("expected one of: forward | permanent | unauthorized | close"),
             );
             None
         }
@@ -173,6 +174,20 @@ mod tests {
                 &mut diags,
             ),
             Some(RedirectPolicy::Permanent),
+        );
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn redirect_policy_parses_close() {
+        let mut diags = Vec::new();
+        assert_eq!(
+            parse_redirect_policy(
+                &labels(&[("sozune.http.web.redirect", "close")]),
+                "sozune.http.web.",
+                &mut diags,
+            ),
+            Some(RedirectPolicy::Close),
         );
         assert!(diags.is_empty());
     }

@@ -254,7 +254,7 @@ pub async fn resolve(
 
     if let Some(answer) = frontend_answer(&decision, entrypoint, &target, request) {
         resolution.outcome = answer.0;
-        resolution.status = Some(answer.1);
+        resolution.status = answer.1;
         resolution.summary = answer.2;
         return Ok(resolution);
     }
@@ -592,11 +592,11 @@ fn frontend_answer(
     entrypoint: &Entrypoint,
     target: &Target,
     request: &ResolveRequest,
-) -> Option<(Outcome, u16, String)> {
+) -> Option<(Outcome, Option<u16>, String)> {
     let redirect = |status: u16| {
         Some((
             Outcome::Redirected,
-            status,
+            Some(status),
             format!("redirected ({status}) by route `{}`", entrypoint.name),
         ))
     };
@@ -607,14 +607,15 @@ fn frontend_answer(
         RedirectPolicy::Unauthorized => {
             return Some((
                 Outcome::Rejected,
-                401,
+                Some(401),
                 format!("route `{}` answers 401 to every request", entrypoint.name),
             ));
         }
         RedirectPolicy::SilentClose => {
+            // No status: the connection is closed before any answer.
             return Some((
                 Outcome::Rejected,
-                444,
+                None,
                 format!(
                     "route `{}` closes the connection without answering",
                     entrypoint.name
@@ -626,7 +627,7 @@ fn frontend_answer(
     if entrypoint.config.https_redirect && target.listener == FrontListener::Http {
         return Some((
             Outcome::Redirected,
-            301,
+            Some(301),
             format!("redirected to HTTPS by route `{}`", entrypoint.name),
         ));
     }
@@ -637,7 +638,7 @@ fn frontend_answer(
     if decision.required_auth && !has_credentials {
         return Some((
             Outcome::Rejected,
-            401,
+            Some(401),
             format!(
                 "route `{}` requires basic auth credentials (add an Authorization header; \
                  they are not checked here)",
@@ -1081,6 +1082,24 @@ mod tests {
 
         assert_eq!(resolution.outcome, Outcome::Redirected);
         assert_eq!(resolution.status, Some(301));
+    }
+
+    /// A closed connection has no status: the answer says so instead.
+    #[tokio::test]
+    async fn a_close_route_answers_without_a_status() {
+        let resolution = resolve_in(
+            vec![route(
+                "bots",
+                &["app.example.com"],
+                serde_json::json!({ "redirect": "close" }),
+            )],
+            get("http://app.example.com/"),
+        )
+        .await;
+
+        assert_eq!(resolution.outcome, Outcome::Rejected);
+        assert_eq!(resolution.status, None);
+        assert!(resolution.summary.contains("closes the connection"));
     }
 
     /// Sōzu routes on header conditions itself: a request without the header

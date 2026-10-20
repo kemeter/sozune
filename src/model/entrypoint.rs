@@ -28,13 +28,12 @@ impl Entrypoint {
         }
     }
 
-    /// Whether the route answers every request itself (a permanent redirect
-    /// or a 401) and so needs no backend.
+    /// Whether the route answers every request itself (a permanent redirect,
+    /// a 401, or a closed connection) and so needs no backend.
     pub fn answers_without_backend(&self) -> bool {
-        matches!(
-            self.config.redirect,
-            Some(RedirectPolicy::Permanent | RedirectPolicy::Unauthorized)
-        )
+        self.config
+            .redirect
+            .is_some_and(RedirectPolicy::answers_without_backend)
     }
 }
 
@@ -334,6 +333,16 @@ pub enum RedirectPolicy {
     Forward,
     Permanent,
     Unauthorized,
+    /// Close the connection without answering, like nginx's 444.
+    Close,
+}
+
+impl RedirectPolicy {
+    /// Whether a route with this policy answers every request itself, and so
+    /// needs no backend.
+    pub fn answers_without_backend(self) -> bool {
+        matches!(self, Self::Permanent | Self::Unauthorized | Self::Close)
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
