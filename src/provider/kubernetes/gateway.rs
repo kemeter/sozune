@@ -37,7 +37,9 @@ use gateway_api::apis::experimental::tcproutes::{TCPRoute, TCPRouteParentRefs, T
 use gateway_api::apis::experimental::tlsroutes::{TLSRoute, TLSRouteParentRefs, TLSRouteRules};
 use gateway_api::apis::experimental::udproutes::{UDPRoute, UDPRouteParentRefs, UDPRouteRules};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
+use gateway_api::apis::standard::gateways::{
+    Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
+};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
     HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
@@ -123,6 +125,42 @@ pub struct ListenerInfo {
     /// `Passthrough`: under `Terminate` the Gateway would decrypt, which is a
     /// different feature (and one Sōzune serves through HTTPS entrypoints).
     pub tls_mode: Option<GatewayListenersTlsMode>,
+    /// `allowedRoutes.namespaces.from`: which namespaces' routes may attach.
+    pub allowed_namespaces: AllowedNamespaces,
+    /// `allowedRoutes.kinds`, as route kinds of the Gateway API group. `None`
+    /// when unset or empty: the protocol decides, which the per-kind listener
+    /// predicates already do.
+    pub allowed_kinds: Option<Vec<String>>,
+}
+
+/// `allowedRoutes.namespaces.from` of a Gateway listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllowedNamespaces {
+    /// Only routes in the Gateway's own namespace (the API default).
+    Same,
+    /// Routes in any namespace.
+    All,
+    /// Routes in namespaces matching a label selector. Namespace labels are
+    /// not watched, so no route is admitted: failing closed keeps a listener
+    /// from serving namespaces it did not mean to.
+    Selector,
+}
+
+impl ListenerInfo {
+    /// True iff this listener's `allowedRoutes` lets a `kind` route from
+    /// `route_ns` attach to it, on a Gateway in `gateway_ns`.
+    pub(crate) fn admits(&self, gateway_ns: &str, route_ns: &str, kind: &str) -> bool {
+        let namespace_ok = match self.allowed_namespaces {
+            AllowedNamespaces::Same => route_ns == gateway_ns,
+            AllowedNamespaces::All => true,
+            AllowedNamespaces::Selector => false,
+        };
+        let kind_ok = self
+            .allowed_kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.iter().any(|k| k == kind));
+        namespace_ok && kind_ok
+    }
 }
 
 /// The parts of a `parentRef` scope resolution actually reads. HTTPRoute and
@@ -188,6 +226,39 @@ pub struct ScopeState {
     /// `HTTPRoute` from `from_namespace` to reach a `Service`. Same-namespace
     /// refs never need a grant and are not stored here.
     reference_grants: HashSet<(String, String)>,
+    /// The last Gateway object seen for each accepted Gateway, so its status
+    /// can be rewritten when the routes attached to it change.
+    gateway_objects: HashMap<(String, String), Gateway>,
+    /// The listeners each route attaches to, keyed by route kind and uid:
+    /// what `attachedRoutes` counts on a listener's status.
+    attachments: HashMap<(&'static str, String), Vec<ListenerKey>>,
+    /// The ports Sōzune listens on, from `config.yaml`.
+    served: ServedPorts,
+    /// Where Gateway status rewrites go when attachments change.
+    status_tx: Option<mpsc::Sender<StatusWrite>>,
+}
+
+/// A Gateway listener: `(namespace, gateway name, listener name)`.
+type ListenerKey = (String, String, String);
+
+/// The ports Sōzune listens on, from `config.yaml`. Sōzune binds them at
+/// startup and opens none from a Gateway, so a Gateway listener is only
+/// served when its port is one of these.
+#[derive(Clone, Debug, Default)]
+pub struct ServedPorts {
+    pub http: u16,
+    pub tcp: HashSet<u16>,
+    pub udp: HashSet<u16>,
+}
+
+impl ServedPorts {
+    pub fn from_config(proxy: &crate::config::ProxyConfig) -> Self {
+        Self {
+            http: proxy.http.listen_address,
+            tcp: proxy.tcp.iter().map(|l| l.listen).collect(),
+            udp: proxy.udp.iter().map(|l| l.listen).collect(),
+        }
+    }
 }
 
 /// Thread-safe handle to the [`ScopeState`] paired with a notifier the
@@ -211,6 +282,167 @@ impl GatewayScope {
         Self::default()
     }
 
+    /// Record the ports Sōzune listens on and where Gateway status rewrites
+    /// go. Called once, before the watchers start.
+    pub fn configure_status(&self, served: ServedPorts, status_tx: mpsc::Sender<StatusWrite>) {
+        match self.state.write() {
+            Ok(mut g) => {
+                g.served = served;
+                g.status_tx = Some(status_tx);
+            }
+            Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
+        }
+    }
+
+    /// Record the listeners a route attaches to: those of a Gateway sōzune
+    /// owns that one of its `parentRefs` selects and that carry its kind
+    /// (`listener_ok`). Per the Gateway API spec, attachment depends on the
+    /// `parentRefs` alone, not on whether the route itself is accepted. A
+    /// Gateway whose count changes gets its status rewritten.
+    pub fn record_attachments<P: ParentRef>(
+        &self,
+        kind: &'static str,
+        uid: &str,
+        route_namespace: &str,
+        route_hostnames: &[String],
+        parent_refs: &[P],
+        listener_ok: fn(&ListenerInfo) -> bool,
+    ) {
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        let mut attached: Vec<ListenerKey> = Vec::new();
+        for parent_ref in parent_refs {
+            if parent_ref.kind().unwrap_or("Gateway") != "Gateway" {
+                continue;
+            }
+            let group = parent_ref.group().unwrap_or(GATEWAY_API_GROUP);
+            if !group.is_empty() && group != GATEWAY_API_GROUP {
+                continue;
+            }
+            let ns = parent_ref
+                .namespace()
+                .unwrap_or(route_namespace)
+                .to_string();
+            let name = parent_ref.name().to_string();
+            let Some(listeners) = g.gateways.get(&(ns.clone(), name.clone())) else {
+                continue;
+            };
+            for listener in listeners
+                .iter()
+                .filter(|l| listener_ok(l) && l.admits(&ns, route_namespace, kind))
+                // A listener whose hostname admits none of the route's
+                // serves none of it.
+                .filter(|l| {
+                    intersect_hostnames(route_hostnames, std::slice::from_ref(*l)).is_some()
+                })
+            {
+                let name_ok = parent_ref.section_name().is_none_or(|s| s == listener.name);
+                let port_ok = parent_ref.port().is_none_or(|p| p == listener.port);
+                let key = (ns.clone(), name.clone(), listener.name.clone());
+                if name_ok && port_ok && !attached.contains(&key) {
+                    attached.push(key);
+                }
+            }
+        }
+        Self::store_attachments(&mut g, (kind, uid.to_string()), attached);
+    }
+
+    /// Forget the listeners a deleted route was attached to.
+    pub fn forget_attachments(&self, kind: &'static str, uid: &str) {
+        match self.state.write() {
+            Ok(mut g) => Self::store_attachments(&mut g, (kind, uid.to_string()), Vec::new()),
+            Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
+        }
+    }
+
+    /// Forget the attachments of the routes of `kind` that are not in
+    /// `uids`, after a relist that did not return them.
+    pub fn retain_attachments(&self, kind: &'static str, uids: &HashSet<String>) {
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        let stale: Vec<String> = g
+            .attachments
+            .keys()
+            .filter(|(k, uid)| *k == kind && !uids.contains(uid))
+            .map(|(_, uid)| uid.clone())
+            .collect();
+        for uid in stale {
+            Self::store_attachments(&mut g, (kind, uid), Vec::new());
+        }
+    }
+
+    fn store_attachments(
+        g: &mut ScopeState,
+        route: (&'static str, String),
+        attached: Vec<ListenerKey>,
+    ) {
+        let previous = if attached.is_empty() {
+            g.attachments.remove(&route).unwrap_or_default()
+        } else {
+            g.attachments
+                .insert(route, attached.clone())
+                .unwrap_or_default()
+        };
+        if previous == attached {
+            return;
+        }
+        let gateways: HashSet<(String, String)> = previous
+            .iter()
+            .chain(attached.iter())
+            .map(|(ns, name, _)| (ns.clone(), name.clone()))
+            .collect();
+        for key in gateways {
+            if g.gateways.contains_key(&key)
+                && let Some(gateway) = g.gateway_objects.get(&key)
+            {
+                queue_status_write(
+                    g.status_tx.as_ref(),
+                    StatusWrite::Gateway(Box::new(gateway.clone())),
+                );
+            }
+        }
+    }
+
+    /// The `status.listeners[]` sōzune reports on an accepted Gateway: per
+    /// listener, the route kinds it carries, how many routes attach to it,
+    /// and whether Sōzune serves its port.
+    pub fn listener_statuses(
+        &self,
+        gateway: &Gateway,
+    ) -> Vec<gateway_api::apis::standard::gateways::GatewayStatusListeners> {
+        let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+        let name = gateway.metadata.name.as_deref().unwrap_or_default();
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return Vec::new();
+            }
+        };
+        listeners_of(gateway)
+            .iter()
+            .map(|listener| {
+                let key = (ns.to_string(), name.to_string(), listener.name.clone());
+                let attached = g
+                    .attachments
+                    .values()
+                    .filter(|keys| keys.contains(&key))
+                    .count();
+                build_listener_status(gateway, listener, &g.served, attached)
+            })
+            .collect()
+    }
+
     /// Subscribe to scope changes. The returned future resolves every
     /// time a watcher mutates the accepted set.
     pub async fn changed(&self) {
@@ -230,13 +462,59 @@ impl GatewayScope {
     /// spec, an unset `sectionName`/`port` binds to the whole Gateway (any
     /// listener), which is the existing behaviour.
     fn accepts_parent_ref<P: ParentRef>(&self, route_namespace: &str, parent_ref: &P) -> bool {
-        // No predicate: an HTTPRoute is served on the configured HTTP listener
-        // whatever the Gateway declares — including when it declares nothing.
+        // An HTTPRoute is served on the configured HTTP listener whatever port
+        // the Gateway declares, but only through an HTTP listener
+        // whose `allowedRoutes` admits it: another protocol's listener would
+        // let it past the restrictions of the HTTP ones.
         self.accepts_parent_ref_where(
             route_namespace,
             parent_ref,
-            None::<fn(&ListenerInfo) -> bool>,
+            "HTTPRoute",
+            Some(Self::listener_serves_http),
         )
+    }
+
+    /// Why a Gateway we own refuses `parent_ref`, for the route's status:
+    /// `NoMatchingParent` when its `sectionName`/`port` selects no listener,
+    /// `NotAllowedByListeners` when the listeners it selects carry no
+    /// `route_kind` (per `listener_ok`) or none admits the route's namespace.
+    /// `None` when the parent is not ours, or accepts the route.
+    fn parent_refusal<P: ParentRef>(
+        &self,
+        route_namespace: &str,
+        parent_ref: &P,
+        route_kind: &str,
+        listener_ok: fn(&ListenerInfo) -> bool,
+    ) -> Option<&'static str> {
+        if parent_ref.kind().unwrap_or("Gateway") != "Gateway" {
+            return None;
+        }
+        let group = parent_ref.group().unwrap_or(GATEWAY_API_GROUP);
+        if !group.is_empty() && group != GATEWAY_API_GROUP {
+            return None;
+        }
+        let ns = parent_ref.namespace().unwrap_or(route_namespace);
+        let key = (ns.to_string(), parent_ref.name().to_string());
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return None;
+            }
+        };
+        let listeners = g.gateways.get(&key)?;
+        let admitted: Vec<ListenerInfo> = listeners
+            .iter()
+            .filter(|l| listener_ok(l) && l.admits(ns, route_namespace, route_kind))
+            .cloned()
+            .collect();
+        if !admitted.is_empty() && parent_ref_selects_listener(parent_ref, &admitted) {
+            None
+        } else if listeners.is_empty() || !parent_ref_selects_listener(parent_ref, listeners) {
+            Some(REASON_NO_MATCHING_PARENT)
+        } else {
+            Some(REASON_NOT_ALLOWED_BY_LISTENERS)
+        }
     }
 
     /// `accepts_parent_ref`, optionally narrowed to listeners satisfying
@@ -252,10 +530,10 @@ impl GatewayScope {
         &self,
         route_namespace: &str,
         parent_ref: &P,
+        route_kind: &str,
         listener_ok: Option<impl Fn(&ListenerInfo) -> bool>,
     ) -> bool {
-        let kind = parent_ref.kind().unwrap_or("Gateway");
-        if kind != "Gateway" {
+        if parent_ref.kind().unwrap_or("Gateway") != "Gateway" {
             return false;
         }
         let group = parent_ref.group().unwrap_or(GATEWAY_API_GROUP);
@@ -268,14 +546,15 @@ impl GatewayScope {
         let key = (ns.to_string(), parent_ref.name().to_string());
         match self.state.read() {
             Ok(g) => match g.gateways.get(&key) {
-                Some(listeners) => match &listener_ok {
-                    None => parent_ref_selects_listener(parent_ref, listeners),
-                    Some(pred) => {
-                        let eligible: Vec<ListenerInfo> =
-                            listeners.iter().filter(|l| pred(l)).cloned().collect();
-                        !eligible.is_empty() && parent_ref_selects_listener(parent_ref, &eligible)
-                    }
-                },
+                Some(listeners) => {
+                    let eligible: Vec<ListenerInfo> = listeners
+                        .iter()
+                        .filter(|l| l.admits(ns, route_namespace, route_kind))
+                        .filter(|l| listener_ok.as_ref().is_none_or(|pred| pred(l)))
+                        .cloned()
+                        .collect();
+                    !eligible.is_empty() && parent_ref_selects_listener(parent_ref, &eligible)
+                }
                 None => false,
             },
             Err(e) => {
@@ -283,6 +562,13 @@ impl GatewayScope {
                 false
             }
         }
+    }
+
+    /// True iff this listener can carry an HTTPRoute: protocol `HTTP`. Routes
+    /// of a Gateway are installed without TLS, so an `HTTPS` listener would
+    /// hand them to plain HTTP.
+    pub(crate) fn listener_serves_http(l: &ListenerInfo) -> bool {
+        l.protocol.eq_ignore_ascii_case("HTTP")
     }
 
     /// True iff this listener can carry a TLSRoute: protocol `TLS` with
@@ -303,6 +589,7 @@ impl GatewayScope {
         self.accepts_parent_ref_where(
             route_namespace,
             parent_ref,
+            "TLSRoute",
             Some(Self::listener_serves_tls_passthrough),
         )
     }
@@ -331,7 +618,12 @@ impl GatewayScope {
         route_namespace: &str,
         parent_ref: &TCPRouteParentRefs,
     ) -> bool {
-        self.accepts_parent_ref_where(route_namespace, parent_ref, Some(Self::listener_serves_tcp))
+        self.accepts_parent_ref_where(
+            route_namespace,
+            parent_ref,
+            "TCPRoute",
+            Some(Self::listener_serves_tcp),
+        )
     }
 
     /// True iff at least one `parentRef` binds this TCPRoute to a listener we
@@ -361,7 +653,7 @@ impl GatewayScope {
             .filter(|p| self.accepts_tcp_parent_ref(route_ns, p))
         {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
-            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+            let Some(listeners) = self.gateway_listeners(ns, &p.name, route_ns, "TCPRoute") else {
                 continue;
             };
             for listener in listeners.into_iter().filter(Self::listener_serves_tcp) {
@@ -388,7 +680,12 @@ impl GatewayScope {
         route_namespace: &str,
         parent_ref: &UDPRouteParentRefs,
     ) -> bool {
-        self.accepts_parent_ref_where(route_namespace, parent_ref, Some(Self::listener_serves_udp))
+        self.accepts_parent_ref_where(
+            route_namespace,
+            parent_ref,
+            "UDPRoute",
+            Some(Self::listener_serves_udp),
+        )
     }
 
     /// True iff at least one `parentRef` binds this UDPRoute to a listener we
@@ -416,7 +713,7 @@ impl GatewayScope {
             .filter(|p| self.accepts_udp_parent_ref(route_ns, p))
         {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
-            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+            let Some(listeners) = self.gateway_listeners(ns, &p.name, route_ns, "UDPRoute") else {
                 continue;
             };
             for listener in listeners.into_iter().filter(Self::listener_serves_udp) {
@@ -456,7 +753,7 @@ impl GatewayScope {
             .filter(|p| self.accepts_tls_parent_ref(route_ns, p))
         {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
-            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+            let Some(listeners) = self.gateway_listeners(ns, &p.name, route_ns, "TLSRoute") else {
                 continue;
             };
             for listener in listeners
@@ -495,9 +792,24 @@ impl GatewayScope {
     /// Returns the listeners of an accepted Gateway named by `(ns, name)`,
     /// or `None` if sōzune doesn't own it. Used to intersect a listener's
     /// `hostname` with a route's hostnames.
-    fn gateway_listeners(&self, ns: &str, name: &str) -> Option<Vec<ListenerInfo>> {
+    fn gateway_listeners(
+        &self,
+        ns: &str,
+        name: &str,
+        route_ns: &str,
+        kind: &str,
+    ) -> Option<Vec<ListenerInfo>> {
         match self.state.read() {
-            Ok(g) => g.gateways.get(&(ns.to_string(), name.to_string())).cloned(),
+            Ok(g) => g
+                .gateways
+                .get(&(ns.to_string(), name.to_string()))
+                .map(|listeners| {
+                    listeners
+                        .iter()
+                        .filter(|l| l.admits(ns, route_ns, kind))
+                        .cloned()
+                        .collect()
+                }),
             Err(e) => {
                 error!("Gateway API: scope lock poisoned: {}", e);
                 None
@@ -531,9 +843,11 @@ impl GatewayScope {
             .filter(|p| self.accepts_parent_ref(route_ns, *p))
         {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
-            let Some(listeners) = self.gateway_listeners(ns, &p.name) else {
+            let Some(mut listeners) = self.gateway_listeners(ns, &p.name, route_ns, "HTTPRoute")
+            else {
                 continue;
             };
+            listeners.retain(Self::listener_serves_http);
             // Restrict to the listener(s) this parentRef selects, so a
             // sectionName/port ref only inherits its own listener's hostname.
             let selected: Vec<ListenerInfo> = if p.section_name.is_none() && p.port.is_none() {
@@ -677,6 +991,11 @@ impl GatewayScope {
         };
         let key = (ns, name.to_string());
         let accepted = g.gateway_classes.contains(class);
+        if accepted {
+            g.gateway_objects.insert(key.clone(), gateway.clone());
+        } else {
+            g.gateway_objects.remove(&key);
+        }
         let changed = match (accepted, g.gateways.get(&key)) {
             (true, None) => {
                 g.gateways.insert(key, listeners);
@@ -719,10 +1038,9 @@ impl GatewayScope {
                 return false;
             }
         };
-        let removed = g
-            .gateways
-            .remove(&(namespace.to_string(), name.to_string()))
-            .is_some();
+        let key = (namespace.to_string(), name.to_string());
+        g.gateway_objects.remove(&key);
+        let removed = g.gateways.remove(&key).is_some();
         drop(g);
         self.fire_if(removed)
     }
@@ -903,6 +1221,35 @@ fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
             hostname: l.hostname.clone(),
             protocol: l.protocol.clone(),
             tls_mode: l.tls.as_ref().and_then(|t| t.mode.clone()),
+            allowed_namespaces: match l
+                .allowed_routes
+                .as_ref()
+                .and_then(|a| a.namespaces.as_ref())
+                .and_then(|n| n.from.as_ref())
+            {
+                None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => {
+                    AllowedNamespaces::Same
+                }
+                Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => AllowedNamespaces::All,
+                Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
+                    AllowedNamespaces::Selector
+                }
+            },
+            allowed_kinds: l
+                .allowed_routes
+                .as_ref()
+                .and_then(|a| a.kinds.as_ref())
+                .filter(|kinds| !kinds.is_empty())
+                .map(|kinds| {
+                    // A kind of another group is no route Sōzune serves:
+                    // dropping it can leave the list empty, which admits
+                    // nothing rather than falling back to the protocol.
+                    kinds
+                        .iter()
+                        .filter(|k| k.group.as_deref().is_none_or(|g| g == GATEWAY_API_GROUP))
+                        .map(|k| k.kind.clone())
+                        .collect()
+                }),
         })
         .collect()
 }
@@ -1015,25 +1362,45 @@ pub async fn run_httproute_watcher(
     resolve_ticker.tick().await;
 
     info!("Gateway API: HTTPRoute watcher started");
+    // The routes the current relist returned; the others were deleted while
+    // the watcher was away.
+    let mut relisted: Option<HashSet<String>> = None;
 
     loop {
         let changed = tokio::select! {
             event = stream.next() => match event {
                 Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    if let (Some(uids), Some(uid)) = (relisted.as_mut(), route.metadata.uid.as_deref()) {
+                        uids.insert(uid.to_string());
+                    }
                     log_route("apply", &route);
                     apply_route(&route, &storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_route("delete", &route);
+                    if let Some(uid) = route.metadata.uid.as_deref() {
+                        scope.forget_attachments("HTTPRoute", uid);
+                    }
                     delete_route(&route, &storage, &index)
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: HTTPRoute init");
+                    relisted = Some(HashSet::new());
                     false
                 }
                 Some(Ok(Event::InitDone)) => {
                     debug!("Gateway API: HTTPRoute init done");
-                    false
+                    match relisted.take() {
+                        Some(uids) => drop_routes_not_relisted(
+                            "HTTPRoute",
+                            &uids,
+                            &index,
+                            |t: &TrackedRoute| t.entrypoint_ids.as_slice(),
+                            &storage,
+                            &scope,
+                        ),
+                        None => false,
+                    }
                 }
                 Some(Err(e)) => {
                     error!("Gateway API: HTTPRoute watcher error: {}", e);
@@ -1357,6 +1724,245 @@ fn build_gateway_conditions(gateway: &Gateway, accepted: bool) -> Vec<Condition>
     ]
 }
 
+const REASON_PORT_UNAVAILABLE: &str = "PortUnavailable";
+const REASON_UNSUPPORTED_PROTOCOL: &str = "UnsupportedProtocol";
+const REASON_INVALID: &str = "Invalid";
+const REASON_INVALID_ROUTE_KINDS: &str = "InvalidRouteKinds";
+
+/// The status of one Gateway listener, as Sōzune routes it. An HTTP listener
+/// is served whatever its port: its routes go through Sōzune's HTTP port, and
+/// the message says which. An HTTPS one is not served: a Gateway's routes are
+/// installed without TLS. A TLS, TCP or UDP listener is
+/// served only on a port a `proxy.tcp` / `proxy.udp` entry listens on, as its
+/// routes are: any other port is reported `Accepted=False`
+/// (`PortUnavailable`) and `Programmed=False`, with the entry to declare.
+fn build_listener_status(
+    gateway: &Gateway,
+    listener: &ListenerInfo,
+    served: &ServedPorts,
+    attached_routes: usize,
+) -> gateway_api::apis::standard::gateways::GatewayStatusListeners {
+    use gateway_api::apis::standard::gateways::{
+        GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+    };
+    let port = u16::try_from(listener.port).ok();
+    let protocol = listener.protocol.to_ascii_uppercase();
+    let (kind, problem) = match protocol.as_str() {
+        // HTTP routing does not depend on the listener's port: every HTTP
+        // route is served on Sōzune's HTTP port, which a Service commonly
+        // maps the listener's port to. So an HTTP listener is served on any
+        // port, and its status says where.
+        "HTTP" => (Some("HTTPRoute"), None),
+        // A TLS listener carries TLSRoutes in Passthrough mode only.
+        "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (None, None),
+        "TLS" | "TCP" => (
+            Some(if protocol == "TLS" { "TLSRoute" } else { "TCPRoute" }),
+            (!port.is_some_and(|p| served.tcp.contains(&p))).then(|| {
+                format!(
+                    "no proxy.tcp listener on port {} in config.yaml: Sōzune opens no port from a Gateway, so routes attached here are not served",
+                    listener.port
+                )
+            }),
+        ),
+        "UDP" => (
+            Some("UDPRoute"),
+            (!port.is_some_and(|p| served.udp.contains(&p))).then(|| {
+                format!(
+                    "no proxy.udp listener on port {} in config.yaml: Sōzune opens no port from a Gateway, so routes attached here are not served",
+                    listener.port
+                )
+            }),
+        ),
+        _ => (None, None),
+    };
+
+    let now = Time(k8s_openapi::chrono::Utc::now());
+    let generation = gateway.metadata.generation;
+    let condition = |type_: &str, ok: bool, reason: &str, message: String| Condition {
+        type_: type_.to_string(),
+        status: if ok { "True" } else { "False" }.to_string(),
+        reason: reason.to_string(),
+        message,
+        last_transition_time: now.clone(),
+        observed_generation: generation,
+    };
+    let mut conditions = match (kind, problem) {
+        (None, _) => {
+            let message = if protocol == "TLS" {
+                "TLS listeners are served in Passthrough mode only".to_string()
+            } else if protocol == "HTTPS" {
+                "HTTPS listeners are not served yet: routes of a Gateway are served over HTTP only"
+                    .to_string()
+            } else {
+                format!(
+                    "protocol {} is not supported: use HTTP, TLS, TCP or UDP",
+                    listener.protocol
+                )
+            };
+            vec![
+                condition(
+                    CONDITION_TYPE_ACCEPTED,
+                    false,
+                    REASON_UNSUPPORTED_PROTOCOL,
+                    message.clone(),
+                ),
+                condition(CONDITION_TYPE_PROGRAMMED, false, REASON_INVALID, message),
+            ]
+        }
+        (Some(_), Some(message)) => vec![
+            condition(
+                CONDITION_TYPE_ACCEPTED,
+                false,
+                REASON_PORT_UNAVAILABLE,
+                message.clone(),
+            ),
+            condition(CONDITION_TYPE_PROGRAMMED, false, REASON_INVALID, message),
+        ],
+        (Some(_), None) => {
+            let served_on = match protocol.as_str() {
+                "HTTP" => served.http,
+                _ => port.unwrap_or_default(),
+            };
+            let programmed = if port == Some(served_on) {
+                format!("Sōzune serves port {served_on}")
+            } else {
+                format!(
+                    "Sōzune serves this listener's routes on its own port {served_on}; map port {} to it",
+                    listener.port
+                )
+            };
+            vec![
+                condition(
+                    CONDITION_TYPE_ACCEPTED,
+                    true,
+                    REASON_ACCEPTED,
+                    "Listener accepted by sōzune".to_string(),
+                ),
+                condition(
+                    CONDITION_TYPE_PROGRAMMED,
+                    true,
+                    REASON_PROGRAMMED,
+                    programmed,
+                ),
+            ]
+        }
+    };
+
+    // `allowedRoutes.kinds` can only narrow what the protocol carries. A kind
+    // it lists that the listener cannot carry is reported, and a listener
+    // left with no kind is not programmed: no route would attach.
+    let protocol_kind = kind;
+    let kind = protocol_kind.filter(|kind| {
+        listener
+            .allowed_kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.iter().any(|k| k == kind))
+    });
+    let kinds_problem = listener
+        .allowed_kinds
+        .as_ref()
+        .filter(|_| protocol_kind.is_some())
+        .and_then(|listed| {
+            let invalid: Vec<&str> = listed
+                .iter()
+                .map(String::as_str)
+                .filter(|k| Some(*k) != kind)
+                .collect();
+            if kind.is_some() && invalid.is_empty() {
+                None
+            } else if invalid.is_empty() {
+                Some(
+                    "allowedRoutes.kinds lists no route kind of the gateway.networking.k8s.io group"
+                        .to_string(),
+                )
+            } else {
+                Some(format!(
+                    "a {} listener cannot carry {}",
+                    protocol,
+                    invalid.join(", ")
+                ))
+            }
+        });
+    if kind.is_none()
+        && let Some(message) = &kinds_problem
+    {
+        for c in conditions
+            .iter_mut()
+            .filter(|c| c.type_ == CONDITION_TYPE_PROGRAMMED)
+        {
+            c.status = "False".to_string();
+            c.reason = REASON_INVALID.to_string();
+            c.message = message.clone();
+        }
+    }
+    // Always reported, so fixing the kinds clears a previous failure.
+    conditions.push(match kinds_problem {
+        Some(message) => condition(
+            CONDITION_TYPE_RESOLVED_REFS,
+            false,
+            REASON_INVALID_ROUTE_KINDS,
+            message,
+        ),
+        None => condition(
+            CONDITION_TYPE_RESOLVED_REFS,
+            true,
+            REASON_RESOLVED_REFS,
+            "Listener references resolved".to_string(),
+        ),
+    });
+
+    GatewayStatusListeners {
+        attached_routes: i32::try_from(attached_routes).unwrap_or(i32::MAX),
+        conditions,
+        name: listener.name.clone(),
+        supported_kinds: kind
+            .map(|kind| GatewayStatusListenersSupportedKinds {
+                group: Some(GATEWAY_API_GROUP.to_string()),
+                kind: kind.to_string(),
+            })
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// Merge freshly built listener statuses with the ones already on the
+/// Gateway: a listener whose conditions did not change keeps its previous
+/// `lastTransitionTime`. Returns the listeners to write and whether anything
+/// sōzune reports changed.
+fn merge_listener_statuses(
+    existing: Option<&[gateway_api::apis::standard::gateways::GatewayStatusListeners]>,
+    ours: Vec<gateway_api::apis::standard::gateways::GatewayStatusListeners>,
+) -> (
+    Vec<gateway_api::apis::standard::gateways::GatewayStatusListeners>,
+    bool,
+) {
+    let existing = existing.unwrap_or_default();
+    let mut changed = existing.len() != ours.len();
+    let merged = ours
+        .into_iter()
+        .map(|mut ours| {
+            match existing.iter().find(|e| e.name == ours.name) {
+                Some(prev) => {
+                    let (conditions, conditions_changed) =
+                        merge_conditions(Some(&prev.conditions), ours.conditions.clone());
+                    ours.conditions = conditions;
+                    changed |= conditions_changed
+                        || prev.attached_routes != ours.attached_routes
+                        || prev.supported_kinds.len() != ours.supported_kinds.len()
+                        || prev
+                            .supported_kinds
+                            .iter()
+                            .zip(&ours.supported_kinds)
+                            .any(|(a, b)| a.kind != b.kind || a.group != b.group);
+                }
+                None => changed = true,
+            }
+            ours
+        })
+        .collect();
+    (merged, changed)
+}
+
 /// Build the single `Accepted` condition sōzune owns on a GatewayClass's
 /// status. Only ever called for a class sōzune owns (controllerName
 /// matches), so the condition is always `Accepted=True`.
@@ -1390,7 +1996,20 @@ fn merge_conditions(
         .filter(|c| !our_types.contains(c.type_.as_str()))
         .cloned()
         .collect();
-    merged.extend(ours.iter().cloned());
+    // `lastTransitionTime` moves only when the status does: a new reason,
+    // message or generation is not a transition.
+    merged.extend(ours.iter().map(|our| {
+        match existing
+            .iter()
+            .find(|c| c.type_ == our.type_ && c.status == our.status)
+        {
+            Some(prev) => Condition {
+                last_transition_time: prev.last_transition_time.clone(),
+                ..our.clone()
+            },
+            None => our.clone(),
+        }
+    }));
 
     // Compare only the slice we own: a change to a foreign condition is not
     // ours to react to. For each of our types, find the matching existing
@@ -1427,11 +2046,15 @@ pub enum StatusWrite {
 /// skipping the write when nothing sōzune cares about changed. Non-fatal:
 /// failures are logged at `warn` and dropped, mirroring [`run_status_writer`]
 /// — routing works without status, and the next event re-attempts the write.
-pub async fn run_gateway_status_writer(client: Client, mut rx: mpsc::Receiver<StatusWrite>) {
+pub async fn run_gateway_status_writer(
+    client: Client,
+    scope: GatewayScope,
+    mut rx: mpsc::Receiver<StatusWrite>,
+) {
     info!("Gateway API: Gateway/GatewayClass status writer started");
     while let Some(msg) = rx.recv().await {
         match msg {
-            StatusWrite::Gateway(gw) => patch_gateway_status(&client, &gw).await,
+            StatusWrite::Gateway(gw) => patch_gateway_status(&client, &scope, &gw).await,
             StatusWrite::GatewayClass(class) => patch_gatewayclass_status(&client, &class).await,
         }
     }
@@ -1449,10 +2072,11 @@ fn queue_status_write(tx: Option<&mpsc::Sender<StatusWrite>>, msg: StatusWrite) 
     }
 }
 
-/// Patch the `conditions[]` sōzune owns onto a Gateway's status. A Gateway
-/// reaches the writer only when sōzune owns its class, so the conditions are
-/// always `Accepted=True`/`Programmed=True`.
-async fn patch_gateway_status(client: &Client, gateway: &Gateway) {
+/// Patch the `conditions[]` and `listeners[]` sōzune owns onto a Gateway's
+/// status. A Gateway reaches the writer only when sōzune owns its class, so
+/// its own conditions are `Accepted=True`/`Programmed=True`; each listener
+/// says whether Sōzune serves its port.
+async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &Gateway) {
     let Some(name) = gateway.metadata.name.as_deref() else {
         return;
     };
@@ -1462,12 +2086,16 @@ async fn patch_gateway_status(client: &Client, gateway: &Gateway) {
         .status
         .as_ref()
         .and_then(|s| s.conditions.as_deref());
-    let (merged, changed) = merge_conditions(existing, ours);
-    if !changed {
+    let (merged, conditions_changed) = merge_conditions(existing, ours);
+    let (listeners, listeners_changed) = merge_listener_statuses(
+        gateway.status.as_ref().and_then(|s| s.listeners.as_deref()),
+        scope.listener_statuses(gateway),
+    );
+    if !conditions_changed && !listeners_changed {
         return;
     }
     let patch = serde_json::json!({
-        "status": { "conditions": merged }
+        "status": { "conditions": merged, "listeners": listeners }
     });
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let pp = PatchParams::default();
@@ -1531,6 +2159,16 @@ fn apply_route(
             return false;
         }
     };
+    // Attachment depends on the parentRefs alone, whether or not the route
+    // is accepted: it is what a listener's `attachedRoutes` counts.
+    scope.record_attachments(
+        "HTTPRoute",
+        &uid,
+        route.metadata.namespace.as_deref().unwrap_or("default"),
+        route.spec.hostnames.as_deref().unwrap_or_default(),
+        route.spec.parent_refs.as_deref().unwrap_or_default(),
+        GatewayScope::listener_serves_http,
+    );
 
     // Out-of-scope routes are tracked but produce zero entrypoints, so
     // they activate the moment a matching Gateway appears (via
@@ -1635,6 +2273,70 @@ fn apply_route(
         },
     );
 
+    changed
+}
+
+/// Forget the routes of `kind` a watcher's relist did not return: deleted
+/// while the watcher was away, they get no `Delete` event, and would keep
+/// routing traffic and counting on their listeners. Returns whether storage
+/// changed.
+fn drop_routes_not_relisted<T>(
+    kind: &'static str,
+    relisted: &HashSet<String>,
+    index: &RwLock<HashMap<String, T>>,
+    entrypoint_ids: fn(&T) -> &[String],
+    storage: &RwLock<BTreeMap<String, Entrypoint>>,
+    scope: &GatewayScope,
+) -> bool {
+    // The entrypoint ids of the routes that stay: a route deleted and created
+    // again under the same name while the watcher was away has the same ids,
+    // and its new version is already installed.
+    let (gone, kept): (Vec<(String, T)>, HashSet<String>) = match index.write() {
+        Ok(mut index) => {
+            let uids: Vec<String> = index
+                .keys()
+                .filter(|uid| !relisted.contains(*uid))
+                .cloned()
+                .collect();
+            let gone = uids
+                .into_iter()
+                .filter_map(|uid| index.remove(&uid).map(|tracked| (uid, tracked)))
+                .collect();
+            let kept = index
+                .values()
+                .flat_map(|tracked| entrypoint_ids(tracked).iter().cloned())
+                .collect();
+            (gone, kept)
+        }
+        Err(e) => {
+            error!("Gateway API: index lock poisoned: {}", e);
+            return false;
+        }
+    };
+    scope.retain_attachments(kind, relisted);
+    if gone.is_empty() {
+        return false;
+    }
+    info!(
+        "Gateway API: {} {} route(s) deleted while the watcher was away, removing them",
+        gone.len(),
+        kind
+    );
+    let mut storage = match storage.write() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("Gateway API: storage lock poisoned: {}", e);
+            return false;
+        }
+    };
+    let mut changed = false;
+    for (_, tracked) in gone {
+        for id in entrypoint_ids(&tracked) {
+            if !kept.contains(id) {
+                changed |= storage.remove(id).is_some();
+            }
+        }
+    }
     changed
 }
 
@@ -1983,6 +2685,8 @@ const REASON_RESOLVED_REFS: &str = "ResolvedRefs";
 const REASON_PROGRAMMED: &str = "Programmed";
 const REASON_UNSUPPORTED_VALUE: &str = "UnsupportedValue";
 const REASON_BACKEND_NOT_FOUND: &str = "BackendNotFound";
+const REASON_NOT_ALLOWED_BY_LISTENERS: &str = "NotAllowedByListeners";
+const REASON_NO_MATCHING_PARENT: &str = "NoMatchingParent";
 
 /// What the watcher decided about a route, computed once and used both
 /// for log output and for the status conditions written back to the
@@ -2004,9 +2708,9 @@ pub enum RouteOutcome {
     /// on pods" from "my route is wrong".
     NoResolvableBackends,
     /// None of the route's parentRefs matched a sōzune-owned Gateway
-    /// (or the route declares no parentRefs at all). We don't write a
-    /// status entry in this case — Gateway API says implementations
-    /// only populate `parents[]` for parents they own.
+    /// (or the route declares no parentRefs at all). Gateway API says
+    /// implementations only populate `parents[]` for parents they own, so
+    /// the only entries written are refusals by a Gateway of ours.
     NotMine,
 }
 
@@ -2014,8 +2718,9 @@ pub enum RouteOutcome {
 /// route+outcome. Other controllers' entries must be preserved by the
 /// caller (see [`merge_route_status`]).
 ///
-/// One entry per parentRef that resolves to a Gateway sōzune accepts.
-/// `Accepted=True` iff [`RouteOutcome::Accepted`]. `ResolvedRefs=True`
+/// One entry per parentRef that resolves to a Gateway sōzune accepts, and
+/// one `Accepted=False` entry per parentRef such a Gateway refuses (see
+/// [`GatewayScope::parent_refusal`]). `Accepted=True` iff [`RouteOutcome::Accepted`]. `ResolvedRefs=True`
 /// only when the outcome is `Accepted` (filters and unresolved
 /// backends both flip it to False with distinct reasons).
 fn build_route_status(
@@ -2023,12 +2728,17 @@ fn build_route_status(
     scope: &GatewayScope,
     outcome: RouteOutcome,
 ) -> Vec<HTTPRouteStatusParents> {
-    if outcome == RouteOutcome::NotMine {
-        return Vec::new();
-    }
     let now = Time(k8s_openapi::chrono::Utc::now());
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let generation = route.metadata.generation;
+    let condition = |type_: &str, status: &str, reason: &str, message: String| Condition {
+        type_: type_.to_string(),
+        status: status.to_string(),
+        reason: reason.to_string(),
+        message,
+        last_transition_time: now.clone(),
+        observed_generation: generation,
+    };
 
     let (accepted_status, accepted_reason, accepted_msg) = match outcome {
         RouteOutcome::Accepted | RouteOutcome::NoResolvableBackends => (
@@ -2041,7 +2751,8 @@ fn build_route_status(
             REASON_UNSUPPORTED_VALUE,
             "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
         ),
-        RouteOutcome::NotMine => unreachable!("filtered out above"),
+        // No parentRef is accepted, so these are never used.
+        RouteOutcome::NotMine => ("False", "", String::new()),
     };
     let (refs_status, refs_reason, refs_msg) = match outcome {
         RouteOutcome::Accepted => (
@@ -2059,7 +2770,7 @@ fn build_route_status(
             REASON_BACKEND_NOT_FOUND,
             "No ready endpoints found for one or more backendRefs".to_string(),
         ),
-        RouteOutcome::NotMine => unreachable!("filtered out above"),
+        RouteOutcome::NotMine => ("False", "", String::new()),
     };
 
     route
@@ -2068,35 +2779,55 @@ fn build_route_status(
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .filter(|p| scope.accepts_parent_ref(route_ns, *p))
-        .map(|p| HTTPRouteStatusParents {
-            controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
-            parent_ref: HTTPRouteStatusParentsParentRef {
-                group: p.group.clone(),
-                kind: p.kind.clone(),
-                name: p.name.clone(),
-                namespace: p.namespace.clone(),
-                port: p.port,
-                section_name: p.section_name.clone(),
-            },
-            conditions: Some(vec![
-                Condition {
-                    type_: CONDITION_TYPE_ACCEPTED.to_string(),
-                    status: accepted_status.to_string(),
-                    reason: accepted_reason.to_string(),
-                    message: accepted_msg.clone(),
-                    last_transition_time: now.clone(),
-                    observed_generation: generation,
+        .filter_map(|p| {
+            let conditions = if scope.accepts_parent_ref(route_ns, p) {
+                vec![
+                    condition(
+                        CONDITION_TYPE_ACCEPTED,
+                        accepted_status,
+                        accepted_reason,
+                        accepted_msg.clone(),
+                    ),
+                    condition(
+                        CONDITION_TYPE_RESOLVED_REFS,
+                        refs_status,
+                        refs_reason,
+                        refs_msg.clone(),
+                    ),
+                ]
+            } else {
+                // Reported rather than skipped: silence would read as a
+                // Gateway that ignores the route. A parent that is not ours
+                // gets no entry.
+                let reason = scope.parent_refusal(
+                    route_ns,
+                    p,
+                    "HTTPRoute",
+                    GatewayScope::listener_serves_http,
+                )?;
+                let message = if reason == REASON_NO_MATCHING_PARENT {
+                    "No listener of this Gateway matches the parentRef's sectionName and port"
+                        .to_string()
+                } else {
+                    format!(
+                        "No HTTP listener selected by this parentRef allows HTTPRoutes from namespace {}",
+                        route_ns
+                    )
+                };
+                vec![condition(CONDITION_TYPE_ACCEPTED, "False", reason, message)]
+            };
+            Some(HTTPRouteStatusParents {
+                controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
+                parent_ref: HTTPRouteStatusParentsParentRef {
+                    group: p.group.clone(),
+                    kind: p.kind.clone(),
+                    name: p.name.clone(),
+                    namespace: p.namespace.clone(),
+                    port: p.port,
+                    section_name: p.section_name.clone(),
                 },
-                Condition {
-                    type_: CONDITION_TYPE_RESOLVED_REFS.to_string(),
-                    status: refs_status.to_string(),
-                    reason: refs_reason.to_string(),
-                    message: refs_msg.clone(),
-                    last_transition_time: now.clone(),
-                    observed_generation: generation,
-                },
-            ]),
+                conditions: Some(conditions),
+            })
         })
         .collect()
 }
@@ -2363,6 +3094,16 @@ fn apply_tls_route(
             return false;
         }
     };
+    // Attachment depends on the parentRefs alone, whether or not the route
+    // is accepted: it is what a listener's `attachedRoutes` counts.
+    scope.record_attachments(
+        "TLSRoute",
+        &uid,
+        route.metadata.namespace.as_deref().unwrap_or("default"),
+        route.spec.hostnames.as_deref().unwrap_or_default(),
+        route.spec.parent_refs.as_deref().unwrap_or_default(),
+        GatewayScope::listener_serves_tls_passthrough,
+    );
 
     // Out-of-scope routes stay tracked with zero entrypoints so they activate
     // as soon as a matching Gateway appears, and deactivate cleanly when one
@@ -2543,25 +3284,45 @@ pub async fn run_tlsroute_watcher(
     resolve_ticker.tick().await;
 
     info!("Gateway API: TLSRoute watcher started");
+    // The routes the current relist returned; the others were deleted while
+    // the watcher was away.
+    let mut relisted: Option<HashSet<String>> = None;
 
     loop {
         let changed = tokio::select! {
             event = stream.next() => match event {
                 Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    if let (Some(uids), Some(uid)) = (relisted.as_mut(), route.metadata.uid.as_deref()) {
+                        uids.insert(uid.to_string());
+                    }
                     log_tls_route("apply", &route);
                     apply_tls_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_tls_route("delete", &route);
+                    if let Some(uid) = route.metadata.uid.as_deref() {
+                        scope.forget_attachments("TLSRoute", uid);
+                    }
                     delete_tls_route(&route, &storage, &index)
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: TLSRoute init");
+                    relisted = Some(HashSet::new());
                     false
                 }
                 Some(Ok(Event::InitDone)) => {
                     debug!("Gateway API: TLSRoute init done");
-                    false
+                    match relisted.take() {
+                        Some(uids) => drop_routes_not_relisted(
+                            "TLSRoute",
+                            &uids,
+                            &index,
+                            |t: &TrackedTlsRoute| t.entrypoint_ids.as_slice(),
+                            &storage,
+                            &scope,
+                        ),
+                        None => false,
+                    }
                 }
                 Some(Err(e)) => {
                     error!("Gateway API: TLSRoute watcher error: {}", e);
@@ -2717,6 +3478,16 @@ fn apply_tcp_route(
             return false;
         }
     };
+    // Attachment depends on the parentRefs alone, whether or not the route
+    // is accepted: it is what a listener's `attachedRoutes` counts.
+    scope.record_attachments(
+        "TCPRoute",
+        &uid,
+        route.metadata.namespace.as_deref().unwrap_or("default"),
+        &[],
+        route.spec.parent_refs.as_deref().unwrap_or_default(),
+        GatewayScope::listener_serves_tcp,
+    );
 
     let new_entrypoints = if !scope.accepts_tcp_route(route) {
         Vec::new()
@@ -2867,25 +3638,45 @@ pub async fn run_tcproute_watcher(
     resolve_ticker.tick().await;
 
     info!("Gateway API: TCPRoute watcher started");
+    // The routes the current relist returned; the others were deleted while
+    // the watcher was away.
+    let mut relisted: Option<HashSet<String>> = None;
 
     loop {
         let changed = tokio::select! {
             event = stream.next() => match event {
                 Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    if let (Some(uids), Some(uid)) = (relisted.as_mut(), route.metadata.uid.as_deref()) {
+                        uids.insert(uid.to_string());
+                    }
                     log_tcp_route("apply", &route);
                     apply_tcp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_tcp_route("delete", &route);
+                    if let Some(uid) = route.metadata.uid.as_deref() {
+                        scope.forget_attachments("TCPRoute", uid);
+                    }
                     delete_tcp_route(&route, &storage, &index)
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: TCPRoute init");
+                    relisted = Some(HashSet::new());
                     false
                 }
                 Some(Ok(Event::InitDone)) => {
                     debug!("Gateway API: TCPRoute init done");
-                    false
+                    match relisted.take() {
+                        Some(uids) => drop_routes_not_relisted(
+                            "TCPRoute",
+                            &uids,
+                            &index,
+                            |t: &TrackedTcpRoute| t.entrypoint_ids.as_slice(),
+                            &storage,
+                            &scope,
+                        ),
+                        None => false,
+                    }
                 }
                 Some(Err(e)) => {
                     error!("Gateway API: TCPRoute watcher error: {}", e);
@@ -3033,6 +3824,16 @@ fn apply_udp_route(
             return false;
         }
     };
+    // Attachment depends on the parentRefs alone, whether or not the route
+    // is accepted: it is what a listener's `attachedRoutes` counts.
+    scope.record_attachments(
+        "UDPRoute",
+        &uid,
+        route.metadata.namespace.as_deref().unwrap_or("default"),
+        &[],
+        route.spec.parent_refs.as_deref().unwrap_or_default(),
+        GatewayScope::listener_serves_udp,
+    );
 
     let new_entrypoints = if !scope.accepts_udp_route(route) {
         Vec::new()
@@ -3183,25 +3984,45 @@ pub async fn run_udproute_watcher(
     resolve_ticker.tick().await;
 
     info!("Gateway API: UDPRoute watcher started");
+    // The routes the current relist returned; the others were deleted while
+    // the watcher was away.
+    let mut relisted: Option<HashSet<String>> = None;
 
     loop {
         let changed = tokio::select! {
             event = stream.next() => match event {
                 Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    if let (Some(uids), Some(uid)) = (relisted.as_mut(), route.metadata.uid.as_deref()) {
+                        uids.insert(uid.to_string());
+                    }
                     log_udp_route("apply", &route);
                     apply_udp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_udp_route("delete", &route);
+                    if let Some(uid) = route.metadata.uid.as_deref() {
+                        scope.forget_attachments("UDPRoute", uid);
+                    }
                     delete_udp_route(&route, &storage, &index)
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: UDPRoute init");
+                    relisted = Some(HashSet::new());
                     false
                 }
                 Some(Ok(Event::InitDone)) => {
                     debug!("Gateway API: UDPRoute init done");
-                    false
+                    match relisted.take() {
+                        Some(uids) => drop_routes_not_relisted(
+                            "UDPRoute",
+                            &uids,
+                            &index,
+                            |t: &TrackedUdpRoute| t.entrypoint_ids.as_slice(),
+                            &storage,
+                            &scope,
+                        ),
+                        None => false,
+                    }
                 }
                 Some(Err(e)) => {
                     error!("Gateway API: UDPRoute watcher error: {}", e);
@@ -3469,7 +4290,10 @@ mod tests {
     use super::*;
     use crate::model::entrypoint::{RedirectPolicy, RedirectScheme};
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
-    use gateway_api::apis::standard::gateways::{GatewayListeners, GatewaySpec};
+    use gateway_api::apis::standard::gateways::{
+        GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
+    };
     use gateway_api::apis::standard::httproutes::{
         HTTPRouteRulesBackendRefs, HTTPRouteRulesFiltersRequestRedirect,
         HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesMatches,
@@ -3506,6 +4330,7 @@ mod tests {
             },
             spec: GatewaySpec {
                 gateway_class_name: "sozune".into(),
+                listeners: vec![gw_listener("http", 80, "HTTP")],
                 ..Default::default()
             },
             status: Default::default(),
@@ -4075,7 +4900,7 @@ mod tests {
 
     #[test]
     fn tcp_route_ignores_a_plain_http_listener() {
-        let scope = default_scope(); // gw with no listeners
+        let scope = default_scope(); // gw with a single HTTP listener
         assert!(!scope.accepts_tcp_route(&tcp_route(9000)));
     }
 
@@ -5641,6 +6466,36 @@ mod tests {
     }
 
     #[test]
+    fn build_status_reports_a_parent_whose_listeners_refuse_the_route() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&gateway("infra", "gw", "sozune"));
+        let mut r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![
+                parent("foreign-gw"),
+                HTTPRouteParentRefs {
+                    name: "gw".into(),
+                    namespace: Some("infra".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        r.metadata.namespace = Some("apps".into());
+
+        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].parent_ref.name, "gw");
+        let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].type_, CONDITION_TYPE_ACCEPTED);
+        assert_eq!(conditions[0].status, "False");
+        assert_eq!(conditions[0].reason, REASON_NOT_ALLOWED_BY_LISTENERS);
+    }
+
+    #[test]
     fn merge_status_preserves_other_controllers_entries() {
         let foreign = HTTPRouteStatusParents {
             controller_name: "traefik.io/gateway-controller".into(),
@@ -5880,6 +6735,9 @@ mod tests {
             },
             spec: GatewaySpec {
                 gateway_class_name: class_name.into(),
+                // The CRD requires a listener; this one admits routes of the
+                // Gateway's own namespace, as an unset `allowedRoutes` does.
+                listeners: vec![gw_listener("http", 80, "HTTP")],
                 ..Default::default()
             },
             status: Default::default(),
@@ -5900,6 +6758,8 @@ mod tests {
             hostname: hostname.map(Into::into),
             protocol: "HTTP".into(),
             tls_mode: None,
+            allowed_namespaces: AllowedNamespaces::Same,
+            allowed_kinds: None,
         }
     }
 
@@ -5916,6 +6776,8 @@ mod tests {
             hostname: hostname.map(Into::into),
             protocol: "TLS".into(),
             tls_mode: Some(mode),
+            allowed_namespaces: AllowedNamespaces::Same,
+            allowed_kinds: None,
         }
     }
 
@@ -5993,6 +6855,377 @@ mod tests {
         assert!(!hostnames_compatible("*.example.com", "example.com"));
         assert!(!hostnames_compatible("*.example.com", "api.other.com"));
         assert!(hostnames_compatible("a.example.com", "a.example.com"));
+    }
+
+    // ---------- Listener status ----------
+
+    fn served() -> ServedPorts {
+        ServedPorts {
+            http: 80,
+            tcp: HashSet::from([5432]),
+            udp: HashSet::from([53]),
+        }
+    }
+
+    fn gw_listener(name: &str, port: i32, protocol: &str) -> GatewayListeners {
+        GatewayListeners {
+            name: name.into(),
+            port,
+            protocol: protocol.into(),
+            ..Default::default()
+        }
+    }
+
+    fn condition_of<'a>(
+        status: &'a gateway_api::apis::standard::gateways::GatewayStatusListeners,
+        type_: &str,
+    ) -> &'a Condition {
+        status.conditions.iter().find(|c| c.type_ == type_).unwrap()
+    }
+
+    /// The status follows routing: an HTTP listener is served on any port,
+    /// a TCP or UDP one only on a port a `proxy.tcp`/`proxy.udp` entry
+    /// listens on; any other is reported, with what to declare.
+    #[test]
+    fn listener_status_reflects_allowed_route_kinds() {
+        let gw = gateway("default", "gw", "sozune");
+        let status = |kinds: &[&str]| {
+            let mut listener = li("l", 80, None);
+            listener.allowed_kinds = Some(kinds.iter().map(|k| k.to_string()).collect());
+            build_listener_status(&gw, &listener, &served(), 0)
+        };
+
+        let http_only = status(&["HTTPRoute"]);
+        assert_eq!(http_only.supported_kinds.len(), 1);
+        assert_eq!(
+            condition_of(&http_only, CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+        assert_eq!(
+            condition_of(&http_only, CONDITION_TYPE_RESOLVED_REFS).status,
+            "True"
+        );
+
+        let mixed = status(&["HTTPRoute", "GRPCRoute"]);
+        assert_eq!(mixed.supported_kinds.len(), 1);
+        assert_eq!(
+            condition_of(&mixed, CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+        let resolved = condition_of(&mixed, CONDITION_TYPE_RESOLVED_REFS);
+        assert_eq!(resolved.status, "False");
+        assert_eq!(resolved.reason, REASON_INVALID_ROUTE_KINDS);
+
+        let grpc_only = status(&["GRPCRoute"]);
+        assert!(grpc_only.supported_kinds.is_empty());
+        assert_eq!(
+            condition_of(&grpc_only, CONDITION_TYPE_PROGRAMMED).status,
+            "False"
+        );
+        assert_eq!(
+            condition_of(&grpc_only, CONDITION_TYPE_RESOLVED_REFS).reason,
+            REASON_INVALID_ROUTE_KINDS
+        );
+    }
+
+    #[test]
+    fn listener_status_follows_how_sozune_routes() {
+        let gw = gateway("default", "gw", "sozune");
+        let status = |port: i32, protocol: &str| {
+            let listener = ListenerInfo {
+                name: "l".into(),
+                port,
+                hostname: None,
+                protocol: protocol.into(),
+                tls_mode: None,
+                allowed_namespaces: AllowedNamespaces::Same,
+                allowed_kinds: None,
+            };
+            build_listener_status(&gw, &listener, &served(), 0)
+        };
+
+        let http = status(80, "HTTP");
+        assert_eq!(
+            condition_of(&http, CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+        assert_eq!(http.supported_kinds[0].kind, "HTTPRoute");
+
+        // An HTTP listener is served whatever its port, on Sōzune's.
+        let other = status(8080, "HTTP");
+        let programmed = condition_of(&other, CONDITION_TYPE_PROGRAMMED);
+        assert_eq!(programmed.status, "True");
+        assert!(programmed.message.contains("port 80"));
+        // Routes are installed without TLS: an HTTPS listener is not served.
+        let https = status(8443, "HTTPS");
+        assert_eq!(
+            condition_of(&https, CONDITION_TYPE_ACCEPTED).reason,
+            REASON_UNSUPPORTED_PROTOCOL
+        );
+        assert!(https.supported_kinds.is_empty());
+
+        assert_eq!(
+            condition_of(&status(5432, "TCP"), CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+        assert_eq!(
+            condition_of(&status(5433, "TCP"), CONDITION_TYPE_ACCEPTED).reason,
+            REASON_PORT_UNAVAILABLE
+        );
+        assert_eq!(
+            condition_of(&status(53, "UDP"), CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+
+        let grpc = status(80, "GRPC");
+        assert_eq!(
+            condition_of(&grpc, CONDITION_TYPE_ACCEPTED).reason,
+            REASON_UNSUPPORTED_PROTOCOL
+        );
+        assert!(grpc.supported_kinds.is_empty());
+    }
+
+    /// `attachedRoutes` counts the routes whose parentRefs select a listener
+    /// that carries their kind, and drops a deleted route.
+    /// A route only attaches to a listener whose hostname admits one of its
+    /// own.
+    #[test]
+    fn a_route_does_not_attach_to_a_listener_refusing_its_hostnames() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut shop = gw_listener("shop", 80, "HTTP");
+        shop.hostname = Some("*.shop.example".into());
+        let mut blog = gw_listener("blog", 8080, "HTTP");
+        blog.hostname = Some("blog.example".into());
+        gw.spec.listeners = vec![shop, blog];
+        scope.upsert_gateway(&gw);
+
+        scope.record_attachments(
+            "HTTPRoute",
+            "r1",
+            "default",
+            &["www.shop.example".to_string()],
+            &[parent("gw")],
+            GatewayScope::listener_serves_http,
+        );
+        let counts: Vec<(String, i32)> = scope
+            .listener_statuses(&gw)
+            .into_iter()
+            .map(|l| (l.name, l.attached_routes))
+            .collect();
+        assert_eq!(counts, [("shop".to_string(), 1), ("blog".to_string(), 0)]);
+    }
+
+    #[test]
+    fn attached_routes_are_counted_per_listener() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![
+            gw_listener("web", 80, "HTTP"),
+            gw_listener("admin", 8080, "HTTP"),
+            gw_listener("db", 5432, "TCP"),
+        ];
+        scope.upsert_gateway(&gw);
+
+        let mut web_only = parent("gw");
+        web_only.section_name = Some("web".into());
+        scope.record_attachments(
+            "HTTPRoute",
+            "r1",
+            "default",
+            &[],
+            &[web_only],
+            GatewayScope::listener_serves_http,
+        );
+        scope.record_attachments(
+            "HTTPRoute",
+            "r2",
+            "default",
+            &[],
+            &[parent("gw")],
+            GatewayScope::listener_serves_http,
+        );
+        let counts = |scope: &GatewayScope| -> Vec<(String, i32)> {
+            scope
+                .listener_statuses(&gw)
+                .into_iter()
+                .map(|l| (l.name, l.attached_routes))
+                .collect()
+        };
+
+        // r1 on web; r2 on both HTTP listeners, never on the TCP one.
+        assert_eq!(
+            counts(&scope),
+            [
+                ("web".to_string(), 2),
+                ("admin".to_string(), 1),
+                ("db".to_string(), 0)
+            ]
+        );
+
+        scope.forget_attachments("HTTPRoute", "r2");
+        assert_eq!(
+            counts(&scope),
+            [
+                ("web".to_string(), 1),
+                ("admin".to_string(), 0),
+                ("db".to_string(), 0)
+            ]
+        );
+    }
+
+    /// A TLS listener that terminates carries no TLSRoute: it is not ready,
+    /// whatever its port.
+    #[test]
+    fn a_terminating_tls_listener_is_not_programmed() {
+        let gw = gateway("default", "gw", "sozune");
+        let terminate = li_tls("tls", 5432, None, GatewayListenersTlsMode::Terminate);
+        let passthrough = li_tls("tls", 5432, None, GatewayListenersTlsMode::Passthrough);
+
+        let status = build_listener_status(&gw, &terminate, &served(), 0);
+        let accepted = condition_of(&status, CONDITION_TYPE_ACCEPTED);
+        assert_eq!(accepted.status, "False");
+        assert_eq!(accepted.reason, REASON_UNSUPPORTED_PROTOCOL);
+        assert!(accepted.message.contains("Passthrough"));
+        assert!(status.supported_kinds.is_empty());
+
+        let status = build_listener_status(&gw, &passthrough, &served(), 0);
+        assert_eq!(
+            condition_of(&status, CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+    }
+
+    /// A condition whose status stays keeps its transition time, even when
+    /// its generation or message moves on.
+    #[test]
+    fn a_condition_keeps_its_transition_time_until_its_status_changes() {
+        let at = |secs| Time(k8s_openapi::chrono::DateTime::from_timestamp(secs, 0).unwrap());
+        let condition = |status: &str, generation, time| Condition {
+            type_: "Accepted".into(),
+            status: status.into(),
+            reason: "Accepted".into(),
+            message: String::new(),
+            last_transition_time: time,
+            observed_generation: Some(generation),
+        };
+        let previous = vec![condition("True", 1, at(1_000))];
+
+        let (merged, changed) =
+            merge_conditions(Some(&previous), vec![condition("True", 2, at(2_000))]);
+        assert!(changed, "a new generation is written");
+        assert_eq!(merged[0].last_transition_time, at(1_000));
+        assert_eq!(merged[0].observed_generation, Some(2));
+
+        let (merged, _) = merge_conditions(Some(&previous), vec![condition("False", 2, at(2_000))]);
+        assert_eq!(merged[0].last_transition_time, at(2_000));
+    }
+
+    /// A route deleted while the watcher was away gets no Delete event: the
+    /// relist that follows drops it, its entrypoints and its attachments.
+    #[test]
+    fn a_route_missing_from_a_relist_is_dropped() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![gw_listener("web", 80, "HTTP")];
+        scope.upsert_gateway(&gw);
+
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let mut kept = route_with(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+        );
+        kept.metadata.uid = Some("kept".into());
+        kept.metadata.name = Some("kept".into());
+        let mut gone = kept.clone();
+        gone.metadata.uid = Some("gone".into());
+        gone.metadata.name = Some("gone".into());
+        gone.spec.hostnames = Some(vec!["b.example.com".into()]);
+        apply_route(&kept, &storage, &index, &r1(), &scope, None);
+        apply_route(&gone, &storage, &index, &r1(), &scope, None);
+        assert_eq!(scope.listener_statuses(&gw)[0].attached_routes, 2);
+        let before = storage.read().unwrap().len();
+
+        let changed = drop_routes_not_relisted(
+            "HTTPRoute",
+            &HashSet::from(["kept".to_string()]),
+            &index,
+            |t: &TrackedRoute| t.entrypoint_ids.as_slice(),
+            &storage,
+            &scope,
+        );
+
+        assert!(changed);
+        assert!(index.read().unwrap().contains_key("kept"));
+        assert!(!index.read().unwrap().contains_key("gone"));
+        assert!(storage.read().unwrap().len() < before);
+        assert_eq!(scope.listener_statuses(&gw)[0].attached_routes, 1);
+    }
+
+    /// A route deleted and created again under the same name while the
+    /// watcher was away comes back with a new uid but the same entrypoint
+    /// ids: dropping the old uid must leave the new route's entrypoints.
+    #[test]
+    fn a_route_recreated_under_its_name_keeps_its_entrypoints() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![gw_listener("web", 80, "HTTP")];
+        scope.upsert_gateway(&gw);
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let mut old = route_with(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+        );
+        old.metadata.uid = Some("old".into());
+        apply_route(&old, &storage, &index, &r1(), &scope, None);
+        let mut recreated = old.clone();
+        recreated.metadata.uid = Some("new".into());
+        apply_route(&recreated, &storage, &index, &r1(), &scope, None);
+        let installed = storage.read().unwrap().len();
+        assert!(installed > 0);
+
+        drop_routes_not_relisted(
+            "HTTPRoute",
+            &HashSet::from(["new".to_string()]),
+            &index,
+            |t: &TrackedRoute| t.entrypoint_ids.as_slice(),
+            &storage,
+            &scope,
+        );
+
+        assert!(!index.read().unwrap().contains_key("old"));
+        assert_eq!(storage.read().unwrap().len(), installed);
+    }
+
+    /// An unchanged listener keeps the time its conditions last changed.
+    #[test]
+    fn unchanged_listener_conditions_keep_their_transition_time() {
+        let gw = gateway("default", "gw", "sozune");
+        let listener = li("web", 80, None);
+        let mut previous = build_listener_status(&gw, &listener, &served(), 1);
+        for condition in &mut previous.conditions {
+            condition.last_transition_time =
+                Time(k8s_openapi::chrono::DateTime::from_timestamp(1_000, 0).unwrap());
+        }
+
+        let (merged, changed) = merge_listener_statuses(
+            Some(std::slice::from_ref(&previous)),
+            vec![build_listener_status(&gw, &listener, &served(), 1)],
+        );
+        assert!(!changed);
+        assert_eq!(merged[0].conditions, previous.conditions);
+
+        let (_, changed) = merge_listener_statuses(
+            Some(std::slice::from_ref(&previous)),
+            vec![build_listener_status(&gw, &listener, &served(), 2)],
+        );
+        assert!(changed, "a new attached route is a change");
     }
 
     #[test]
@@ -6110,13 +7343,215 @@ mod tests {
         r.metadata.namespace = Some("apps".into());
         assert!(!scope.accepts_route(&r));
 
-        // Same route with explicit parent namespace — accepted.
+        // Naming `infra/gw` reaches the Gateway, whose listener only admits
+        // routes of its own namespace by default.
         r.spec.parent_refs = Some(vec![HTTPRouteParentRefs {
             name: "gw".into(),
             namespace: Some("infra".into()),
             ..Default::default()
         }]);
+        assert!(!scope.accepts_route(&r));
+
+        // Once the listener admits every namespace, the route is accepted.
+        let mut gw = gateway("infra", "gw", "sozune");
+        gw.spec.listeners[0].allowed_routes = Some(allowed_from(
+            GatewayListenersAllowedRoutesNamespacesFrom::All,
+        ));
+        scope.upsert_gateway(&gw);
         assert!(scope.accepts_route(&r));
+    }
+
+    fn allowed_from(
+        from: GatewayListenersAllowedRoutesNamespacesFrom,
+    ) -> GatewayListenersAllowedRoutes {
+        GatewayListenersAllowedRoutes {
+            namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                from: Some(from),
+                selector: None,
+            }),
+            kinds: None,
+        }
+    }
+
+    fn allowed_kind(group: Option<&str>, kind: &str) -> GatewayListenersAllowedRoutes {
+        GatewayListenersAllowedRoutes {
+            namespaces: None,
+            kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
+                group: group.map(Into::into),
+                kind: kind.into(),
+            }]),
+        }
+    }
+
+    /// Namespace labels are not watched, so a selector admits nothing — even
+    /// a route of the Gateway's own namespace.
+    #[test]
+    fn a_namespace_selector_admits_no_route() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners[0].allowed_routes = Some(allowed_from(
+            GatewayListenersAllowedRoutesNamespacesFrom::Selector,
+        ));
+        scope.upsert_gateway(&gw);
+
+        let r = route_with(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+        );
+        assert!(!scope.accepts_route(&r));
+    }
+
+    /// A listener of another protocol that admits every namespace does not
+    /// open the Gateway to HTTPRoutes its HTTP listener refuses.
+    #[test]
+    fn an_httproute_only_attaches_through_http_listeners() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("infra", "gw", "sozune");
+        let mut raw = gw_listener("raw", 9000, "TCP");
+        raw.allowed_routes = Some(allowed_from(
+            GatewayListenersAllowedRoutesNamespacesFrom::All,
+        ));
+        gw.spec.listeners.push(raw);
+        scope.upsert_gateway(&gw);
+
+        let mut r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![HTTPRouteParentRefs {
+                name: "gw".into(),
+                namespace: Some("infra".into()),
+                ..Default::default()
+            }],
+        );
+        r.metadata.namespace = Some("apps".into());
+        assert!(!scope.accepts_route(&r));
+        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+        assert_eq!(parents.len(), 1);
+        assert_eq!(
+            parents[0].conditions.as_deref().unwrap_or_default()[0].reason,
+            REASON_NOT_ALLOWED_BY_LISTENERS
+        );
+    }
+
+    /// A Gateway of ours that refuses a parentRef says why in the route's
+    /// status, instead of leaving no entry behind.
+    #[test]
+    fn a_refused_parent_reports_why() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![gw_listener("raw", 9000, "TCP")];
+        scope.upsert_gateway(&gw);
+        let reason_for = |parent_ref: HTTPRouteParentRefs| {
+            let r = route_with_uid_parents(
+                "uid-1",
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["a.example.com".into()],
+                vec![parent_ref],
+            );
+            assert!(!scope.accepts_route(&r));
+            let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+            assert_eq!(parents.len(), 1);
+            parents[0].conditions.as_deref().unwrap_or_default()[0]
+                .reason
+                .clone()
+        };
+
+        // Only a TCP listener: nothing carries an HTTPRoute.
+        assert_eq!(reason_for(parent("gw")), REASON_NOT_ALLOWED_BY_LISTENERS);
+        let mut missing = parent("gw");
+        missing.section_name = Some("web".into());
+        assert_eq!(reason_for(missing), REASON_NO_MATCHING_PARENT);
+    }
+
+    #[test]
+    fn allowed_route_kinds_narrow_what_attaches() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let r = route_with(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+        );
+        let accepts_with = |allowed: GatewayListenersAllowedRoutes| {
+            let mut gw = gateway("default", "gw", "sozune");
+            gw.spec.listeners[0].allowed_routes = Some(allowed);
+            scope.upsert_gateway(&gw);
+            scope.accepts_route(&r)
+        };
+
+        assert!(accepts_with(allowed_kind(None, "HTTPRoute")));
+        assert!(accepts_with(allowed_kind(
+            Some(GATEWAY_API_GROUP),
+            "HTTPRoute"
+        )));
+        assert!(!accepts_with(allowed_kind(None, "GRPCRoute")));
+        assert!(!accepts_with(allowed_kind(
+            Some("example.com"),
+            "HTTPRoute"
+        )));
+        // An empty list leaves the choice to the protocol.
+        assert!(accepts_with(GatewayListenersAllowedRoutes {
+            namespaces: None,
+            kinds: Some(Vec::new()),
+        }));
+    }
+
+    /// A route from another namespace only gets the ports, and only counts
+    /// on the listeners, that admit its namespace.
+    #[test]
+    fn a_cross_namespace_route_only_binds_listeners_that_admit_it() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("infra", "gw", "sozune");
+        let mut open = gw_listener("open", 9000, "TCP");
+        open.allowed_routes = Some(allowed_from(
+            GatewayListenersAllowedRoutesNamespacesFrom::All,
+        ));
+        gw.spec.listeners = vec![open, gw_listener("own", 9001, "TCP")];
+        scope.upsert_gateway(&gw);
+
+        let mut route = tcp_route(9000);
+        route.metadata.namespace = Some("apps".into());
+        route.spec.parent_refs = Some(vec![TCPRouteParentRefs {
+            name: "gw".into(),
+            namespace: Some("infra".into()),
+            ..Default::default()
+        }]);
+        assert!(scope.accepts_tcp_route(&route));
+        assert_eq!(
+            scope
+                .effective_tcp_ports(&route)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [9000]
+        );
+
+        scope.record_attachments(
+            "TCPRoute",
+            "uid-tcp-1",
+            "apps",
+            &[],
+            route.spec.parent_refs.as_deref().unwrap_or_default(),
+            GatewayScope::listener_serves_tcp,
+        );
+        let counts: Vec<(String, i32)> = scope
+            .listener_statuses(&gw)
+            .into_iter()
+            .map(|l| (l.name, l.attached_routes))
+            .collect();
+        assert_eq!(counts, [("open".to_string(), 1), ("own".to_string(), 0)]);
+
+        // Naming the listener that refuses it binds nothing.
+        route.spec.parent_refs = Some(vec![TCPRouteParentRefs {
+            name: "gw".into(),
+            namespace: Some("infra".into()),
+            section_name: Some("own".into()),
+            ..Default::default()
+        }]);
+        assert!(!scope.accepts_tcp_route(&route));
     }
 
     #[test]

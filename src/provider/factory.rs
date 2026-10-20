@@ -224,6 +224,7 @@ pub async fn start_services(
         // waiting for the periodic tick.
         let tcp_listeners_for_gateway = config.proxy.tcp.clone();
         let udp_listeners_for_gateway = config.proxy.udp.clone();
+        let served_ports_for_gateway = gateway::ServedPorts::from_config(&config.proxy);
         tokio::spawn(async move {
             let client = match kubernetes_provider_for_gateway.build_client().await {
                 Ok(c) => c,
@@ -248,9 +249,11 @@ pub async fn start_services(
             // apiserver PATCH round-trip. Buffer sized like the HTTPRoute
             // status channel.
             let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
+            scope.configure_status(served_ports_for_gateway, status_tx.clone());
             let status_client = client.clone();
+            let status_scope = scope.clone();
             tokio::spawn(async move {
-                gateway::run_gateway_status_writer(status_client, status_rx).await;
+                gateway::run_gateway_status_writer(status_client, status_scope, status_rx).await;
             });
 
             let gc_client = client.clone();

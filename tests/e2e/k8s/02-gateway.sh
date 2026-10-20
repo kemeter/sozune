@@ -25,6 +25,31 @@ else
     fail "svcb NOT reachable through HTTPRoute (timeout)"
 fi
 
+log "[02] Gateway: listener status"
+
+# Sōzune serves HTTP listeners whatever their port, so `http` is programmed,
+# and counts the HTTPRoutes attached to it.
+listener_programmed=""
+listener_attached=0
+for _ in $(seq 1 30); do
+    listener_programmed=$(kubectl get gateway gw -n sozune-test \
+        -o jsonpath='{.status.listeners[?(@.name=="http")].conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
+    listener_attached=$(kubectl get gateway gw -n sozune-test \
+        -o jsonpath='{.status.listeners[?(@.name=="http")].attachedRoutes}' 2>/dev/null || true)
+    [[ "$listener_programmed" == "True" && "${listener_attached:-0}" -gt 0 ]] && break
+    sleep 1
+done
+if [[ "$listener_programmed" == "True" ]]; then
+    pass "the http listener is Programmed"
+else
+    fail "the http listener is not Programmed (got '$listener_programmed')"
+fi
+if [[ "${listener_attached:-0}" -gt 0 ]]; then
+    pass "the http listener counts its attached routes ($listener_attached)"
+else
+    fail "the http listener reports no attached route"
+fi
+
 log "[02] Gateway: each HTTPRoute lands on its own backend"
 
 a_body=$(curl -s --max-time 2 -H "Host: $GW_HOST_A" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
@@ -627,6 +652,44 @@ if [[ "$xns_revoked_status" == "404" ]]; then
     pass "deleting the ReferenceGrant stops serving the cross-namespace backend (got 404)"
 else
     fail "cross-namespace backend still served after grant deletion (got $xns_revoked_status, expected 404)"
+fi
+
+log "[02] Gateway: a listener refuses routes from another namespace by default"
+
+# `gw` admits routes of its own namespace only (`from: Same`): a route in
+# gw-frontend that names it is refused, and says so in its status.
+kubectl apply -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: xns-parent-route
+  namespace: gw-frontend
+spec:
+  parentRefs:
+    - name: gw
+      namespace: sozune-test
+  hostnames:
+    - gw-xns-parent.k8s-test.localhost
+  rules:
+    - backendRefs:
+        - name: svcb
+          namespace: sozune-test
+          port: 80
+YAML
+
+xns_parent_reason=""
+for _ in $(seq 1 20); do
+    xns_parent_reason=$(kubectl get httproute xns-parent-route -n gw-frontend \
+        -o jsonpath='{.status.parents[?(@.controllerName=="kemeter.io/sozune")].conditions[?(@.type=="Accepted")].reason}' 2>/dev/null)
+    if [[ -n "$xns_parent_reason" ]]; then
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$xns_parent_reason" == "NotAllowedByListeners" ]]; then
+    pass "a route from another namespace is refused with NotAllowedByListeners"
+else
+    fail "a route from another namespace got reason '$xns_parent_reason', expected NotAllowedByListeners"
 fi
 
 # Cleanup of the dynamically-applied resources to leave the cluster
