@@ -16,6 +16,15 @@ use tokio::sync::mpsc;
 /// be missing from it: refused by Sōzu, or not applied yet.
 pub type LiveRoutes = Arc<RwLock<BTreeMap<String, Entrypoint>>>;
 
+/// The ports of `proxy.gateway_ports` a Gateway route is served on but that
+/// Sōzune could not open, with the reason. Published by the proxy after every
+/// reload, read by the Gateway listener status.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UnopenedGatewayPorts {
+    pub tcp: BTreeMap<u16, String>,
+    pub udp: BTreeMap<u16, String>,
+}
+
 pub struct ProxyInputs {
     pub storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     pub shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -37,6 +46,7 @@ pub struct ProxyInputs {
     /// Backends the health checker found unhealthy: each reload leaves them
     /// out of their routes.
     pub unhealthy_backends: Arc<RwLock<crate::proxy::health::UnhealthyMap>>,
+    pub unopened_gateway_ports: tokio::sync::watch::Sender<UnopenedGatewayPorts>,
     /// Compiled WASM plugins, keyed by declared name. Built once at startup.
     pub plugins: PluginRegistry,
     pub handle: tokio::runtime::Handle,

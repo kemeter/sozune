@@ -27,3 +27,11 @@ nodes:
       - containerPort: 18446
         hostPort: 18446
         protocol: UDP
+      # Ports a Gateway opens from proxy.gateway_ports, for the
+      # gateway-ports suite.
+      - containerPort: 18447
+        hostPort: 18447
+        protocol: TCP
+      - containerPort: 18448
+        hostPort: 18448
+        protocol: UDP

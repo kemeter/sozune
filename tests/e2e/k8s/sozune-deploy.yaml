@@ -81,8 +81,7 @@ data:
       https:
         listen_address: 18443
       # TLSRoute attaches here: a Gateway declaring a TLS listener on this port
-      # resolves to this named listener. Sōzune binds TCP ports at startup and
-      # never opens one from a Gateway alone.
+      # resolves to this named listener.
       tcp:
         - name: tlspassthrough
           listen: 18444
@@ -94,6 +93,10 @@ data:
       udp:
         - name: udpraw
           listen: 18446
+      # Ports a Gateway listener may open with no listener declared above.
+      gateway_ports:
+        tcp: ["18447"]
+        udp: ["18448"]
 
     middleware:
       port: 13180

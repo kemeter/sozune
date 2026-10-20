@@ -25,7 +25,7 @@ proxy:
 
 | Field | Description |
 |---|---|
-| `name` | Identifier referenced by service labels. Must be unique across `proxy.tcp`. |
+| `name` | Identifier referenced by service labels. Must be unique across `proxy.tcp`. `gateway:tcp:<port>` is reserved for the listeners Kubernetes Gateways open. |
 | `listen` | Port to bind on `0.0.0.0`. |
 | `ip_allow_list` | CIDRs / bare IPs allowed to connect, checked at `accept()`. Empty (default) = allow all. See [Source-IP allow-list](#source-ip-allow-list). |
 | `idle_timeout` | Seconds a connection may stay silent in both directions before it is closed. Absent keeps Sōzu's defaults (closed after `30`s of silence). See [Idle timeout](#idle-timeout). |

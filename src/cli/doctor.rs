@@ -824,7 +824,10 @@ fn check_privileges(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
     let needs_low_port = cfg.proxy.http.listen_address < 1024
         || cfg.proxy.https.listen_address < 1024
         || cfg.proxy.tcp.iter().any(|t| t.listen < 1024)
-        || cfg.proxy.udp.iter().any(|u| u.listen < 1024);
+        || cfg.proxy.udp.iter().any(|u| u.listen < 1024)
+        || (cfg.proxy.gateway_ports.tcp.iter())
+            .chain(&cfg.proxy.gateway_ports.udp)
+            .any(|r| r.start < 1024);
 
     if needs_low_port && unsafe { libc_geteuid() == 0 } {
         results.push(CheckResult::ok(

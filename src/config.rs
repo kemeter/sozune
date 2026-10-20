@@ -577,6 +577,10 @@ pub struct ProxyConfig {
     pub tcp: Vec<TcpListenerConfig>,
     #[serde(default)]
     pub udp: Vec<UdpListenerConfig>,
+    /// Ports a Kubernetes Gateway listener may open when no `tcp` / `udp`
+    /// entry declares its port. Empty by default: Sōzune opens none.
+    #[serde(default)]
+    pub gateway_ports: GatewayPortsConfig,
     #[serde(
         default = "default_max_buffers",
         deserialize_with = "deserialize_max_buffers_with_env"
@@ -857,6 +861,118 @@ pub struct UdpListenerConfig {
     pub listen: u16,
 }
 
+/// The ports a Kubernetes Gateway listener may open on its own. A TCP, TLS or
+/// UDP listener whose port no `proxy.tcp` / `proxy.udp` entry declares is
+/// served when its port is listed here: Sōzune binds it once a route attaches
+/// to the listener and closes it when none is left.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct GatewayPortsConfig {
+    /// Ports for TCP and TLS listeners.
+    #[serde(default)]
+    pub tcp: Vec<PortRange>,
+    /// Ports for UDP listeners.
+    #[serde(default)]
+    pub udp: Vec<PortRange>,
+}
+
+impl GatewayPortsConfig {
+    pub fn allows_tcp(&self, port: u16) -> bool {
+        self.tcp.iter().any(|r| r.contains(port))
+    }
+
+    pub fn allows_udp(&self, port: u16) -> bool {
+        self.udp.iter().any(|r| r.contains(port))
+    }
+}
+
+/// The listener a Gateway opens on a TCP port of `gateway_ports`. Its name
+/// carries the port, so the proxy knows what to bind when a route refers to it.
+pub fn gateway_tcp_listener(port: u16) -> String {
+    format!("{GATEWAY_TCP_PREFIX}{port}")
+}
+
+/// The UDP twin of [`gateway_tcp_listener`].
+pub fn gateway_udp_listener(port: u16) -> String {
+    format!("{GATEWAY_UDP_PREFIX}{port}")
+}
+
+/// The port of a listener named by [`gateway_tcp_listener`].
+pub fn gateway_tcp_port(name: &str) -> Option<u16> {
+    name.strip_prefix(GATEWAY_TCP_PREFIX)?.parse().ok()
+}
+
+/// The port of a listener named by [`gateway_udp_listener`].
+pub fn gateway_udp_port(name: &str) -> Option<u16> {
+    name.strip_prefix(GATEWAY_UDP_PREFIX)?.parse().ok()
+}
+
+const GATEWAY_TCP_PREFIX: &str = "gateway:tcp:";
+const GATEWAY_UDP_PREFIX: &str = "gateway:udp:";
+
+/// A port or an inclusive range of ports, written `5432` or `"9000-9099"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    pub fn contains(&self, port: u16) -> bool {
+        (self.start..=self.end).contains(&port)
+    }
+}
+
+impl std::fmt::Display for PortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
+}
+
+impl std::str::FromStr for PortRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let port = |p: &str| {
+            p.trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("`{s}` is not a port or a range like `9000-9099`"))
+        };
+        let (start, end) = match s.split_once('-') {
+            Some((start, end)) => (port(start)?, port(end)?),
+            None => {
+                let p = port(s)?;
+                (p, p)
+            }
+        };
+        if start > end {
+            return Err(format!("`{s}` ends before it starts"));
+        }
+        Ok(Self { start, end })
+    }
+}
+
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Port(u64),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Port(p) => p.to_string().parse(),
+            Raw::Text(s) => s.parse(),
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct DashboardConfig {
     #[serde(default, deserialize_with = "deserialize_dashboard_enabled_with_env")]
@@ -1078,6 +1194,7 @@ impl Default for ProxyConfig {
             https: Default::default(),
             tcp: Vec::new(),
             udp: Vec::new(),
+            gateway_ports: GatewayPortsConfig::default(),
             max_buffers: default_max_buffers(),
             buffer_size: default_buffer_size(),
             startup_delay_ms: default_startup_delay_ms(),
@@ -2430,6 +2547,50 @@ https:
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.udp.is_empty());
+        assert_eq!(config.gateway_ports, GatewayPortsConfig::default());
+    }
+
+    #[test]
+    fn gateway_ports_take_ports_and_ranges() {
+        let yaml = r#"
+http:
+  listen_address: 80
+https:
+  listen_address: 443
+gateway_ports:
+  tcp: [5432, "9000-9099"]
+  udp: ["53"]
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let ports = &config.gateway_ports;
+        assert!(ports.allows_tcp(5432));
+        assert!(ports.allows_tcp(9000));
+        assert!(ports.allows_tcp(9099));
+        assert!(!ports.allows_tcp(9100));
+        assert!(!ports.allows_tcp(53));
+        assert!(ports.allows_udp(53));
+        assert!(!ports.allows_udp(5432));
+    }
+
+    #[test]
+    fn a_malformed_gateway_port_is_refused() {
+        for bad in ["0", "\"9100-9000\"", "\"http\"", "70000", "\"1-\""] {
+            let yaml = format!(
+                "http:\n  listen_address: 80\nhttps:\n  listen_address: 443\ngateway_ports:\n  tcp: [{bad}]\n"
+            );
+            assert!(
+                serde_yaml::from_str::<ProxyConfig>(&yaml).is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_listener_names_carry_their_port() {
+        assert_eq!(gateway_tcp_port(&gateway_tcp_listener(9000)), Some(9000));
+        assert_eq!(gateway_udp_port(&gateway_udp_listener(53)), Some(53));
+        assert_eq!(gateway_tcp_port(&gateway_udp_listener(53)), None);
+        assert_eq!(gateway_tcp_port("postgres"), None);
     }
 
     #[test]

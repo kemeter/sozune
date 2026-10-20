@@ -47,6 +47,15 @@ pub struct ListenersView {
     pub timeouts: TimeoutsView,
     pub tcp: Vec<TcpListenerView>,
     pub udp: Vec<UdpListenerView>,
+    /// The ports a Kubernetes Gateway listener may open, as written in
+    /// `proxy.gateway_ports`.
+    pub gateway_ports: GatewayPortsView,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GatewayPortsView {
+    pub tcp: Vec<String>,
+    pub udp: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,6 +247,20 @@ fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
                 port: l.listen,
             })
             .collect(),
+        gateway_ports: GatewayPortsView {
+            tcp: proxy
+                .gateway_ports
+                .tcp
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
+            udp: proxy
+                .gateway_ports
+                .udp
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
+        },
     }
 }
 
@@ -539,6 +562,7 @@ mod tests {
             sni_preread_max_bytes: None,
             idle_timeout: Some(3600),
         }];
+        cfg.proxy.gateway_ports.tcp = vec!["9000-9099".parse().unwrap()];
         cfg.proxy.udp = vec![UdpListenerConfig {
             name: "dns".into(),
             listen: 53,
@@ -552,6 +576,8 @@ mod tests {
         assert_eq!(rate_limit.exempt, vec!["172.16.0.0/12"]);
         assert_eq!(tcp.idle_timeout, Some(3600));
         assert_eq!(view.listeners.udp[0].port, 53);
+        assert_eq!(view.listeners.gateway_ports.tcp, vec!["9000-9099"]);
+        assert!(view.listeners.gateway_ports.udp.is_empty());
     }
 
     #[test]

@@ -290,8 +290,8 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 
 | Condition | Status | Reason | When |
 |---|---|---|---|
-| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener, whatever its port: its routes are served on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry, a `UDP` one on the port of a `proxy.udp` entry |
-| `Accepted`, `Programmed` | `False` (`PortUnavailable`, `Invalid`) | A `TLS`, `TCP` or `UDP` listener on a port no `proxy.tcp` / `proxy.udp` entry listens on: Sōzune opens none from a Gateway, and the message names the entry to add |
+| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener, whatever its port: its routes are served on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry or of `proxy.gateway_ports.tcp`, a `UDP` one on the port of a `proxy.udp` entry or of `proxy.gateway_ports.udp` |
+| `Accepted`, `Programmed` | `False` (`PortUnavailable`, `Invalid`) | A `TLS`, `TCP` or `UDP` listener on a port no `proxy.tcp` / `proxy.udp` entry listens on and `proxy.gateway_ports` does not list — the message names the settings to change — or a port of `proxy.gateway_ports` Sōzune could not open, with the reason |
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | The listener's `allowedRoutes.kinds` is unset, or only lists the kind it carries |
 | `ResolvedRefs` | `False` (`InvalidRouteKinds`) | `allowedRoutes.kinds` lists a kind the listener's protocol cannot carry. If it leaves out the one it can, `Programmed` is `False` (`Invalid`) too: no route attaches |
 | `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | An `HTTPS` listener: a Gateway's HTTPRoutes are served over HTTP only, so it would hand them to plain HTTP. A `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`), or any other protocol |
@@ -505,18 +505,27 @@ spec:
           port: 8443
 ```
 
-### The port must already be declared
+### Which ports a Gateway is served on
 
-Sōzune binds TCP ports at startup from `config.yaml` and never opens one from a Gateway alone — the same rule that applies to Docker labels, kept so startup state stays predictable. A Gateway listener on port `8443` is therefore served only if a `proxy.tcp` entry already listens there:
+A Gateway listener on port `8443` is served in one of two cases:
+
+- **A `proxy.tcp` entry listens on that port.** Sōzune binds it at startup, and the entry's settings (`ip_allow_list`, `rate_limit`, `idle_timeout`, …) apply to the Gateway's routes.
+- **`proxy.gateway_ports.tcp` lists the port.** Sōzune opens it once a route is served on the listener, and closes it when no route is left. Nothing else can open a port: the list is how you choose which ones a Gateway may take.
 
 ```yaml
 proxy:
   tcp:
     - name: tlsgw
       listen: 8443
+  # Ports a Gateway may open on its own: single ports or inclusive ranges.
+  gateway_ports:
+    tcp: [5432, "9000-9099"]
+    udp: ["5300-5399"]
 ```
 
-A `TLSRoute` whose listener port has no matching entry is tracked but not served: Sōzune logs which port it wanted, and the Gateway's listener status says `PortUnavailable` (see [Status conditions](#status-conditions)). Declare the listener and the route goes live on the next reload, with no need to re-apply it.
+A declared entry wins when both apply. A port opened from `gateway_ports` has none of the entry settings: declare a `proxy.tcp` entry to filter or rate-limit it.
+
+A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which port it wanted, and the Gateway's listener status says `PortUnavailable` (see [Status conditions](#status-conditions)). Declare the listener or list the port and the route goes live on the next reload, with no need to re-apply it. If a listed port cannot be bound, because another process holds it, the listener status says `PortUnavailable` with the reason, and Sōzune tries again on the next reload.
 
 ### What is supported
 
@@ -564,9 +573,9 @@ spec:
           port: 5432
 ```
 
-### The port must already be declared
+### Which ports a Gateway is served on
 
-Exactly as for TLSRoute: the Gateway's `TCP` listener port must match a `proxy.tcp` entry in `config.yaml`. Sōzune binds TCP ports at startup and never opens one from a Gateway alone. A route on an undeclared port is tracked but not served — the listener status says `PortUnavailable` — and goes live on the next reload once the listener is declared.
+Exactly as for TLSRoute: the Gateway's `TCP` listener port must match a `proxy.tcp` entry in `config.yaml`, or be listed in `proxy.gateway_ports.tcp` (see [Which ports a Gateway is served on](#which-ports-a-gateway-is-served-on)). A route on any other port is tracked but not served — the listener status says `PortUnavailable` — and goes live on the next reload once the port is declared or listed.
 
 ```yaml
 proxy:
@@ -616,7 +625,7 @@ spec:
           port: 53
 ```
 
-The Gateway's `UDP` listener port must match a `proxy.udp` entry in `config.yaml`, exactly as TCPRoute requires a `proxy.tcp` one:
+The Gateway's `UDP` listener port must match a `proxy.udp` entry in `config.yaml`, or be listed in `proxy.gateway_ports.udp`, exactly as TCPRoute requires a `proxy.tcp` entry or a port of `proxy.gateway_ports.tcp`:
 
 ```yaml
 proxy:
@@ -644,7 +653,7 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
 - **Gateway API: `GRPCRoute` and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
-- **TLSRoute and TCPRoute serve on a pre-declared port.** The listener's port must already be bound by a `proxy.tcp` entry — Sōzune does not open TCP ports from a Gateway alone. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what HTTPS entrypoints are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
+- **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what HTTPS entrypoints are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables
 

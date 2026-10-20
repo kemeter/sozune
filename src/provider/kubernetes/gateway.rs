@@ -86,6 +86,16 @@ type RouteIndex = Arc<RwLock<HashMap<String, TrackedRoute>>>;
 
 const SOURCE_TAG: &str = "k8s-gateway";
 
+/// Whether a route comes from the Gateway API: only such a route may open a
+/// port of `proxy.gateway_ports`.
+pub fn is_gateway_route(entrypoint: &Entrypoint) -> bool {
+    entrypoint
+        .source
+        .as_deref()
+        .and_then(|s| s.strip_prefix(SOURCE_TAG))
+        .is_some_and(|rest| rest.starts_with('-'))
+}
+
 /// Route watchers that consume `GatewayScope::changed()`: HTTPRoute, TLSRoute,
 /// TCPRoute and UDPRoute. Each scope mutation posts one permit per watcher so
 /// all re-resolve immediately instead of one waiting out its periodic tick.
@@ -241,14 +251,16 @@ pub struct ScopeState {
 /// A Gateway listener: `(namespace, gateway name, listener name)`.
 type ListenerKey = (String, String, String);
 
-/// The ports Sōzune listens on, from `config.yaml`. Sōzune binds them at
-/// startup and opens none from a Gateway, so a Gateway listener is only
-/// served when its port is one of these.
+/// The ports Sōzune can serve a Gateway listener on, from `config.yaml`: the
+/// ones it binds at startup, and those a Gateway may open (`gateway_ports`).
 #[derive(Clone, Debug, Default)]
 pub struct ServedPorts {
     pub http: u16,
     pub tcp: HashSet<u16>,
     pub udp: HashSet<u16>,
+    pub gateway: crate::config::GatewayPortsConfig,
+    /// The ports of `gateway` Sōzune could not open, as the proxy reported.
+    pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
 }
 
 impl ServedPorts {
@@ -257,6 +269,38 @@ impl ServedPorts {
             http: proxy.http.listen_address,
             tcp: proxy.tcp.iter().map(|l| l.listen).collect(),
             udp: proxy.udp.iter().map(|l| l.listen).collect(),
+            gateway: proxy.gateway_ports.clone(),
+            unopened: Default::default(),
+        }
+    }
+
+    /// Why a TCP or TLS listener on `port` is not served, if it is not.
+    fn tcp_problem(&self, port: i32) -> Option<String> {
+        match u16::try_from(port).ok() {
+            Some(p) if self.tcp.contains(&p) => None,
+            Some(p) if self.gateway.allows_tcp(p) => self
+                .unopened
+                .tcp
+                .get(&p)
+                .map(|e| format!("Sōzune could not open port {p}: {e}")),
+            _ => Some(format!(
+                "port {port} is neither a proxy.tcp listener nor in proxy.gateway_ports.tcp in config.yaml, so routes attached here are not served"
+            )),
+        }
+    }
+
+    /// The UDP twin of [`Self::tcp_problem`].
+    fn udp_problem(&self, port: i32) -> Option<String> {
+        match u16::try_from(port).ok() {
+            Some(p) if self.udp.contains(&p) => None,
+            Some(p) if self.gateway.allows_udp(p) => self
+                .unopened
+                .udp
+                .get(&p)
+                .map(|e| format!("Sōzune could not open port {p}: {e}")),
+            _ => Some(format!(
+                "port {port} is neither a proxy.udp listener nor in proxy.gateway_ports.udp in config.yaml, so routes attached here are not served"
+            )),
         }
     }
 }
@@ -409,6 +453,59 @@ impl GatewayScope {
                     g.status_tx.as_ref(),
                     StatusWrite::Gateway(Box::new(gateway.clone())),
                 );
+            }
+        }
+    }
+
+    /// Record the ports of `proxy.gateway_ports` the proxy could not open,
+    /// and rewrite the status of the Gateways with a listener on a port whose
+    /// state changed. Waits for room in the status channel rather than drop a
+    /// write: no other event would bring the listener status up to date.
+    pub async fn set_unopened_ports(&self, ports: crate::proxy::backend::UnopenedGatewayPorts) {
+        let (writes, status_tx) = {
+            let mut g = match self.state.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("Gateway API: scope lock poisoned: {}", e);
+                    return;
+                }
+            };
+            let changed = |old: &BTreeMap<u16, String>, new: &BTreeMap<u16, String>| {
+                old.keys()
+                    .chain(new.keys())
+                    .filter(|p| old.get(p) != new.get(p))
+                    .copied()
+                    .collect::<HashSet<u16>>()
+            };
+            let tcp = changed(&g.served.unopened.tcp, &ports.tcp);
+            let udp = changed(&g.served.unopened.udp, &ports.udp);
+            g.served.unopened = ports;
+            let affected = |listener: &ListenerInfo| {
+                let Ok(port) = u16::try_from(listener.port) else {
+                    return false;
+                };
+                match listener.protocol.to_ascii_uppercase().as_str() {
+                    "TLS" | "TCP" => tcp.contains(&port),
+                    "UDP" => udp.contains(&port),
+                    _ => false,
+                }
+            };
+            let writes: Vec<StatusWrite> = g
+                .gateway_objects
+                .iter()
+                .filter(|(key, gateway)| {
+                    g.gateways.contains_key(*key) && listeners_of(gateway).iter().any(affected)
+                })
+                .map(|(_, gateway)| StatusWrite::Gateway(Box::new(gateway.clone())))
+                .collect();
+            (writes, g.status_tx.clone())
+        };
+        let Some(status_tx) = status_tx else {
+            return;
+        };
+        for write in writes {
+            if status_tx.send(write).await.is_err() {
+                return;
             }
         }
     }
@@ -1733,9 +1830,10 @@ const REASON_INVALID_ROUTE_KINDS: &str = "InvalidRouteKinds";
 /// is served whatever its port: its routes go through Sōzune's HTTP port, and
 /// the message says which. An HTTPS one is not served: a Gateway's routes are
 /// installed without TLS. A TLS, TCP or UDP listener is
-/// served only on a port a `proxy.tcp` / `proxy.udp` entry listens on, as its
-/// routes are: any other port is reported `Accepted=False`
-/// (`PortUnavailable`) and `Programmed=False`, with the entry to declare.
+/// served only on a port a `proxy.tcp` / `proxy.udp` entry listens on or
+/// `proxy.gateway_ports` lists, as its routes are: any other port is reported
+/// `Accepted=False` (`PortUnavailable`) and `Programmed=False`, with the
+/// setting to change.
 fn build_listener_status(
     gateway: &Gateway,
     listener: &ListenerInfo,
@@ -1756,23 +1854,14 @@ fn build_listener_status(
         // A TLS listener carries TLSRoutes in Passthrough mode only.
         "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (None, None),
         "TLS" | "TCP" => (
-            Some(if protocol == "TLS" { "TLSRoute" } else { "TCPRoute" }),
-            (!port.is_some_and(|p| served.tcp.contains(&p))).then(|| {
-                format!(
-                    "no proxy.tcp listener on port {} in config.yaml: Sōzune opens no port from a Gateway, so routes attached here are not served",
-                    listener.port
-                )
+            Some(if protocol == "TLS" {
+                "TLSRoute"
+            } else {
+                "TCPRoute"
             }),
+            served.tcp_problem(listener.port),
         ),
-        "UDP" => (
-            Some("UDPRoute"),
-            (!port.is_some_and(|p| served.udp.contains(&p))).then(|| {
-                format!(
-                    "no proxy.udp listener on port {} in config.yaml: Sōzune opens no port from a Gateway, so routes attached here are not served",
-                    listener.port
-                )
-            }),
-        ),
+        "UDP" => (Some("UDPRoute"), served.udp_problem(listener.port)),
         _ => (None, None),
     };
 
@@ -3116,15 +3205,15 @@ fn apply_tls_route(
         scope
             .effective_tls_hostnames_by_port(route)
             .into_iter()
-            .flat_map(|(port, hostnames)| match listener_ports.get(&port) {
+            .flat_map(|(port, hostnames)| match listener_ports.get(port) {
                 Some(listener_name) => {
-                    tls_route_to_entrypoints(route, resolver, scope, &hostnames, listener_name, port)
+                    tls_route_to_entrypoints(route, resolver, scope, &hostnames, &listener_name, port)
                 }
                 None => {
                     let ns = route.metadata.namespace.as_deref().unwrap_or("default");
                     let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
                     warn!(
-                        "Gateway API: TLSRoute {}/{} binds to a Gateway listener on port {} but no `proxy.tcp` listener is declared there — declare one in config.yaml, Sōzune does not open TCP ports on the fly",
+                        "Gateway API: TLSRoute {}/{} binds to a Gateway listener on port {}, which is neither a `proxy.tcp` listener nor in `proxy.gateway_ports.tcp` in config.yaml",
                         ns, name, port
                     );
                     Vec::new()
@@ -3495,15 +3584,15 @@ fn apply_tcp_route(
         scope
             .effective_tcp_ports(route)
             .into_iter()
-            .flat_map(|port| match listener_ports.get(&port) {
+            .flat_map(|port| match listener_ports.get(port) {
                 Some(listener_name) => {
-                    tcp_route_to_entrypoints(route, resolver, scope, listener_name, port)
+                    tcp_route_to_entrypoints(route, resolver, scope, &listener_name, port)
                 }
                 None => {
                     let ns = route.metadata.namespace.as_deref().unwrap_or("default");
                     let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
                     warn!(
-                        "Gateway API: TCPRoute {}/{} binds to a Gateway listener on port {} but no `proxy.tcp` listener is declared there — declare one in config.yaml, Sōzune does not open TCP ports on the fly",
+                        "Gateway API: TCPRoute {}/{} binds to a Gateway listener on port {}, which is neither a `proxy.tcp` listener nor in `proxy.gateway_ports.tcp` in config.yaml",
                         ns, name, port
                     );
                     Vec::new()
@@ -3716,16 +3805,22 @@ fn log_tcp_route(action: &str, route: &TCPRoute) {
 // The datagram twin of TCPRoute: forward a whole `proxy.udp` listener port to
 // the backends, one catch-all `Protocol::Udp` entrypoint per (route, port).
 
-/// Maps a Gateway listener port onto the name of a statically declared
-/// `proxy.udp` listener. Same static-port contract as TCP.
-pub type UdpListenerPorts = Arc<HashMap<i32, String>>;
+/// Maps a Gateway listener port onto the `proxy.udp` listener serving it, as
+/// [`TcpListenerPorts`] does for TCP.
+pub type UdpListenerPorts = Arc<ListenerPorts>;
 
-pub fn udp_listener_ports(udp: &[crate::config::UdpListenerConfig]) -> UdpListenerPorts {
-    Arc::new(
-        udp.iter()
+pub fn udp_listener_ports(
+    udp: &[crate::config::UdpListenerConfig],
+    gateway_ports: &crate::config::GatewayPortsConfig,
+) -> UdpListenerPorts {
+    Arc::new(ListenerPorts {
+        declared: udp
+            .iter()
             .map(|l| (i32::from(l.listen), l.name.clone()))
             .collect(),
-    )
+        open: gateway_ports.udp.clone(),
+        open_name: crate::config::gateway_udp_listener,
+    })
 }
 
 struct TrackedUdpRoute {
@@ -3841,15 +3936,15 @@ fn apply_udp_route(
         scope
             .effective_udp_ports(route)
             .into_iter()
-            .flat_map(|port| match listener_ports.get(&port) {
+            .flat_map(|port| match listener_ports.get(port) {
                 Some(listener_name) => {
-                    udp_route_to_entrypoints(route, resolver, scope, listener_name, port)
+                    udp_route_to_entrypoints(route, resolver, scope, &listener_name, port)
                 }
                 None => {
                     let ns = route.metadata.namespace.as_deref().unwrap_or("default");
                     let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
                     warn!(
-                        "Gateway API: UDPRoute {}/{} binds to a Gateway listener on port {} but no `proxy.udp` listener is declared there — declare one in config.yaml, Sōzune does not open UDP ports on the fly",
+                        "Gateway API: UDPRoute {}/{} binds to a Gateway listener on port {}, which is neither a `proxy.udp` listener nor in `proxy.gateway_ports.udp` in config.yaml",
                         ns, name, port
                     );
                     Vec::new()
@@ -4057,22 +4152,59 @@ fn log_udp_route(action: &str, route: &UDPRoute) {
     debug!("Gateway API: UDPRoute {} {}/{}", action, ns, name);
 }
 
-/// Maps a Gateway listener port onto the name of a statically declared
-/// `proxy.tcp` listener.
-///
-/// Sōzune binds TCP ports at startup from `config.yaml` and deliberately does
-/// not open them on the fly, so a Gateway declaring `port: 8443` is served only
-/// if some `proxy.tcp` entry already listens there. Built once at startup and
-/// read on every TLSRoute apply.
-pub type TcpListenerPorts = Arc<HashMap<i32, String>>;
+/// Maps a Gateway listener port onto the listener serving it: the `proxy.tcp`
+/// entry declared on that port, or else the one Sōzune opens there when
+/// `proxy.gateway_ports.tcp` lists the port. A Gateway declaring `port: 8443`
+/// is served only in one of these two cases. Built once at startup and read
+/// on every route apply.
+pub type TcpListenerPorts = Arc<ListenerPorts>;
+
+/// The listener serving each port a Gateway listener may declare.
+pub struct ListenerPorts {
+    declared: HashMap<i32, String>,
+    open: Vec<crate::config::PortRange>,
+    open_name: fn(u16) -> String,
+}
+
+impl ListenerPorts {
+    /// The listener serving `port`. A declared one wins over opening the port.
+    pub fn get(&self, port: i32) -> Option<String> {
+        if let Some(name) = self.declared.get(&port) {
+            return Some(name.clone());
+        }
+        let port = u16::try_from(port).ok()?;
+        self.open
+            .iter()
+            .any(|r| r.contains(port))
+            .then(|| (self.open_name)(port))
+    }
+}
+
+/// A table of declared listeners only, opening no port.
+#[cfg(test)]
+impl FromIterator<(i32, String)> for ListenerPorts {
+    fn from_iter<I: IntoIterator<Item = (i32, String)>>(iter: I) -> Self {
+        Self {
+            declared: iter.into_iter().collect(),
+            open: Vec::new(),
+            open_name: crate::config::gateway_tcp_listener,
+        }
+    }
+}
 
 /// Build the port → listener-name table from the proxy config.
-pub fn tcp_listener_ports(tcp: &[crate::config::TcpListenerConfig]) -> TcpListenerPorts {
-    Arc::new(
-        tcp.iter()
+pub fn tcp_listener_ports(
+    tcp: &[crate::config::TcpListenerConfig],
+    gateway_ports: &crate::config::GatewayPortsConfig,
+) -> TcpListenerPorts {
+    Arc::new(ListenerPorts {
+        declared: tcp
+            .iter()
             .map(|l| (i32::from(l.listen), l.name.clone()))
             .collect(),
-    )
+        open: gateway_ports.tcp.clone(),
+        open_name: crate::config::gateway_tcp_listener,
+    })
 }
 
 /// Convert a TLSRoute into Sōzune `Entrypoint`s, one per (rule, hostname).
@@ -4575,7 +4707,7 @@ mod tests {
         let route = tls_route(vec!["a.example.com"], 8443);
         let by_port = scope.effective_tls_hostnames_by_port(&route);
         assert!(by_port.contains_key(&9443));
-        assert!(ports_8443().get(&9443).is_none());
+        assert!(ports_8443().get(9443).is_none());
     }
 
     #[test]
@@ -4807,10 +4939,36 @@ mod tests {
                 idle_timeout: None,
             },
         ];
-        let ports = tcp_listener_ports(&listeners);
-        assert_eq!(ports.get(&8443).map(String::as_str), Some("tlsgw"));
-        assert_eq!(ports.get(&5432).map(String::as_str), Some("pg"));
-        assert!(ports.get(&443).is_none());
+        let ports = tcp_listener_ports(&listeners, &Default::default());
+        assert_eq!(ports.get(8443).as_deref(), Some("tlsgw"));
+        assert_eq!(ports.get(5432).as_deref(), Some("pg"));
+        assert!(ports.get(443).is_none());
+    }
+
+    #[test]
+    fn a_gateway_port_resolves_to_the_listener_opened_there() {
+        let listeners = vec![crate::config::TcpListenerConfig {
+            name: "pg".into(),
+            listen: 5432,
+            ip_allow_list: Vec::new(),
+            rate_limit: None,
+            sni_preread_timeout: None,
+            sni_preread_max_bytes: None,
+            idle_timeout: None,
+        }];
+        let gateway_ports = crate::config::GatewayPortsConfig {
+            tcp: vec!["5000-5500".parse().unwrap()],
+            udp: Vec::new(),
+        };
+        let ports = tcp_listener_ports(&listeners, &gateway_ports);
+        // A declared listener wins over opening its port.
+        assert_eq!(ports.get(5432).as_deref(), Some("pg"));
+        assert_eq!(
+            ports.get(5433),
+            Some(crate::config::gateway_tcp_listener(5433))
+        );
+        assert!(ports.get(5501).is_none());
+        assert!(ports.get(-1).is_none());
     }
 
     // ---------- TCPRoute ----------
@@ -5086,9 +5244,17 @@ mod tests {
             name: "dns".into(),
             listen: 53,
         }];
-        let ports = udp_listener_ports(&listeners);
-        assert_eq!(ports.get(&53).map(String::as_str), Some("dns"));
-        assert!(ports.get(&443).is_none());
+        let gateway_ports = crate::config::GatewayPortsConfig {
+            tcp: vec!["5353".parse().unwrap()],
+            udp: vec!["5353".parse().unwrap()],
+        };
+        let ports = udp_listener_ports(&listeners, &gateway_ports);
+        assert_eq!(ports.get(53).as_deref(), Some("dns"));
+        assert_eq!(
+            ports.get(5353),
+            Some(crate::config::gateway_udp_listener(5353))
+        );
+        assert!(ports.get(443).is_none());
     }
 
     /// Resolver test double: returns the same canned IP for every Service
@@ -6864,6 +7030,11 @@ mod tests {
             http: 80,
             tcp: HashSet::from([5432]),
             udp: HashSet::from([53]),
+            gateway: crate::config::GatewayPortsConfig {
+                tcp: vec!["9000-9099".parse().unwrap()],
+                udp: vec!["5353".parse().unwrap()],
+            },
+            unopened: Default::default(),
         }
     }
 
@@ -6976,6 +7147,19 @@ mod tests {
             condition_of(&status(53, "UDP"), CONDITION_TYPE_PROGRAMMED).status,
             "True"
         );
+        // A port of `gateway_ports` is served without a declared listener.
+        assert_eq!(
+            condition_of(&status(9050, "TCP"), CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+        assert_eq!(
+            condition_of(&status(5353, "UDP"), CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
+        assert_eq!(
+            condition_of(&status(5353, "TCP"), CONDITION_TYPE_ACCEPTED).reason,
+            REASON_PORT_UNAVAILABLE
+        );
 
         let grpc = status(80, "GRPC");
         assert_eq!(
@@ -6983,6 +7167,43 @@ mod tests {
             REASON_UNSUPPORTED_PROTOCOL
         );
         assert!(grpc.supported_kinds.is_empty());
+    }
+
+    /// A port of `gateway_ports` the proxy could not open is not served.
+    #[test]
+    fn listener_status_reports_a_port_that_could_not_be_opened() {
+        let gw = gateway("default", "gw", "sozune");
+        let listener = ListenerInfo {
+            name: "l".into(),
+            port: 9050,
+            hostname: None,
+            protocol: "TCP".into(),
+            tls_mode: None,
+            allowed_namespaces: AllowedNamespaces::Same,
+            allowed_kinds: None,
+        };
+        let mut served = served();
+        served
+            .unopened
+            .tcp
+            .insert(9050, "Address already in use".into());
+
+        let status = build_listener_status(&gw, &listener, &served, 1);
+        let programmed = condition_of(&status, CONDITION_TYPE_PROGRAMMED);
+        assert_eq!(programmed.status, "False");
+        assert!(programmed.message.contains("Address already in use"));
+        assert_eq!(
+            condition_of(&status, CONDITION_TYPE_ACCEPTED).reason,
+            REASON_PORT_UNAVAILABLE
+        );
+        // Only the port that failed.
+        served.unopened.tcp.clear();
+        served.unopened.udp.insert(9050, "taken".into());
+        let status = build_listener_status(&gw, &listener, &served, 1);
+        assert_eq!(
+            condition_of(&status, CONDITION_TYPE_PROGRAMMED).status,
+            "True"
+        );
     }
 
     /// `attachedRoutes` counts the routes whose parentRefs select a listener
@@ -7015,6 +7236,41 @@ mod tests {
             .map(|l| (l.name, l.attached_routes))
             .collect();
         assert_eq!(counts, [("shop".to_string(), 1), ("blog".to_string(), 0)]);
+    }
+
+    /// A port the proxy could not open rewrites the status of the Gateways
+    /// listening on it, and only theirs.
+    #[tokio::test]
+    async fn an_unopened_port_rewrites_the_gateways_on_it() {
+        let scope = GatewayScope::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        scope.configure_status(served(), tx);
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut on_port = gateway("default", "on-port", "sozune");
+        on_port.spec.listeners = vec![gw_listener("tcp", 9050, "TCP")];
+        scope.upsert_gateway(&on_port);
+        let mut elsewhere = gateway("default", "elsewhere", "sozune");
+        elsewhere.spec.listeners = vec![gw_listener("tcp", 9060, "TCP")];
+        scope.upsert_gateway(&elsewhere);
+        while rx.try_recv().is_ok() {}
+
+        let mut ports = crate::proxy::backend::UnopenedGatewayPorts::default();
+        ports.tcp.insert(9050, "Address already in use".into());
+        scope.set_unopened_ports(ports.clone()).await;
+        let written: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|w| match w {
+                StatusWrite::Gateway(gw) => gw.metadata.name.unwrap_or_default(),
+                StatusWrite::GatewayClass(_) => "class".into(),
+            })
+            .collect();
+        assert_eq!(written, ["on-port"]);
+        let statuses = scope.listener_statuses(&on_port);
+        let programmed = condition_of(&statuses[0], CONDITION_TYPE_PROGRAMMED);
+        assert_eq!(programmed.status, "False");
+
+        // Nothing changed: nothing to rewrite.
+        scope.set_unopened_ports(ports).await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
