@@ -126,16 +126,26 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
-  # Optional: only needed if you want Gateway API support. `tlsroutes` is
-  # only consulted when the (experimental) CRD is installed; without the
-  # permission Sōzune logs a warning and skips that watcher.
+  # Optional: only needed if you want Gateway API support. `tlsroutes`,
+  # `tcproutes` and `udproutes` are only consulted when their (experimental)
+  # CRDs are installed; without the permission Sōzune logs a warning and skips
+  # that watcher.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["httproutes", "tlsroutes", "gateways", "gatewayclasses", "referencegrants"]
+      [
+        "httproutes",
+        "tlsroutes",
+        "tcproutes",
+        "udproutes",
+        "gateways",
+        "gatewayclasses",
+        "referencegrants",
+      ]
     verbs: ["get", "list", "watch"]
   # Optional: only needed for Gateway API status reporting (kubectl
   # describe will show sōzune's conditions: Accepted/ResolvedRefs on
-  # HTTPRoutes, Accepted/Programmed on Gateways, Accepted on GatewayClasses).
+  # HTTPRoutes, Accepted/Programmed on Gateways and their listeners, Accepted
+  # on GatewayClasses).
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]
     verbs: ["update", "patch"]
@@ -237,6 +247,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
 - `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix).
 - `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
+- Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
 - `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. A request that fails a query or method condition, or a header match on `Host` or `Cookie` (which Sōzu cannot route on), gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
@@ -257,6 +268,8 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Route is in scope (parent owned), filters are OK |
 | `Accepted` | `False` (`UnsupportedValue`) | Route declares unsupported filters |
+| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)). No `ResolvedRefs` is reported for that parent |
+| `Accepted` | `False` (`NoMatchingParent`) | The `parentRef`'s `sectionName` / `port` names no listener of a Gateway Sōzune owns |
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | All backendRefs resolved to ready endpoints |
 | `ResolvedRefs` | `False` (`BackendNotFound`) | One or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
 | `ResolvedRefs` | `False` (`UnsupportedValue`) | Route was rejected because of unsupported filters |
@@ -270,6 +283,19 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 | `Accepted` | `True` (`Accepted`) | Gateway's `gatewayClassName` points at a class sōzune owns |
 | `Programmed` | `True` (`Programmed`) | Same instant as acceptance — sōzune does not stage programming |
 
+**Gateway listeners** (`status.listeners[]`), one entry per listener:
+
+- `supportedKinds` — the route kind the listener carries: `HTTPRoute` for `HTTP`, `TLSRoute` for `TLS`, `TCPRoute` for `TCP`, `UDPRoute` for `UDP`; none when its `allowedRoutes.kinds` leaves that kind out.
+- `attachedRoutes` — how many routes select the listener through their `parentRefs` (by `sectionName`/`port`, or all of a Gateway's listeners when neither is set) and are admitted by its `allowedRoutes` and its `hostname`, whether or not the routes are accepted.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener, whatever its port: its routes are served on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry, a `UDP` one on the port of a `proxy.udp` entry |
+| `Accepted`, `Programmed` | `False` (`PortUnavailable`, `Invalid`) | A `TLS`, `TCP` or `UDP` listener on a port no `proxy.tcp` / `proxy.udp` entry listens on: Sōzune opens none from a Gateway, and the message names the entry to add |
+| `ResolvedRefs` | `True` (`ResolvedRefs`) | The listener's `allowedRoutes.kinds` is unset, or only lists the kind it carries |
+| `ResolvedRefs` | `False` (`InvalidRouteKinds`) | `allowedRoutes.kinds` lists a kind the listener's protocol cannot carry. If it leaves out the one it can, `Programmed` is `False` (`Invalid`) too: no route attaches |
+| `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | An `HTTPS` listener: a Gateway's HTTPRoutes are served over HTTP only, so it would hand them to plain HTTP. A `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`), or any other protocol |
+
 **GatewayClass** (`status.conditions[]`):
 
 | Condition | Status | Reason | When |
@@ -277,6 +303,31 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 | `Accepted` | `True` (`Accepted`) | `spec.controllerName` is `kemeter.io/sozune` |
 
 Gateways and GatewayClasses that belong to another controller receive **no status entry** from sōzune.
+
+### Which routes a listener admits (allowedRoutes)
+
+A listener only takes the routes its `allowedRoutes` admits, for every route kind (HTTPRoute, TLSRoute, TCPRoute, UDPRoute). An HTTPRoute only attaches through `HTTP` listeners, a TLSRoute through `TLS` ones, and so on:
+
+| Field | Behaviour |
+|---|---|
+| `namespaces.from: Same` (the default) | Routes in the Gateway's own namespace only. |
+| `namespaces.from: All` | Routes in any namespace. |
+| `namespaces.from: Selector` | No route: namespace labels are not watched yet, so Sōzune admits none rather than guess. |
+| `kinds` | Only the listed route kinds (group `gateway.networking.k8s.io`). Unset or empty, the listener's protocol decides. |
+
+A route in another namespace that names a Gateway therefore needs `from: All` on the listeners it should attach to:
+
+```yaml
+listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+```
+
+A `parentRef` none of whose listeners admits the route is not served; an HTTPRoute reports it with `Accepted=False` (`NotAllowedByListeners`).
 
 ### Cross-namespace backends (ReferenceGrant)
 
@@ -304,7 +355,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 ### What's not supported (yet)
 
-- Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
+- Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. The listener's status names the port its routes are served on. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`.
 - A `backendRef` that is invalid (an unsupported kind, a cross-namespace ref with no `ReferenceGrant`) is left out of the rule, and its share of the traffic goes to the other backends. The spec asks for that share to be answered with `500`.
@@ -465,7 +516,7 @@ proxy:
       listen: 8443
 ```
 
-A `TLSRoute` whose listener port has no matching entry is tracked but not served, and Sōzune logs which port it wanted. Declare the listener and the route goes live on the next reload, with no need to re-apply it.
+A `TLSRoute` whose listener port has no matching entry is tracked but not served: Sōzune logs which port it wanted, and the Gateway's listener status says `PortUnavailable` (see [Status conditions](#status-conditions)). Declare the listener and the route goes live on the next reload, with no need to re-apply it.
 
 ### What is supported
 
@@ -475,7 +526,7 @@ A `TLSRoute` whose listener port has no matching entry is tracked but not served
 | `hostnames` | Each becomes one SNI route. Exact names and a single leading `*.` wildcard label, per spec. A route with no hostname serves nothing: there is no name to match a ClientHello against. |
 | Listener `hostname` | Intersected with the route's hostnames, exactly as for HTTPRoute. |
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
-| `parentRefs` | `sectionName` and `port` select a listener, as for HTTPRoute. A route may bind listeners on several ports; each serves only the names its own `hostname` admits. |
+| `parentRefs` | `sectionName` and `port` select a listener, as for HTTPRoute, among those whose [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes) admit the route. A route may bind listeners on several ports; each serves only the names its own `hostname` admits. |
 | Invalid hostnames | A name Sōzu could not route (a wildcard beyond one leading `*.` label, `/`, an empty label, non-ASCII) is dropped with a warning; the route's other names still serve. |
 | Unmatched SNI | Dropped. Once a listener carries SNI routes there is no catch-all — declare a route for every name you serve. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough). |
 
@@ -515,7 +566,7 @@ spec:
 
 ### The port must already be declared
 
-Exactly as for TLSRoute: the Gateway's `TCP` listener port must match a `proxy.tcp` entry in `config.yaml`. Sōzune binds TCP ports at startup and never opens one from a Gateway alone. A route on an undeclared port is tracked but not served, and goes live on the next reload once the listener is declared.
+Exactly as for TLSRoute: the Gateway's `TCP` listener port must match a `proxy.tcp` entry in `config.yaml`. Sōzune binds TCP ports at startup and never opens one from a Gateway alone. A route on an undeclared port is tracked but not served — the listener status says `PortUnavailable` — and goes live on the next reload once the listener is declared.
 
 ```yaml
 proxy:
@@ -531,7 +582,7 @@ proxy:
 | Listener | `protocol: TCP` only. A `TLS` or `HTTP` listener is ignored by TCPRoutes. |
 | Routing | None — the whole port goes to the backend. One rule → one entrypoint. No hostnames, matches, or filters (a TCPRoute has none). |
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
-| `parentRefs` | `sectionName` and `port` select a listener. A route may bind listeners on several ports; each gets its own entrypoint. |
+| `parentRefs` | `sectionName` and `port` select a listener, among those whose [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes) admit the route. A route may bind listeners on several ports; each gets its own entrypoint. |
 
 ## Gateway API (UDPRoute)
 
