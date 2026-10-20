@@ -1,8 +1,6 @@
 # Backend health checks
 
-Sōzune actively probes every backend in the background and reports their status. This runs automatically — no configuration needed.
-
-> **Health is reported, not acted on.** An unhealthy backend shows up in `GET /entrypoints`, the dashboard and `sozune route resolve`, but it stays in the load-balancing rotation: Sōzu keeps sending it its share of traffic, and only skips it while it refuses connections. To take a container out of rotation when it fails, give it a Docker `HEALTHCHECK` — see [Readiness](/documentation/providers/docker#readiness--docker-healthcheck).
+Sōzune actively probes every backend in the background, takes the unhealthy ones out of rotation and reports why. This runs automatically — no configuration needed.
 
 ## How it works
 
@@ -16,7 +14,14 @@ Every **10 seconds**, Sōzune probes each backend. By default this is a **TCP co
 | Timeout | Backend marked unhealthy |
 | HTTP status not accepted | Backend marked unhealthy (`bad_status`) |
 
-A backend's status changes as soon as a probe gives a different result, and is visible right away.
+When a backend turns unhealthy, Sōzune takes it out of its route: Sōzu and the Sōzune middleware stop sending it requests, and the connections Sōzu holds to it are closed. A WebSocket tunnel the middleware opened stays until one side closes it (see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves)). It keeps being probed, and comes back as soon as a probe succeeds.
+
+- **Every backend unhealthy:** none is taken out. A route with nothing left would refuse every request, and a probe can be wrong — a misconfigured `healthCheck.path` fails on every backend at once. The dashboard and `sozune route resolve` say so.
+- **Backups:** a backend of [weight `0`](/documentation/routing/load-balancing#weighted-load-balancing) is a backup. When the others are unhealthy and it is not, it serves.
+- **Shared backends:** a backend that several routes use is probed once per health check they declare, and each route takes it out on its own check's result.
+- **UDP** backends are not probed.
+
+The unhealthy backends show up in `GET /entrypoints` (`unhealthy_backends`, with `in_rotation` telling whether each is out), the dashboard and `sozune route resolve`.
 
 ## HTTP health checks
 
@@ -42,7 +47,6 @@ Without `healthCheck.path`, the backend keeps the plain TCP probe — fully back
 ## What it does not do
 
 - **No per-service interval.** The probe interval (10s) is global and hardcoded; only the per-check HTTP `timeout` is configurable so far.
-- **No eviction.** An unhealthy backend keeps receiving traffic (see the note above).
 - **No threshold logic.** A single failed probe marks the backend unhealthy. There is no "fail N times" debouncing.
 - **No gRPC / custom method / custom headers** on the HTTP probe yet — it is a plain `GET`.
 

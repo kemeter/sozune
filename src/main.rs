@@ -267,6 +267,12 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let api_plugins = Arc::new(plugins.clone());
     let live_routes: proxy::backend::LiveRoutes = Arc::new(RwLock::new(BTreeMap::new()));
     let live_routes_proxy = Arc::clone(&live_routes);
+    // Build the health checker up-front so its unhealthy-backend state can be
+    // shared with the proxy (which leaves those backends out of rotation), the
+    // API (read by `GET /entrypoints`) and the runtime task.
+    let health_checker = proxy::health::HealthChecker::new(Arc::clone(&storage), reload_tx.clone());
+    let unhealthy_backends = health_checker.unhealthy_backends();
+    let unhealthy_backends_proxy = Arc::clone(&unhealthy_backends);
     let metrics_store_proxy = Arc::clone(&metrics_store);
     let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         proxy::backend::init_proxy(
@@ -282,6 +288,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 middleware_state: middleware_state_proxy,
                 middleware_port,
                 live_routes: live_routes_proxy,
+                unhealthy_backends: unhealthy_backends_proxy,
                 plugins,
                 handle,
             },
@@ -322,11 +329,6 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             .await
         }
     });
-
-    // Build the health checker up-front so its unhealthy-backend state can be
-    // shared with the API (read by `GET /entrypoints`) and the runtime task.
-    let health_checker = proxy::health::HealthChecker::new(Arc::clone(&storage), reload_tx.clone());
-    let unhealthy_backends = health_checker.unhealthy_backends();
 
     let storage_server = storage.clone();
     let api_config = config.api.clone();

@@ -7,9 +7,23 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::model::{Entrypoint, HealthCheckConfig, Protocol};
+use crate::model::{Backend, Entrypoint, HealthCheckConfig, Protocol};
 
-/// Map of backend `host:port` keys to the reason they were marked down. Shared
+/// The key a backend's health is kept under: its address, and the HTTP check
+/// of the route that probes it. Two routes that share a backend but check it
+/// differently get a probe and a verdict each, so one route's check never
+/// takes the backend out of the other.
+pub fn probe_key(backend: &Backend, health_check: Option<&HealthCheckConfig>) -> String {
+    match health_check {
+        None => backend.to_string(),
+        Some(hc) => format!(
+            "{backend} GET {} status={:?} timeout={:?}",
+            hc.path, hc.status, hc.timeout_ms
+        ),
+    }
+}
+
+/// Map of [`probe_key`]s to the reason the probe marked the backend down. Shared
 /// between [`HealthChecker`] and the API layer so `GET /entrypoints` can return
 /// a structured reason instead of just listing addresses.
 pub type UnhealthyMap = HashMap<String, UnhealthyReason>;
@@ -215,18 +229,14 @@ impl HealthChecker {
             if entrypoint.protocol == Protocol::Udp {
                 continue;
             }
+            let health_check = entrypoint.config.health_check.as_ref();
             for backend in &entrypoint.backends {
-                let key = backend.to_string();
-                let entry = backends.entry(key.clone()).or_insert_with(|| BackendProbe {
-                    addr: key.clone(),
-                    health_check: None,
-                });
-                // A backend shared across entrypoints keeps the first HTTP
-                // health check found, so an explicit check is never lost to a
-                // later entrypoint that only does TCP.
-                if entry.health_check.is_none() {
-                    entry.health_check = entrypoint.config.health_check.clone();
-                }
+                backends
+                    .entry(probe_key(backend, health_check))
+                    .or_insert_with(|| BackendProbe {
+                        addr: backend.to_string(),
+                        health_check: health_check.cloned(),
+                    });
             }
         }
         backends
@@ -353,6 +363,49 @@ mod tests {
             status,
             timeout_ms: None,
         }
+    }
+
+    /// Two routes that share a backend but check it differently get a probe
+    /// each, under keys of their own: one route's verdict must not take the
+    /// backend out of the other.
+    #[test]
+    fn a_shared_backend_gets_one_probe_per_route_check() {
+        let backend = Backend::new("10.0.0.1", 80);
+        let route = |id: &str, health_check: Option<HealthCheckConfig>| {
+            let mut ep: Entrypoint = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "name": id,
+                "backends": [{ "address": "10.0.0.1", "port": 80 }],
+                "protocol": "Http",
+                "config": {
+                    "hostnames": [format!("{id}.example.com")],
+                    "path": null,
+                    "tls": false,
+                    "strip_prefix": false,
+                    "https_redirect": false,
+                    "priority": 0,
+                    "auth": null,
+                    "headers": []
+                }
+            }))
+            .unwrap();
+            ep.config.health_check = health_check;
+            (id.to_string(), ep)
+        };
+        let storage = BTreeMap::from([
+            route("strict", Some(hc("/health", Some(200)))),
+            route("plain", None),
+        ]);
+        let (reload_tx, _rx) = mpsc::channel(64);
+        let checker = HealthChecker::new(Arc::new(RwLock::new(storage)), reload_tx);
+
+        let probes = checker.collect_backends();
+
+        assert_eq!(probes.len(), 2);
+        let strict = probe_key(&backend, Some(&hc("/health", Some(200))));
+        assert!(probes[&strict].health_check.is_some());
+        assert!(probes[&probe_key(&backend, None)].health_check.is_none());
+        assert_ne!(strict, probe_key(&backend, Some(&hc("/health", None))));
     }
 
     #[tokio::test]

@@ -83,7 +83,7 @@ Numeric values in both formats are produced from the same in-memory snapshot, so
 | `sozune_entrypoints_by_protocol{protocol="http\|tcp\|udp"}` | gauge | Entrypoints per protocol |
 | `sozune_entrypoints_tls` | gauge | Entrypoints with TLS enabled |
 | `sozune_backends` | gauge | Total backends across all entrypoints |
-| `sozune_backends_unhealthy` | gauge | Backends currently marked down by the health checker |
+| `sozune_backends_unhealthy` | gauge | Health checks currently failing. A backend shared by routes that check it differently counts once per failing check |
 | `sozune_diagnostics{severity="error\|warn\|info"}` | gauge | Active diagnostics by severity |
 | `sozune_acme_enabled` | gauge | `1` if the ACME module is enabled, `0` otherwise |
 

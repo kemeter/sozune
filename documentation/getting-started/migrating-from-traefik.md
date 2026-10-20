@@ -88,7 +88,7 @@ A rule that mixes `||` across different matcher types has no single-route equiva
 |---|---|
 | `services.<s>.loadbalancer.server.port` | `port` |
 | `services.<s>.loadbalancer.sticky.cookie=true` | `stickySession=true` |
-| `services.<s>.loadbalancer.healthcheck.path` | `healthCheck.path`, which reports the backend's health but does not take it out of rotation yet: use a Docker `HEALTHCHECK` for that. See [Health checks](/documentation/advanced/health-checks). |
+| `services.<s>.loadbalancer.healthcheck.path` | `healthCheck.path`. A backend that fails it leaves the rotation, unless every backend of the route does. See [Health checks](/documentation/advanced/health-checks). |
 | `services.<s>.loadbalancer.healthcheck.timeout=2s` | `healthCheck.timeout=2000` (milliseconds) |
 | `serverstransport.forwardingtimeouts.responseheadertimeout=2s` | `backendTimeout=2000` (milliseconds). It caps the whole response, not only the wait for its headers: leave room for a long or streamed body. |
 

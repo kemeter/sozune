@@ -235,7 +235,11 @@ fn render(method: &str, url: &str, resolution: &Resolution) -> String {
     });
     section(&mut out, "backends", &resolution.backends, |b| {
         let glyph = if b.healthy { "✓" } else { "✗" };
-        (glyph, b.address.clone(), b.reason.clone())
+        let reason = match (&b.reason, b.in_rotation) {
+            (Some(reason), false) => Some(format!("{reason}; out of rotation")),
+            (reason, _) => reason.clone(),
+        };
+        (glyph, b.address.clone(), reason)
     });
     out
 }
