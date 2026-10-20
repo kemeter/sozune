@@ -24,10 +24,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddBackend, Cluster, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, QueryMetricsOptions, RemoveBackend, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, ResponseStatus, RulePosition,
-        SocketAddress, TlsVersion, UdpClusterConfig, WorkerRequest, WorkerResponse,
+        ActivateListener, AddBackend, CloseSessions, Cluster, ListenerType,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, QueryMetricsOptions, RemoveBackend,
+        Request, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, ResponseStatus,
+        RulePosition, SocketAddress, TlsVersion, UdpClusterConfig, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
     },
 };
@@ -934,18 +934,23 @@ fn handle_reload(
     // of hundreds of entrypoints is unaffected: every ack resets the counter, so
     // only a genuinely unresponsive worker trips the short-circuit.
     with_reload_budget(|| {
-        apply_routing_diff(previous_snapshot, &current_snapshot, channels);
+        let departed = apply_routing_diff(previous_snapshot, &current_snapshot, channels);
 
         // Update middleware route table
         update_middleware_routes(&storage_read, middleware_state, plugins, trusted_proxies);
 
-        match configure_sozu_routing(
+        let outcome = configure_sozu_routing(
             channels,
             &storage_read,
             previous_snapshot,
             cluster_setup_delay_ms,
             middleware_port,
-        ) {
+        );
+        // Once the changed routes are back, so a client that reconnects at
+        // once reaches them instead of a route being reinstalled. A route the
+        // reload did not install keeps its sessions: they are all it has left.
+        close_departed_sessions(channels, &reinstalled_only(departed, &outcome));
+        match outcome {
             Ok(skipped) => {
                 // Entrypoints we chose not to send must not be recorded as
                 // live, or the next reload would see them unchanged and never
@@ -1285,7 +1290,11 @@ fn configure_sozu_routing(
             }
         }
 
-        applied.insert(cluster_id.clone());
+        // A rejected route was not installed: left out, it stays out of the
+        // snapshot when a later route fails the reload, and is retried.
+        if !skipped.contains(cluster_id) {
+            applied.insert(cluster_id.clone());
+        }
 
         thread::sleep(std::time::Duration::from_millis(cluster_setup_delay_ms));
     }
@@ -2307,6 +2316,159 @@ fn add_backends(
 
 /// Remove a specific subset of backends by address-derived id (mirror of
 /// [`add_backends`]).
+/// Closes the sessions still holding a connection to a backend that left
+/// `cluster_id`, or to any of its backends when `backend` is `None`. Sent after
+/// the removal, so a client that reconnects reaches what is left. Sōzu lets an
+/// HTTP request in flight finish and drains HTTP/2 streams; a WebSocket or TCP
+/// session closes at once. Without it, such a session stays tied to a backend
+/// that is no longer routed, for as long as the connection lives.
+fn close_sessions(
+    channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    worker: &str,
+    cluster_id: &str,
+    backend: Option<(String, SocketAddress)>,
+) {
+    let (backend_id, address) = match backend {
+        Some((id, address)) => (Some(id), Some(address)),
+        None => (None, None),
+    };
+    let target = backend_id.clone().unwrap_or_else(|| cluster_id.to_string());
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("close-sessions-{worker}-{target}"),
+        RequestType::CloseSessions(CloseSessions {
+            cluster_id: cluster_id.to_string(),
+            backend_id,
+            address,
+        }),
+    ) {
+        debug!("Failed to close {worker} sessions of {target}: {e}");
+    }
+}
+
+/// [`close_sessions`] for HTTP backends that left `cluster_id`, on the HTTP
+/// worker and, for a TLS route, the HTTPS one.
+fn close_http_backend_sessions(
+    command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    cluster_id: &str,
+    departed: &[&Backend],
+    tls: bool,
+) {
+    for backend in departed {
+        let Ok(address) = parse_backend_address(backend) else {
+            continue;
+        };
+        let id = backend_id(cluster_id, 0, backend);
+        close_sessions(
+            command_channel,
+            "http",
+            cluster_id,
+            Some((id.clone(), address)),
+        );
+        if tls {
+            close_sessions(
+                command_channel_https,
+                "https",
+                cluster_id,
+                Some((id, address)),
+            );
+        }
+    }
+}
+
+/// Backends a changed route lost, whose sessions are closed once the route is
+/// installed again.
+struct DepartedBackends {
+    cluster_id: String,
+    route: Entrypoint,
+    backends: Vec<Backend>,
+    /// The route changed protocol: every session of the old one goes, since
+    /// its frontend is gone whatever the backends.
+    whole_cluster: bool,
+}
+
+impl DepartedBackends {
+    fn new(cluster_id: &str, old: &Entrypoint, new: &Entrypoint) -> Self {
+        Self {
+            cluster_id: cluster_id.to_string(),
+            route: old.clone(),
+            backends: departed_backends(old, new).into_iter().cloned().collect(),
+            whole_cluster: old.protocol != new.protocol,
+        }
+    }
+}
+
+/// The departed backends of the routes `outcome` installed again: a route the
+/// reload skipped, or did not reach, keeps its sessions.
+fn reinstalled_only(
+    departed: Vec<DepartedBackends>,
+    outcome: &Result<BTreeSet<String>, ReloadFailure>,
+) -> Vec<DepartedBackends> {
+    departed
+        .into_iter()
+        .filter(|lost| match outcome {
+            Ok(skipped) => !skipped.contains(&lost.cluster_id),
+            Err(ReloadFailure { applied, .. }) => applied.contains(&lost.cluster_id),
+        })
+        .collect()
+}
+
+/// Closes the sessions of the backends changed routes lost, after the reload
+/// installed the routes again.
+fn close_departed_sessions(channels: &mut Channels, departed: &[DepartedBackends]) {
+    for lost in departed {
+        if lost.whole_cluster {
+            match lost.route.protocol {
+                Protocol::Http => {
+                    close_sessions(&mut channels.http, "http", &lost.cluster_id, None);
+                    if lost.route.config.tls {
+                        close_sessions(&mut channels.https, "https", &lost.cluster_id, None);
+                    }
+                }
+                Protocol::Tcp => {
+                    close_tcp_sessions(&mut channels.tcp, &lost.cluster_id, &lost.route, None)
+                }
+                Protocol::Udp => {}
+            }
+            continue;
+        }
+        if lost.backends.is_empty() {
+            continue;
+        }
+        let backends: Vec<&Backend> = lost.backends.iter().collect();
+        match lost.route.protocol {
+            Protocol::Http => close_http_backend_sessions(
+                &mut channels.http,
+                &mut channels.https,
+                &lost.cluster_id,
+                &backends,
+                lost.route.config.tls,
+            ),
+            Protocol::Tcp => close_tcp_sessions(
+                &mut channels.tcp,
+                &lost.cluster_id,
+                &lost.route,
+                Some(&backends),
+            ),
+            // Sōzu keeps no session for a UDP flow to close.
+            Protocol::Udp => {}
+        }
+    }
+}
+
+/// The backends of `old` that `new` no longer has, matched by address.
+fn departed_backends<'a>(old: &'a Entrypoint, new: &Entrypoint) -> Vec<&'a Backend> {
+    old.backends
+        .iter()
+        .filter(|b| {
+            !new.backends
+                .iter()
+                .any(|n| n.address == b.address && n.port == b.port)
+        })
+        .collect()
+}
+
 fn remove_backend_set(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
@@ -2588,6 +2750,13 @@ fn diff_backends_in_place(
                     &removed,
                     new.config.tls,
                 );
+                close_http_backend_sessions(
+                    &mut channels.http,
+                    &mut channels.https,
+                    cluster_id,
+                    &removed,
+                    new.config.tls,
+                );
             }
         }
         Protocol::Tcp => {
@@ -2666,14 +2835,22 @@ fn l4_diff_backends_in_place(
         ) {
             debug!("Failed to remove {proto} backend {backend_id}: {e}");
         }
+        // Sōzu keeps no session for a UDP flow to close.
+        if proto == "tcp" {
+            close_sessions(channel, proto, cluster_id, Some((backend_id, address)));
+        }
     }
 }
 
+/// Applies the removals a reload implies, and returns the backends the
+/// changed routes lost: their sessions are closed by the caller once the
+/// routes are installed again ([`close_departed_sessions`]).
 fn apply_routing_diff(
     previous: &RoutingSnapshot,
     current: &RoutingSnapshot,
     channels: &mut Channels,
-) {
+) -> Vec<DepartedBackends> {
+    let mut departed = Vec::new();
     let needed_twins: Vec<RequestHttpFrontend> = current
         .values()
         .filter(|entrypoint| entrypoint.protocol == Protocol::Http)
@@ -2697,6 +2874,10 @@ fn apply_routing_diff(
                         https_addr,
                     );
                     remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    close_sessions(&mut channels.http, "http", cluster_id, None);
+                    if old.config.tls {
+                        close_sessions(&mut channels.https, "https", cluster_id, None);
+                    }
                     remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
 
                     if channels.acme_challenge_port.is_some() {
@@ -2715,6 +2896,7 @@ fn apply_routing_diff(
                 }
                 Protocol::Tcp => {
                     remove_tcp_entrypoint(&mut channels.tcp, cluster_id, old);
+                    close_tcp_sessions(&mut channels.tcp, cluster_id, old, None);
                 }
                 Protocol::Udp => {
                     remove_udp_entrypoint(&mut channels.udp, cluster_id, old);
@@ -2755,6 +2937,13 @@ fn apply_routing_diff(
                         https_addr,
                     );
                     remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    // Only the backends the route no longer has: one it keeps
+                    // is re-added, and closing its sessions would cut every
+                    // WebSocket on each change to the route. Through the
+                    // middleware, Sōzu's backend is the middleware itself.
+                    if !middleware::needs_middleware(&old.config) || old.protocol != new.protocol {
+                        departed.push(DepartedBackends::new(cluster_id, old, new));
+                    }
 
                     if channels.acme_challenge_port.is_some() {
                         remove_acme_twins(
@@ -2776,9 +2965,51 @@ fn apply_routing_diff(
                 }
                 Protocol::Tcp => {
                     remove_tcp_entrypoint(&mut channels.tcp, cluster_id, old);
+                    // With no listener for the new route, nothing replaces
+                    // the old one: its sessions are all that is left.
+                    let replaced = new.protocol != Protocol::Tcp
+                        || new
+                            .config
+                            .entrypoint
+                            .as_deref()
+                            .is_some_and(|name| channels.tcp.contains_key(name));
+                    if replaced {
+                        departed.push(DepartedBackends::new(cluster_id, old, new));
+                    }
                 }
                 Protocol::Udp => {
                     remove_udp_entrypoint(&mut channels.udp, cluster_id, old);
+                }
+            }
+        }
+    }
+    departed
+}
+
+/// [`close_sessions`] for a TCP route on its listener: the sessions of the
+/// `departed` backends, or of the whole cluster when it is `None`.
+fn close_tcp_sessions(
+    tcp_channels: &mut L4Channels,
+    cluster_id: &str,
+    entrypoint: &Entrypoint,
+    departed: Option<&[&Backend]>,
+) {
+    let Some(listener) = entrypoint
+        .config
+        .entrypoint
+        .as_deref()
+        .and_then(|name| tcp_channels.get_mut(name))
+    else {
+        return;
+    };
+    let channel = &mut listener.channel;
+    match departed {
+        None => close_sessions(channel, "tcp", cluster_id, None),
+        Some(backends) => {
+            for backend in backends {
+                if let Ok(address) = parse_backend_address(backend) {
+                    let id = l4_backend_id(cluster_id, backend);
+                    close_sessions(channel, "tcp", cluster_id, Some((id, address)));
                 }
             }
         }
@@ -4024,6 +4255,60 @@ mod tests {
         let mut new = base_ep(vec![Backend::new("10.0.0.1", 80)]);
         new.config.compress = true;
         assert!(!frontend_unchanged(&old, &new));
+    }
+
+    /// A route the reload did not install again keeps its sessions; one that
+    /// changed protocol loses them all.
+    #[test]
+    fn departed_sessions_close_only_for_reinstalled_routes() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut moved = old.clone();
+        moved.backends = vec![Backend::new("10.0.0.2", 80)];
+        let departed = || {
+            vec![
+                DepartedBackends::new("a", &old, &moved),
+                DepartedBackends::new("b", &old, &moved),
+            ]
+        };
+        let ids = |kept: Vec<DepartedBackends>| -> Vec<String> {
+            kept.into_iter().map(|d| d.cluster_id).collect()
+        };
+
+        let skipped = Ok(BTreeSet::from(["b".to_string()]));
+        assert_eq!(ids(reinstalled_only(departed(), &skipped)), ["a"]);
+        let failure = Err(ReloadFailure {
+            error: anyhow::anyhow!("refused"),
+            applied: BTreeSet::from(["b".to_string()]),
+        });
+        assert_eq!(ids(reinstalled_only(departed(), &failure)), ["b"]);
+
+        let mut tcp = old.clone();
+        tcp.protocol = Protocol::Tcp;
+        let switched = DepartedBackends::new("a", &old, &tcp);
+        assert!(switched.whole_cluster);
+        assert!(switched.backends.is_empty());
+        assert!(!DepartedBackends::new("a", &old, &moved).whole_cluster);
+    }
+
+    /// Only a backend the route no longer has has its sessions closed: one it
+    /// keeps, even with another weight, is re-added and keeps them.
+    #[test]
+    fn departed_backends_are_those_the_route_no_longer_has() {
+        let old = base_ep(vec![
+            Backend::new("10.0.0.1", 80),
+            Backend::new("10.0.0.2", 80),
+            Backend::new("10.0.0.3", 80),
+        ]);
+        let new = base_ep(vec![
+            Backend::new("10.0.0.1", 80).with_weight(5),
+            Backend::new("10.0.0.3", 8080),
+        ]);
+        let departed: Vec<String> = departed_backends(&old, &new)
+            .iter()
+            .map(|b| format!("{}:{}", b.address, b.port))
+            .collect();
+        assert_eq!(departed, ["10.0.0.2:80", "10.0.0.3:80"]);
+        assert!(departed_backends(&old, &old).is_empty());
     }
 
     #[test]

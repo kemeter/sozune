@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
 - Sōzu upgraded to 2.3.2, a published release instead of a development revision. A frontend change a worker refuses is now rolled back instead of leaving the workers out of step, and backends stay tied to their cluster when routes are reloaded.
 - A route with no backend answered `502` when it went through the middleware and `503` when it did not. It answers `503` both ways.
 - Gateway API `backendRef` weights now follow the spec: a weight is the Service's share, so a Service running 3 pods no longer weighs 3 times its `weight`; an unset weight is `1`, not `100`, so it no longer outweighs an explicit `weight: 1` a hundredfold; and `weight: 0` sends no traffic. A rule whose backendRefs all weigh `0` answers `503` instead of being reported as `BackendNotFound`.
+- A route Sōzu refused during a reload that failed further on was recorded as applied, and never retried until it changed again. It is retried on the next reload, as when the reload succeeds.
+- When a backend leaves a route (container stopped, scale down, rollout, route removed), its open connections are now closed after it is removed, so clients reconnect to a backend that is still there. They used to stay tied to it — a WebSocket or a TCP connection for as long as it lived. An HTTP request in flight finishes first. See [When a backend leaves](documentation/routing/load-balancing.md#when-a-backend-leaves).
 
 ### TLS / ACME
 
