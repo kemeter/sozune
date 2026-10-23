@@ -40,7 +40,7 @@ use gateway_api::apis::experimental::udproutes::{UDPRoute, UDPRouteParentRefs, U
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
-    GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
+    GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
@@ -103,6 +103,10 @@ pub fn is_gateway_route(entrypoint: &Entrypoint) -> bool {
 /// all re-resolve immediately instead of one waiting out its periodic tick.
 /// Bump this when adding another route watcher.
 const SCOPE_SUBSCRIBERS: usize = 4;
+
+/// How long a Gateway status write that failed waits before it is tried
+/// again.
+const STATUS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// In-memory snapshot of the Gateway API resources sōzune has decided to
 /// honour. The HTTPRoute watcher consults this on every apply to decide
@@ -333,6 +337,10 @@ pub struct ScopeState {
     secret_grants: HashMap<(String, String), SecretGrant>,
     /// The labels of each namespace, for `allowedRoutes.namespaces.selector`.
     namespace_labels: HashMap<String, BTreeMap<String, String>>,
+    /// Sōzune's addresses, as `(type, value)`, for the `status.addresses` of
+    /// the Gateways it owns. `None` leaves them alone: neither
+    /// `publish_service` nor `publish_addresses` is set.
+    addresses: Option<Vec<(String, String)>>,
 }
 
 /// The Secrets a ReferenceGrant lets Gateways of other namespaces name in
@@ -1580,6 +1588,82 @@ impl GatewayScope {
         }
         drop(g);
         self.fire_if(true);
+    }
+
+    /// Record Sōzune's addresses, and rewrite the status of every Gateway it
+    /// owns when they change. Waits for room in the status channel rather
+    /// than drop a write: no other event would bring the address up to date.
+    pub async fn set_addresses(&self, addresses: Vec<(String, String)>) {
+        let (writes, status_tx) = {
+            let mut g = match self.state.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("Gateway API: scope lock poisoned: {}", e);
+                    return;
+                }
+            };
+            if g.addresses.as_ref() == Some(&addresses) {
+                return;
+            }
+            g.addresses = Some(addresses);
+            let writes: Vec<StatusWrite> = g
+                .gateway_objects
+                .iter()
+                .filter(|(key, _)| g.gateways.contains_key(*key))
+                .map(|(_, gateway)| StatusWrite::Gateway(Box::new(gateway.clone())))
+                .collect();
+            (writes, g.status_tx.clone())
+        };
+        let Some(status_tx) = status_tx else {
+            return;
+        };
+        for write in writes {
+            if status_tx.send(write).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Write the status of Gateway `ns/name` again after a while, as it is
+    /// then: a status write that failed is not tried again otherwise until
+    /// something else changes.
+    fn retry_gateway_status(&self, ns: &str, name: &str) {
+        let scope = self.clone();
+        let key = (ns.to_string(), name.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(STATUS_RETRY_DELAY).await;
+            let (gateway, status_tx) = match scope.state.read() {
+                Ok(g) if g.gateways.contains_key(&key) => {
+                    (g.gateway_objects.get(&key).cloned(), g.status_tx.clone())
+                }
+                _ => return,
+            };
+            if let (Some(gateway), Some(status_tx)) = (gateway, status_tx) {
+                let _ = status_tx
+                    .send(StatusWrite::Gateway(Box::new(gateway)))
+                    .await;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published_addresses_for_tests(&self) -> Option<Vec<(String, String)>> {
+        self.state.read().ok()?.addresses.clone()
+    }
+
+    /// The `status.addresses` of the Gateways Sōzune owns, `None` when it
+    /// publishes none.
+    fn gateway_addresses(&self) -> Option<Vec<GatewayStatusAddresses>> {
+        let g = self.state.read().ok()?;
+        g.addresses.as_ref().map(|addresses| {
+            addresses
+                .iter()
+                .map(|(type_, value)| GatewayStatusAddresses {
+                    r#type: Some(type_.clone()),
+                    value: value.clone(),
+                })
+                .collect()
+        })
     }
 
     /// Record the labels of a namespace; `None` once it is gone.
@@ -2958,21 +3042,45 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
         gateway.status.as_ref().and_then(|s| s.listeners.as_deref()),
         scope.listener_statuses(gateway),
     );
-    if !conditions_changed && !listeners_changed {
+    // Written only when Sōzune publishes an address: otherwise what is
+    // there is left alone.
+    let addresses = scope.gateway_addresses();
+    let addresses_changed = addresses.as_ref().is_some_and(|ours| {
+        gateway
+            .status
+            .as_ref()
+            .and_then(|s| s.addresses.as_ref())
+            .is_none_or(|current| current != ours)
+    });
+    if !conditions_changed && !listeners_changed && !addresses_changed {
         return;
     }
-    let patch = serde_json::json!({
+    let mut patch = serde_json::json!({
         "status": { "conditions": merged, "listeners": listeners }
     });
+    if let Some(addresses) = addresses {
+        patch["status"]["addresses"] = serde_json::json!(addresses);
+    }
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let pp = PatchParams::default();
-    if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
-        warn!(
-            "Gateway API: failed to patch status on Gateway {}/{}: {}",
-            ns, name, e
-        );
-    } else {
-        debug!("Gateway API: status patched on Gateway {}/{}", ns, name);
+    match api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
+        // Deleted meanwhile: nothing left to write.
+        Err(kube::Error::Api(r)) if r.code == 404 => {
+            debug!(
+                "Gateway API: Gateway {}/{} is gone, its status is not written",
+                ns, name
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Gateway API: failed to patch status on Gateway {}/{}, trying again shortly: {}",
+                ns, name, e
+            );
+            scope.retry_gateway_status(ns, name);
+        }
+        Ok(_) => {
+            debug!("Gateway API: status patched on Gateway {}/{}", ns, name);
+        }
     }
 }
 

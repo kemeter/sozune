@@ -23,7 +23,7 @@ All fields:
 | `namespace` | *all* | Restrict discovery to a single namespace: Services, Ingresses and the TLS Secrets their certificates come from. Gateway API resources, and the Secrets Gateway listeners name, are watched in every namespace. Omit to watch the whole cluster. |
 | `ingress_class` | `sozune` | Match value for `Ingress.spec.ingressClassName`. Ingresses with a different (or missing) class are ignored. |
 | `expose_by_default` | `false` | If `true`, every Service is a candidate even without a `sozune.*` annotation. |
-| `publish_service` | *none* | The Service, as `namespace/name`, whose load-balancer address the Ingresses Sōzune serves get in `status.loadBalancer` — usually Sōzune's own `LoadBalancer` Service. Followed live (`SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE`). See [Ingress status](#ingress-status). |
+| `publish_service` | *none* | The Service, as `namespace/name`, whose load-balancer address the Ingresses Sōzune serves get in `status.loadBalancer`, and the Gateways it owns in `status.addresses` — usually Sōzune's own `LoadBalancer` Service. Followed live (`SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE`). See [Ingress status](#ingress-status). |
 | `publish_addresses` | `[]` | Fixed IPs or hostnames to write there instead, for a Sōzune reached without a `LoadBalancer` Service (host network, an external load balancer). Takes precedence over `publish_service`. |
 
 ### Restrict to one namespace, point at a specific kubeconfig
@@ -148,6 +148,8 @@ providers:
     enabled: true
     publish_service: sozune/sozune   # the LoadBalancer Service in front of Sōzune
 ```
+
+The Gateways Sōzune owns get the same addresses in `status.addresses`, typed `IPAddress` or `Hostname`, which external-dns reads for Gateways too.
 
 With `publish_service`, the Ingresses get the addresses that Service's load balancer was given, updated when they change. With `publish_addresses`, they get those addresses, an IP as `ip` and anything else as `hostname`. An Ingress Sōzune stops serving keeps the status it had. Sōzune needs to update `ingresses/status` for this (see [Minimum RBAC](#minimum-rbac)).
 
@@ -418,6 +420,8 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Gateway's `gatewayClassName` points at a class sōzune owns |
 | `Programmed` | `True` (`Programmed`) | Same instant as acceptance — sōzune does not stage programming |
+
+With `publish_service` or `publish_addresses` set, `status.addresses` carries Sōzune's address (see [Ingress status](#ingress-status)).
 
 **Gateway listeners** (`status.listeners[]`), one entry per listener:
 

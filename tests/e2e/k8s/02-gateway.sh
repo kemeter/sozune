@@ -700,3 +700,17 @@ kubectl delete gatewayclass foreign >/dev/null 2>&1 || true
 kubectl delete namespace gw-frontend >/dev/null 2>&1 || true
 
 set -e
+
+log "[02] Gateway: status.addresses carries the published address"
+
+address=""
+for _ in $(seq 1 30); do
+    address=$(kubectl get gateway gw -n sozune-test -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)
+    [[ "$address" == "192.0.2.10" ]] && break
+    sleep 1
+done
+if [[ "$address" == "192.0.2.10" ]]; then
+    pass "Gateway status.addresses carries publish_addresses"
+else
+    fail "Gateway status.addresses was not written (got '$address')"
+fi

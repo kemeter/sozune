@@ -347,6 +347,7 @@ impl KubernetesProvider {
 
         // Fixed addresses are written as Ingresses are applied; a Service's
         // are followed as its load balancer gets them.
+        self.publish_gateway_addresses().await;
         if self.config.publish_addresses.is_empty() && !self.config.publish_service.is_empty() {
             tokio::spawn(Arc::clone(&self).watch_published_service(client.clone()));
         }
