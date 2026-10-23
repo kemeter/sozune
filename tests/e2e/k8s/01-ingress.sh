@@ -50,3 +50,17 @@ fi
 
 # Restore strict mode for the orchestrator.
 set -e
+
+log "[01] Ingress: status.loadBalancer carries the published address"
+
+published=""
+for _ in $(seq 1 30); do
+    published=$(kubectl get ingress svca-ingress -n sozune-test -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+    [[ "$published" == "192.0.2.10" ]] && break
+    sleep 1
+done
+if [[ "$published" == "192.0.2.10" ]]; then
+    pass "Ingress status.loadBalancer carries publish_addresses"
+else
+    fail "Ingress status.loadBalancer was not written (got '$published')"
+fi

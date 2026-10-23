@@ -395,6 +395,15 @@ pub struct KubernetesConfig {
         deserialize_with = "deserialize_kubernetes_expose_by_default_with_env"
     )]
     pub expose_by_default: bool,
+    /// The Service, as `namespace/name`, whose load-balancer address the
+    /// Ingresses Sōzune serves get in `status.loadBalancer`: Sōzune's own
+    /// Service. Empty leaves their status alone.
+    #[serde(default)]
+    pub publish_service: String,
+    /// Fixed addresses (IPs or hostnames) to write in the `status.loadBalancer`
+    /// of the Ingresses Sōzune serves, instead of a Service's.
+    #[serde(default)]
+    pub publish_addresses: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1089,6 +1098,8 @@ impl Default for KubernetesConfig {
             namespace: String::new(),
             ingress_class: default_kubernetes_ingress_class(),
             expose_by_default: false,
+            publish_service: String::new(),
+            publish_addresses: Vec::new(),
         }
     }
 }
@@ -1898,6 +1909,9 @@ impl KubernetesConfig {
         }
         if let Some(v) = env_bool("SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT") {
             self.expose_by_default = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE") {
+            self.publish_service = v;
         }
     }
 }

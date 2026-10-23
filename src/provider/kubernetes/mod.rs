@@ -2,6 +2,7 @@ pub mod gateway;
 pub mod gateway_filters;
 pub mod gateway_matches;
 pub mod gateway_tls;
+mod ingress_status;
 
 use crate::config::KubernetesConfig;
 use crate::diagnostics::{self, DiagnosticsStore};
@@ -60,6 +61,15 @@ pub struct KubernetesProvider {
     /// Where an Ingress's `spec.tls[].secretName` goes: the scope serving
     /// the Secrets' certificates, and the hostnames ACME must leave alone.
     tls_secrets: Option<(gateway::GatewayScope, crate::acme::SecretHosts)>,
+    /// What the Ingresses Sōzune serves get in `status.loadBalancer`, `None`
+    /// when neither `publish_addresses` nor `publish_service` is set.
+    published:
+        Arc<RwLock<Option<Vec<k8s_openapi::api::networking::v1::IngressLoadBalancerIngress>>>>,
+    /// Ingresses whose status is to be written, by `namespace/name`: new
+    /// ones, and those whose last write failed.
+    status_pending: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Wakes the status writer for a new entry of `status_pending`.
+    status_wake: Arc<Notify>,
 }
 
 #[async_trait]
@@ -103,7 +113,26 @@ impl LabelSource for KubernetesProvider {
 
 impl KubernetesProvider {
     pub fn new(config: KubernetesConfig) -> anyhow::Result<Self> {
+        if config.publish_addresses.is_empty()
+            && !config.publish_service.is_empty()
+            && config
+                .publish_service
+                .split_once('/')
+                .is_none_or(|(ns, name)| ns.is_empty() || name.is_empty() || name.contains('/'))
+        {
+            anyhow::bail!(
+                "providers.kubernetes.publish_service `{}` must be `namespace/name`",
+                config.publish_service
+            );
+        }
+        // Fixed addresses win. A Service's are only known once it is seen:
+        // until then, Ingress status is left alone rather than emptied.
+        let published = (!config.publish_addresses.is_empty())
+            .then(|| ingress_status::addresses_from_config(&config.publish_addresses));
         Ok(Self {
+            published: Arc::new(RwLock::new(published)),
+            status_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            status_wake: Arc::new(Notify::new()),
             config,
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
@@ -314,6 +343,15 @@ impl KubernetesProvider {
             "Kubernetes auth OK: {} namespace(s) visible to ServiceAccount",
             ns_list.items.len()
         );
+
+        // Fixed addresses are written as Ingresses are applied; a Service's
+        // are followed as its load balancer gets them.
+        if self.config.publish_addresses.is_empty() && !self.config.publish_service.is_empty() {
+            tokio::spawn(Arc::clone(&self).watch_published_service(client.clone()));
+        }
+        if !self.config.publish_addresses.is_empty() || !self.config.publish_service.is_empty() {
+            tokio::spawn(Arc::clone(&self).write_statuses(client.clone()));
+        }
 
         let svc_provider = Arc::clone(&self);
         let svc_storage = Arc::clone(&storage);
@@ -762,6 +800,7 @@ impl KubernetesProvider {
             match event {
                 Ok(Event::Apply(ing)) | Ok(Event::InitApply(ing)) => {
                     self.apply_ingress(&ing, &ctx).await;
+                    self.queue_ingress_status(&ing);
                 }
                 Ok(Event::Delete(ing)) => {
                     self.remove_ingress(&ing, &ctx).await;
@@ -1179,11 +1218,16 @@ mod tests {
                 namespace: String::new(),
                 ingress_class: "sozune".to_string(),
                 expose_by_default,
+                publish_service: String::new(),
+                publish_addresses: Vec::new(),
             },
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
             ingress_keys: Arc::new(RwLock::new(HashMap::new())),
             tls_secrets: None,
+            published: Arc::new(RwLock::new(None)),
+            status_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            status_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -1578,6 +1622,22 @@ mod tests {
             exact_entry.1.config.path.as_ref().unwrap().rule_type,
             PathRuleType::Exact
         );
+    }
+
+    #[test]
+    fn a_publish_service_must_be_namespace_and_name() {
+        let config = |service: &str| KubernetesConfig {
+            enabled: true,
+            publish_service: service.into(),
+            ..KubernetesConfig::default()
+        };
+        assert!(KubernetesProvider::new(config("sozune/sozune")).is_ok());
+        for bad in ["sozune", "/sozune", "sozune/", "sozune/sozune/extra"] {
+            assert!(KubernetesProvider::new(config(bad)).is_err(), "{bad}");
+        }
+        // Nothing is written until the Service is seen.
+        let provider = KubernetesProvider::new(config("sozune/sozune")).unwrap();
+        assert!(provider.published.read().unwrap().is_none());
     }
 
     #[test]
