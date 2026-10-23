@@ -326,7 +326,24 @@ spec:
 
 ### HTTPS listeners
 
-An `HTTPS` listener terminates TLS for the HTTPRoutes attached to it, with the certificates its `tls.certificateRefs` name: `kubernetes.io/tls` Secrets in the Gateway's namespace.
+An `HTTPS` listener terminates TLS for the HTTPRoutes attached to it, with the certificates its `tls.certificateRefs` name: `kubernetes.io/tls` Secrets in the Gateway's namespace, or in another one whose `ReferenceGrant` lets Gateways of the Gateway's namespace reference them:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: shared-certificates
+  namespace: certificates        # where the Secret lives
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      namespace: default         # the Gateway's namespace
+  to:
+    - group: ""
+      kind: Secret
+      name: example-com-tls      # omit to open every Secret of the namespace
+```
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -356,7 +373,7 @@ spec:
 - ACME never orders a certificate for a Gateway route: its certificate comes from the Secret.
 - Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). It only watches those of type `kubernetes.io/tls`.
 
-A listener whose certificateRefs cannot be used says so in its status (see [Status conditions](#status-conditions)): `ResolvedRefs=False` with `InvalidCertificateRef` for a missing Secret, one of another type or kind, or one whose certificate is expired (checked every minute, so a certificate expiring unrenewed is caught), does not match its key or does not cover the listener's `hostname`, and `RefNotPermitted` for a Secret in another namespace, which Sōzune does not support yet. The references that resolve are still served. A listener left with no usable certificate serves no route over HTTPS, and redirects none there: its routes come back once a Secret it names is fixed.
+A listener whose certificateRefs cannot be used says so in its status (see [Status conditions](#status-conditions)): `ResolvedRefs=False` with `InvalidCertificateRef` for a missing Secret, one of another type or kind, or one whose certificate is expired (checked every minute, so a certificate expiring unrenewed is caught), does not match its key or does not cover the listener's `hostname`, and `RefNotPermitted` for a Secret in another namespace that no `ReferenceGrant` opens to the Gateway. The references that resolve are still served. A listener left with no usable certificate serves no route over HTTPS, and redirects none there: its routes come back once a Secret it names is fixed.
 
 Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
 
@@ -478,7 +495,6 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 - Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. The listener's status names the port its routes are served on. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`.
-- An `HTTPS` listener's certificateRefs to a Secret in another namespace, even with a `ReferenceGrant`: reported `RefNotPermitted`.
 - A `backendRef` that is invalid (an unsupported kind, a cross-namespace ref with no `ReferenceGrant`) is left out of the rule, and its share of the traffic goes to the other backends. The spec asks for that share to be answered with `500`.
 
 ### HTTPRoute filters
