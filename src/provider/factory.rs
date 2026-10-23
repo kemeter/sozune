@@ -342,6 +342,12 @@ pub async fn start_services(
                 }
             });
 
+            // `allowedRoutes.namespaces.selector` matches namespace labels.
+            tokio::spawn(gateway::run_namespace_watcher(
+                client.clone(),
+                scope.clone(),
+            ));
+
             let rg_client = client.clone();
             let rg_scope = scope.clone();
             tokio::spawn(async move {
