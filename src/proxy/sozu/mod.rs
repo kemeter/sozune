@@ -193,6 +193,9 @@ struct Channels {
     /// Loopback port serving the ACME HTTP-01 challenge responder, when
     /// ACME is enabled. `None` disables every ACME-specific code path.
     acme_challenge_port: Option<u16>,
+    /// Loopback port of the middleware server, the only backend of a route
+    /// that goes through it.
+    middleware_port: u16,
     /// The TCP and UDP listeners opened for Gateways, whose workers are in
     /// `tcp` and `udp` alongside the declared ones.
     gateway: GatewayListeners,
@@ -768,6 +771,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         https_port,
         https_ip: https_bind_ip.octets(),
         acme_challenge_port,
+        middleware_port,
         gateway: GatewayListeners::new(
             config.gateway_ports.clone(),
             WorkerSettings::from_config(config),
@@ -1700,6 +1704,7 @@ fn reinstall_http_frontends(
             &mut channels.https,
             cluster_id,
             entrypoint,
+            channels.middleware_port,
         );
         remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
     }
@@ -2028,11 +2033,10 @@ fn configure_http_entrypoint(
             "Routing {} through middleware server at 127.0.0.1:{}",
             entrypoint.name, middleware_port
         );
-        let address = SocketAddress::new_v4(127, 0, 0, 1, middleware_port);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: format!("{}-backend-0", cluster_id),
-            address,
+            backend_id: middleware_backend_id(cluster_id),
+            address: SocketAddress::new_v4(127, 0, 0, 1, middleware_port),
             load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
             sticky_id: None,
             backup: None,
@@ -2906,30 +2910,52 @@ fn remove_backend_set(
     }
 }
 
+/// The id of the backend standing for the middleware server in a route that
+/// goes through it.
+fn middleware_backend_id(cluster_id: &str) -> String {
+    format!("{cluster_id}-backend-0")
+}
+
+/// Remove the backends of `entrypoint`: its own, or the middleware server
+/// when it goes through it, the only backend Sōzu then holds for it.
 fn remove_backends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     cluster_id: &str,
     entrypoint: &Entrypoint,
+    middleware_port: u16,
 ) {
-    for (i, backend_entry) in entrypoint.backends.iter().enumerate() {
-        let address = match parse_backend_address(backend_entry) {
-            Ok(addr) => addr,
-            Err(e) => {
-                debug!(
-                    "Failed to parse backend address {} for removal: {}",
-                    backend_entry, e
-                );
-                continue;
-            }
-        };
-        let backend_id = backend_id(cluster_id, i, backend_entry);
-        let remove = RemoveBackend {
+    let removals: Vec<RemoveBackend> = if middleware::needs_middleware(&entrypoint.config) {
+        vec![RemoveBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: backend_id.clone(),
-            address,
-        };
-
+            backend_id: middleware_backend_id(cluster_id),
+            address: SocketAddress::new_v4(127, 0, 0, 1, middleware_port),
+        }]
+    } else {
+        entrypoint
+            .backends
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(i, backend_entry)| match parse_backend_address(backend_entry) {
+                    Ok(address) => Some(RemoveBackend {
+                        cluster_id: cluster_id.to_string(),
+                        backend_id: backend_id(cluster_id, i, backend_entry),
+                        address,
+                    }),
+                    Err(e) => {
+                        debug!(
+                            "Failed to parse backend address {} for removal: {}",
+                            backend_entry, e
+                        );
+                        None
+                    }
+                },
+            )
+            .collect()
+    };
+    for (i, remove) in removals.into_iter().enumerate() {
+        let backend_id = remove.backend_id.clone();
         if let Err(e) = send_to_worker(
             command_channel,
             format!("rm-backend-http-{}-{}", cluster_id, i),
@@ -3270,7 +3296,13 @@ fn apply_routing_diff(
                         http_port,
                         https_addr,
                     );
-                    remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    remove_backends(
+                        &mut channels.http,
+                        &mut channels.https,
+                        cluster_id,
+                        old,
+                        channels.middleware_port,
+                    );
                     close_sessions(&mut channels.http, "http", cluster_id, None);
                     if old.config.tls {
                         close_sessions(&mut channels.https, "https", cluster_id, None);
@@ -3333,7 +3365,13 @@ fn apply_routing_diff(
                         http_port,
                         https_addr,
                     );
-                    remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    remove_backends(
+                        &mut channels.http,
+                        &mut channels.https,
+                        cluster_id,
+                        old,
+                        channels.middleware_port,
+                    );
                     // Only the backends the route no longer has: one it keeps
                     // is re-added, and closing its sessions would cut every
                     // WebSocket on each change to the route. Through the
