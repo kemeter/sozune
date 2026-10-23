@@ -1421,15 +1421,89 @@ fn skipped_on_sni_clash(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<Stri
     skipped
 }
 
-/// The order Sōzu matches routes in: priority descending, then cluster id.
-/// Sōzu checks its Pre rules in insertion order, first match wins, so this is
-/// both the order frontends are sent in and the order anything reproducing
-/// Sōzu's choice has to try them in.
+/// The order Sōzu matches routes in: priority descending, then the more
+/// specific route first, then cluster id. Sōzu checks its Pre rules in
+/// insertion order, first match wins, so this is both the order frontends are
+/// sent in and the order anything reproducing Sōzu's choice has to try them
+/// in.
 pub(crate) fn routing_order(storage: &BTreeMap<String, Entrypoint>) -> Vec<(&String, &Entrypoint)> {
     let mut ordered: Vec<(&String, &Entrypoint)> = storage.iter().collect();
     // Stable sort over the BTreeMap's id order: ties keep their ids ascending.
-    ordered.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
+    ordered.sort_by_key(|(_, ep)| {
+        (
+            std::cmp::Reverse(ep.config.priority),
+            host_specificity(&ep.config.hostnames),
+            path_specificity(ep.config.path.as_ref()),
+        )
+    });
     ordered
+}
+
+/// Whether `a` is tried before `b` for being more specific, their priority
+/// being equal.
+pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
+    (
+        host_specificity(&a.config.hostnames),
+        path_specificity(a.config.path.as_ref()),
+    ) < (
+        host_specificity(&b.config.hostnames),
+        path_specificity(b.config.path.as_ref()),
+    )
+}
+
+/// How specific a route's hostnames are, the most specific first: an exact
+/// name, then a regex, then a wildcard (the longer, the more specific), then
+/// any host (`*`, or no hostname at all). A route is as specific as its most
+/// specific hostname.
+fn host_specificity(hostnames: &[String]) -> (u8, std::cmp::Reverse<usize>) {
+    hostnames
+        .iter()
+        .map(|h| {
+            let rank = if h == "*" {
+                3
+            } else if h.starts_with("*.") {
+                2
+            } else if h.contains('/') {
+                1
+            } else {
+                0
+            };
+            (rank, std::cmp::Reverse(h.len()))
+        })
+        .min()
+        .unwrap_or((3, std::cmp::Reverse(0)))
+}
+
+/// How specific a route's path is, the most specific first: an exact path,
+/// then a prefix, the longer first. A regex counts as the literal prefix it
+/// starts with: its length says nothing of the paths it matches. No path is
+/// the `/` prefix.
+fn path_specificity(path: Option<&crate::model::PathConfig>) -> (u8, std::cmp::Reverse<usize>) {
+    use crate::model::PathRuleType;
+    match path {
+        Some(p) if p.rule_type == PathRuleType::Exact => (0, std::cmp::Reverse(p.value.len())),
+        // An alternative can match far wider than its first branch: such a
+        // regex counts as `/`.
+        Some(p) if p.rule_type == PathRuleType::Regex && p.value.contains('|') => {
+            (1, std::cmp::Reverse(1))
+        }
+        Some(p) if p.rule_type == PathRuleType::Regex => (
+            1,
+            std::cmp::Reverse(regex_literal_prefix(&p.value).len().max(1)),
+        ),
+        Some(p) => (1, std::cmp::Reverse(p.value.len())),
+        None => (1, std::cmp::Reverse(1)),
+    }
+}
+
+/// The literal text a path regex starts with, up to its first construct:
+/// `^/api/v[0-9]+` gives `/api/v`.
+fn regex_literal_prefix(pattern: &str) -> &str {
+    let pattern = pattern.strip_prefix('^').unwrap_or(pattern);
+    let end = pattern
+        .find(|c: char| ".*+?()[]{}|\\$".contains(c))
+        .unwrap_or(pattern.len());
+    &pattern[..end]
 }
 
 /// Applies `storage` to the workers. Returns the cluster IDs deliberately left
@@ -1491,7 +1565,7 @@ fn configure_sozu_routing(
                 // Pre rules are checked in insertion order, so the more specific
                 // ACME path must be registered first to take priority over "/"
                 if channels.acme_challenge_port.is_some() {
-                    for hostname in &entrypoint.config.hostnames {
+                    for hostname in acme_hostnames(&entrypoint.config.hostnames) {
                         let acme_front = build_acme_frontend(hostname, channels.http_port);
                         if let Err(e) = send_to_worker(
                             &mut channels.http,
@@ -1651,15 +1725,21 @@ pub(crate) fn build_acme_twins(
     if header_predicates.is_empty() {
         return Vec::new();
     }
-    entrypoint
-        .config
-        .hostnames
-        .iter()
+    acme_hostnames(&entrypoint.config.hostnames)
         .map(|hostname| RequestHttpFrontend {
             header_predicates: header_predicates.clone(),
             ..build_acme_frontend(hostname, http_port)
         })
         .collect()
+}
+
+/// The hostnames that get an ACME HTTP-01 challenge frontend: exact names
+/// only. HTTP-01 validates no wildcard, and one for `*` or a pattern would
+/// take the challenge path of hosts that never asked for a certificate.
+fn acme_hostnames(hostnames: &[String]) -> impl Iterator<Item = &String> {
+    hostnames
+        .iter()
+        .filter(|h| !h.starts_with('*') && !h.contains('/'))
 }
 
 /// The listener a frontend is installed on.
@@ -2927,7 +3007,7 @@ fn remove_acme_frontends(
     hostnames: &[String],
     http_port: u16,
 ) {
-    for hostname in hostnames {
+    for hostname in acme_hostnames(hostnames) {
         let acme_front = build_acme_frontend(hostname, http_port);
 
         if let Err(e) = send_to_worker(
@@ -3671,6 +3751,95 @@ mod tests {
     fn tcp_idle_timeout_zero_is_refused() {
         let err = tcp_listener_with_idle_timeout(Some(0)).unwrap_err();
         assert!(err.to_string().contains("greater than zero"), "{err}");
+    }
+
+    /// At equal priority the more specific route is tried first: an exact
+    /// host before a wildcard before any host, an exact path before a prefix,
+    /// a longer prefix before a shorter one. Priority still comes first.
+    #[test]
+    fn routes_of_equal_priority_go_most_specific_first() {
+        assert_eq!(regex_literal_prefix("^/api/v[0-9]+"), "/api/v");
+        assert_eq!(regex_literal_prefix("^/.*"), "/");
+        // An alternative may match anything: no more specific than `/`.
+        let alternation = crate::model::PathConfig {
+            rule_type: crate::model::PathRuleType::Regex,
+            value: "^/longpath$|^/.*".into(),
+        };
+        assert_eq!(path_specificity(Some(&alternation)), path_specificity(None));
+        let http = |id: &str,
+                    host: &str,
+                    path: Option<(crate::model::PathRuleType, &str)>,
+                    priority: i32| {
+            let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+            ep.id = id.into();
+            ep.config.hostnames = vec![host.into()];
+            ep.config.path = path.map(|(rule_type, value)| crate::model::PathConfig {
+                rule_type,
+                value: value.into(),
+            });
+            ep.config.priority = priority;
+            (id.to_string(), ep)
+        };
+        let storage: BTreeMap<String, Entrypoint> = [
+            http("a-any", "*", None, 0),
+            http("b-wildcard", "*.example.com", None, 0),
+            http("c-root", "app.example.com", None, 0),
+            http(
+                "d-api",
+                "app.example.com",
+                Some((crate::model::PathRuleType::Prefix, "/api")),
+                0,
+            ),
+            http(
+                "e-exact",
+                "app.example.com",
+                Some((crate::model::PathRuleType::Exact, "/a")),
+                0,
+            ),
+            http("f-boosted", "*", None, 10),
+            http(
+                "g-regex",
+                "app.example.com",
+                Some((crate::model::PathRuleType::Regex, "^/.*")),
+                0,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let order: Vec<&str> = routing_order(&storage)
+            .into_iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "f-boosted",
+                "e-exact",
+                "d-api",
+                "c-root",
+                "g-regex",
+                "b-wildcard",
+                "a-any"
+            ]
+        );
+    }
+
+    /// Only exact hostnames get an ACME challenge frontend.
+    #[test]
+    fn acme_challenges_are_only_routed_for_exact_hostnames() {
+        let hostnames: Vec<String> = [
+            "*",
+            "*.example.com",
+            "/api[0-9]/.example.com",
+            "app.example.com",
+        ]
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+        assert_eq!(
+            acme_hostnames(&hostnames).collect::<Vec<_>>(),
+            ["app.example.com"]
+        );
     }
 
     /// A certificate two senders added stays until both removed it.

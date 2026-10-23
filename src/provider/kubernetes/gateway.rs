@@ -1429,7 +1429,18 @@ impl GatewayScope {
         };
         let removed = g.gateway_classes.remove(name);
         if removed {
-            g.gateways.clear();
+            // Only that class's Gateways: those of another class stay
+            // accepted, and nothing would bring them back otherwise.
+            let gone: Vec<(String, String)> = g
+                .gateway_objects
+                .iter()
+                .filter(|(_, gw)| gw.spec.gateway_class_name == name)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in gone {
+                g.gateways.remove(&key);
+                g.gateway_objects.remove(&key);
+            }
         }
         drop(g);
         self.fire_if(removed)
@@ -1995,21 +2006,6 @@ fn listener_certificates(
             ))
         } else {
             match secrets.get(&(ns.clone(), name.clone())) {
-                // Sōzu picks a certificate by SNI: one that does not cover
-                // the listener's hostname would never be presented for it.
-                Some(Ok(certificate))
-                    if l.hostname
-                        .as_deref()
-                        .is_some_and(|h| !crate::manual_certs::covered(&certificate.names, h)) =>
-                {
-                    Err((
-                        REASON_INVALID_CERTIFICATE_REF,
-                        format!(
-                            "the certificate of Secret {ns}/{name} does not cover hostname {}",
-                            l.hostname.as_deref().unwrap_or_default()
-                        ),
-                    ))
-                }
                 Some(Ok(certificate)) => Ok(Arc::clone(certificate)),
                 Some(Err(e)) => Err((
                     REASON_INVALID_CERTIFICATE_REF,
@@ -3417,8 +3413,8 @@ pub async fn httproute_crd_installed(client: &Client) -> bool {
 /// port to reach them on.
 struct ResolvedRef {
     weight: Option<i32>,
-    pods: Vec<String>,
-    port: u16,
+    /// Each ready pod's address and the port it listens on.
+    pods: Vec<(String, u16)>,
 }
 
 /// The largest weight Sōzu takes for a backend.
@@ -3503,8 +3499,7 @@ fn weigh_backend_refs(refs: Vec<ResolvedRef>) -> Option<Vec<Backend>> {
             .into_iter()
             .zip(per_pod)
             .flat_map(|((_, r), weight)| {
-                let port = r.port;
-                r.pods.into_iter().map(move |address| Backend {
+                r.pods.into_iter().map(move |(address, port)| Backend {
                     address,
                     port,
                     weight: weight as u32,
@@ -3537,11 +3532,37 @@ fn gcd(a: u128, b: u128) -> u128 {
 /// `IpAddr`).
 pub trait ServiceResolver: Send + Sync {
     fn pod_ips(&self, namespace: &str, service: &str) -> Vec<String>;
+
+    /// The ready pods behind the `protocol` port `port` of `service`, each
+    /// with the port it listens on: the Service's `targetPort`. The Service
+    /// port itself when that is not known.
+    fn pod_addresses(
+        &self,
+        namespace: &str,
+        service: &str,
+        port: u16,
+        _protocol: &str,
+    ) -> Vec<(String, u16)> {
+        self.pod_ips(namespace, service)
+            .into_iter()
+            .map(|ip| (ip, port))
+            .collect()
+    }
 }
 
 impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
     fn pod_ips(&self, namespace: &str, service: &str) -> Vec<String> {
         self.pod_ips_for(&format!("{namespace}/{service}"))
+    }
+
+    fn pod_addresses(
+        &self,
+        namespace: &str,
+        service: &str,
+        port: u16,
+        protocol: &str,
+    ) -> Vec<(String, u16)> {
+        self.pod_addresses_for(&format!("{namespace}/{service}"), port, protocol)
     }
 }
 
@@ -3617,40 +3638,65 @@ pub fn route_entrypoints_by_scheme(
     .into_iter()
     .filter(|(hostnames, ..)| !hostnames.is_empty())
     .collect();
-    // A scheme admitting every host keeps the entrypoints it had before
-    // HTTPS listeners were served, with no hostname. Sōzu routes on a host,
-    // so they serve none, but a route is not dropped by a listener of the
-    // other scheme being added.
-    if plain_all {
-        sets.push((Vec::new(), false, false, ""));
-    }
-    if secure_all && !plain_all {
-        sets.push((Vec::new(), true, true, "-https"));
+    // A scheme admitting every host serves the route on any host (`*`),
+    // tried after every route naming its hosts.
+    let any = || vec!["*".to_string()];
+    match (plain_all, secure_all) {
+        (true, true) => sets.push((any(), true, false, "-tls")),
+        (true, false) => sets.push((any(), false, false, "")),
+        (false, true) => sets.push((any(), true, true, "-https")),
+        (false, false) => {}
     }
     if sets.is_empty() {
         sets.push(if only_secure {
-            (Vec::new(), true, true, "-https")
+            (any(), true, true, "-https")
         } else {
-            (Vec::new(), false, false, "")
+            (any(), false, false, "")
         });
     }
 
-    sets.into_iter()
-        .flat_map(|(hostnames, tls, redirect, suffix)| {
-            route_to_entrypoints_with_hostnames(route, resolver, grants, &hostnames)
-                .into_iter()
-                .map(move |mut ep| {
-                    ep.id.push_str(suffix);
-                    ep.name.push_str(suffix);
-                    ep.config.tls = tls;
-                    ep.config.https_redirect = redirect;
-                    if redirect {
-                        ep.config.https_redirect_port = https_port;
-                    }
-                    ep
-                })
-        })
-        .collect()
+    let mut entrypoints = Vec::new();
+    for (hostnames, tls, redirect, suffix) in sets {
+        // Sōzune orders a route by its most specific hostname: a route's
+        // wildcard must not be tried as early as its exact names, so each
+        // goes into an entrypoint of its own.
+        let groups = specificity_groups(hostnames);
+        let numbered = groups.len() > 1;
+        for (group, hostnames) in groups.into_iter().enumerate() {
+            let suffix = if numbered {
+                format!("{suffix}-h{group}")
+            } else {
+                suffix.to_string()
+            };
+            for mut ep in route_to_entrypoints_with_hostnames(route, resolver, grants, &hostnames) {
+                ep.id.push_str(&suffix);
+                ep.name.push_str(&suffix);
+                ep.config.tls = tls;
+                ep.config.https_redirect = redirect;
+                if redirect {
+                    ep.config.https_redirect_port = https_port;
+                }
+                entrypoints.push(ep);
+            }
+        }
+    }
+    entrypoints
+}
+
+/// Hostnames split by how specific they are: the exact names together, then
+/// each wildcard on its own, `*` last.
+fn specificity_groups(hostnames: Vec<String>) -> Vec<Vec<String>> {
+    let (exact, wildcards): (Vec<String>, Vec<String>) =
+        hostnames.into_iter().partition(|h| !h.starts_with('*'));
+    let mut groups = Vec::new();
+    if !exact.is_empty() {
+        groups.push(exact);
+    }
+    groups.extend(wildcards.into_iter().map(|w| vec![w]));
+    if groups.is_empty() {
+        groups.push(Vec::new());
+    }
+    groups
 }
 
 /// Convert a HTTPRoute into one or more Sozune `Entrypoint`s, serving
@@ -4027,8 +4073,7 @@ fn rule_to_entrypoints(
             }
             Some(ResolvedRef {
                 weight: b.weight,
-                pods: resolver.pod_ips(target_ns, &b.name),
-                port,
+                pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
             })
         })
         .collect();
@@ -4527,8 +4572,7 @@ fn tcp_rule_backends(
             }
             Some(ResolvedRef {
                 weight: b.weight,
-                pods: resolver.pod_ips(target_ns, &b.name),
-                port,
+                pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
             })
         })
         .collect();
@@ -4881,8 +4925,7 @@ fn udp_rule_backends(
             }
             Some(ResolvedRef {
                 weight: b.weight,
-                pods: resolver.pod_ips(target_ns, &b.name),
-                port,
+                pods: resolver.pod_addresses(target_ns, &b.name, port, "UDP"),
             })
         })
         .collect();
@@ -5327,8 +5370,7 @@ fn tls_rule_backends(
             }
             Some(ResolvedRef {
                 weight: b.weight,
-                pods: resolver.pod_ips(target_ns, &b.name),
-                port,
+                pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
             })
         })
         .collect();
@@ -7034,9 +7076,8 @@ mod tests {
         ResolvedRef {
             weight,
             pods: (0..pods)
-                .map(|i| format!("10.{}.{}.{}", pods % 256, i / 256, i % 256))
+                .map(|i| (format!("10.{}.{}.{}", pods % 256, i / 256, i % 256), 80))
                 .collect(),
-            port: 80,
         }
     }
 
@@ -8138,29 +8179,20 @@ mod tests {
         );
     }
 
-    /// A certificate is only used by a listener whose hostname it covers,
-    /// and stops being used once it expires.
+    /// A certificate stops being used once it expires.
     #[test]
-    fn a_listener_takes_a_certificate_covering_it_until_it_expires() {
+    fn a_listener_drops_its_certificate_once_it_expires() {
         let scope = GatewayScope::new();
         scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
         let mut gw = gateway("default", "gw", "sozune");
-        let mut api = https_listener("api", None, "wildcard-tls");
+        let mut api = https_listener("api", None, "api-tls");
         api.hostname = Some("api.example.com".into());
-        let mut shop = https_listener("shop", None, "other-tls");
-        shop.hostname = Some("shop.example.com".into());
-        gw.spec.listeners = vec![api, shop];
+        gw.spec.listeners = vec![api];
         scope.upsert_gateway(&gw);
-        store_secret(&scope, "default", "wildcard-tls", "*.example.com");
-        store_secret(&scope, "default", "other-tls", "other.example.com");
-
+        // Whatever names it covers: a Gateway's certificateRefs are not
+        // checked against its listener's hostname.
+        store_secret(&scope, "default", "api-tls", "other.example.com");
         assert_eq!(resolved_refs(&scope, &gw, "api").status, "True");
-        let shop = resolved_refs(&scope, &gw, "shop");
-        assert_eq!(shop.reason, REASON_INVALID_CERTIFICATE_REF);
-        assert!(
-            shop.message
-                .contains("does not cover hostname shop.example.com")
-        );
         assert_eq!(scope.referenced_certificates().len(), 1);
 
         scope.expire_tls_secrets(i64::MAX);
@@ -8196,6 +8228,28 @@ mod tests {
             vec![parent("gw")],
         );
         assert_eq!(scope.https_redirect_port(&route), Some(8443));
+    }
+
+    /// Removing a GatewayClass drops its own Gateways, not those of the
+    /// other classes Sōzune owns.
+    #[test]
+    fn removing_a_class_keeps_the_gateways_of_the_others() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway_class(&class("other", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&gateway("default", "kept", "sozune"));
+        scope.upsert_gateway(&gateway("default", "gone", "other"));
+
+        scope.remove_gateway_class("other");
+        let route = |gw: &str| {
+            route_with_parents(
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["a.example.com".into()],
+                vec![parent(gw)],
+            )
+        };
+        assert!(scope.accepts_route(&route("kept")));
+        assert!(!scope.accepts_route(&route("gone")));
     }
 
     /// A Secret of another namespace is used once a ReferenceGrant there lets
@@ -8516,7 +8570,7 @@ mod tests {
                     true,
                     false
                 ),
-                (id.clone(), Vec::new(), false, false),
+                (id.clone(), vec!["*".to_string()], false, false),
             ]
         );
         assert_eq!(
@@ -8528,7 +8582,44 @@ mod tests {
                     true,
                     false
                 ),
-                (format!("{id}-https"), Vec::new(), true, true),
+                (format!("{id}-https"), vec!["*".to_string()], true, true),
+            ]
+        );
+    }
+
+    /// A route's wildcard hostnames get entrypoints of their own, so each is
+    /// ordered after the exact names of other routes.
+    #[test]
+    fn wildcard_hostnames_are_split_from_exact_ones() {
+        let route = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        let hosts: Vec<(String, Vec<String>)> = route_entrypoints_by_scheme(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs,
+            Some(vec![
+                "a.example.com".into(),
+                "*.example.com".into(),
+                "b.example.com".into(),
+            ]),
+            None,
+            None,
+        )
+        .into_iter()
+        .map(|ep| (ep.id, ep.config.hostnames))
+        .collect();
+        let id = format!("{SOURCE_TAG}-default-web-0");
+        assert_eq!(
+            hosts,
+            [
+                (
+                    format!("{id}-h0"),
+                    vec!["a.example.com".to_string(), "b.example.com".to_string()]
+                ),
+                (format!("{id}-h1"), vec!["*.example.com".to_string()]),
             ]
         );
     }
