@@ -236,7 +236,7 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-`namespaces` is only used for the start-up sanity check; if you want a strictly minimal role, drop it (Sōzune logs a warning instead of an info line).
+`namespaces` is used for the start-up sanity check and, with the Gateway API, for listeners admitting routes by namespace selector (`allowedRoutes.namespaces.from: Selector`). Without it Sōzune logs a warning, and such listeners admit no route.
 
 ### Reaching Sōzune from outside
 
@@ -449,7 +449,7 @@ A listener only takes the routes its `allowedRoutes` admits, for every route kin
 |---|---|
 | `namespaces.from: Same` (the default) | Routes in the Gateway's own namespace only. |
 | `namespaces.from: All` | Routes in any namespace. |
-| `namespaces.from: Selector` | No route: namespace labels are not watched yet, so Sōzune admits none rather than guess. |
+| `namespaces.from: Selector` | Routes in the namespaces whose labels match `namespaces.selector` (`matchLabels` and `matchExpressions` with `In`, `NotIn`, `Exists`, `DoesNotExist`), followed live as namespaces are relabelled. A missing selector, or one with another operator, admits no route. Sōzune needs to list and watch namespaces for this (see [Minimum RBAC](#minimum-rbac)). |
 | `kinds` | Only the listed route kinds (group `gateway.networking.k8s.io`). Unset or empty, the listener's protocol decides. |
 
 A route in another namespace that names a Gateway therefore needs `from: All` on the listeners it should attach to:

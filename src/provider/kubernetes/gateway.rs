@@ -146,26 +146,100 @@ pub struct ListenerInfo {
 }
 
 /// `allowedRoutes.namespaces.from` of a Gateway listener.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AllowedNamespaces {
     /// Only routes in the Gateway's own namespace (the API default).
     Same,
     /// Routes in any namespace.
     All,
-    /// Routes in namespaces matching a label selector. Namespace labels are
-    /// not watched, so no route is admitted: failing closed keeps a listener
-    /// from serving namespaces it did not mean to.
-    Selector,
+    /// Routes in namespaces whose labels match the selector. `None` when the
+    /// listener gives none, or one Sōzune cannot read: no route is admitted
+    /// then, rather than more than meant.
+    Selector(Option<NamespaceSelector>),
+}
+
+/// A label selector over namespaces, as `allowedRoutes.namespaces.selector`
+/// writes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceSelector {
+    match_labels: BTreeMap<String, String>,
+    match_expressions: Vec<(String, SelectorOperator, Vec<String>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorOperator {
+    In,
+    NotIn,
+    Exists,
+    DoesNotExist,
+}
+
+impl NamespaceSelector {
+    fn of(
+        selector: &gateway_api::apis::standard::gateways::GatewayListenersAllowedRoutesNamespacesSelector,
+    ) -> Option<Self> {
+        let match_expressions = selector
+            .match_expressions
+            .iter()
+            .flatten()
+            .map(|e| {
+                let values = e.values.clone().unwrap_or_default();
+                // As Kubernetes has it: `In` and `NotIn` need values, the
+                // others none. Read otherwise, `NotIn` with no value would
+                // match every namespace.
+                let operator = match e.operator.as_str() {
+                    "In" if !values.is_empty() => SelectorOperator::In,
+                    "NotIn" if !values.is_empty() => SelectorOperator::NotIn,
+                    "Exists" if values.is_empty() => SelectorOperator::Exists,
+                    "DoesNotExist" if values.is_empty() => SelectorOperator::DoesNotExist,
+                    _ => return None,
+                };
+                Some((e.key.clone(), operator, values))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            match_labels: selector.match_labels.clone().unwrap_or_default(),
+            match_expressions,
+        })
+    }
+
+    /// Whether a namespace with `labels` matches. An empty selector matches
+    /// every namespace, as in Kubernetes.
+    fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.match_labels
+            .iter()
+            .all(|(k, v)| labels.get(k) == Some(v))
+            && self.match_expressions.iter().all(|(key, op, values)| {
+                let value = labels.get(key);
+                match op {
+                    SelectorOperator::In => value.is_some_and(|v| values.contains(v)),
+                    SelectorOperator::NotIn => value.is_none_or(|v| !values.contains(v)),
+                    SelectorOperator::Exists => value.is_some(),
+                    SelectorOperator::DoesNotExist => value.is_none(),
+                }
+            })
+    }
 }
 
 impl ListenerInfo {
     /// True iff this listener's `allowedRoutes` lets a `kind` route from
-    /// `route_ns` attach to it, on a Gateway in `gateway_ns`.
-    pub(crate) fn admits(&self, gateway_ns: &str, route_ns: &str, kind: &str) -> bool {
-        let namespace_ok = match self.allowed_namespaces {
+    /// `route_ns` attach to it, on a Gateway in `gateway_ns`, the namespaces
+    /// having `namespace_labels`.
+    pub(crate) fn admits(
+        &self,
+        gateway_ns: &str,
+        route_ns: &str,
+        kind: &str,
+        namespace_labels: &HashMap<String, BTreeMap<String, String>>,
+    ) -> bool {
+        let namespace_ok = match &self.allowed_namespaces {
             AllowedNamespaces::Same => route_ns == gateway_ns,
             AllowedNamespaces::All => true,
-            AllowedNamespaces::Selector => false,
+            AllowedNamespaces::Selector(selector) => selector.as_ref().is_some_and(|s| {
+                namespace_labels
+                    .get(route_ns)
+                    .is_some_and(|labels| s.matches(labels))
+            }),
         };
         let kind_ok = self
             .allowed_kinds
@@ -257,6 +331,8 @@ pub struct ScopeState {
     /// What each ReferenceGrant lets Gateways reference among Secrets, by
     /// grant `(namespace, name)`.
     secret_grants: HashMap<(String, String), SecretGrant>,
+    /// The labels of each namespace, for `allowedRoutes.namespaces.selector`.
+    namespace_labels: HashMap<String, BTreeMap<String, String>>,
 }
 
 /// The Secrets a ReferenceGrant lets Gateways of other namespaces name in
@@ -444,7 +520,9 @@ impl GatewayScope {
             };
             for listener in listeners
                 .iter()
-                .filter(|l| listener_ok(l) && l.admits(&ns, route_namespace, kind))
+                .filter(|l| {
+                    listener_ok(l) && l.admits(&ns, route_namespace, kind, &g.namespace_labels)
+                })
                 // A listener whose hostname admits none of the route's
                 // serves none of it.
                 .filter(|l| {
@@ -848,7 +926,9 @@ impl GatewayScope {
         let listeners = g.gateways.get(&key)?;
         let admitted: Vec<ListenerInfo> = listeners
             .iter()
-            .filter(|l| listener_ok(l) && l.admits(ns, route_namespace, route_kind))
+            .filter(|l| {
+                listener_ok(l) && l.admits(ns, route_namespace, route_kind, &g.namespace_labels)
+            })
             .cloned()
             .collect();
         if !admitted.is_empty() && parent_ref_selects_listener(parent_ref, &admitted) {
@@ -892,7 +972,7 @@ impl GatewayScope {
                 Some(listeners) => {
                     let eligible: Vec<ListenerInfo> = listeners
                         .iter()
-                        .filter(|l| l.admits(ns, route_namespace, route_kind))
+                        .filter(|l| l.admits(ns, route_namespace, route_kind, &g.namespace_labels))
                         .filter(|l| listener_ok.as_ref().is_none_or(|pred| pred(l)))
                         .cloned()
                         .collect();
@@ -1161,7 +1241,7 @@ impl GatewayScope {
                 .map(|listeners| {
                     listeners
                         .iter()
-                        .filter(|l| l.admits(ns, route_ns, kind))
+                        .filter(|l| l.admits(ns, route_ns, kind, &g.namespace_labels))
                         .cloned()
                         .collect()
                 }),
@@ -1502,6 +1582,63 @@ impl GatewayScope {
         self.fire_if(true);
     }
 
+    /// Record the labels of a namespace; `None` once it is gone.
+    pub fn set_namespace_labels(&self, name: &str, labels: Option<BTreeMap<String, String>>) {
+        self.update_namespace_labels(|known| match labels {
+            Some(labels) => known.insert(name.to_string(), labels.clone()) != Some(labels),
+            None => known.remove(name).is_some(),
+        });
+    }
+
+    /// Replace every namespace's labels with those a relist brought, at
+    /// once: one re-resolution for the whole list.
+    pub fn replace_namespace_labels(&self, labels: HashMap<String, BTreeMap<String, String>>) {
+        self.update_namespace_labels(|known| {
+            let changed = *known != labels;
+            *known = labels;
+            changed
+        });
+    }
+
+    /// Apply `update` to the namespace labels. When it changed them, the
+    /// routes are resolved again and the Gateways with a listener admitting
+    /// namespaces by selector get their status rewritten.
+    fn update_namespace_labels(
+        &self,
+        update: impl FnOnce(&mut HashMap<String, BTreeMap<String, String>>) -> bool,
+    ) {
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        if !update(&mut g.namespace_labels) {
+            return;
+        }
+        let selecting: Vec<Gateway> = g
+            .gateway_objects
+            .iter()
+            .filter(|(key, _)| {
+                g.gateways.get(*key).is_some_and(|listeners| {
+                    listeners
+                        .iter()
+                        .any(|l| matches!(l.allowed_namespaces, AllowedNamespaces::Selector(_)))
+                })
+            })
+            .map(|(_, gateway)| gateway.clone())
+            .collect();
+        for gateway in selecting {
+            queue_status_write(
+                g.status_tx.as_ref(),
+                StatusWrite::Gateway(Box::new(gateway)),
+            );
+        }
+        drop(g);
+        self.fire_if(true);
+    }
+
     /// Keep only the ReferenceGrants a relist brought back: one deleted while
     /// the watch was down sends no `Delete`, and must not keep authorising
     /// anything.
@@ -1834,7 +1971,13 @@ fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
                 }
                 Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => AllowedNamespaces::All,
                 Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
-                    AllowedNamespaces::Selector
+                    AllowedNamespaces::Selector(
+                        l.allowed_routes
+                            .as_ref()
+                            .and_then(|a| a.namespaces.as_ref())
+                            .and_then(|n| n.selector.as_ref())
+                            .and_then(NamespaceSelector::of),
+                    )
                 }
             },
             allowed_kinds: l
@@ -2205,6 +2348,85 @@ pub async fn run_referencegrant_watcher(client: Client, scope: GatewayScope) -> 
 
     warn!("Gateway API: ReferenceGrant watcher stream ended unexpectedly");
     Ok(())
+}
+
+/// Whether a watch failed because the API server refuses the request.
+fn is_forbidden(error: &watcher::Error) -> bool {
+    let code = match error {
+        watcher::Error::InitialListFailed(kube::Error::Api(r))
+        | watcher::Error::WatchStartFailed(kube::Error::Api(r))
+        | watcher::Error::WatchFailed(kube::Error::Api(r)) => r.code,
+        watcher::Error::WatchError(r) => r.code,
+        _ => return false,
+    };
+    code == 401 || code == 403
+}
+
+/// Watch the namespaces' labels, which `allowedRoutes.namespaces.selector`
+/// matches routes' namespaces against.
+pub async fn run_namespace_watcher(client: Client, scope: GatewayScope) {
+    use k8s_openapi::api::core::v1::Namespace;
+    use kube::runtime::WatchStreamExt;
+
+    let mut failing = false;
+    // A new watch on every refusal: one resumed from where it stopped would
+    // not list again the namespaces whose labels were dropped.
+    loop {
+        let api: Api<Namespace> = Api::all(client.clone());
+        let mut stream = watcher::watcher(api, watcher::Config::default())
+            .default_backoff()
+            .boxed();
+        // The namespaces a relist brings back, applied together once it is
+        // done: those it does not bring back are gone.
+        let mut relisted: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(Event::InitApply(ns)) => {
+                    if let Some(name) = ns.metadata.name.clone() {
+                        relisted.insert(name, ns.metadata.labels.unwrap_or_default());
+                    }
+                }
+                Ok(Event::Apply(ns)) => {
+                    if let Some(name) = ns.metadata.name.clone() {
+                        scope.set_namespace_labels(
+                            &name,
+                            Some(ns.metadata.labels.unwrap_or_default()),
+                        );
+                    }
+                }
+                Ok(Event::Delete(ns)) => {
+                    if let Some(name) = ns.metadata.name.as_deref() {
+                        scope.set_namespace_labels(name, None);
+                    }
+                }
+                Ok(Event::Init) => relisted.clear(),
+                Ok(Event::InitDone) => {
+                    failing = false;
+                    scope.replace_namespace_labels(std::mem::take(&mut relisted));
+                }
+                Err(e) => {
+                    if !failing {
+                        failing = true;
+                        warn!(
+                            "Gateway API: cannot watch namespaces; without the RBAC to, listeners admitting routes by namespace selector admit none: {}",
+                            e
+                        );
+                    } else {
+                        debug!("Gateway API: Namespace watcher error: {}", e);
+                    }
+                    // Permission lost: the labels can no longer be kept up
+                    // to date, so they stop admitting routes until a new
+                    // watch lists them again. Another failure is a passing
+                    // one, as for every watcher: the labels stay.
+                    if is_forbidden(&e) {
+                        scope.replace_namespace_labels(HashMap::new());
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Watch Gateways cluster-wide and keep [`GatewayScope`] in sync. A
@@ -8856,7 +9078,110 @@ mod tests {
     /// Namespace labels are not watched, so a selector admits nothing — even
     /// a route of the Gateway's own namespace.
     #[test]
-    fn a_namespace_selector_admits_no_route() {
+    fn a_namespace_selector_admits_the_namespaces_it_matches() {
+        use gateway_api::apis::standard::gateways::{
+            GatewayListenersAllowedRoutesNamespacesSelector,
+            GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions,
+        };
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("infra", "gw", "sozune");
+        let mut allowed = allowed_from(GatewayListenersAllowedRoutesNamespacesFrom::Selector);
+        allowed.namespaces.as_mut().unwrap().selector =
+            Some(GatewayListenersAllowedRoutesNamespacesSelector {
+                match_labels: Some(BTreeMap::from([("team".into(), "web".into())])),
+                match_expressions: Some(vec![
+                    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+                        key: "env".into(),
+                        operator: "NotIn".into(),
+                        values: Some(vec!["test".into()]),
+                    },
+                ]),
+            });
+        gw.spec.listeners[0].allowed_routes = Some(allowed);
+        scope.upsert_gateway(&gw);
+
+        let route_in = |ns: &str| {
+            let mut r = route_with_parents(
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["a.example.com".into()],
+                vec![HTTPRouteParentRefs {
+                    name: "gw".into(),
+                    namespace: Some("infra".into()),
+                    ..Default::default()
+                }],
+            );
+            r.metadata.namespace = Some(ns.into());
+            r
+        };
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // Namespace labels not known yet: nothing is admitted.
+        assert!(!scope.accepts_route(&route_in("shop")));
+
+        scope.set_namespace_labels("shop", Some(labels(&[("team", "web")])));
+        scope.set_namespace_labels("qa", Some(labels(&[("team", "web"), ("env", "test")])));
+        scope.set_namespace_labels("data", Some(labels(&[("team", "data")])));
+        assert!(scope.accepts_route(&route_in("shop")));
+        assert!(!scope.accepts_route(&route_in("qa")));
+        assert!(!scope.accepts_route(&route_in("data")));
+
+        // A relabelled namespace follows.
+        scope.set_namespace_labels("data", Some(labels(&[("team", "web")])));
+        assert!(scope.accepts_route(&route_in("data")));
+        scope.replace_namespace_labels(HashMap::from([(
+            "shop".to_string(),
+            labels(&[("team", "web")]),
+        )]));
+        assert!(scope.accepts_route(&route_in("shop")));
+        assert!(!scope.accepts_route(&route_in("data")));
+    }
+
+    #[test]
+    fn only_a_refusal_counts_as_forbidden() {
+        let response = |code: u16| kube::error::ErrorResponse {
+            status: "Failure".into(),
+            message: String::new(),
+            reason: String::new(),
+            code,
+        };
+        assert!(is_forbidden(&watcher::Error::WatchError(response(403))));
+        assert!(is_forbidden(&watcher::Error::InitialListFailed(
+            kube::Error::Api(response(401))
+        )));
+        assert!(!is_forbidden(&watcher::Error::WatchError(response(500))));
+        assert!(!is_forbidden(&watcher::Error::NoResourceVersion));
+    }
+
+    /// A selector Sōzune cannot read, or none at all, admits no route.
+    #[test]
+    fn a_missing_or_unknown_selector_admits_no_route() {
+        use gateway_api::apis::standard::gateways::{
+            GatewayListenersAllowedRoutesNamespacesSelector,
+            GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions,
+        };
+        let expression = |operator: &str, values: Option<Vec<String>>| {
+            NamespaceSelector::of(&GatewayListenersAllowedRoutesNamespacesSelector {
+                match_labels: None,
+                match_expressions: Some(vec![
+                    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+                        key: "env".into(),
+                        operator: operator.into(),
+                        values,
+                    },
+                ]),
+            })
+        };
+        assert!(expression("Gt", None).is_none());
+        // `NotIn` with no value would match every namespace.
+        assert!(expression("NotIn", None).is_none());
+        assert!(expression("Exists", Some(vec!["x".into()])).is_none());
+        assert!(expression("NotIn", Some(vec!["test".into()])).is_some());
+
         let scope = GatewayScope::new();
         scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
         let mut gw = gateway("default", "gw", "sozune");
@@ -8864,7 +9189,7 @@ mod tests {
             GatewayListenersAllowedRoutesNamespacesFrom::Selector,
         ));
         scope.upsert_gateway(&gw);
-
+        scope.set_namespace_labels("default", Some(BTreeMap::new()));
         let r = route_with(
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
