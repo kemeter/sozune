@@ -25,6 +25,9 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses", "ingressclasses"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["update", "patch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       [
@@ -70,6 +73,7 @@ data:
         enabled: true
         namespace: "sozune-test"
         ingress_class: "sozune"
+        publish_addresses: ["192.0.2.10"]
 
     api:
       enabled: true

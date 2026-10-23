@@ -23,6 +23,8 @@ All fields:
 | `namespace` | *all* | Restrict discovery to a single namespace: Services, Ingresses and the TLS Secrets their certificates come from. Gateway API resources, and the Secrets Gateway listeners name, are watched in every namespace. Omit to watch the whole cluster. |
 | `ingress_class` | `sozune` | Match value for `Ingress.spec.ingressClassName`. Ingresses with a different (or missing) class are ignored. |
 | `expose_by_default` | `false` | If `true`, every Service is a candidate even without a `sozune.*` annotation. |
+| `publish_service` | *none* | The Service, as `namespace/name`, whose load-balancer address the Ingresses Sōzune serves get in `status.loadBalancer` — usually Sōzune's own `LoadBalancer` Service. Followed live (`SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE`). See [Ingress status](#ingress-status). |
+| `publish_addresses` | `[]` | Fixed IPs or hostnames to write there instead, for a Sōzune reached without a `LoadBalancer` Service (host network, an external load balancer). Takes precedence over `publish_service`. |
 
 ### Restrict to one namespace, point at a specific kubeconfig
 
@@ -105,6 +107,19 @@ spec:
 - Backend Services must live in the **same namespace** as the Ingress (Kubernetes spec).
 - Ingresses cannot express middleware (auth, rate-limit, headers, compression…). Use Service annotations when you need those.
 
+### Ingress status
+
+Tools that wait on an Ingress read where it is reachable from its `status.loadBalancer`: external-dns creates its DNS records from it, Argo CD only calls an Ingress healthy once it is set. Sōzune writes it on the Ingresses it serves when `publish_service` or `publish_addresses` is set:
+
+```yaml
+providers:
+  kubernetes:
+    enabled: true
+    publish_service: sozune/sozune   # the LoadBalancer Service in front of Sōzune
+```
+
+With `publish_service`, the Ingresses get the addresses that Service's load balancer was given, updated when they change. With `publish_addresses`, they get those addresses, an IP as `ip` and anything else as `hostname`. An Ingress Sōzune stops serving keeps the status it had. Sōzune needs to update `ingresses/status` for this (see [Minimum RBAC](#minimum-rbac)).
+
 ## Deploying Sōzune in-cluster
 
 Run as a `Deployment` with a `ServiceAccount` bound to a `ClusterRole` that grants read access to Services, EndpointSlices, Ingresses, and Namespaces.
@@ -126,6 +141,11 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
+  # Optional: only needed with publish_service or publish_addresses, to write
+  # the Ingresses' status.loadBalancer.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["update", "patch"]
   # Optional: only needed if you want Gateway API support. `tlsroutes`,
   # `tcproutes` and `udproutes` are only consulted when their (experimental)
   # CRDs are installed; without the permission Sōzune logs a warning and skips
