@@ -609,10 +609,11 @@ xns_denied_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
     -H "Host: gw-xns.k8s-test.localhost" \
     "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
 xns_denied_status=${xns_denied_status:-000}
-if [[ "$xns_denied_status" == "404" ]]; then
-    pass "cross-namespace backend without a ReferenceGrant is not served (got 404)"
+# Its rule is left without backend, which Gateway API answers 500.
+if [[ "$xns_denied_status" == "500" ]]; then
+    pass "cross-namespace backend without a ReferenceGrant is not served (got 500)"
 else
-    fail "cross-namespace backend served without a grant (got $xns_denied_status, expected 404)"
+    fail "cross-namespace backend served without a grant (got $xns_denied_status, expected 500)"
 fi
 
 log "[02] Gateway: applying a ReferenceGrant authorises the cross-namespace backend"
@@ -648,10 +649,10 @@ xns_revoked_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
     -H "Host: gw-xns.k8s-test.localhost" \
     "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
 xns_revoked_status=${xns_revoked_status:-000}
-if [[ "$xns_revoked_status" == "404" ]]; then
-    pass "deleting the ReferenceGrant stops serving the cross-namespace backend (got 404)"
+if [[ "$xns_revoked_status" == "500" ]]; then
+    pass "deleting the ReferenceGrant stops serving the cross-namespace backend (got 500)"
 else
-    fail "cross-namespace backend still served after grant deletion (got $xns_revoked_status, expected 404)"
+    fail "cross-namespace backend still served after grant deletion (got $xns_revoked_status, expected 500)"
 fi
 
 log "[02] Gateway: a listener refuses routes from another namespace by default"

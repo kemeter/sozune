@@ -39,6 +39,8 @@ All notable changes to this project will be documented in this file.
 - Deleting a GatewayClass made Sōzune forget every Gateway, of every class: their routes stopped being served until each Gateway was edited. Only that class's Gateways are dropped now.
 - An HTTPRoute without `hostnames`, on a listener without one, served no host. It serves every host, after the routes naming theirs.
 - A Gateway API wildcard hostname (`*.example.com`) only served hosts one label deeper. It serves `a.b.example.com` too, as the spec says.
+- A Gateway API backendRef that cannot be used — not a `Service`, a Service of another namespace no `ReferenceGrant` opens, a Service that does not exist — left its rule unserved, answering `404`, and the route reported `ResolvedRefs=False` with `BackendNotFound` whatever the cause. A rule left without backend now answers `500`, as the spec requires, and `ResolvedRefs` says why: `InvalidKind`, `RefNotPermitted` or `BackendNotFound`. It is reported on a parent that refuses the route too.
+- An HTTPRoute none of whose hostnames a listener of its Gateway admits was reported `Accepted`. It is now `Accepted=False` with `NoMatchingListenerHostname`.
 - An HTTPRoute header modifier's `add` replaced the header's existing value, as `set` does. It now adds its value next to it.
 - A `ReferenceGrant` deleted while Sōzune's watcher was reconnecting kept authorising the cross-namespace backends it had opened. The list sent on reconnection now drops it.
 - A Gateway API route deleted while Sōzune's watcher was reconnecting to the API server kept routing traffic: no deletion event comes for it, and the list sent on reconnection was not compared with the routes Sōzune held. It is now removed when that list does not include it.

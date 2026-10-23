@@ -43,8 +43,8 @@ use gateway_api::apis::standard::gateways::{
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
 };
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
-    HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
+    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesBackendRefs,
+    HTTPRouteRulesMatches, HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
     HTTPRouteStatusParentsParentRef,
 };
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
@@ -1317,12 +1317,32 @@ impl GatewayScope {
         }
     }
 
+    /// Whether a listener the route binds admits one of its hostnames, an
+    /// `HTTPS` listener counting whether it has a certificate or not.
+    fn listener_hostname_matches(&self, route: &HTTPRoute) -> bool {
+        let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
+        self.bound_listeners_where(route, Self::listener_serves_http, false)
+            .iter()
+            .any(|selected| intersect_hostnames(&route_hostnames, selected).is_some())
+    }
+
     /// The listeners each accepted `parentRef` of the route binds among those
     /// `listener_ok` takes, one list per parentRef that binds any.
     fn bound_listeners(
         &self,
         route: &HTTPRoute,
         listener_ok: fn(&ListenerInfo) -> bool,
+    ) -> Vec<Vec<ListenerInfo>> {
+        self.bound_listeners_where(route, listener_ok, true)
+    }
+
+    /// [`Self::bound_listeners`], an `HTTPS` listener without a usable
+    /// certificate left out only when `need_certificate`.
+    fn bound_listeners_where(
+        &self,
+        route: &HTTPRoute,
+        listener_ok: fn(&ListenerInfo) -> bool,
+        need_certificate: bool,
     ) -> Vec<Vec<ListenerInfo>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let Some(refs) = route.spec.parent_refs.as_ref() else {
@@ -1335,7 +1355,8 @@ impl GatewayScope {
                 let mut listeners = self.gateway_listeners(ns, &p.name, route_ns, "HTTPRoute")?;
                 listeners.retain(listener_ok);
                 listeners.retain(|l| {
-                    !Self::listener_serves_https(l)
+                    !need_certificate
+                        || !Self::listener_serves_https(l)
                         || self.listener_has_certificate(ns, &p.name, &l.name)
                 });
                 // Restrict to the listener(s) this parentRef selects, so a
@@ -2189,7 +2210,8 @@ pub async fn run_httproute_watcher(
     // small enough that we drop quietly under sustained load rather
     // than holding everything in memory. Lost status writes are
     // observability-only; routing keeps working.
-    let (status_tx, status_rx) = mpsc::channel::<(HTTPRoute, RouteOutcome)>(256);
+    let (status_tx, status_rx) =
+        mpsc::channel::<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>(256);
     {
         let client = client.clone();
         let scope = scope.clone();
@@ -2573,16 +2595,16 @@ pub async fn run_gateway_watcher(
 /// genuine apiserver issues that deserve operator attention.
 async fn run_status_writer(
     client: Client,
-    mut rx: mpsc::Receiver<(HTTPRoute, RouteOutcome)>,
+    mut rx: mpsc::Receiver<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>,
     scope: GatewayScope,
 ) {
     info!("Gateway API: HTTPRoute status writer started");
-    while let Some((route, outcome)) = rx.recv().await {
+    while let Some((route, outcome, invalid_ref)) = rx.recv().await {
         let Some(name) = route.metadata.name.as_deref() else {
             continue;
         };
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let our_status = build_route_status(&route, &scope, outcome);
+        let our_status = build_route_status(&route, &scope, outcome, invalid_ref);
         let (merged, changed) = merge_route_status(route.status.as_ref(), our_status);
         if !changed {
             continue;
@@ -3121,7 +3143,7 @@ fn apply_route(
     index: &RouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
-    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome)>>,
+    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -3181,7 +3203,14 @@ fn apply_route(
         let secure =
             scope.effective_hostnames_for_route(route, GatewayScope::listener_serves_https);
         if plain.is_none() && secure.is_none() {
-            (RouteOutcome::NoResolvableBackends, Vec::new())
+            // A hostname may match an HTTPS listener that has no usable
+            // certificate yet: its own status says so.
+            let outcome = if scope.listener_hostname_matches(route) {
+                RouteOutcome::NoResolvableBackends
+            } else {
+                RouteOutcome::NoMatchingListenerHostname
+            };
+            (outcome, Vec::new())
         } else {
             let eps = route_entrypoints_by_scheme(
                 route,
@@ -3205,8 +3234,9 @@ fn apply_route(
     // writer; it computes the desired status, deduplicates against the
     // current object, and PATCHes only when something changed. Send
     // failures are non-fatal: status is observability, not routing.
+    let invalid_ref = route_invalid_ref(route, resolver, scope);
     if let Some(tx) = status_tx
-        && let Err(e) = tx.try_send((route.clone(), outcome))
+        && let Err(e) = tx.try_send((route.clone(), outcome, invalid_ref))
     {
         debug!("Gateway API: status channel full or closed: {}", e);
     }
@@ -3364,7 +3394,7 @@ fn re_resolve_all(
     index: &RouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
-    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome)>>,
+    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>>,
 ) -> bool {
     let routes: Vec<HTTPRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
@@ -3548,6 +3578,11 @@ pub trait ServiceResolver: Send + Sync {
             .map(|ip| (ip, port))
             .collect()
     }
+
+    /// Whether `service` exists, `None` when that is not known yet.
+    fn service_exists(&self, _namespace: &str, _service: &str) -> Option<bool> {
+        None
+    }
 }
 
 impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
@@ -3563,6 +3598,13 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
         protocol: &str,
     ) -> Vec<(String, u16)> {
         self.pod_addresses_for(&format!("{namespace}/{service}"), port, protocol)
+    }
+
+    fn service_exists(&self, namespace: &str, service: &str) -> Option<bool> {
+        crate::provider::kubernetes::KubernetesProvider::service_exists(
+            self,
+            &format!("{namespace}/{service}"),
+        )
     }
 }
 
@@ -3812,6 +3854,79 @@ const REASON_UNSUPPORTED_VALUE: &str = "UnsupportedValue";
 const REASON_BACKEND_NOT_FOUND: &str = "BackendNotFound";
 const REASON_NOT_ALLOWED_BY_LISTENERS: &str = "NotAllowedByListeners";
 const REASON_NO_MATCHING_PARENT: &str = "NoMatchingParent";
+const REASON_NO_MATCHING_LISTENER_HOSTNAME: &str = "NoMatchingListenerHostname";
+const REASON_INVALID_KIND: &str = "InvalidKind";
+
+/// Why a backendRef cannot be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidRef {
+    /// Not a Service: the only kind Sōzune routes to.
+    Kind,
+    /// A Service of another namespace no ReferenceGrant lets the route use.
+    NotPermitted,
+    /// A Service that does not exist.
+    NotFound,
+}
+
+impl InvalidRef {
+    /// The `ResolvedRefs` reason and message it reports.
+    fn condition(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Kind => (REASON_INVALID_KIND, "A backendRef is not a Service"),
+            Self::NotPermitted => (
+                REASON_REF_NOT_PERMITTED,
+                "A backendRef names a Service of another namespace no ReferenceGrant allows",
+            ),
+            Self::NotFound => (
+                REASON_BACKEND_NOT_FOUND,
+                "A backendRef names a Service that does not exist",
+            ),
+        }
+    }
+}
+
+/// Why `backend` cannot be used by a route of `namespace`, if it cannot.
+fn check_backend_ref(
+    namespace: &str,
+    backend: &HTTPRouteRulesBackendRefs,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Result<(), InvalidRef> {
+    // Service-typed backends only. group/kind defaulting to empty/Service
+    // per Gateway API spec is what we accept.
+    let kind_ok = backend.kind.as_deref().is_none_or(|k| k == "Service");
+    let group_ok = backend.group.as_deref().is_none_or(str::is_empty);
+    if !kind_ok || !group_ok {
+        return Err(InvalidRef::Kind);
+    }
+    let target_ns = backend.namespace.as_deref().unwrap_or(namespace);
+    // Cross-namespace backendRefs require a ReferenceGrant in the target
+    // namespace trusting this route's namespace: a namespace must opt in to
+    // being referenced. Same-namespace refs never consult the grant set.
+    if !grants.allows(namespace, target_ns) {
+        return Err(InvalidRef::NotPermitted);
+    }
+    if resolver.service_exists(target_ns, &backend.name) == Some(false) {
+        return Err(InvalidRef::NotFound);
+    }
+    Ok(())
+}
+
+/// The first backendRef of `route` that cannot be used, if any.
+fn route_invalid_ref(
+    route: &HTTPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Option<InvalidRef> {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    route
+        .spec
+        .rules
+        .iter()
+        .flatten()
+        .flat_map(|rule| rule.backend_refs.iter().flatten())
+        .find_map(|b| check_backend_ref(namespace, b, resolver, grants).err())
+}
 
 /// What the watcher decided about a route, computed once and used both
 /// for log output and for the status conditions written back to the
@@ -3832,6 +3947,9 @@ pub enum RouteOutcome {
     /// reason=BackendNotFound` so users can distinguish "I'm waiting
     /// on pods" from "my route is wrong".
     NoResolvableBackends,
+    /// No listener the route binds to admits any of its hostnames.
+    /// Surfaces as `Accepted=False reason=NoMatchingListenerHostname`.
+    NoMatchingListenerHostname,
     /// None of the route's parentRefs matched a sōzune-owned Gateway
     /// (or the route declares no parentRefs at all). Gateway API says
     /// implementations only populate `parents[]` for parents they own, so
@@ -3845,13 +3963,16 @@ pub enum RouteOutcome {
 ///
 /// One entry per parentRef that resolves to a Gateway sōzune accepts, and
 /// one `Accepted=False` entry per parentRef such a Gateway refuses (see
-/// [`GatewayScope::parent_refusal`]). `Accepted=True` iff [`RouteOutcome::Accepted`]. `ResolvedRefs=True`
-/// only when the outcome is `Accepted` (filters and unresolved
-/// backends both flip it to False with distinct reasons).
+/// [`GatewayScope::parent_refusal`]). `Accepted=True` iff the outcome is
+/// [`RouteOutcome::Accepted`] or [`RouteOutcome::NoResolvableBackends`].
+/// `ResolvedRefs` speaks of the route's backendRefs, whether the parent
+/// accepts the route or not: `False` for unsupported filters, a backendRef
+/// that cannot be used (`invalid_ref`), or no ready endpoint.
 fn build_route_status(
     route: &HTTPRoute,
     scope: &GatewayScope,
     outcome: RouteOutcome,
+    invalid_ref: Option<InvalidRef>,
 ) -> Vec<HTTPRouteStatusParents> {
     let now = Time(k8s_openapi::chrono::Utc::now());
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -3876,26 +3997,42 @@ fn build_route_status(
             REASON_UNSUPPORTED_VALUE,
             "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
         ),
+        RouteOutcome::NoMatchingListenerHostname => (
+            "False",
+            REASON_NO_MATCHING_LISTENER_HOSTNAME,
+            "No listener of the Gateway admits any of the route's hostnames".to_string(),
+        ),
         // No parentRef is accepted, so these are never used.
         RouteOutcome::NotMine => ("False", "", String::new()),
     };
-    let (refs_status, refs_reason, refs_msg) = match outcome {
-        RouteOutcome::Accepted => (
-            "True",
-            REASON_RESOLVED_REFS,
-            "All backendRefs resolved to ready endpoints".to_string(),
-        ),
-        RouteOutcome::UnsupportedFilters => (
+    let (refs_status, refs_reason, refs_msg) = match (outcome, invalid_ref) {
+        (RouteOutcome::UnsupportedFilters, _) => (
             "False",
             REASON_UNSUPPORTED_VALUE,
             "Route filters are not supported".to_string(),
         ),
-        RouteOutcome::NoResolvableBackends => (
+        (_, Some(invalid)) => {
+            let (reason, message) = invalid.condition();
+            ("False", reason, message.to_string())
+        }
+        (RouteOutcome::NoResolvableBackends, None) => (
             "False",
             REASON_BACKEND_NOT_FOUND,
             "No ready endpoints found for one or more backendRefs".to_string(),
         ),
-        RouteOutcome::NotMine => ("False", "", String::new()),
+        _ => (
+            "True",
+            REASON_RESOLVED_REFS,
+            "All backendRefs resolved to ready endpoints".to_string(),
+        ),
+    };
+    let resolved_refs = || {
+        condition(
+            CONDITION_TYPE_RESOLVED_REFS,
+            refs_status,
+            refs_reason,
+            refs_msg.clone(),
+        )
     };
 
     route
@@ -3913,12 +4050,7 @@ fn build_route_status(
                         accepted_reason,
                         accepted_msg.clone(),
                     ),
-                    condition(
-                        CONDITION_TYPE_RESOLVED_REFS,
-                        refs_status,
-                        refs_reason,
-                        refs_msg.clone(),
-                    ),
+                    resolved_refs(),
                 ]
             } else {
                 // Reported rather than skipped: silence would read as a
@@ -3939,7 +4071,10 @@ fn build_route_status(
                         route_ns
                     )
                 };
-                vec![condition(CONDITION_TYPE_ACCEPTED, "False", reason, message)]
+                vec![
+                    condition(CONDITION_TYPE_ACCEPTED, "False", reason, message),
+                    resolved_refs(),
+                ]
             };
             Some(HTTPRouteStatusParents {
                 controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
@@ -4051,39 +4186,40 @@ fn rule_to_entrypoints(
     let Some(backend_refs) = rule.backend_refs.as_ref() else {
         return Vec::new();
     };
-    let resolved: Vec<ResolvedRef> = backend_refs
-        .iter()
-        .filter_map(|b| {
-            let port = u16::try_from(b.port?).ok()?;
-            // Service-typed backends only for v1. group/kind defaulting to
-            // empty/Service per Gateway API spec is what we accept; anything
-            // else (e.g. an external resource) is out of scope.
-            let kind_ok = b.kind.as_deref().map(|k| k == "Service").unwrap_or(true);
-            let group_ok = b.group.as_deref().map(|g| g.is_empty()).unwrap_or(true);
-            if !kind_ok || !group_ok {
-                return None;
-            }
-            let target_ns = b.namespace.as_deref().unwrap_or(namespace);
-            // Cross-namespace backendRefs require a ReferenceGrant in the
-            // target namespace trusting this route's namespace. Without one
-            // the ref is dropped (not routed), per the Gateway API spec:
-            // a namespace must opt in to being referenced. Same-namespace
-            // refs are always allowed and never consult the grant set.
-            if !grants.allows(namespace, target_ns) {
-                warn!(
-                    "Gateway API: HTTPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
-                    namespace, route_name, target_ns, b.name
-                );
-                return None;
-            }
-            Some(ResolvedRef {
-                weight: b.weight,
-                pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
-            })
-        })
-        .collect();
-    let Some(backends) = weigh_backend_refs(resolved) else {
-        return Vec::new();
+    let mut resolved: Vec<ResolvedRef> = Vec::new();
+    let mut invalid = 0;
+    for b in backend_refs {
+        if let Err(reason) = check_backend_ref(namespace, b, resolver, grants) {
+            warn!(
+                "Gateway API: HTTPRoute {}/{} rule {} cannot use backendRef {} ({:?})",
+                namespace, route_name, rule_index, b.name, reason
+            );
+            invalid += 1;
+            continue;
+        }
+        let Some(port) = b.port.and_then(|p| u16::try_from(p).ok()) else {
+            continue;
+        };
+        let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+        resolved.push(ResolvedRef {
+            weight: b.weight,
+            pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
+        });
+    }
+    // Gateway API: a rule whose backendRefs are all invalid answers 500.
+    // A redirect answers without them.
+    let invalid_backends = invalid > 0
+        && invalid == backend_refs.len()
+        && !redirect
+            .as_ref()
+            .is_some_and(|r| r.policy.answers_without_backend());
+    let backends = if invalid_backends {
+        Vec::new()
+    } else {
+        let Some(backends) = weigh_backend_refs(resolved) else {
+            return Vec::new();
+        };
+        backends
     };
 
     // Gateway API: matches inside a rule are OR'd. Emit one entrypoint
@@ -4181,6 +4317,7 @@ fn rule_to_entrypoints(
                     match_headers,
                     match_query,
                     match_client_ip: Vec::new(),
+                    invalid_backends,
                     ip_allow_list: Vec::new(),
                 },
                 source: Some(id),
@@ -5425,6 +5562,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         match_headers: Vec::new(),
         match_query: Vec::new(),
         match_client_ip: Vec::new(),
+        invalid_backends: false,
         ip_allow_list: Vec::new(),
     }
 }
@@ -6581,9 +6719,16 @@ mod tests {
         b.namespace = Some("other".into());
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
         // Empty scope: no ReferenceGrant, so the cross-namespace ref is
-        // refused and the route resolves to zero entrypoints.
+        // refused and the rule answers 500.
         let scope = GatewayScope::new();
-        assert!(route_to_entrypoints(&r, &CrossNsResolver, &scope).is_empty());
+        let eps = route_to_entrypoints(&r, &CrossNsResolver, &scope);
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].backends.is_empty());
+        assert!(eps[0].config.invalid_backends);
+        assert_eq!(
+            route_invalid_ref(&r, &CrossNsResolver, &scope),
+            Some(InvalidRef::NotPermitted)
+        );
     }
 
     #[test]
@@ -6864,11 +7009,60 @@ mod tests {
     }
 
     #[test]
-    fn non_service_kind_backend_is_skipped() {
+    fn a_rule_of_non_service_backends_answers_500() {
         let mut b = backend("svc", 80);
         b.kind = Some("CustomResource".into());
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
-        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].backends.is_empty());
+        assert!(eps[0].config.invalid_backends);
+        assert_eq!(
+            route_invalid_ref(&r, &r1(), &AllowAllBackendRefs),
+            Some(InvalidRef::Kind)
+        );
+    }
+
+    /// An invalid backendRef next to a valid one leaves the rule to the
+    /// valid one.
+    #[test]
+    fn a_valid_backend_ref_serves_next_to_an_invalid_one() {
+        let mut b = backend("svc", 80);
+        b.kind = Some("CustomResource".into());
+        let r = route_with(
+            vec![rule(None, vec![b, backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert!(!eps[0].backends.is_empty());
+        assert!(!eps[0].config.invalid_backends);
+    }
+
+    /// A Service known not to exist is invalid; one not known yet is not.
+    #[test]
+    fn a_missing_service_is_invalid_once_services_are_known() {
+        struct Known(Option<bool>);
+        impl ServiceResolver for Known {
+            fn pod_ips(&self, _namespace: &str, _service: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn service_exists(&self, _namespace: &str, _service: &str) -> Option<bool> {
+                self.0
+            }
+        }
+        let r = route_with(
+            vec![rule(None, vec![backend("ghost", 80)])],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &Known(Some(false)), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].config.invalid_backends);
+        assert!(route_to_entrypoints(&r, &Known(None), &AllowAllBackendRefs).is_empty());
+        assert_eq!(
+            route_invalid_ref(&r, &Known(None), &AllowAllBackendRefs),
+            None
+        );
     }
 
     fn route_with_uid(uid: &str, rules: Vec<HTTPRouteRules>, hostnames: Vec<String>) -> HTTPRoute {
@@ -7562,7 +7756,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent_default_gw()],
         );
-        let parents = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let parents = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].controller_name, SOZUNE_CONTROLLER_NAME);
         assert_eq!(parents[0].parent_ref.name, "gw");
@@ -7585,7 +7779,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent_default_gw()],
         );
-        let parents = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters);
+        let parents = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters, None);
         assert_eq!(
             condition(&parents, 0, CONDITION_TYPE_ACCEPTED).status,
             "False"
@@ -7614,7 +7808,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent_default_gw()],
         );
-        let parents = build_route_status(&r, &scope, RouteOutcome::NoResolvableBackends);
+        let parents = build_route_status(&r, &scope, RouteOutcome::NoResolvableBackends, None);
         assert_eq!(
             condition(&parents, 0, CONDITION_TYPE_ACCEPTED).status,
             "True"
@@ -7641,7 +7835,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent("foreign-gw")],
         );
-        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
         assert!(parents.is_empty());
     }
 
@@ -7657,7 +7851,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent("foreign-gw"), parent_default_gw()],
         );
-        let parents = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let parents = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].parent_ref.name, "gw");
     }
@@ -7682,14 +7876,62 @@ mod tests {
         );
         r.metadata.namespace = Some("apps".into());
 
-        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].parent_ref.name, "gw");
         let conditions = parents[0].conditions.as_deref().unwrap_or_default();
-        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions.len(), 2);
         assert_eq!(conditions[0].type_, CONDITION_TYPE_ACCEPTED);
         assert_eq!(conditions[0].status, "False");
         assert_eq!(conditions[0].reason, REASON_NOT_ALLOWED_BY_LISTENERS);
+        // The backendRefs are reported on, whether the parent takes the route
+        // or not.
+        assert_eq!(conditions[1].type_, CONDITION_TYPE_RESOLVED_REFS);
+        assert_eq!(conditions[1].status, "True");
+    }
+
+    #[test]
+    fn build_status_reports_why_a_backend_ref_cannot_be_used() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&gateway("default", "gw", "sozune"));
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        for (invalid, reason) in [
+            (InvalidRef::Kind, REASON_INVALID_KIND),
+            (InvalidRef::NotPermitted, REASON_REF_NOT_PERMITTED),
+            (InvalidRef::NotFound, REASON_BACKEND_NOT_FOUND),
+        ] {
+            let parents = build_route_status(&r, &scope, RouteOutcome::Accepted, Some(invalid));
+            let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+            assert_eq!(conditions[0].status, "True");
+            assert_eq!(conditions[1].type_, CONDITION_TYPE_RESOLVED_REFS);
+            assert_eq!(conditions[1].status, "False");
+            assert_eq!(conditions[1].reason, reason);
+        }
+    }
+
+    #[test]
+    fn build_status_reports_a_route_no_listener_hostname_admits() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&gateway("default", "gw", "sozune"));
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        let parents =
+            build_route_status(&r, &scope, RouteOutcome::NoMatchingListenerHostname, None);
+        let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+        assert_eq!(conditions[0].status, "False");
+        assert_eq!(conditions[0].reason, REASON_NO_MATCHING_LISTENER_HOSTNAME);
+        assert_eq!(conditions[1].status, "True");
     }
 
     #[test]
@@ -7720,7 +7962,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent_default_gw()],
         );
-        let ours = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let ours = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
         let (merged, changed) = merge_route_status(Some(&existing), ours);
         assert!(changed);
         assert_eq!(merged.len(), 2);
@@ -7749,7 +7991,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent_default_gw()],
         );
-        let first = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let first = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
         // Simulate a status write having already happened: the
         // existing object now contains our slice. A second computation
         // of the same outcome should be detected as a no-op.
@@ -7758,7 +8000,7 @@ mod tests {
         };
         // Sleep a few ms so timestamps actually differ.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let second = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let second = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
         let (_merged, changed) = merge_route_status(Some(&existing), second);
         assert!(
             !changed,
@@ -7775,11 +8017,11 @@ mod tests {
             vec!["a.example.com".into()],
             vec![parent_default_gw()],
         );
-        let accepted = build_route_status(&r, &scope, RouteOutcome::Accepted);
+        let accepted = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
         let existing = HTTPRouteStatus {
             parents: accepted.clone(),
         };
-        let unsupported = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters);
+        let unsupported = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters, None);
         let (merged, changed) = merge_route_status(Some(&existing), unsupported);
         assert!(changed);
         assert_eq!(merged.len(), 1);
@@ -8635,6 +8877,28 @@ mod tests {
         );
     }
 
+    /// A hostname an HTTPS listener without certificate admits still
+    /// matches the listener: the route is not reported as matching none.
+    #[test]
+    fn a_listener_without_certificate_still_matches_hostnames() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut https = https_listener("tls", None, "shop-tls");
+        https.hostname = Some("*.shop.example".into());
+        gw.spec.listeners = vec![https];
+        scope.upsert_gateway(&gw);
+        let route = |host: &str| {
+            route_with_parents(
+                vec![rule(None, vec![backend("api", 80)])],
+                vec![host.into()],
+                vec![parent("gw")],
+            )
+        };
+        assert!(scope.listener_hostname_matches(&route("www.shop.example")));
+        assert!(!scope.listener_hostname_matches(&route("blog.example")));
+    }
+
     /// An HTTPRoute attaches through an HTTPS listener, and is served over
     /// HTTPS on the names that listener admits.
     #[test]
@@ -9433,7 +9697,7 @@ mod tests {
         );
         r.metadata.namespace = Some("apps".into());
         assert!(!scope.accepts_route(&r));
-        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+        let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
         assert_eq!(parents.len(), 1);
         assert_eq!(
             parents[0].conditions.as_deref().unwrap_or_default()[0].reason,
@@ -9458,7 +9722,7 @@ mod tests {
                 vec![parent_ref],
             );
             assert!(!scope.accepts_route(&r));
-            let parents = build_route_status(&r, &scope, RouteOutcome::NotMine);
+            let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
             assert_eq!(parents.len(), 1);
             parents[0].conditions.as_deref().unwrap_or_default()[0]
                 .reason

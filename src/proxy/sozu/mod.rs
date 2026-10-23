@@ -3841,6 +3841,31 @@ mod tests {
         );
     }
 
+    /// A route with no valid backend answers 500 only to the requests its
+    /// conditions match: the match check runs first.
+    #[test]
+    fn invalid_backends_answer_after_the_match_check() {
+        let mut ep = base_ep(Vec::new());
+        ep.config.invalid_backends = true;
+        ep.config.match_query = vec![crate::model::MatchCondition {
+            key: "v".into(),
+            value: "1".into(),
+        }];
+        assert!(middleware::needs_middleware(&ep.config));
+        let route = middleware::build_middleware_route(
+            "c",
+            &ep.config,
+            &ep.backends,
+            &middleware::build_forward_auth_client(),
+            &middleware::PluginRegistry::new(),
+            &middleware::ip_allow_list::TrustedProxies::default(),
+        );
+        let names: Vec<&str> = route.middlewares.iter().map(|m| m.name()).collect();
+        let matched = names.iter().position(|n| *n == "request-match");
+        let invalid = names.iter().position(|n| *n == "invalid-backends");
+        assert!(matched.is_some() && matched < invalid, "{names:?}");
+    }
+
     /// A wildcard taking any number of labels ranks as the `*.` one.
     #[test]
     fn an_any_labels_wildcard_ranks_as_a_wildcard() {
@@ -4577,6 +4602,7 @@ mod tests {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
+                invalid_backends: false,
             },
             candidates: Vec::new(),
         }

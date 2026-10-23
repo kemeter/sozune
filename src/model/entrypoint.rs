@@ -222,6 +222,11 @@ pub struct EntrypointConfig {
     /// see `ProxyConfig::trusted_proxies`.
     #[serde(default)]
     pub match_client_ip: Vec<String>,
+    /// The route declares backends none of which could be resolved (a kind
+    /// Sōzune cannot serve, a reference not permitted, a Service that does
+    /// not exist): it answers `500` to every request.
+    #[serde(default)]
+    pub invalid_backends: bool,
 }
 
 /// One key/value match condition used by header and query matching. An empty

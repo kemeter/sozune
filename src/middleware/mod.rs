@@ -4,6 +4,7 @@ mod compress;
 mod diag;
 mod forward_auth;
 pub mod in_flight_req;
+mod invalid_backends;
 pub mod ip_allow_list;
 mod proxy;
 pub mod rate_limit;
@@ -23,6 +24,7 @@ use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
 use in_flight_req::{InFlightLimiter, InFlightReqMiddleware};
+use invalid_backends::InvalidBackends;
 use ip_allow_list::{IpAllowList, IpAllowListMiddleware, TrustedProxies};
 use rate_limit::{RateLimitMiddleware, RateLimiter};
 use request_match::RequestMatchMiddleware;
@@ -531,7 +533,8 @@ pub fn middleware_header_conditions(config: &EntrypointConfig) -> Vec<MatchCondi
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.backend_timeout.is_some()
+    config.invalid_backends
+        || config.backend_timeout.is_some()
         || config.rate_limit.is_some()
         || config.in_flight_req.is_some()
         || config.compress
@@ -618,6 +621,12 @@ pub fn build_middleware_route(
             client_ip,
             trusted_proxies.clone(),
         )));
+    }
+
+    // A route with no valid backend answers the requests it matches, and
+    // nothing else runs.
+    if config.invalid_backends {
+        middlewares.push(Arc::new(InvalidBackends));
     }
 
     if let Some(cfg) = config.forward_auth.as_ref() {

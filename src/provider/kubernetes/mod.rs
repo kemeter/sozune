@@ -47,6 +47,9 @@ struct PortsCache {
     /// Each EndpointSlice's ports by Service then slice, as `(name, port)`:
     /// a Service port's `targetPort`, resolved, under the same name.
     slices: HashMap<String, HashMap<String, Vec<(String, i32)>>>,
+    /// Whether the Service watcher listed every Service once: until then a
+    /// Service missing from `services` may just not be seen yet.
+    services_listed: bool,
 }
 
 /// Maps `namespace/ingress` → set of entrypoint keys it owns. Lets us remove
@@ -316,6 +319,19 @@ impl KubernetesProvider {
         self.addresses(svc_id, name.as_deref(), port)
     }
 
+    /// Whether Service `svc_id` exists, `None` until every Service was
+    /// listed once, and for a namespace the Service watcher does not cover.
+    pub fn service_exists(&self, svc_id: &str) -> Option<bool> {
+        let namespace = svc_id.split_once('/').map_or(svc_id, |(ns, _)| ns);
+        if !self.config.namespace.is_empty() && namespace != self.config.namespace {
+            return None;
+        }
+        let cache = self.ports.read().ok()?;
+        cache
+            .services_listed
+            .then(|| cache.services.contains_key(svc_id))
+    }
+
     /// The ready pods of Service `svc_id` behind its port named `name`, each
     /// with the port it listens on. Empty when no slice names that port.
     pub fn pod_addresses_named(&self, svc_id: &str, name: &str) -> Vec<(String, u16)> {
@@ -551,9 +567,18 @@ impl KubernetesProvider {
         // Whether a relist changed some Service's ports: the Ingresses are
         // then applied again once, when it is done, rather than per Service.
         let mut relist_changed_ports = false;
+        // The Services a relist went through: one deleted while the watcher
+        // was away is dropped from the cache once the relist is done.
+        let mut relisted: HashSet<String> = HashSet::new();
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::InitApply(svc)) => {
+                    if let (Some(ns), Some(name)) = (
+                        svc.metadata.namespace.as_deref(),
+                        svc.metadata.name.as_deref(),
+                    ) {
+                        relisted.insert(format!("{ns}/{name}"));
+                    }
                     relist_changed_ports |= self.record_service_ports(&svc, true);
                     self.upsert_service(&svc, &ctx).await;
                 }
@@ -577,9 +602,17 @@ impl KubernetesProvider {
                 }
                 Ok(Event::Init) => {
                     debug!("Service watcher restart: reinitialising");
+                    relisted.clear();
                 }
                 Ok(Event::InitDone) => {
                     debug!("Service watcher initial sync complete");
+                    if let Ok(mut cache) = self.ports.write() {
+                        let before = cache.services.len();
+                        cache.services.retain(|id, _| relisted.contains(id));
+                        relist_changed_ports |= cache.services.len() != before;
+                        cache.services_listed = true;
+                    }
+                    relisted.clear();
                     if std::mem::take(&mut relist_changed_ports) {
                         self.refresh_all_ingresses(&client, &ctx).await;
                     }
@@ -1324,6 +1357,7 @@ impl IngressParseCtx<'_> {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
+                invalid_backends: false,
                 ip_allow_list: Vec::new(),
             },
             source: Some(self.provider.name.to_string()),
@@ -1392,6 +1426,26 @@ mod tests {
     /// One host rule: `(Some(host) | None, [paths])`.
     type TestIngressRule<'a> = (Option<&'a str>, Vec<TestIngressPath<'a>>);
     use std::collections::BTreeMap;
+
+    /// A Service is known missing only once every Service was listed, and
+    /// only in the namespace the watcher covers.
+    #[test]
+    fn service_existence_is_unknown_until_listed_and_outside_the_namespace() {
+        let mut provider = make_provider(false);
+        provider
+            .ports
+            .write()
+            .unwrap()
+            .services
+            .insert("apps/api".into(), Vec::new());
+        assert_eq!(provider.service_exists("apps/ghost"), None);
+        provider.ports.write().unwrap().services_listed = true;
+        assert_eq!(provider.service_exists("apps/api"), Some(true));
+        assert_eq!(provider.service_exists("apps/ghost"), Some(false));
+        provider.config.namespace = "apps".into();
+        assert_eq!(provider.service_exists("apps/ghost"), Some(false));
+        assert_eq!(provider.service_exists("other/api"), None);
+    }
 
     fn make_provider(expose_by_default: bool) -> KubernetesProvider {
         KubernetesProvider {
