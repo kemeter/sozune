@@ -31,6 +31,7 @@ pub async fn start_services(
     >,
     cert_tx: mpsc::Sender<crate::acme::CertCommand>,
     file_certificates: std::collections::HashSet<String>,
+    secret_hosts: crate::acme::SecretHosts,
 ) -> anyhow::Result<()> {
     info!("Loading initial entrypoints and starting provider services");
 
@@ -180,10 +181,44 @@ pub async fn start_services(
         && kubernetes_config.enabled
     {
         info!("Starting Kubernetes service");
+        // The certificates of kubernetes.io/tls Secrets, named by Ingresses
+        // and Gateway HTTPS listeners, are tracked in one scope, which the
+        // Gateway watchers share when the Gateway API CRDs are installed.
+        let scope = gateway::GatewayScope::new();
         let kubernetes_provider = Arc::new(
             KubernetesProvider::new(kubernetes_config.clone())
-                .context("Failed to create Kubernetes provider")?,
+                .context("Failed to create Kubernetes provider")?
+                .with_tls_secrets(scope.clone(), secret_hosts),
         );
+
+        let secret_provider = Arc::clone(&kubernetes_provider);
+        let secret_scope = scope.clone();
+        let secret_namespace = kubernetes_config.namespace.clone();
+        let gateway_secret_namespace = kubernetes_config.namespace.clone();
+        tokio::spawn(async move {
+            let client = match secret_provider.build_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "Kubernetes: failed to build kube client for TLS Secrets: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+            let secrets = secret_provider.scoped_api(&client);
+            let namespace = Some(secret_namespace).filter(|ns| !ns.is_empty());
+            if let Err(e) =
+                gateway_tls::run_tls_secret_watcher(secrets, secret_scope, namespace).await
+            {
+                error!("Kubernetes: TLS Secret watcher failed: {}", e);
+            }
+        });
+        tokio::spawn(gateway_tls::run_certificate_sync(
+            scope.clone(),
+            cert_tx,
+            file_certificates,
+        ));
         let storage_kubernetes = Arc::clone(&storage);
         let reload_tx_kubernetes = reload_tx.clone();
         let acme_notify_kubernetes = Arc::clone(&acme_notify);
@@ -247,7 +282,21 @@ pub async fn start_services(
                 return;
             }
 
-            let scope = gateway::GatewayScope::new();
+            // Gateways are watched in every namespace, and so are the Secrets
+            // their listeners name, even when the provider is restricted to
+            // one namespace.
+            if !gateway_secret_namespace.is_empty() {
+                let secrets = kube::Api::all(client.clone());
+                let secret_scope = scope.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        gateway_tls::run_tls_secret_watcher(secrets, secret_scope, None).await
+                    {
+                        error!("Gateway API: TLS Secret watcher failed: {}", e);
+                    }
+                });
+            }
+
             let resolver: Arc<dyn gateway::ServiceResolver> =
                 kubernetes_provider_for_gateway.clone();
 
@@ -292,24 +341,6 @@ pub async fn start_services(
                     error!("Gateway API: Gateway watcher failed: {}", e);
                 }
             });
-
-            // HTTPS listeners terminate TLS with the certificates their
-            // certificateRefs name: watch the TLS Secrets, and hand the
-            // referenced certificates to the HTTPS worker.
-            let secret_client = client.clone();
-            let secret_scope = scope.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    gateway_tls::run_tls_secret_watcher(secret_client, secret_scope).await
-                {
-                    error!("Gateway API: TLS Secret watcher failed: {}", e);
-                }
-            });
-            tokio::spawn(gateway_tls::run_certificate_sync(
-                scope.clone(),
-                cert_tx,
-                file_certificates,
-            ));
 
             let rg_client = client.clone();
             let rg_scope = scope.clone();

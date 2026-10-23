@@ -138,6 +138,10 @@ pub struct CertCommand {
     pub action: CertAction,
 }
 
+/// The hostnames served with a certificate from a Kubernetes Secret, by the
+/// Ingress naming it in `spec.tls[].secretName`. ACME orders nothing for them.
+pub type SecretHosts = Arc<RwLock<HashMap<String, Vec<String>>>>;
+
 /// What a [`CertCommand`] asks of the HTTPS worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CertAction {
@@ -204,9 +208,25 @@ pub struct AcmeManager {
     /// served, so ordering one from ACME would only spend rate limit — and
     /// fail outright when its DNS does not point here.
     manual_names: Vec<String>,
+    /// Names whose certificate a Kubernetes Secret provides.
+    secret_hosts: SecretHosts,
+    /// The leaf certificates the HTTPS worker took from this manager, by
+    /// hostname: a renewal adds one without removing the one before.
+    loaded: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+    /// Hostnames whose certificate from `certs_dir` was taken back, or left
+    /// out at startup, because a Secret serves them: sent again from disk
+    /// once it no longer does.
+    retired: Arc<Mutex<BTreeSet<String>>>,
+    /// The last [`AcmeManager::follow_secret_hosts`] left work undone.
+    secret_sync_pending: std::sync::atomic::AtomicBool,
 }
 
+/// How soon a certificate the worker refused while following the Secrets is
+/// tried again.
+const SECRET_SYNC_RETRY: Duration = Duration::from_secs(30);
+
 impl AcmeManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AcmeConfig,
         challenges: ChallengeState,
@@ -215,6 +235,7 @@ impl AcmeManager {
         cert_tx: mpsc::Sender<CertCommand>,
         notify: Arc<Notify>,
         manual_names: Vec<String>,
+        secret_hosts: SecretHosts,
     ) -> Self {
         let certs_dir = PathBuf::from(&config.certs_dir);
         Self {
@@ -228,6 +249,10 @@ impl AcmeManager {
             backoff: Backoff::default(),
             undelivered: Arc::new(Mutex::new(BTreeSet::new())),
             manual_names,
+            secret_hosts,
+            loaded: Arc::new(Mutex::new(BTreeMap::new())),
+            retired: Arc::new(Mutex::new(BTreeSet::new())),
+            secret_sync_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -248,10 +273,18 @@ impl AcmeManager {
         loop {
             // A far-future default so the branch is inert when nothing is
             // backing off; `sleep` needs a concrete duration to await.
-            let until_retry = self
+            let mut until_retry = self
                 .backoff
                 .soonest_retry()
                 .unwrap_or(Duration::from_secs(12 * 3600));
+            // A certificate the worker refused to take back or to take again
+            // while following the Secrets: soon, not at the next renewal.
+            if self
+                .secret_sync_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                until_retry = until_retry.min(SECRET_SYNC_RETRY);
+            }
             tokio::select! {
                 _ = interval.tick() => {
                     info!("Running ACME renewal check");
@@ -273,6 +306,7 @@ impl AcmeManager {
 
     /// Scan storage for entrypoints with tls: true and provision certificates
     async fn provision_all(&self) -> anyhow::Result<()> {
+        self.follow_secret_hosts().await;
         let certs = self.collect_tls_certs();
         if certs.is_empty() {
             debug!("No TLS-enabled hostnames found, skipping ACME provisioning");
@@ -374,7 +408,25 @@ impl AcmeManager {
             }
         }
 
+        // Resolver-managed domains included: a Secret serving the name wins.
+        certs.retain(|(hostname, _)| {
+            let from_secret = self.served_from_secret(hostname);
+            if from_secret {
+                debug!(
+                    "{} is served with a certificate from a Kubernetes Secret, skipping ACME",
+                    hostname
+                );
+            }
+            !from_secret
+        });
         retain_uncovered(certs, &self.manual_names)
+    }
+
+    /// Whether an Ingress serves `hostname` with the certificate of a Secret.
+    fn served_from_secret(&self, hostname: &str) -> bool {
+        self.secret_hosts
+            .read()
+            .is_ok_and(|hosts| hosts.values().flatten().any(|h| h == hostname))
     }
 
     /// Validate that a hostname is safe to use as a directory name (no path traversal).
@@ -511,6 +563,7 @@ impl AcmeManager {
             .await?;
 
         let (cert_pem, chain) = split_pem_chain(&cert_chain_pem);
+        let leaf = cert_pem.clone();
         let (accepted_tx, accepted_rx) = oneshot::channel();
         self.cert_tx
             .send(CertCommand {
@@ -530,6 +583,7 @@ impl AcmeManager {
         match accepted_rx.await {
             Ok(true) => {
                 self.mark_delivered(hostname);
+                self.record_loaded(hostname, leaf);
                 info!("Certificate for {} provisioned successfully", hostname);
             }
             Ok(false) => {
@@ -813,6 +867,13 @@ impl AcmeManager {
                 continue;
             }
 
+            // A Secret serves it: the certificate waits until it no longer
+            // does.
+            if self.served_from_secret(&hostname) {
+                set_insert(&self.retired, &hostname);
+                continue;
+            }
+
             let cert_path = path.join("cert.pem");
             let key_path = path.join("key.pem");
 
@@ -843,6 +904,7 @@ impl AcmeManager {
             }
 
             let (cert, chain) = split_pem_chain(&cert_pem);
+            let leaf = cert.clone();
             if let Err(e) = self
                 .cert_tx
                 .send(CertCommand {
@@ -859,10 +921,150 @@ impl AcmeManager {
             {
                 error!("Failed to send cert command for {}: {}", hostname, e);
             } else {
+                self.record_loaded(&hostname, leaf);
                 info!("Loaded existing certificate for {}", hostname);
             }
         }
     }
+
+    /// Take back from the HTTPS worker the certificate of a hostname a
+    /// Secret now serves, so Sōzu cannot pick it over the Secret's, and send
+    /// it again from disk once no Secret serves the hostname.
+    async fn follow_secret_hosts(&self) {
+        let mut pending = false;
+        let held: Vec<(String, Vec<String>)> = self
+            .loaded
+            .lock()
+            .map(|l| l.iter().map(|(h, c)| (h.clone(), c.clone())).collect())
+            .unwrap_or_default();
+        for (hostname, leaves) in held {
+            if !self.served_from_secret(&hostname) {
+                continue;
+            }
+            // Every certificate the worker took for it, renewals included.
+            let mut kept = Vec::new();
+            for leaf in leaves {
+                if !self.withdraw(&hostname, &leaf).await {
+                    kept.push(leaf);
+                }
+            }
+            pending |= !kept.is_empty();
+            if let Ok(mut loaded) = self.loaded.lock() {
+                if kept.is_empty() {
+                    loaded.remove(&hostname);
+                } else {
+                    loaded.insert(hostname.clone(), kept);
+                }
+            }
+            set_insert(&self.retired, &hostname);
+            info!(
+                "ACME certificate for {} withdrawn: a Kubernetes Secret serves it",
+                hostname
+            );
+        }
+        for hostname in set_snapshot(&self.retired) {
+            if self.served_from_secret(&hostname) {
+                continue;
+            }
+            match self.restore_from_disk(&hostname).await {
+                Some(true) => {
+                    set_remove(&self.retired, &hostname);
+                    info!("ACME certificate for {} served again", hostname);
+                }
+                // Refused: tried again soon.
+                Some(false) => pending = true,
+                // Nothing usable on disk: the provisioning pass orders one.
+                None => set_remove(&self.retired, &hostname),
+            }
+        }
+        self.secret_sync_pending
+            .store(pending, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take back from the HTTPS worker the certificate `leaf`.
+    async fn withdraw(&self, hostname: &str, leaf: &str) -> bool {
+        let (accepted, answer) = oneshot::channel();
+        let command = CertCommand {
+            names: vec![hostname.to_string()],
+            cert_pem: leaf.to_string(),
+            key_pem: String::new(),
+            chain: Vec::new(),
+            accepted: Some(accepted),
+            action: CertAction::Remove,
+        };
+        if self.cert_tx.send(command).await.is_err() {
+            return false;
+        }
+        answer.await.unwrap_or(false)
+    }
+
+    /// Hand the HTTPS worker the certificate of `hostname` in `certs_dir`.
+    /// Returns whether the worker took it, or `None` when there is no usable
+    /// one on disk.
+    async fn restore_from_disk(&self, hostname: &str) -> Option<bool> {
+        let dir = self.certs_dir.join(path_safe(hostname));
+        let cert_pem = tokio::fs::read_to_string(dir.join("cert.pem")).await.ok()?;
+        let key_pem = tokio::fs::read_to_string(dir.join("key.pem")).await.ok()?;
+        if cheti::needs_renewal(&cert_pem, 0) {
+            return None;
+        }
+        let (cert, chain) = split_pem_chain(&cert_pem);
+        let leaf = cert.clone();
+        // Still held, its withdrawal having been refused: adding it again
+        // would make the worker count it twice.
+        if self
+            .loaded
+            .lock()
+            .is_ok_and(|l| l.get(hostname).is_some_and(|leaves| leaves.contains(&leaf)))
+        {
+            return Some(true);
+        }
+        let (accepted, answer) = oneshot::channel();
+        let command = CertCommand {
+            names: vec![hostname.to_string()],
+            cert_pem: cert,
+            key_pem,
+            chain,
+            accepted: Some(accepted),
+            action: CertAction::Add,
+        };
+        if self.cert_tx.send(command).await.is_err() {
+            return Some(false);
+        }
+        let taken = answer.await.unwrap_or(false);
+        if taken {
+            self.record_loaded(hostname, leaf);
+        }
+        Some(taken)
+    }
+
+    /// Remember a leaf certificate the HTTPS worker took for `hostname`.
+    fn record_loaded(&self, hostname: &str, leaf: String) {
+        if let Ok(mut loaded) = self.loaded.lock() {
+            let leaves = loaded.entry(hostname.to_string()).or_default();
+            if !leaves.contains(&leaf) {
+                leaves.push(leaf);
+            }
+        }
+    }
+}
+
+fn set_insert(set: &Mutex<BTreeSet<String>>, hostname: &str) {
+    if let Ok(mut set) = set.lock() {
+        set.insert(hostname.to_string());
+    }
+}
+
+fn set_remove(set: &Mutex<BTreeSet<String>>, hostname: &str) {
+    if let Ok(mut set) = set.lock() {
+        set.remove(hostname);
+    }
+}
+
+fn set_snapshot(set: &Mutex<BTreeSet<String>>) -> Vec<String> {
+    set.lock()
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Write data to a file with 0600 permissions (owner read/write only)
@@ -1102,6 +1304,137 @@ fn parse_utc_stamp_to_epoch(stamp: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ACME certificate is taken back while a Kubernetes Secret serves its
+    /// hostname, and handed over again from disk once it no longer does.
+    #[tokio::test]
+    async fn an_acme_certificate_steps_aside_for_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_dir = dir.path().join("a.test");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["a.test".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(host_dir.join("cert.pem"), cert.pem()).unwrap();
+        std::fs::write(host_dir.join("key.pem"), key.serialize_pem()).unwrap();
+
+        let config: AcmeConfig = serde_yaml::from_str(&format!(
+            "enabled: true\nemail: ops@a.test\ncerts_dir: {}\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let (cert_tx, mut cert_rx) = mpsc::channel(8);
+        let secret_hosts: SecretHosts = Arc::new(RwLock::new(HashMap::new()));
+        let manager = AcmeManager::new(
+            config,
+            Arc::new(RwLock::new(HashMap::new())),
+            TlsAlpnResponder::new(),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            cert_tx,
+            Arc::new(Notify::new()),
+            Vec::new(),
+            Arc::clone(&secret_hosts),
+        );
+        let worker = tokio::spawn(async move {
+            let mut actions = Vec::new();
+            while let Some(command) = cert_rx.recv().await {
+                actions.push(command.action);
+                let _ = command.accepted.unwrap().send(true);
+            }
+            actions
+        });
+
+        manager.record_loaded("a.test", cert.pem());
+        manager.record_loaded("a.test", "renewed leaf".into());
+        manager.follow_secret_hosts().await;
+        // No Secret serves it: nothing to do.
+        secret_hosts
+            .write()
+            .unwrap()
+            .insert("default/web".into(), vec!["a.test".into()]);
+        manager.follow_secret_hosts().await;
+        assert!(manager.loaded.lock().unwrap().is_empty());
+        assert_eq!(set_snapshot(&manager.retired), ["a.test"]);
+        secret_hosts.write().unwrap().clear();
+        manager.follow_secret_hosts().await;
+        assert_eq!(manager.loaded.lock().unwrap()["a.test"].len(), 1);
+        assert!(set_snapshot(&manager.retired).is_empty());
+
+        drop(manager);
+        // Both certificates the worker held are taken back.
+        assert_eq!(
+            worker.await.unwrap(),
+            [CertAction::Remove, CertAction::Remove, CertAction::Add]
+        );
+    }
+
+    /// A withdrawal the worker refuses is retried soon, and the certificate
+    /// it still holds is not added a second time.
+    #[tokio::test]
+    async fn a_refused_withdrawal_is_retried_and_never_doubled() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_dir = dir.path().join("a.test");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["a.test".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(host_dir.join("cert.pem"), cert.pem()).unwrap();
+        std::fs::write(host_dir.join("key.pem"), key.serialize_pem()).unwrap();
+
+        let config: AcmeConfig = serde_yaml::from_str(&format!(
+            "enabled: true\nemail: ops@a.test\ncerts_dir: {}\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let (cert_tx, mut cert_rx) = mpsc::channel(8);
+        let secret_hosts: SecretHosts = Arc::new(RwLock::new(HashMap::new()));
+        let manager = AcmeManager::new(
+            config,
+            Arc::new(RwLock::new(HashMap::new())),
+            TlsAlpnResponder::new(),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            cert_tx,
+            Arc::new(Notify::new()),
+            Vec::new(),
+            Arc::clone(&secret_hosts),
+        );
+        let worker = tokio::spawn(async move {
+            let mut actions = Vec::new();
+            while let Some(command) = cert_rx.recv().await {
+                actions.push(command.action);
+                let ok = command.action != CertAction::Remove;
+                let _ = command.accepted.unwrap().send(ok);
+            }
+            actions
+        });
+
+        let (leaf, _) = split_pem_chain(&cert.pem());
+        manager.record_loaded("a.test", leaf);
+        manager.follow_secret_hosts().await;
+        // No Secret serves it: nothing to do.
+        secret_hosts
+            .write()
+            .unwrap()
+            .insert("default/web".into(), vec!["a.test".into()]);
+        manager.follow_secret_hosts().await;
+        assert_eq!(manager.loaded.lock().unwrap()["a.test"].len(), 1);
+        assert!(
+            manager
+                .secret_sync_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        secret_hosts.write().unwrap().clear();
+        manager.follow_secret_hosts().await;
+        assert!(set_snapshot(&manager.retired).is_empty());
+
+        drop(manager);
+        // Still held: never added again.
+        assert_eq!(worker.await.unwrap(), [CertAction::Remove]);
+    }
 
     /// A certificate on disk the HTTPS worker never accepted is not a
     /// certificate: `add_certificate` can fail after `save_certificate` has

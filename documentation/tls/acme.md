@@ -192,7 +192,7 @@ The preread neither decrypts nor consumes the connection: normal HTTPS reaches t
 
 ## How it works
 
-When you declare a service with `tls=true`, Sōzune scans every TLS-enabled hostname and triggers an HTTP-01 challenge for each one that is missing a certificate or is expiring within 30 days. A Kubernetes Gateway route is left out: its certificate comes from the Secret its `HTTPS` listener names (see [HTTPS listeners](/documentation/providers/kubernetes#https-listeners)).
+When you declare a service with `tls=true`, Sōzune scans every TLS-enabled hostname and triggers an HTTP-01 challenge for each one that is missing a certificate or is expiring within 30 days. A Kubernetes Gateway route is left out: its certificate comes from the Secret its `HTTPS` listener names (see [HTTPS listeners](/documentation/providers/kubernetes#https-listeners)). So is a hostname an Ingress serves with a `spec.tls[].secretName` (see [Ingress resources](/documentation/providers/kubernetes#ingress-resources)).
 
 ```
    tls=true on app.example.com

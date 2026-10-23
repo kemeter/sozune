@@ -251,6 +251,9 @@ pub struct ScopeState {
     /// The `kubernetes.io/tls` Secrets, keyed by `(namespace, name)`: the
     /// certificate each holds, or why it cannot be used.
     tls_secrets: HashMap<(String, String), Result<Arc<SecretCertificate>, String>>,
+    /// The TLS Secrets each Ingress names in `spec.tls[].secretName`, by
+    /// Ingress `namespace/name`.
+    ingress_secrets: HashMap<String, Vec<(String, String)>>,
 }
 
 /// A Gateway listener: `(namespace, gateway name, listener name)`.
@@ -566,11 +569,13 @@ impl GatewayScope {
         });
     }
 
-    /// Drop every TLS Secret not in `kept`: those a relist did not bring back.
-    pub fn retain_tls_secrets(&self, kept: &HashSet<(String, String)>) {
+    /// Drop every TLS Secret of `namespace` (`None`: of any) not in `kept`:
+    /// those a relist of it did not bring back.
+    pub fn retain_tls_secrets(&self, kept: &HashSet<(String, String)>, namespace: Option<&str>) {
         self.update_tls_secrets(|secrets| {
             let gone: Vec<(String, String)> = secrets
                 .keys()
+                .filter(|(ns, _)| namespace.is_none_or(|n| n == ns))
                 .filter(|key| !kept.contains(*key))
                 .cloned()
                 .collect();
@@ -635,8 +640,30 @@ impl GatewayScope {
             .is_some_and(|l| !listener_certificates(&g.tls_secrets, ns, l).0.is_empty())
     }
 
-    /// The certificates the `HTTPS` listeners of the accepted Gateways
-    /// reference and can use.
+    /// Record the TLS Secrets an Ingress names, none once it is gone.
+    pub fn set_ingress_secrets(&self, ingress: &str, secrets: Vec<(String, String)>) {
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        let changed = if secrets.is_empty() {
+            g.ingress_secrets.remove(ingress).is_some()
+        } else {
+            g.ingress_secrets
+                .insert(ingress.to_string(), secrets.clone())
+                != Some(secrets)
+        };
+        drop(g);
+        if changed {
+            self.certificates.notify_one();
+        }
+    }
+
+    /// The certificates the `HTTPS` listeners of the accepted Gateways, and
+    /// the Ingresses, reference and can use.
     pub fn referenced_certificates(&self) -> Vec<Arc<SecretCertificate>> {
         let g = match self.state.read() {
             Ok(g) => g,
@@ -657,6 +684,12 @@ impl GatewayScope {
                     .flat_map(|l| listener_certificates(&g.tls_secrets, ns, l).0)
                     .collect::<Vec<_>>()
             })
+            .chain(
+                g.ingress_secrets
+                    .values()
+                    .flatten()
+                    .filter_map(|key| g.tls_secrets.get(key)?.as_ref().ok().cloned()),
+            )
             .collect()
     }
 
@@ -7688,7 +7721,10 @@ mod tests {
         scope.upsert_gateway(&gw);
         assert_eq!(scope.referenced_certificates().len(), 1);
 
-        scope.retain_tls_secrets(&HashSet::new());
+        // A relist of another namespace keeps it.
+        scope.retain_tls_secrets(&HashSet::new(), Some("infra"));
+        assert_eq!(scope.referenced_certificates().len(), 1);
+        scope.retain_tls_secrets(&HashSet::new(), None);
         assert!(scope.referenced_certificates().is_empty());
         store_secret(&scope, "default", "shop-tls", "shop.example.com");
         scope.remove_gateway("default", "gw");
