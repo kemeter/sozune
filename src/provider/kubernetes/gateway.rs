@@ -254,6 +254,59 @@ pub struct ScopeState {
     /// The TLS Secrets each Ingress names in `spec.tls[].secretName`, by
     /// Ingress `namespace/name`.
     ingress_secrets: HashMap<String, Vec<(String, String)>>,
+    /// What each ReferenceGrant lets Gateways reference among Secrets, by
+    /// grant `(namespace, name)`.
+    secret_grants: HashMap<(String, String), SecretGrant>,
+}
+
+/// The Secrets a ReferenceGrant lets Gateways of other namespaces name in
+/// their listeners' certificateRefs.
+#[derive(Clone, Debug, PartialEq)]
+struct SecretGrant {
+    /// The namespace of the grant, and of the Secrets it covers.
+    namespace: String,
+    /// The namespaces of the Gateways it trusts.
+    from: HashSet<String>,
+    /// The Secrets it covers by name; `None`: all of its namespace.
+    names: Option<HashSet<String>>,
+}
+
+impl SecretGrant {
+    fn of(grant: &ReferenceGrant) -> Option<Self> {
+        let namespace = grant.metadata.namespace.clone()?;
+        let from: HashSet<String> = grant
+            .spec
+            .from
+            .iter()
+            .filter(|f| f.group == GATEWAY_API_GROUP && f.kind == "Gateway")
+            .map(|f| f.namespace.clone())
+            .collect();
+        let to: Vec<&_> = grant
+            .spec
+            .to
+            .iter()
+            .filter(|t| t.group.is_empty() && t.kind == "Secret")
+            .collect();
+        if from.is_empty() || to.is_empty() {
+            return None;
+        }
+        // One entry naming no Secret opens them all.
+        let names = to
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Option<HashSet<String>>>();
+        Some(Self {
+            namespace,
+            from,
+            names,
+        })
+    }
+
+    fn allows(&self, gateway_ns: &str, secret_ns: &str, secret: &str) -> bool {
+        self.namespace == secret_ns
+            && self.from.contains(gateway_ns)
+            && self.names.as_ref().is_none_or(|n| n.contains(secret))
+    }
 }
 
 /// A Gateway listener: `(namespace, gateway name, listener name)`.
@@ -637,7 +690,11 @@ impl GatewayScope {
         g.gateway_objects
             .get(&(ns.to_string(), name.to_string()))
             .and_then(|gw| gw.spec.listeners.iter().find(|l| l.name == listener))
-            .is_some_and(|l| !listener_certificates(&g.tls_secrets, ns, l).0.is_empty())
+            .is_some_and(|l| {
+                !listener_certificates(&g.tls_secrets, &g.secret_grants, ns, l)
+                    .0
+                    .is_empty()
+            })
     }
 
     /// Record the TLS Secrets an Ingress names, none once it is gone.
@@ -681,7 +738,7 @@ impl GatewayScope {
                     .listeners
                     .iter()
                     .filter(|l| serves_https(l))
-                    .flat_map(|l| listener_certificates(&g.tls_secrets, ns, l).0)
+                    .flat_map(|l| listener_certificates(&g.tls_secrets, &g.secret_grants, ns, l).0)
                     .collect::<Vec<_>>()
             })
             .chain(
@@ -723,7 +780,7 @@ impl GatewayScope {
                     .listeners
                     .iter()
                     .find(|l| l.name == listener.name && serves_https(l))
-                    .and_then(|l| listener_certificates(&g.tls_secrets, ns, l).1);
+                    .and_then(|l| listener_certificates(&g.tls_secrets, &g.secret_grants, ns, l).1);
                 build_listener_status(gateway, listener, &g.served, attached, certificates)
             })
             .collect()
@@ -1407,6 +1464,92 @@ impl GatewayScope {
         }
     }
 
+    /// Record what a ReferenceGrant lets Gateways reference among Secrets,
+    /// `None` once it is gone or covers no Secret. A change rewrites the
+    /// status of the Gateways naming a Secret of its namespace and hands the
+    /// certificates over again.
+    fn update_secret_grant(&self, grant: &ReferenceGrant, secret_grant: Option<SecretGrant>) {
+        let (Some(ns), Some(name)) = (
+            grant.metadata.namespace.clone(),
+            grant.metadata.name.clone(),
+        ) else {
+            return;
+        };
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        let key = (ns.clone(), name);
+        let changed = match secret_grant {
+            Some(sg) => g.secret_grants.insert(key, sg.clone()).as_ref() != Some(&sg),
+            None => g.secret_grants.remove(&key).is_some(),
+        };
+        if !changed {
+            return;
+        }
+        for (key, gateway) in &g.gateway_objects {
+            if g.gateways.contains_key(key) && references_secret_in(gateway, &ns) {
+                queue_status_write(
+                    g.status_tx.as_ref(),
+                    StatusWrite::Gateway(Box::new(gateway.clone())),
+                );
+            }
+        }
+        drop(g);
+        self.fire_if(true);
+    }
+
+    /// Keep only the ReferenceGrants a relist brought back: one deleted while
+    /// the watch was down sends no `Delete`, and must not keep authorising
+    /// anything.
+    pub fn retain_reference_grants(&self, kept: &[ReferenceGrant]) {
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        let pairs: HashSet<(String, String)> = kept
+            .iter()
+            .filter_map(|grant| {
+                let to_ns = grant.metadata.namespace.clone()?;
+                Some(
+                    trusted_route_from_namespaces(grant)
+                        .into_iter()
+                        .map(move |from| (from, to_ns.clone())),
+                )
+            })
+            .flatten()
+            .collect();
+        let keys: HashSet<(String, String)> = kept
+            .iter()
+            .filter_map(|grant| {
+                Some((
+                    grant.metadata.namespace.clone()?,
+                    grant.metadata.name.clone()?,
+                ))
+            })
+            .collect();
+        let before = g.secret_grants.len();
+        g.secret_grants.retain(|key, _| keys.contains(key));
+        let changed = g.reference_grants != pairs || g.secret_grants.len() != before;
+        g.reference_grants = pairs;
+        if changed {
+            for gateway in g.gateway_objects.values() {
+                queue_status_write(
+                    g.status_tx.as_ref(),
+                    StatusWrite::Gateway(Box::new(gateway.clone())),
+                );
+            }
+        }
+        drop(g);
+        self.fire_if(changed);
+    }
+
     /// Mutates the scope on a ReferenceGrant apply. The grant lives in the
     /// referenced (`to`) namespace and lists the `from` namespaces/kinds it
     /// trusts. We only care about grants that let an `HTTPRoute` reach a
@@ -1416,6 +1559,7 @@ impl GatewayScope {
         let Some(to_ns) = grant.metadata.namespace.as_deref() else {
             return false;
         };
+        self.update_secret_grant(grant, SecretGrant::of(grant));
         let froms = trusted_route_from_namespaces(grant);
 
         let mut g = match self.state.write() {
@@ -1461,6 +1605,7 @@ impl GatewayScope {
         let Some(to_ns) = grant.metadata.namespace.as_deref() else {
             return false;
         };
+        self.update_secret_grant(grant, None);
         let froms = trusted_route_from_namespaces(grant);
         if froms.is_empty() {
             return false;
@@ -1570,6 +1715,18 @@ fn certificate_refs<'a>(
         })
 }
 
+/// Whether one of the Gateway's `HTTPS` listeners names a Secret of
+/// `namespace`.
+fn references_secret_in(gateway: &Gateway, namespace: &str) -> bool {
+    let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+    gateway
+        .spec
+        .listeners
+        .iter()
+        .filter(|l| serves_https(l))
+        .any(|l| certificate_refs(ns, l).any(|((secret_ns, _), _)| secret_ns == namespace))
+}
+
 /// Whether one of the Gateway's `HTTPS` listeners references `secret`.
 fn references_secret(gateway: &Gateway, secret: &(String, String)) -> bool {
     let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
@@ -1586,6 +1743,7 @@ fn references_secret(gateway: &Gateway, secret: &(String, String)) -> bool {
 /// The references that resolve are served even when another does not.
 fn listener_certificates(
     secrets: &HashMap<(String, String), Result<Arc<SecretCertificate>, String>>,
+    grants: &HashMap<(String, String), SecretGrant>,
     gateway_ns: &str,
     l: &GatewayListeners,
 ) -> (Vec<Arc<SecretCertificate>>, Option<(&'static str, String)>) {
@@ -1607,11 +1765,11 @@ fn listener_certificates(
                 REASON_INVALID_CERTIFICATE_REF,
                 format!("certificateRef {name} is not a core Secret"),
             ))
-        } else if ns != gateway_ns {
+        } else if ns != gateway_ns && !grants.values().any(|g| g.allows(gateway_ns, &ns, &name)) {
             Err((
                 REASON_REF_NOT_PERMITTED,
                 format!(
-                    "certificateRef {ns}/{name} is in another namespace, which Sōzune does not support yet"
+                    "certificateRef {ns}/{name} is in another namespace, and no ReferenceGrant there lets Gateways of {gateway_ns} reference it"
                 ),
             ))
         } else {
@@ -2009,9 +2167,15 @@ pub async fn run_referencegrant_watcher(client: Client, scope: GatewayScope) -> 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     info!("Gateway API: ReferenceGrant watcher started");
 
+    // The grants a relist brings back: those it does not are gone.
+    let mut relisted: Vec<ReferenceGrant> = Vec::new();
     while let Some(event) = stream.next().await {
         match event {
-            Ok(Event::Apply(grant)) | Ok(Event::InitApply(grant)) => {
+            Ok(Event::InitApply(grant)) => {
+                scope.upsert_reference_grant(&grant);
+                relisted.push(grant);
+            }
+            Ok(Event::Apply(grant)) => {
                 let name = grant.metadata.name.as_deref().unwrap_or("<no-name>");
                 let ns = grant
                     .metadata
@@ -2033,8 +2197,8 @@ pub async fn run_referencegrant_watcher(client: Client, scope: GatewayScope) -> 
                     info!("Gateway API: ReferenceGrant {}/{} removed", ns, name);
                 }
             }
-            Ok(Event::Init) => debug!("Gateway API: ReferenceGrant init"),
-            Ok(Event::InitDone) => debug!("Gateway API: ReferenceGrant init done"),
+            Ok(Event::Init) => relisted.clear(),
+            Ok(Event::InitDone) => scope.retain_reference_grants(&std::mem::take(&mut relisted)),
             Err(e) => error!("Gateway API: ReferenceGrant watcher error: {}", e),
         }
     }
@@ -7702,6 +7866,87 @@ mod tests {
             vec![parent("gw")],
         );
         assert_eq!(scope.https_redirect_port(&route), Some(8443));
+    }
+
+    /// A Secret of another namespace is used once a ReferenceGrant there lets
+    /// the Gateway's namespace reference it, and only that Secret when the
+    /// grant names one.
+    #[test]
+    fn a_reference_grant_opens_a_secret_of_another_namespace() {
+        use gateway_api::apis::standard::referencegrants::{
+            ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+        };
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![
+            https_listener("shared", Some("infra"), "shared-tls"),
+            https_listener("other", Some("infra"), "other-tls"),
+        ];
+        scope.upsert_gateway(&gw);
+        store_secret(&scope, "infra", "shared-tls", "shared.example.com");
+        store_secret(&scope, "infra", "other-tls", "other.example.com");
+        assert_eq!(
+            resolved_refs(&scope, &gw, "shared").reason,
+            REASON_REF_NOT_PERMITTED
+        );
+
+        let grant = |from_kind: &str, name: Option<&str>| ReferenceGrant {
+            metadata: ObjectMeta {
+                namespace: Some("infra".into()),
+                name: Some("certs".into()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: GATEWAY_API_GROUP.into(),
+                    kind: from_kind.into(),
+                    namespace: "default".into(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: String::new(),
+                    kind: "Secret".into(),
+                    name: name.map(str::to_string),
+                }],
+            },
+        };
+        // A grant for routes does not open Secrets to Gateways.
+        scope.upsert_reference_grant(&grant("HTTPRoute", None));
+        assert!(scope.referenced_certificates().is_empty());
+
+        scope.upsert_reference_grant(&grant("Gateway", Some("shared-tls")));
+        assert_eq!(resolved_refs(&scope, &gw, "shared").status, "True");
+        assert_eq!(
+            resolved_refs(&scope, &gw, "other").reason,
+            REASON_REF_NOT_PERMITTED
+        );
+        assert_eq!(scope.referenced_certificates().len(), 1);
+
+        scope.upsert_reference_grant(&grant("Gateway", None));
+        assert_eq!(scope.referenced_certificates().len(), 2);
+
+        scope.remove_reference_grant(&grant("Gateway", None));
+        assert!(scope.referenced_certificates().is_empty());
+
+        // A grant a relist does not bring back no longer opens anything.
+        scope.upsert_reference_grant(&grant("Gateway", None));
+        assert_eq!(scope.referenced_certificates().len(), 2);
+        scope.retain_reference_grants(&[]);
+        assert!(scope.referenced_certificates().is_empty());
+    }
+
+    /// A backend grant deleted while the watch was down is dropped by the
+    /// relist that follows.
+    #[test]
+    fn a_relist_drops_the_backend_grants_it_does_not_bring_back() {
+        let scope = GatewayScope::new();
+        let grant = reference_grant("backend", "frontend");
+        scope.upsert_reference_grant(&grant);
+        assert!(scope.allows_backend_ref("frontend", "backend"));
+        scope.retain_reference_grants(std::slice::from_ref(&grant));
+        assert!(scope.allows_backend_ref("frontend", "backend"));
+        scope.retain_reference_grants(&[]);
+        assert!(!scope.allows_backend_ref("frontend", "backend"));
     }
 
     /// Only an accepted Gateway's certificates are served, and only while
