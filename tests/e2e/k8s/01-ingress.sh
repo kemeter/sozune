@@ -64,3 +64,23 @@ if [[ "$published" == "192.0.2.10" ]]; then
 else
     fail "Ingress status.loadBalancer was not written (got '$published')"
 fi
+
+log "[01] Ingress: sozune.* annotations add middleware to its routes"
+
+kubectl annotate ingress svca-ingress -n sozune-test --overwrite \
+    sozune.headers.response.X-Sozune-Ingress=annotated >/dev/null 2>&1
+
+header=""
+for _ in $(seq 1 30); do
+    header=$(curl -s -o /dev/null -D - --max-time 2 -H "Host: $HOST_A" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null \
+        | tr -d '\r' | awk -F': ' 'tolower($1)=="x-sozune-ingress"{print $2}')
+    [[ "$header" == "annotated" ]] && break
+    sleep 1
+done
+if [[ "$header" == "annotated" ]]; then
+    pass "An Ingress annotation sets a response header on its route"
+else
+    fail "The Ingress annotation did not reach the route (got '$header')"
+fi
+
+kubectl annotate ingress svca-ingress -n sozune-test sozune.headers.response.X-Sozune-Ingress- >/dev/null 2>&1
