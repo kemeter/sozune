@@ -20,6 +20,15 @@ docker run -d \
 | `edge` | The current state of `main`, rebuilt after every merge that passes CI. For trying a fix or feature before it is released: it is not a release, and can break at any time. `linux/amd64` only. |
 | `sha-<full commit hash>` | The `main` build of that commit, never rebuilt. |
 
+## Kubernetes (Helm)
+
+```bash
+git clone https://github.com/kemeter/sozune
+helm install sozune ./sozune/charts/sozune --namespace sozune --create-namespace
+```
+
+See [Deploying Sōzune in-cluster](/documentation/providers/kubernetes#deploying-sōzune-in-cluster) for its values.
+
 ## From source
 
 Requirements: stable Rust, Cargo.

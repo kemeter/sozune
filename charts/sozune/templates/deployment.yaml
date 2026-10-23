@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sozune.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sozune.labels" . | nindent 4 }}
+spec:
+  {{- if and (gt (int .Values.replicaCount) 1) (dig "acme" "enabled" false .Values.config) }}
+  {{- fail "replicaCount must be 1 with config.acme.enabled: each pod keeps its own ACME challenge tokens" }}
+  {{- end }}
+  replicas: {{ .Values.replicaCount }}
+  {{- if or .Values.persistence.enabled (dig "acme" "enabled" false .Values.config) }}
+  # One pod at a time: a ReadWriteOnce claim attaches to one node, and ACME
+  # challenge tokens live in the pod that ordered the certificate.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "sozune.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # A config change rolls the pods: Sōzune reads config.yaml at startup.
+        checksum/config: {{ include "sozune.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "sozune.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "sozune.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: sozune
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: CONFIG_PATH
+              value: /etc/sozune/config.yaml
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPorts.http }}
+            - name: https
+              containerPort: {{ .Values.containerPorts.https }}
+            - name: api
+              containerPort: {{ .Values.containerPorts.api }}
+            {{- range .Values.service.extraPorts }}
+            - name: {{ .name }}
+              containerPort: {{ .targetPort | default .port }}
+              protocol: {{ .protocol | default "TCP" }}
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sozune/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: certs
+              mountPath: {{ .Values.persistence.mountPath }}
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "sozune.fullname" . }}
+        - name: certs
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "sozune.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

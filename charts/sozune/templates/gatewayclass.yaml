@@ -1,0 +1,10 @@
+{{- if .Values.gatewayClass.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gatewayClass.name }}
+  labels:
+    {{- include "sozune.labels" . | nindent 4 }}
+spec:
+  controllerName: kemeter.io/sozune
+{{- end }}

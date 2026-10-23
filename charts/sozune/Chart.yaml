@@ -1,0 +1,14 @@
+apiVersion: v2
+name: sozune
+description: Reverse proxy built on Sōzu, as a Kubernetes Ingress and Gateway API controller
+type: application
+version: 0.1.0
+appVersion: "0.16.0"
+home: https://github.com/kemeter/sozune
+sources:
+  - https://github.com/kemeter/sozune
+keywords:
+  - ingress
+  - gateway-api
+  - reverse-proxy
+  - sozu

@@ -1,0 +1,113 @@
+image:
+  repository: ghcr.io/kemeter/sozune
+  # `edge` is the current state of main, which this chart needs until 0.16.0
+  # is released (`linux/amd64` only). Empty uses the chart's appVersion.
+  tag: edge
+  # `edge` moves with main: pulled again on every start.
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+# One pod with ACME: HTTP-01 challenge tokens live in the pod answering the
+# order, and another replica could receive the validation request.
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  # Defaults to the release's full name.
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+  # Watch the Gateway API resources and write their status.
+  gatewayAPI: true
+  # Read kubernetes.io/tls Secrets, for Ingress spec.tls[].secretName and
+  # Gateway HTTPS listeners.
+  secrets: true
+
+# Creates the IngressClass Sōzune serves, `ingressClass.name`, which must
+# match `config.providers.kubernetes.ingress_class`.
+ingressClass:
+  create: true
+  name: sozune
+  default: false
+
+# Creates the GatewayClass Sōzune owns. Needs the Gateway API CRDs.
+gatewayClass:
+  create: false
+  name: sozune
+
+service:
+  type: LoadBalancer
+  annotations: {}
+  # When set, the Ingresses Sōzune serves get this Service's load-balancer
+  # address in status.loadBalancer (providers.kubernetes.publish_service).
+  publishAddress: true
+  ports:
+    http: 80
+    https: 443
+  # More ports, for the TCP and UDP listeners of config.proxy.tcp, .udp and
+  # .gateway_ports, e.g. {name: postgres, port: 5432, protocol: TCP}.
+  # `targetPort` defaults to `port`.
+  extraPorts: []
+  externalTrafficPolicy: ""
+
+# Sōzune's config.yaml. The chart fills in the parts tied to the release (the
+# Kubernetes provider's ingress class and published Service); everything else
+# is yours. See https://github.com/kemeter/sozune/tree/main/documentation.
+config:
+  providers:
+    kubernetes:
+      enabled: true
+  proxy:
+    http:
+      listen_address: 8080
+    https:
+      listen_address: 8443
+  # The REST API and dashboard need users (api.users) before they start:
+  # see documentation/configuration/api.md. On loopback by default: it
+  # speaks plain HTTP Basic auth.
+  api:
+    enabled: false
+    listen_address: "127.0.0.1:3035"
+
+# The container ports Sōzune listens on, as set under config.proxy.
+containerPorts:
+  http: 8080
+  https: 8443
+  api: 3035
+
+env: []
+
+resources: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ACME certificates are stored on this volume, an emptyDir unless this keeps
+# them across restarts. The chart points acme.certs_dir at mountPath.
+persistence:
+  enabled: false
+  mountPath: /etc/sozune/certs
+  size: 128Mi
+  storageClass: ""
+  accessModes: ["ReadWriteOnce"]
+
+# `edge` is published for linux/amd64 only.
+nodeSelector:
+  kubernetes.io/arch: amd64
+tolerations: []
+affinity: {}

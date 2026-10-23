@@ -122,6 +122,33 @@ With `publish_service`, the Ingresses get the addresses that Service's load bala
 
 ## Deploying Sōzune in-cluster
 
+### With the Helm chart
+
+The chart in [`charts/sozune`](https://github.com/kemeter/sozune/tree/main/charts/sozune) deploys Sōzune with its `ServiceAccount`, RBAC, config and a `LoadBalancer` Service:
+
+```bash
+helm install sozune ./charts/sozune --namespace sozune --create-namespace
+```
+
+| Value | Default | What it does |
+|---|---|---|
+| `config` | Kubernetes provider on, HTTP on `8080`, HTTPS on `8443`, API off | Sōzune's `config.yaml`, stored in a Secret since it can hold credentials. The chart sets the provider's `ingress_class` and, with a `LoadBalancer` Service, its `publish_service`; everything else is yours. A change rolls the pods. |
+| `ingressClass.create` / `ingressClass.name` | `true` / `sozune` | Creates the `IngressClass` Sōzune serves. `ingressClass.default` makes it the cluster's default. |
+| `gatewayClass.create` / `gatewayClass.name` | `false` / `sozune` | Creates the `GatewayClass` (`controllerName: kemeter.io/sozune`). Needs the Gateway API CRDs. |
+| `rbac.gatewayAPI` | `true` | Lets Sōzune watch the Gateway API resources and write their status. |
+| `rbac.secrets` | `true` | Lets Sōzune read `kubernetes.io/tls` Secrets, for Ingress `secretName` and Gateway HTTPS listeners. |
+| `service.extraPorts` | `[]` | More Service ports for TCP and UDP listeners (`proxy.tcp`, `proxy.udp`, `proxy.gateway_ports`): `{name, port, targetPort, protocol}`. |
+| `service.type` | `LoadBalancer` | With `LoadBalancer` and `service.publishAddress`, the Ingresses Sōzune serves get the Service's address in their status ([Ingress status](#ingress-status)). |
+| `persistence.enabled` | `false` | Keeps the ACME certificates (`/etc/sozune/certs`) on a `PersistentVolumeClaim` instead of an `emptyDir`. Turn it on with ACME. |
+| `image.tag` | `edge` | The Sōzune image, from `ghcr.io/kemeter/sozune`. The chart relies on features of the next release: until it is out, it runs `edge`, the current state of `main`, pulled on every start and scheduled on `amd64` nodes (`nodeSelector`), the only architecture it is built for. |
+| `replicaCount` | `1` | Pods. Must stay `1` with ACME: each pod keeps its own challenge tokens. With ACME or `persistence.enabled`, an upgrade stops the old pod before starting the new one. |
+
+The pod runs as the image's `nonroot` user with a read-only root filesystem, which is why Sōzune listens on `8080` / `8443` and the Service maps `80` / `443` to them.
+
+The `IngressClass` and `GatewayClass` are cluster-wide: a second release in the same cluster sets its own `ingressClass.name` (and `gatewayClass.name`), or `ingressClass.create=false` to serve the class the first one created.
+
+### By hand
+
 Run as a `Deployment` with a `ServiceAccount` bound to a `ClusterRole` that grants read access to Services, EndpointSlices, Ingresses, and Namespaces.
 
 ### Minimum RBAC
