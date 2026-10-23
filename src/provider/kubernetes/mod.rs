@@ -57,6 +57,9 @@ pub struct KubernetesProvider {
     name: &'static str,
     endpoints: EndpointsCache,
     ingress_keys: IngressOwnership,
+    /// Where an Ingress's `spec.tls[].secretName` goes: the scope serving
+    /// the Secrets' certificates, and the hostnames ACME must leave alone.
+    tls_secrets: Option<(gateway::GatewayScope, crate::acme::SecretHosts)>,
 }
 
 #[async_trait]
@@ -105,7 +108,65 @@ impl KubernetesProvider {
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
             ingress_keys: Arc::new(RwLock::new(HashMap::new())),
+            tls_secrets: None,
         })
+    }
+
+    /// Serve the hostnames of an Ingress's `spec.tls[].secretName` entries
+    /// with the certificates of those Secrets.
+    pub fn with_tls_secrets(
+        mut self,
+        scope: gateway::GatewayScope,
+        hosts: crate::acme::SecretHosts,
+    ) -> Self {
+        self.tls_secrets = Some((scope, hosts));
+        self
+    }
+
+    /// Record the TLS Secrets an Ingress names and the hostnames they
+    /// serve; `None` forgets them. Done before its entrypoints are stored,
+    /// so ACME never sees one of those hostnames as its own. Returns whether
+    /// those hostnames changed, which ACME has to act on.
+    fn record_ingress_secrets(&self, ing_id: &str, ing: Option<&Ingress>) -> bool {
+        let Some((scope, hosts)) = &self.tls_secrets else {
+            return false;
+        };
+        let namespace = ing
+            .and_then(|i| i.metadata.namespace.as_deref())
+            .unwrap_or("default");
+        let entries: Vec<_> = ing
+            .and_then(|i| i.spec.as_ref())
+            .and_then(|s| s.tls.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|t| Some((t.secret_name.clone()?, t.hosts.clone().unwrap_or_default())))
+            .collect();
+        let secrets: Vec<(String, String)> = entries
+            .iter()
+            .map(|(secret, _)| (namespace.to_string(), secret.clone()))
+            .collect();
+        // Only the hostnames this Ingress routes: a `tls` entry naming
+        // another one takes nothing away from the route that serves it.
+        let routed: HashSet<&str> = ing
+            .and_then(|i| i.spec.as_ref())
+            .and_then(|s| s.rules.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.host.as_deref())
+            .collect();
+        let served: Vec<String> = entries
+            .iter()
+            .flat_map(|(_, h)| h)
+            .filter(|h| routed.contains(h.as_str()))
+            .cloned()
+            .collect();
+        let changed = match hosts.write() {
+            Ok(mut hosts) if served.is_empty() => hosts.remove(ing_id).is_some(),
+            Ok(mut hosts) => hosts.insert(ing_id.to_string(), served.clone()) != Some(served),
+            Err(_) => false,
+        };
+        scope.set_ingress_secrets(ing_id, secrets);
+        changed
     }
 
     pub async fn build_client(&self) -> anyhow::Result<Client> {
@@ -128,7 +189,7 @@ impl KubernetesProvider {
     }
 
     /// Build a namespaced or cluster-wide Api handle depending on config.
-    fn scoped_api<K>(&self, client: &Client) -> Api<K>
+    pub(crate) fn scoped_api<K>(&self, client: &Client) -> Api<K>
     where
         K: Resource<Scope = k8s_openapi::NamespaceResourceScope>,
         <K as Resource>::DynamicType: Default,
@@ -735,6 +796,7 @@ impl KubernetesProvider {
             return;
         }
 
+        let secret_hosts_changed = self.record_ingress_secrets(&ing_id, Some(ing));
         let new_entries = self.ingress_to_entrypoints(ing);
         let new_keys: HashSet<String> = new_entries.iter().map(|(k, _)| k.clone()).collect();
 
@@ -805,6 +867,12 @@ impl KubernetesProvider {
                 ctx.acme_notify.notify_one();
             }
         }
+        // ACME takes back or orders the certificates of the hostnames a
+        // Secret now serves or no longer does, whether or not the routes
+        // changed.
+        if secret_hosts_changed {
+            ctx.acme_notify.notify_one();
+        }
     }
 
     async fn remove_ingress(&self, ing: &Ingress, ctx: &WatchCtx<'_>) {
@@ -812,6 +880,9 @@ impl KubernetesProvider {
             return;
         };
 
+        if self.record_ingress_secrets(&ing_id, None) {
+            ctx.acme_notify.notify_one();
+        }
         let keys = match self.ingress_keys.write() {
             Ok(mut owned) => owned.remove(&ing_id).unwrap_or_default(),
             Err(e) => {
@@ -869,7 +940,8 @@ impl KubernetesProvider {
             return Vec::new();
         };
 
-        // Hosts that should get TLS termination via ACME.
+        // Hosts that get TLS termination: with the certificate of the Secret
+        // their entry names, or else one ordered through ACME.
         let tls_hosts: HashSet<String> = spec
             .tls
             .as_ref()
@@ -1111,6 +1183,7 @@ mod tests {
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
             ingress_keys: Arc::new(RwLock::new(HashMap::new())),
+            tls_secrets: None,
         }
     }
 
@@ -1532,6 +1605,52 @@ mod tests {
             .unwrap();
         assert!(api_entry.1.config.tls);
         assert!(!public_entry.1.config.tls);
+    }
+
+    /// An Ingress naming a TLS Secret has its certificate served, and its
+    /// hostnames kept from ACME, until it is gone.
+    #[test]
+    fn an_ingress_tls_secret_is_served_while_the_ingress_names_it() {
+        use super::gateway_tls::{certificate_from_secret, tests::self_signed, tests::tls_secret};
+
+        let scope = gateway::GatewayScope::new();
+        let hosts: crate::acme::SecretHosts = Arc::new(RwLock::new(HashMap::new()));
+        let provider = make_provider(false).with_tls_secrets(scope.clone(), Arc::clone(&hosts));
+        let (cert, key) = self_signed(&["api.test"]);
+        let secret = tls_secret("default", "web-tls", &cert, &key);
+        scope.upsert_tls_secret(
+            ("default".into(), "web-tls".into()),
+            certificate_from_secret(&secret).map(Arc::new),
+        );
+
+        let mut ing = make_ingress(
+            "web",
+            "default",
+            Some("sozune"),
+            vec![(Some("api.test"), vec![("/", "Prefix", "api", 80)])],
+            vec!["api.test"],
+        );
+        // An Ingress without a secretName is left to ACME.
+        provider.record_ingress_secrets("default/web", Some(&ing));
+        assert!(scope.referenced_certificates().is_empty());
+        assert!(hosts.read().unwrap().is_empty());
+
+        let tls = &mut ing.spec.as_mut().unwrap().tls.as_mut().unwrap()[0];
+        tls.secret_name = Some("web-tls".into());
+        // A host the Ingress does not route stays ACME's.
+        tls.hosts.as_mut().unwrap().push("elsewhere.test".into());
+        provider.record_ingress_secrets("default/web", Some(&ing));
+        assert_eq!(scope.referenced_certificates().len(), 1);
+        assert_eq!(
+            hosts.read().unwrap().get("default/web"),
+            Some(&vec!["api.test".to_string()])
+        );
+        // Its routes are still served over HTTPS.
+        assert!(provider.ingress_to_entrypoints(&ing)[0].1.config.tls);
+
+        provider.record_ingress_secrets("default/web", None);
+        assert!(scope.referenced_certificates().is_empty());
+        assert!(hosts.read().unwrap().is_empty());
     }
 
     #[test]

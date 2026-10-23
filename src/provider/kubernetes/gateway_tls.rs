@@ -11,14 +11,14 @@ use super::gateway::GatewayScope;
 use crate::acme::{CertAction, CertCommand, certificate_fingerprint, split_pem_chain};
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
+use kube::Api;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
-use kube::{Api, Client};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// The certificate and key a TLS Secret holds, checked.
 #[derive(Debug, PartialEq)]
@@ -85,10 +85,15 @@ pub fn certificate_from_secret(secret: &Secret) -> Result<SecretCertificate, Str
 /// since it was read, which no watch event announces.
 const EXPIRY_CHECK: Duration = Duration::from_secs(60);
 
-/// Watch the `kubernetes.io/tls` Secrets and keep the scope in sync with
-/// them.
-pub async fn run_tls_secret_watcher(client: Client, scope: GatewayScope) -> anyhow::Result<()> {
-    let api: Api<Secret> = Api::all(client);
+/// Watch the `kubernetes.io/tls` Secrets of `api` and keep the scope in sync
+/// with them. `namespace` is the one `api` is restricted to, `None` for
+/// every namespace: a relist only forgets the Secrets of what it watches, so
+/// a namespaced watch and a cluster-wide one can feed the same scope.
+pub async fn run_tls_secret_watcher(
+    api: Api<Secret>,
+    scope: GatewayScope,
+    namespace: Option<String>,
+) -> anyhow::Result<()> {
     let config = watcher::Config::default().fields("type=kubernetes.io/tls");
     // Backed off: without the RBAC to read Secrets, every attempt fails at
     // once, and the watcher would otherwise retry in a tight loop.
@@ -97,6 +102,9 @@ pub async fn run_tls_secret_watcher(client: Client, scope: GatewayScope) -> anyh
 
     // The Secrets a relist brings back: those it does not are gone.
     let mut relisted: HashSet<(String, String)> = HashSet::new();
+    // Reported once until the watch works again: without the RBAC to read
+    // Secrets, it fails on every retry.
+    let mut failing = false;
     let mut expiry = tokio::time::interval(EXPIRY_CHECK);
     loop {
         let event = tokio::select! {
@@ -134,8 +142,18 @@ pub async fn run_tls_secret_watcher(client: Client, scope: GatewayScope) -> anyh
                 }
             }
             Ok(Event::Init) => relisted.clear(),
-            Ok(Event::InitDone) => scope.retain_tls_secrets(&relisted),
-            Err(e) => error!("Gateway API: TLS Secret watcher error: {}", e),
+            Ok(Event::InitDone) => {
+                failing = false;
+                scope.retain_tls_secrets(&relisted, namespace.as_deref());
+            }
+            Err(e) if failing => debug!("Kubernetes: TLS Secret watcher error: {}", e),
+            Err(e) => {
+                failing = true;
+                warn!(
+                    "Kubernetes: cannot watch TLS Secrets, so Ingress secretName entries and Gateway HTTPS listeners get no certificate (does the RBAC allow secrets?): {}",
+                    e
+                );
+            }
         }
     }
 

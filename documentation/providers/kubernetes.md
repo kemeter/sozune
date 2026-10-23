@@ -20,7 +20,7 @@ All fields:
 |---|---|---|
 | `enabled` | `false` | Enables the Kubernetes provider. |
 | `kubeconfig` | *auto* | Path to a specific kubeconfig file. Omit to auto-discover (in-cluster ServiceAccount, otherwise `$KUBECONFIG` / `~/.kube/config`). |
-| `namespace` | *all* | Restrict discovery to a single namespace. Omit to watch the whole cluster. |
+| `namespace` | *all* | Restrict discovery to a single namespace: Services, Ingresses and the TLS Secrets their certificates come from. Gateway API resources, and the Secrets Gateway listeners name, are watched in every namespace. Omit to watch the whole cluster. |
 | `ingress_class` | `sozune` | Match value for `Ingress.spec.ingressClassName`. Ingresses with a different (or missing) class are ignored. |
 | `expose_by_default` | `false` | If `true`, every Service is a candidate even without a `sozune.*` annotation. |
 
@@ -100,7 +100,7 @@ spec:
 - Only Ingresses with `spec.ingressClassName` matching the configured `ingress_class` are picked up. Ingresses without an `ingressClassName` are ignored.
 - Each `(rule, path)` pair becomes one entrypoint. The key is `ingress_<namespace>-<name>_r<rule_idx>p<path_idx>`.
 - `pathType: Prefix` and `Exact` map directly. `ImplementationSpecific` is treated as `Prefix`.
-- `spec.tls[].hosts` enables HTTPS termination and triggers ACME provisioning for those hostnames.
+- `spec.tls[].hosts` enables HTTPS termination for those hostnames. With a `secretName`, they are served with the certificate of that `kubernetes.io/tls` Secret in the Ingress's namespace — the one cert-manager writes, for instance — picked up live when it is renewed, and ACME orders nothing for them. Without one, ACME provisions their certificate. A Secret that is missing or unusable (expired, key not matching) leaves those hostnames without a certificate: their handshakes fail, and ACME does not step in. Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). An ACME wildcard declared in a resolver's `domains` still covers such a hostname: Sōzu then presents whichever of the two certificates expires later.
 - `spec.defaultBackend` is supported as a catch-all entrypoint with no host filter.
 - Backend Services must live in the **same namespace** as the Ingress (Kubernetes spec).
 - Ingresses cannot express middleware (auth, rate-limit, headers, compression…). Use Service annotations when you need those.
@@ -149,9 +149,10 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]
     verbs: ["update", "patch"]
-  # Optional: only needed for Gateway HTTPS listeners, which read their
-  # certificates from the `kubernetes.io/tls` Secrets their certificateRefs
-  # name. Sōzune only watches Secrets of that type.
+  # Optional: only needed for an Ingress `spec.tls[].secretName` and for
+  # Gateway HTTPS listeners, which read their certificates from
+  # `kubernetes.io/tls` Secrets. Sōzune only watches Secrets of that type;
+  # without this rule it logs a warning and serves no such certificate.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]

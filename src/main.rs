@@ -200,6 +200,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
     let cert_tx_manual = cert_tx.clone();
     let cert_tx_providers = cert_tx.clone();
+    let secret_hosts: acme::SecretHosts = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let secret_hosts_providers = Arc::clone(&secret_hosts);
     // Fingerprints of the certificates from files, which Gateway Secrets
     // never replace or take back.
     let file_fingerprints: std::collections::HashSet<String> = manual_certs
@@ -338,6 +340,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 unopened_gateway_ports,
                 cert_tx_providers,
                 file_fingerprints,
+                secret_hosts_providers,
             )
             .await
         }
@@ -461,6 +464,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                     cert_tx,
                     Arc::clone(&acme_notify),
                     manual_names,
+                    secret_hosts,
                 );
 
                 if let Err(e) = manager.run().await {
