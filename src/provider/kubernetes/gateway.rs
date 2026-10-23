@@ -29,6 +29,7 @@
 
 use super::gateway_filters;
 use super::gateway_matches;
+use super::gateway_tls::SecretCertificate;
 use crate::model::{
     Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
 };
@@ -38,7 +39,8 @@ use gateway_api::apis::experimental::tlsroutes::{TLSRoute, TLSRouteParentRefs, T
 use gateway_api::apis::experimental::udproutes::{UDPRoute, UDPRouteParentRefs, UDPRouteRules};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{
-    Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
+    Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
+    GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesMatches,
@@ -246,6 +248,9 @@ pub struct ScopeState {
     served: ServedPorts,
     /// Where Gateway status rewrites go when attachments change.
     status_tx: Option<mpsc::Sender<StatusWrite>>,
+    /// The `kubernetes.io/tls` Secrets, keyed by `(namespace, name)`: the
+    /// certificate each holds, or why it cannot be used.
+    tls_secrets: HashMap<(String, String), Result<Arc<SecretCertificate>, String>>,
 }
 
 /// A Gateway listener: `(namespace, gateway name, listener name)`.
@@ -256,6 +261,7 @@ type ListenerKey = (String, String, String);
 #[derive(Clone, Debug, Default)]
 pub struct ServedPorts {
     pub http: u16,
+    pub https: u16,
     pub tcp: HashSet<u16>,
     pub udp: HashSet<u16>,
     pub gateway: crate::config::GatewayPortsConfig,
@@ -267,6 +273,7 @@ impl ServedPorts {
     pub fn from_config(proxy: &crate::config::ProxyConfig) -> Self {
         Self {
             http: proxy.http.listen_address,
+            https: proxy.https.listen_address,
             tcp: proxy.tcp.iter().map(|l| l.listen).collect(),
             udp: proxy.udp.iter().map(|l| l.listen).collect(),
             gateway: proxy.gateway_ports.clone(),
@@ -319,6 +326,9 @@ pub struct GatewayScope {
     /// events collapse into a single re-resolve pass, matching how the
     /// outer reload pipeline already debounces.
     changed: Arc<Notify>,
+    /// Woken when the certificates the accepted Gateways reference may have
+    /// changed, for the task handing them to the HTTPS worker.
+    certificates: Arc<Notify>,
 }
 
 impl GatewayScope {
@@ -510,6 +520,146 @@ impl GatewayScope {
         }
     }
 
+    /// Woken when the certificates the accepted Gateways reference may have
+    /// changed.
+    pub async fn certificates_changed(&self) {
+        self.certificates.notified().await
+    }
+
+    /// Record what a TLS Secret holds, and rewrite the status of the Gateways
+    /// referencing it.
+    pub fn upsert_tls_secret(
+        &self,
+        key: (String, String),
+        certificate: Result<Arc<SecretCertificate>, String>,
+    ) {
+        self.update_tls_secrets(|secrets| {
+            if secrets.get(&key) == Some(&certificate) {
+                return Vec::new();
+            }
+            secrets.insert(key.clone(), certificate);
+            vec![key]
+        });
+    }
+
+    pub fn remove_tls_secret(&self, key: &(String, String)) {
+        self.update_tls_secrets(|secrets| {
+            secrets
+                .remove(key)
+                .map(|_| vec![key.clone()])
+                .unwrap_or_default()
+        });
+    }
+
+    /// Mark unusable every TLS Secret whose certificate expired by `now`.
+    pub fn expire_tls_secrets(&self, now: i64) {
+        self.update_tls_secrets(|secrets| {
+            let expired: Vec<(String, String)> = secrets
+                .iter()
+                .filter(|(_, c)| c.as_ref().is_ok_and(|c| c.not_after < now))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &expired {
+                secrets.insert(key.clone(), Err("the certificate has expired".to_string()));
+            }
+            expired
+        });
+    }
+
+    /// Drop every TLS Secret not in `kept`: those a relist did not bring back.
+    pub fn retain_tls_secrets(&self, kept: &HashSet<(String, String)>) {
+        self.update_tls_secrets(|secrets| {
+            let gone: Vec<(String, String)> = secrets
+                .keys()
+                .filter(|key| !kept.contains(*key))
+                .cloned()
+                .collect();
+            for key in &gone {
+                secrets.remove(key);
+            }
+            gone
+        });
+    }
+
+    /// Apply `update` to the TLS Secrets. It returns the Secrets it changed:
+    /// the Gateways referencing one get their status rewritten, and the
+    /// certificates are handed over again.
+    fn update_tls_secrets(
+        &self,
+        update: impl FnOnce(
+            &mut HashMap<(String, String), Result<Arc<SecretCertificate>, String>>,
+        ) -> Vec<(String, String)>,
+    ) {
+        let mut g = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return;
+            }
+        };
+        let changed = update(&mut g.tls_secrets);
+        if changed.is_empty() {
+            return;
+        }
+        for (key, gateway) in &g.gateway_objects {
+            if g.gateways.contains_key(key)
+                && changed
+                    .iter()
+                    .any(|secret| references_secret(gateway, secret))
+            {
+                queue_status_write(
+                    g.status_tx.as_ref(),
+                    StatusWrite::Gateway(Box::new(gateway.clone())),
+                );
+            }
+        }
+        drop(g);
+        // Routes too: an HTTPS listener serves them only with a certificate.
+        self.fire_if(true);
+    }
+
+    /// Whether the `HTTPS` listener `listener` of Gateway `ns/name` has a
+    /// certificate it can serve. Without one, its routes are not served
+    /// over HTTPS: there is nothing to complete a handshake with.
+    fn listener_has_certificate(&self, ns: &str, name: &str, listener: &str) -> bool {
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return false;
+            }
+        };
+        g.gateway_objects
+            .get(&(ns.to_string(), name.to_string()))
+            .and_then(|gw| gw.spec.listeners.iter().find(|l| l.name == listener))
+            .is_some_and(|l| !listener_certificates(&g.tls_secrets, ns, l).0.is_empty())
+    }
+
+    /// The certificates the `HTTPS` listeners of the accepted Gateways
+    /// reference and can use.
+    pub fn referenced_certificates(&self) -> Vec<Arc<SecretCertificate>> {
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return Vec::new();
+            }
+        };
+        g.gateway_objects
+            .iter()
+            .filter(|(key, _)| g.gateways.contains_key(*key))
+            .flat_map(|((ns, _), gateway)| {
+                gateway
+                    .spec
+                    .listeners
+                    .iter()
+                    .filter(|l| serves_https(l))
+                    .flat_map(|l| listener_certificates(&g.tls_secrets, ns, l).0)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// The `status.listeners[]` sōzune reports on an accepted Gateway: per
     /// listener, the route kinds it carries, how many routes attach to it,
     /// and whether Sōzune serves its port.
@@ -535,7 +685,13 @@ impl GatewayScope {
                     .values()
                     .filter(|keys| keys.contains(&key))
                     .count();
-                build_listener_status(gateway, listener, &g.served, attached)
+                let certificates = gateway
+                    .spec
+                    .listeners
+                    .iter()
+                    .find(|l| l.name == listener.name && serves_https(l))
+                    .and_then(|l| listener_certificates(&g.tls_secrets, ns, l).1);
+                build_listener_status(gateway, listener, &g.served, attached, certificates)
             })
             .collect()
     }
@@ -661,11 +817,23 @@ impl GatewayScope {
         }
     }
 
-    /// True iff this listener can carry an HTTPRoute: protocol `HTTP`. Routes
-    /// of a Gateway are installed without TLS, so an `HTTPS` listener would
-    /// hand them to plain HTTP.
+    /// True iff this listener can carry an HTTPRoute: protocol `HTTP`, or
+    /// `HTTPS` terminating TLS.
     pub(crate) fn listener_serves_http(l: &ListenerInfo) -> bool {
+        Self::listener_is_plain_http(l) || Self::listener_serves_https(l)
+    }
+
+    /// True iff this listener serves its routes over plain HTTP.
+    pub(crate) fn listener_is_plain_http(l: &ListenerInfo) -> bool {
         l.protocol.eq_ignore_ascii_case("HTTP")
+    }
+
+    /// True iff this listener serves its routes over HTTPS: protocol `HTTPS`
+    /// with `tls.mode: Terminate`, the default. `Passthrough` belongs on a
+    /// `TLS` listener.
+    pub(crate) fn listener_serves_https(l: &ListenerInfo) -> bool {
+        l.protocol.eq_ignore_ascii_case("HTTPS")
+            && matches!(l.tls_mode, None | Some(GatewayListenersTlsMode::Terminate))
     }
 
     /// True iff this listener can carry a TLSRoute: protocol `TLS` with
@@ -919,47 +1087,28 @@ impl GatewayScope {
     /// Unions the per-parentRef intersections: a route attached to two
     /// listeners serves the union of what each listener admits.
     ///
+    /// Only the listeners `listener_ok` takes count: those serving HTTP, or
+    /// those serving HTTPS.
+    ///
     /// Returns `Some(hostnames)` (deduplicated, order-stable; an empty vec
     /// means "all hosts", exactly like an empty `spec.hostnames`), or `None`
-    /// when every bound listener constrains hostnames and none of them
-    /// overlaps the route — the route resolves to nothing on this Gateway.
-    /// Falls back to the route's own hostnames when no bound listener
-    /// constrains hostnames.
-    fn effective_hostnames_for_route(&self, route: &HTTPRoute) -> Option<Vec<String>> {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    /// when the route binds no such listener, or when every one it binds
+    /// constrains hostnames and none of them overlaps the route — the route
+    /// resolves to nothing there. Falls back to the route's own hostnames
+    /// when no bound listener constrains hostnames.
+    fn effective_hostnames_for_route(
+        &self,
+        route: &HTTPRoute,
+        listener_ok: fn(&ListenerInfo) -> bool,
+    ) -> Option<Vec<String>> {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
-        let Some(refs) = route.spec.parent_refs.as_ref() else {
+        if route.spec.parent_refs.is_none() {
             return Some(route_hostnames);
-        };
+        }
 
         let mut out: Vec<String> = Vec::new();
-        let mut any_listener = false;
         let mut any_overlap = false;
-        for p in refs
-            .iter()
-            .filter(|p| self.accepts_parent_ref(route_ns, *p))
-        {
-            let ns = p.namespace.as_deref().unwrap_or(route_ns);
-            let Some(mut listeners) = self.gateway_listeners(ns, &p.name, route_ns, "HTTPRoute")
-            else {
-                continue;
-            };
-            listeners.retain(Self::listener_serves_http);
-            // Restrict to the listener(s) this parentRef selects, so a
-            // sectionName/port ref only inherits its own listener's hostname.
-            let selected: Vec<ListenerInfo> = if p.section_name.is_none() && p.port.is_none() {
-                listeners
-            } else {
-                listeners
-                    .into_iter()
-                    .filter(|l| {
-                        let name_ok = p.section_name.as_deref().is_none_or(|s| s == l.name);
-                        let port_ok = p.port.is_none_or(|port| port == l.port);
-                        name_ok && port_ok
-                    })
-                    .collect()
-            };
-            any_listener = true;
+        for selected in self.bound_listeners(route, listener_ok) {
             if let Some(hs) = intersect_hostnames(&route_hostnames, &selected) {
                 any_overlap = true;
                 for h in hs {
@@ -969,14 +1118,59 @@ impl GatewayScope {
                 }
             }
         }
+        any_overlap.then_some(out)
+    }
 
-        if !any_listener {
-            Some(route_hostnames)
-        } else if any_overlap {
-            Some(out)
-        } else {
-            None
+    /// The port to redirect plain HTTP requests to, for a route only served
+    /// over HTTPS: the port of the `HTTPS` listeners it binds, when they all
+    /// share one other than 443. `None` keeps the default port.
+    fn https_redirect_port(&self, route: &HTTPRoute) -> Option<u16> {
+        let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
+        let ports: HashSet<i32> = self
+            .bound_listeners(route, Self::listener_serves_https)
+            .into_iter()
+            .flatten()
+            .filter(|l| intersect_hostnames(&route_hostnames, std::slice::from_ref(l)).is_some())
+            .map(|l| l.port)
+            .collect();
+        match ports.into_iter().collect::<Vec<_>>()[..] {
+            [port] if port != 443 => u16::try_from(port).ok(),
+            _ => None,
         }
+    }
+
+    /// The listeners each accepted `parentRef` of the route binds among those
+    /// `listener_ok` takes, one list per parentRef that binds any.
+    fn bound_listeners(
+        &self,
+        route: &HTTPRoute,
+        listener_ok: fn(&ListenerInfo) -> bool,
+    ) -> Vec<Vec<ListenerInfo>> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return Vec::new();
+        };
+        refs.iter()
+            .filter(|p| self.accepts_parent_ref(route_ns, *p))
+            .filter_map(|p| {
+                let ns = p.namespace.as_deref().unwrap_or(route_ns);
+                let mut listeners = self.gateway_listeners(ns, &p.name, route_ns, "HTTPRoute")?;
+                listeners.retain(listener_ok);
+                listeners.retain(|l| {
+                    !Self::listener_serves_https(l)
+                        || self.listener_has_certificate(ns, &p.name, &l.name)
+                });
+                // Restrict to the listener(s) this parentRef selects, so a
+                // sectionName/port ref only inherits its own listener's
+                // hostname.
+                listeners.retain(|l| {
+                    let name_ok = p.section_name.as_deref().is_none_or(|s| s == l.name);
+                    let port_ok = p.port.is_none_or(|port| port == l.port);
+                    name_ok && port_ok
+                });
+                (!listeners.is_empty()).then_some(listeners)
+            })
+            .collect()
     }
 
     /// True iff at least one of the route's `parentRefs` points to an
@@ -1003,6 +1197,7 @@ impl GatewayScope {
             for _ in 0..SCOPE_SUBSCRIBERS {
                 self.changed.notify_one();
             }
+            self.certificates.notify_one();
         }
         changed
     }
@@ -1088,27 +1283,36 @@ impl GatewayScope {
         };
         let key = (ns, name.to_string());
         let accepted = g.gateway_classes.contains(class);
+        let tls_of =
+            |gw: &Gateway| -> Vec<_> { gw.spec.listeners.iter().map(|l| l.tls.clone()).collect() };
+        // The certificateRefs decide which HTTPS listeners serve their routes,
+        // and they are not in the listener list compared below.
+        let tls_changed = accepted
+            && g.gateway_objects
+                .get(&key)
+                .is_none_or(|old| tls_of(old) != tls_of(gateway));
         if accepted {
             g.gateway_objects.insert(key.clone(), gateway.clone());
         } else {
             g.gateway_objects.remove(&key);
         }
-        let changed = match (accepted, g.gateways.get(&key)) {
-            (true, None) => {
-                g.gateways.insert(key, listeners);
-                true
-            }
-            (true, Some(existing)) if *existing != listeners => {
-                g.gateways.insert(key, listeners);
-                true
-            }
-            (true, Some(_)) => false,
-            (false, Some(_)) => {
-                g.gateways.remove(&key);
-                true
-            }
-            (false, None) => false,
-        };
+        let changed = tls_changed
+            | match (accepted, g.gateways.get(&key)) {
+                (true, None) => {
+                    g.gateways.insert(key, listeners);
+                    true
+                }
+                (true, Some(existing)) if *existing != listeners => {
+                    g.gateways.insert(key, listeners);
+                    true
+                }
+                (true, Some(_)) => false,
+                (false, Some(_)) => {
+                    g.gateways.remove(&key);
+                    true
+                }
+                (false, None) => false,
+            };
         drop(g);
         self.fire_if(changed)
     }
@@ -1139,6 +1343,7 @@ impl GatewayScope {
         g.gateway_objects.remove(&key);
         let removed = g.gateways.remove(&key).is_some();
         drop(g);
+        self.certificates.notify_one();
         self.fire_if(removed)
     }
 
@@ -1307,6 +1512,115 @@ fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
 /// Extract the [`ListenerInfo`] slice sōzune tracks from a Gateway's
 /// `spec.listeners[]`. Only `name`, `port` and `hostname` are kept — the
 /// data needed for `parentRef` listener selection and hostname narrowing.
+/// Whether a listener of the Gateway spec terminates TLS for HTTPRoutes,
+/// as [`GatewayScope::listener_serves_https`] says of its [`ListenerInfo`].
+fn serves_https(l: &GatewayListeners) -> bool {
+    l.protocol.eq_ignore_ascii_case("HTTPS")
+        && matches!(
+            l.tls.as_ref().and_then(|t| t.mode.as_ref()),
+            None | Some(GatewayListenersTlsMode::Terminate)
+        )
+}
+
+/// The TLS Secrets a listener's `certificateRefs` name, as `(namespace,
+/// name)`, with the reference itself.
+fn certificate_refs<'a>(
+    gateway_ns: &'a str,
+    l: &'a GatewayListeners,
+) -> impl Iterator<Item = ((String, String), &'a GatewayListenersTlsCertificateRefs)> + 'a {
+    l.tls
+        .iter()
+        .flat_map(|t| t.certificate_refs.iter().flatten())
+        .map(move |r| {
+            let ns = r.namespace.as_deref().unwrap_or(gateway_ns);
+            ((ns.to_string(), r.name.clone()), r)
+        })
+}
+
+/// Whether one of the Gateway's `HTTPS` listeners references `secret`.
+fn references_secret(gateway: &Gateway, secret: &(String, String)) -> bool {
+    let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+    gateway
+        .spec
+        .listeners
+        .iter()
+        .filter(|l| serves_https(l))
+        .any(|l| certificate_refs(ns, l).any(|(key, _)| &key == secret))
+}
+
+/// The certificates an `HTTPS` listener's `certificateRefs` resolve to, and
+/// the first reason one does not, as a `ResolvedRefs` reason and message.
+/// The references that resolve are served even when another does not.
+fn listener_certificates(
+    secrets: &HashMap<(String, String), Result<Arc<SecretCertificate>, String>>,
+    gateway_ns: &str,
+    l: &GatewayListeners,
+) -> (Vec<Arc<SecretCertificate>>, Option<(&'static str, String)>) {
+    let mut certificates = Vec::new();
+    let mut problem = None;
+    let mut refs = certificate_refs(gateway_ns, l).peekable();
+    if refs.peek().is_none() {
+        problem = Some((
+            REASON_INVALID_CERTIFICATE_REF,
+            "an HTTPS listener needs a certificateRefs entry naming a kubernetes.io/tls Secret"
+                .to_string(),
+        ));
+    }
+    for ((ns, name), r) in refs {
+        let found = if r.group.as_deref().is_some_and(|g| !g.is_empty())
+            || r.kind.as_deref().is_some_and(|k| k != "Secret")
+        {
+            Err((
+                REASON_INVALID_CERTIFICATE_REF,
+                format!("certificateRef {name} is not a core Secret"),
+            ))
+        } else if ns != gateway_ns {
+            Err((
+                REASON_REF_NOT_PERMITTED,
+                format!(
+                    "certificateRef {ns}/{name} is in another namespace, which Sōzune does not support yet"
+                ),
+            ))
+        } else {
+            match secrets.get(&(ns.clone(), name.clone())) {
+                // Sōzu picks a certificate by SNI: one that does not cover
+                // the listener's hostname would never be presented for it.
+                Some(Ok(certificate))
+                    if l.hostname
+                        .as_deref()
+                        .is_some_and(|h| !crate::manual_certs::covered(&certificate.names, h)) =>
+                {
+                    Err((
+                        REASON_INVALID_CERTIFICATE_REF,
+                        format!(
+                            "the certificate of Secret {ns}/{name} does not cover hostname {}",
+                            l.hostname.as_deref().unwrap_or_default()
+                        ),
+                    ))
+                }
+                Some(Ok(certificate)) => Ok(Arc::clone(certificate)),
+                Some(Err(e)) => Err((
+                    REASON_INVALID_CERTIFICATE_REF,
+                    format!("Secret {ns}/{name} cannot be used: {e}"),
+                )),
+                None => Err((
+                    REASON_INVALID_CERTIFICATE_REF,
+                    format!(
+                        "Secret {ns}/{name} does not exist or is not of type kubernetes.io/tls"
+                    ),
+                )),
+            }
+        };
+        match found {
+            Ok(certificate) => certificates.push(certificate),
+            Err(e) => {
+                problem.get_or_insert(e);
+            }
+        }
+    }
+    (certificates, problem)
+}
+
 fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
     gateway
         .spec
@@ -1394,13 +1708,36 @@ fn intersect_hostnames(
     if route_hostnames.is_empty() {
         return Some(listener_hosts.iter().map(|h| h.to_string()).collect());
     }
-    // Keep each route hostname that matches at least one listener hostname.
-    let kept: Vec<String> = route_hostnames
-        .iter()
-        .filter(|rh| listener_hosts.iter().any(|lh| hostnames_compatible(rh, lh)))
-        .cloned()
-        .collect();
+    // Keep what each route hostname shares with each listener hostname: the
+    // narrower of the two, so `*.example.com` on a `web.example.com` listener
+    // serves `web.example.com` alone. Of two compatible names, the longer is
+    // the narrower.
+    let mut kept: Vec<String> = Vec::new();
+    for rh in route_hostnames {
+        for lh in &listener_hosts {
+            if !hostnames_compatible(rh, lh) {
+                continue;
+            }
+            let narrower = if lh.len() > rh.len() {
+                *lh
+            } else {
+                rh.as_str()
+            };
+            if !kept.iter().any(|k| k == narrower) {
+                kept.push(narrower.to_string());
+            }
+        }
+    }
     if kept.is_empty() { None } else { Some(kept) }
+}
+
+/// Whether the Gateway API hostname `pattern` takes every host `host` does:
+/// the same name, or a `*.` wildcard over it.
+fn hostname_covers(pattern: &str, host: &str) -> bool {
+    pattern == host
+        || pattern
+            .strip_prefix("*.")
+            .is_some_and(|suffix| host.strip_suffix(suffix).is_some_and(|p| p.ends_with('.')))
 }
 
 /// Two Gateway API hostnames are compatible if one matches the other,
@@ -1825,6 +2162,8 @@ const REASON_PORT_UNAVAILABLE: &str = "PortUnavailable";
 const REASON_UNSUPPORTED_PROTOCOL: &str = "UnsupportedProtocol";
 const REASON_INVALID: &str = "Invalid";
 const REASON_INVALID_ROUTE_KINDS: &str = "InvalidRouteKinds";
+const REASON_INVALID_CERTIFICATE_REF: &str = "InvalidCertificateRef";
+const REASON_REF_NOT_PERMITTED: &str = "RefNotPermitted";
 
 /// The status of one Gateway listener, as Sōzune routes it. An HTTP listener
 /// is served whatever its port: its routes go through Sōzune's HTTP port, and
@@ -1839,6 +2178,7 @@ fn build_listener_status(
     listener: &ListenerInfo,
     served: &ServedPorts,
     attached_routes: usize,
+    certificates: Option<(&'static str, String)>,
 ) -> gateway_api::apis::standard::gateways::GatewayStatusListeners {
     use gateway_api::apis::standard::gateways::{
         GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
@@ -1851,6 +2191,8 @@ fn build_listener_status(
         // maps the listener's port to. So an HTTP listener is served on any
         // port, and its status says where.
         "HTTP" => (Some("HTTPRoute"), None),
+        // Likewise on Sōzune's HTTPS port, when the listener terminates TLS.
+        "HTTPS" if GatewayScope::listener_serves_https(listener) => (Some("HTTPRoute"), None),
         // A TLS listener carries TLSRoutes in Passthrough mode only.
         "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (None, None),
         "TLS" | "TCP" => (
@@ -1880,11 +2222,10 @@ fn build_listener_status(
             let message = if protocol == "TLS" {
                 "TLS listeners are served in Passthrough mode only".to_string()
             } else if protocol == "HTTPS" {
-                "HTTPS listeners are not served yet: routes of a Gateway are served over HTTP only"
-                    .to_string()
+                "HTTPS listeners terminate TLS: Passthrough belongs on a TLS listener".to_string()
             } else {
                 format!(
-                    "protocol {} is not supported: use HTTP, TLS, TCP or UDP",
+                    "protocol {} is not supported: use HTTP, HTTPS, TLS, TCP or UDP",
                     listener.protocol
                 )
             };
@@ -1910,6 +2251,7 @@ fn build_listener_status(
         (Some(_), None) => {
             let served_on = match protocol.as_str() {
                 "HTTP" => served.http,
+                "HTTPS" => served.https,
                 _ => port.unwrap_or_default(),
             };
             let programmed = if port == Some(served_on) {
@@ -1984,15 +2326,32 @@ fn build_listener_status(
             c.message = message.clone();
         }
     }
+    // A certificateRef that does not resolve leaves the listener without the
+    // certificate it was given: not programmed, as the spec has it.
+    if kinds_problem.is_none()
+        && let Some((_, message)) = &certificates
+    {
+        for c in conditions
+            .iter_mut()
+            .filter(|c| c.type_ == CONDITION_TYPE_PROGRAMMED && c.status == "True")
+        {
+            c.status = "False".to_string();
+            c.reason = REASON_INVALID.to_string();
+            c.message = message.clone();
+        }
+    }
     // Always reported, so fixing the kinds clears a previous failure.
-    conditions.push(match kinds_problem {
-        Some(message) => condition(
+    conditions.push(match (kinds_problem, certificates) {
+        (Some(message), _) => condition(
             CONDITION_TYPE_RESOLVED_REFS,
             false,
             REASON_INVALID_ROUTE_KINDS,
             message,
         ),
-        None => condition(
+        (None, Some((reason, message))) => {
+            condition(CONDITION_TYPE_RESOLVED_REFS, false, reason, message)
+        }
+        (None, None) => condition(
             CONDITION_TYPE_RESOLVED_REFS,
             true,
             REASON_RESOLVED_REFS,
@@ -2290,26 +2649,31 @@ fn apply_route(
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
     } else {
-        // Narrow the route's hostnames by the listener(s) it binds to: a
-        // listener with a `hostname` only serves matching route hostnames.
-        // `None` means no bound listener admits any of the route's
-        // hostnames, so the route produces nothing here.
-        match scope.effective_hostnames_for_route(route) {
-            Some(effective_hostnames) => {
-                let eps = route_to_entrypoints_with_hostnames(
-                    route,
-                    resolver,
-                    scope,
-                    &effective_hostnames,
-                );
-                let outcome = if eps.is_empty() {
-                    RouteOutcome::NoResolvableBackends
-                } else {
-                    RouteOutcome::Accepted
-                };
-                (outcome, eps)
-            }
-            None => (RouteOutcome::NoResolvableBackends, Vec::new()),
+        // Narrow the route's hostnames by the listener(s) it binds to, over
+        // HTTP and over HTTPS: a listener with a `hostname` only serves
+        // matching route hostnames. `None` means no bound listener of that
+        // kind admits any of the route's hostnames.
+        let plain =
+            scope.effective_hostnames_for_route(route, GatewayScope::listener_is_plain_http);
+        let secure =
+            scope.effective_hostnames_for_route(route, GatewayScope::listener_serves_https);
+        if plain.is_none() && secure.is_none() {
+            (RouteOutcome::NoResolvableBackends, Vec::new())
+        } else {
+            let eps = route_entrypoints_by_scheme(
+                route,
+                resolver,
+                scope,
+                plain,
+                secure,
+                scope.https_redirect_port(route),
+            );
+            let outcome = if eps.is_empty() {
+                RouteOutcome::NoResolvableBackends
+            } else {
+                RouteOutcome::Accepted
+            };
+            (outcome, eps)
         }
     };
 
@@ -2666,6 +3030,100 @@ pub fn route_to_entrypoints(
 ) -> Vec<Entrypoint> {
     let hostnames = route.spec.hostnames.clone().unwrap_or_default();
     route_to_entrypoints_with_hostnames(route, resolver, grants, &hostnames)
+}
+
+/// The entrypoints of an HTTPRoute, given the hostnames its `HTTP` listeners
+/// (`plain`) and its `HTTPS` ones (`secure`) admit. A hostname admitted by
+/// both is served over HTTP and HTTPS; one only an `HTTPS` listener admits
+/// is served over HTTPS, its plain HTTP requests redirected there; one only
+/// an `HTTP` listener admits is served over HTTP. Each set gets its own
+/// entrypoints, told apart by a suffix on their ids. `https_port` is where a
+/// redirect to HTTPS points, `None` for the default port.
+pub fn route_entrypoints_by_scheme(
+    route: &HTTPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+    plain: Option<Vec<String>>,
+    secure: Option<Vec<String>>,
+    https_port: Option<u16>,
+) -> Vec<Entrypoint> {
+    // An empty set is every host: what the other scheme names, it admits.
+    let plain_all = plain.as_ref().is_some_and(Vec::is_empty);
+    let secure_all = secure.as_ref().is_some_and(Vec::is_empty);
+    let only_secure = plain.is_none();
+    let plain = plain.unwrap_or_default();
+    let secure = secure.unwrap_or_default();
+    // Served over both: a name one scheme admits that the other covers,
+    // itself or through a wildcard.
+    let both: Vec<String> = if plain_all {
+        secure.clone()
+    } else if secure_all {
+        plain.clone()
+    } else {
+        let mut both: Vec<String> = Vec::new();
+        for (names, others) in [(&secure, &plain), (&plain, &secure)] {
+            for name in names {
+                if others.iter().any(|other| hostname_covers(other, name)) && !both.contains(name) {
+                    both.push(name.clone());
+                }
+            }
+        }
+        both
+    };
+    let plain_only: Vec<String> = plain
+        .iter()
+        .filter(|h| !both.contains(h))
+        .cloned()
+        .collect();
+    let secure_only: Vec<String> = secure
+        .iter()
+        .filter(|h| !both.contains(h))
+        .cloned()
+        .collect();
+
+    // (hostnames, served over HTTPS, plain HTTP redirected, id suffix)
+    let mut sets: Vec<(Vec<String>, bool, bool, &str)> = [
+        (plain_only, false, false, ""),
+        (both, true, false, "-tls"),
+        (secure_only, true, true, "-https"),
+    ]
+    .into_iter()
+    .filter(|(hostnames, ..)| !hostnames.is_empty())
+    .collect();
+    // A scheme admitting every host keeps the entrypoints it had before
+    // HTTPS listeners were served, with no hostname. Sōzu routes on a host,
+    // so they serve none, but a route is not dropped by a listener of the
+    // other scheme being added.
+    if plain_all {
+        sets.push((Vec::new(), false, false, ""));
+    }
+    if secure_all && !plain_all {
+        sets.push((Vec::new(), true, true, "-https"));
+    }
+    if sets.is_empty() {
+        sets.push(if only_secure {
+            (Vec::new(), true, true, "-https")
+        } else {
+            (Vec::new(), false, false, "")
+        });
+    }
+
+    sets.into_iter()
+        .flat_map(|(hostnames, tls, redirect, suffix)| {
+            route_to_entrypoints_with_hostnames(route, resolver, grants, &hostnames)
+                .into_iter()
+                .map(move |mut ep| {
+                    ep.id.push_str(suffix);
+                    ep.name.push_str(suffix);
+                    ep.config.tls = tls;
+                    ep.config.https_redirect = redirect;
+                    if redirect {
+                        ep.config.https_redirect_port = https_port;
+                    }
+                    ep
+                })
+        })
+        .collect()
 }
 
 /// Convert a HTTPRoute into one or more Sozune `Entrypoint`s, serving
@@ -7001,6 +7459,22 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_route_hostname_narrows_to_the_listener() {
+        let listeners = vec![
+            li("web", 80, Some("web.example.com")),
+            li("api", 80, Some("*.api.example.com")),
+        ];
+        let got = intersect_hostnames(&["*.example.com".into()], &listeners);
+        assert_eq!(
+            got,
+            Some(vec![
+                "web.example.com".to_string(),
+                "*.api.example.com".to_string()
+            ])
+        );
+    }
+
+    #[test]
     fn no_hostname_overlap_yields_none() {
         let listeners = vec![li("web", 80, Some("example.com"))];
         let got = intersect_hostnames(&["a.other.com".into()], &listeners);
@@ -7028,6 +7502,7 @@ mod tests {
     fn served() -> ServedPorts {
         ServedPorts {
             http: 80,
+            https: 443,
             tcp: HashSet::from([5432]),
             udp: HashSet::from([53]),
             gateway: crate::config::GatewayPortsConfig {
@@ -7057,13 +7532,456 @@ mod tests {
     /// The status follows routing: an HTTP listener is served on any port,
     /// a TCP or UDP one only on a port a `proxy.tcp`/`proxy.udp` entry
     /// listens on; any other is reported, with what to declare.
+    fn https_listener(name: &str, secret_ns: Option<&str>, secret: &str) -> GatewayListeners {
+        let mut l = gw_listener(name, 443, "HTTPS");
+        l.tls = Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
+            certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                name: secret.into(),
+                namespace: secret_ns.map(str::to_string),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        l
+    }
+
+    fn store_secret(scope: &GatewayScope, ns: &str, name: &str, host: &str) -> String {
+        let (cert, key) = super::super::gateway_tls::tests::self_signed(&[host]);
+        let secret = super::super::gateway_tls::tests::tls_secret(ns, name, &cert, &key);
+        let certificate = super::super::gateway_tls::certificate_from_secret(&secret).unwrap();
+        let fingerprint = certificate.fingerprint.clone();
+        scope.upsert_tls_secret((ns.into(), name.into()), Ok(Arc::new(certificate)));
+        fingerprint
+    }
+
+    fn resolved_refs(scope: &GatewayScope, gw: &Gateway, listener: &str) -> Condition {
+        let statuses = scope.listener_statuses(gw);
+        let status = statuses.iter().find(|l| l.name == listener).unwrap();
+        condition_of(status, CONDITION_TYPE_RESOLVED_REFS).clone()
+    }
+
+    /// An accepted Gateway's HTTPS listeners hand over the certificates their
+    /// certificateRefs name, and their status says when one cannot be used.
+    #[test]
+    fn https_listeners_take_the_certificates_they_reference() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![
+            https_listener("shop", None, "shop-tls"),
+            https_listener("other", Some("infra"), "infra-tls"),
+            https_listener("ghost", None, "nowhere"),
+        ];
+        scope.upsert_gateway(&gw);
+        let shop = store_secret(&scope, "default", "shop-tls", "shop.example.com");
+        store_secret(&scope, "infra", "infra-tls", "infra.example.com");
+
+        let served: Vec<String> = scope
+            .referenced_certificates()
+            .iter()
+            .map(|c| c.fingerprint.clone())
+            .collect();
+        assert_eq!(served, [shop]);
+
+        assert_eq!(resolved_refs(&scope, &gw, "shop").status, "True");
+        assert_eq!(
+            resolved_refs(&scope, &gw, "other").reason,
+            REASON_REF_NOT_PERMITTED
+        );
+        let ghost = resolved_refs(&scope, &gw, "ghost");
+        assert_eq!(ghost.reason, REASON_INVALID_CERTIFICATE_REF);
+        assert!(ghost.message.contains("default/nowhere"));
+        let statuses = scope.listener_statuses(&gw);
+        let ghost = statuses.iter().find(|l| l.name == "ghost").unwrap();
+        assert_eq!(
+            condition_of(ghost, CONDITION_TYPE_PROGRAMMED).status,
+            "False"
+        );
+
+        // A Secret that becomes unusable is no longer served.
+        scope.upsert_tls_secret(
+            ("default".into(), "shop-tls".into()),
+            Err("the certificate has expired".into()),
+        );
+        assert!(scope.referenced_certificates().is_empty());
+        assert!(
+            resolved_refs(&scope, &gw, "shop")
+                .message
+                .contains("the certificate has expired")
+        );
+    }
+
+    /// A certificate is only used by a listener whose hostname it covers,
+    /// and stops being used once it expires.
+    #[test]
+    fn a_listener_takes_a_certificate_covering_it_until_it_expires() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut api = https_listener("api", None, "wildcard-tls");
+        api.hostname = Some("api.example.com".into());
+        let mut shop = https_listener("shop", None, "other-tls");
+        shop.hostname = Some("shop.example.com".into());
+        gw.spec.listeners = vec![api, shop];
+        scope.upsert_gateway(&gw);
+        store_secret(&scope, "default", "wildcard-tls", "*.example.com");
+        store_secret(&scope, "default", "other-tls", "other.example.com");
+
+        assert_eq!(resolved_refs(&scope, &gw, "api").status, "True");
+        let shop = resolved_refs(&scope, &gw, "shop");
+        assert_eq!(shop.reason, REASON_INVALID_CERTIFICATE_REF);
+        assert!(
+            shop.message
+                .contains("does not cover hostname shop.example.com")
+        );
+        assert_eq!(scope.referenced_certificates().len(), 1);
+
+        scope.expire_tls_secrets(i64::MAX);
+        assert!(scope.referenced_certificates().is_empty());
+        assert!(
+            resolved_refs(&scope, &gw, "api")
+                .message
+                .contains("the certificate has expired")
+        );
+    }
+
+    /// The redirect to HTTPS goes to the port of the HTTPS listener that
+    /// admits the route.
+    #[test]
+    fn the_redirect_port_is_that_of_the_listener_admitting_the_route() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut foo = https_listener("foo", None, "foo-tls");
+        foo.port = 8443;
+        foo.hostname = Some("foo.example.com".into());
+        let mut bar = https_listener("bar", None, "bar-tls");
+        bar.port = 9443;
+        bar.hostname = Some("bar.example.com".into());
+        gw.spec.listeners = vec![foo, bar];
+        scope.upsert_gateway(&gw);
+        store_secret(&scope, "default", "foo-tls", "foo.example.com");
+        store_secret(&scope, "default", "bar-tls", "bar.example.com");
+
+        let route = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["foo.example.com".into()],
+            vec![parent("gw")],
+        );
+        assert_eq!(scope.https_redirect_port(&route), Some(8443));
+    }
+
+    /// Only an accepted Gateway's certificates are served, and only while
+    /// their Secret is there.
+    #[test]
+    fn certificates_follow_the_gateway_and_its_secrets() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut foreign = gateway("default", "foreign", "someone-else");
+        foreign.spec.listeners = vec![https_listener("shop", None, "shop-tls")];
+        scope.upsert_gateway(&foreign);
+        store_secret(&scope, "default", "shop-tls", "shop.example.com");
+        assert!(scope.referenced_certificates().is_empty());
+
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![https_listener("shop", None, "shop-tls")];
+        scope.upsert_gateway(&gw);
+        assert_eq!(scope.referenced_certificates().len(), 1);
+
+        scope.retain_tls_secrets(&HashSet::new());
+        assert!(scope.referenced_certificates().is_empty());
+        store_secret(&scope, "default", "shop-tls", "shop.example.com");
+        scope.remove_gateway("default", "gw");
+        assert!(scope.referenced_certificates().is_empty());
+    }
+
+    /// A Secret that changes rewrites the status of the Gateways that
+    /// reference it, and only theirs.
+    #[tokio::test]
+    async fn a_secret_change_rewrites_the_gateways_referencing_it() {
+        let scope = GatewayScope::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        scope.configure_status(served(), tx);
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut shop = gateway("default", "shop", "sozune");
+        shop.spec.listeners = vec![https_listener("tls", None, "shop-tls")];
+        scope.upsert_gateway(&shop);
+        let mut blog = gateway("default", "blog", "sozune");
+        blog.spec.listeners = vec![https_listener("tls", None, "blog-tls")];
+        scope.upsert_gateway(&blog);
+        while rx.try_recv().is_ok() {}
+
+        let woken = {
+            let scope = scope.clone();
+            tokio::spawn(async move { scope.changed().await })
+        };
+        tokio::task::yield_now().await;
+        store_secret(&scope, "default", "shop-tls", "shop.example.com");
+        // The routes are resolved again: the listener can now serve them.
+        tokio::time::timeout(std::time::Duration::from_secs(1), woken)
+            .await
+            .expect("a Secret change wakes the route watchers")
+            .unwrap();
+        let written: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|w| match w {
+                StatusWrite::Gateway(gw) => gw.metadata.name.unwrap_or_default(),
+                StatusWrite::GatewayClass(_) => "class".into(),
+            })
+            .collect();
+        assert_eq!(written, ["shop"]);
+    }
+
+    /// The certificate sync hands certificates to the HTTPS worker, retries
+    /// what it refuses, replaces one whose chain changed, takes back one no
+    /// Gateway references, and leaves a file's certificate alone.
+    #[tokio::test]
+    async fn certificate_sync_follows_the_scope() {
+        use crate::acme::{CertAction, CertCommand};
+        use std::time::Duration;
+
+        async fn next(rx: &mut mpsc::Receiver<CertCommand>) -> CertCommand {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a certificate command")
+                .unwrap()
+        }
+        fn answer(command: CertCommand, ok: bool) -> CertAction {
+            let _ = command.accepted.unwrap().send(ok);
+            command.action
+        }
+
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![
+            https_listener("shop", None, "shop-tls"),
+            https_listener("file", None, "file-tls"),
+        ];
+        scope.upsert_gateway(&gw);
+        let shop = store_secret(&scope, "default", "shop-tls", "shop.example.com");
+        let file = store_secret(&scope, "default", "file-tls", "file.example.com");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(super::super::gateway_tls::run_certificate_sync(
+            scope.clone(),
+            tx,
+            HashSet::from([file]),
+        ));
+
+        // Refused: sent again on the next change.
+        let first = next(&mut rx).await;
+        assert_eq!(first.names, ["shop.example.com"]);
+        assert_eq!(answer(first, false), CertAction::Add);
+        scope.upsert_gateway(&gw);
+        assert_eq!(answer(next(&mut rx).await, true), CertAction::Add);
+
+        // The same leaf with another chain is replaced.
+        let held = scope.referenced_certificates();
+        let held = held.iter().find(|c| c.fingerprint == shop).unwrap();
+        let rechained = SecretCertificate {
+            names: held.names.clone(),
+            cert_pem: held.cert_pem.clone(),
+            chain: vec![held.cert_pem.clone()],
+            key_pem: held.key_pem.clone(),
+            fingerprint: held.fingerprint.clone(),
+            not_after: held.not_after,
+        };
+        scope.upsert_tls_secret(
+            ("default".into(), "shop-tls".into()),
+            Ok(Arc::new(rechained)),
+        );
+        assert_eq!(answer(next(&mut rx).await, true), CertAction::Replace);
+
+        // No Gateway references it any more: taken back.
+        scope.remove_gateway("default", "gw");
+        let removed = next(&mut rx).await;
+        assert_eq!(removed.names, ["shop.example.com"]);
+        assert_eq!(answer(removed, true), CertAction::Remove);
+        // The file's certificate was never sent.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    /// A route is served over HTTPS for the hostnames its HTTPS listeners
+    /// admit, over HTTP for those its HTTP listeners admit, and over both for
+    /// those both admit.
+    #[test]
+    fn route_entrypoints_follow_the_scheme_of_their_listeners() {
+        let route = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        let host = |hosts: &[&str]| Some(hosts.iter().map(|h| h.to_string()).collect());
+        let schemes = |plain, secure| -> Vec<(String, Vec<String>, bool, bool)> {
+            route_entrypoints_by_scheme(&route, &r1(), &AllowAllBackendRefs, plain, secure, None)
+                .into_iter()
+                .map(|ep| {
+                    (
+                        ep.id,
+                        ep.config.hostnames,
+                        ep.config.tls,
+                        ep.config.https_redirect,
+                    )
+                })
+                .collect()
+        };
+        let id = format!("{SOURCE_TAG}-default-web-0");
+
+        assert_eq!(
+            schemes(host(&["a.example.com"]), None),
+            [(id.clone(), vec!["a.example.com".to_string()], false, false)]
+        );
+        assert_eq!(
+            schemes(None, host(&["a.example.com"])),
+            [(
+                format!("{id}-https"),
+                vec!["a.example.com".to_string()],
+                true,
+                true
+            )]
+        );
+        assert_eq!(
+            schemes(
+                host(&["a.example.com", "b.example.com"]),
+                host(&["a.example.com", "c.example.com"])
+            ),
+            [
+                (id.clone(), vec!["b.example.com".to_string()], false, false),
+                (
+                    format!("{id}-tls"),
+                    vec!["a.example.com".to_string()],
+                    true,
+                    false
+                ),
+                (
+                    format!("{id}-https"),
+                    vec!["c.example.com".to_string()],
+                    true,
+                    true
+                ),
+            ]
+        );
+        // A wildcard on one side covers the exact names of the other.
+        assert_eq!(
+            schemes(host(&["*.example.com"]), host(&["api.example.com"])),
+            [
+                (id.clone(), vec!["*.example.com".to_string()], false, false),
+                (
+                    format!("{id}-tls"),
+                    vec!["api.example.com".to_string()],
+                    true,
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            schemes(host(&["api.example.com"]), host(&["*.example.com"])),
+            [
+                (
+                    format!("{id}-tls"),
+                    vec!["api.example.com".to_string()],
+                    true,
+                    false
+                ),
+                (
+                    format!("{id}-https"),
+                    vec!["*.example.com".to_string()],
+                    true,
+                    true
+                ),
+            ]
+        );
+        // A listener admitting every host admits the other scheme's names.
+        assert_eq!(
+            schemes(Some(Vec::new()), host(&["a.example.com"])),
+            [
+                (
+                    format!("{id}-tls"),
+                    vec!["a.example.com".to_string()],
+                    true,
+                    false
+                ),
+                (id.clone(), Vec::new(), false, false),
+            ]
+        );
+        assert_eq!(
+            schemes(host(&["a.example.com"]), Some(Vec::new())),
+            [
+                (
+                    format!("{id}-tls"),
+                    vec!["a.example.com".to_string()],
+                    true,
+                    false
+                ),
+                (format!("{id}-https"), Vec::new(), true, true),
+            ]
+        );
+    }
+
+    /// An HTTPRoute attaches through an HTTPS listener, and is served over
+    /// HTTPS on the names that listener admits.
+    #[test]
+    fn an_httproute_attaches_through_an_https_listener() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut https = https_listener("tls", None, "shop-tls");
+        https.hostname = Some("*.shop.example".into());
+        gw.spec.listeners = vec![gw_listener("http", 80, "HTTP"), https];
+        scope.upsert_gateway(&gw);
+
+        let route = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["www.shop.example".into(), "blog.example".into()],
+            vec![parent("gw")],
+        );
+        assert!(scope.accepts_route(&route));
+        // Not over HTTPS until the listener has a certificate to serve.
+        assert_eq!(
+            scope.effective_hostnames_for_route(&route, GatewayScope::listener_serves_https),
+            None
+        );
+        store_secret(&scope, "default", "shop-tls", "*.shop.example");
+        assert_eq!(
+            scope.effective_hostnames_for_route(&route, GatewayScope::listener_serves_https),
+            Some(vec!["www.shop.example".to_string()])
+        );
+        assert_eq!(
+            scope.effective_hostnames_for_route(&route, GatewayScope::listener_is_plain_http),
+            Some(vec![
+                "www.shop.example".to_string(),
+                "blog.example".to_string()
+            ])
+        );
+
+        // Redirected to the default HTTPS port: the listener is on 443.
+        assert_eq!(scope.https_redirect_port(&route), None);
+        let mut on_8443 = gw.clone();
+        on_8443.spec.listeners[1].port = 8443;
+        scope.upsert_gateway(&on_8443);
+        assert_eq!(scope.https_redirect_port(&route), Some(8443));
+        scope.upsert_gateway(&gw);
+
+        // Through the HTTPS listener alone, nothing is served over HTTP.
+        let mut only_https = route.clone();
+        only_https.spec.parent_refs.as_mut().unwrap()[0].section_name = Some("tls".into());
+        assert_eq!(
+            scope.effective_hostnames_for_route(&only_https, GatewayScope::listener_is_plain_http),
+            None
+        );
+    }
+
     #[test]
     fn listener_status_reflects_allowed_route_kinds() {
         let gw = gateway("default", "gw", "sozune");
         let status = |kinds: &[&str]| {
             let mut listener = li("l", 80, None);
             listener.allowed_kinds = Some(kinds.iter().map(|k| k.to_string()).collect());
-            build_listener_status(&gw, &listener, &served(), 0)
+            build_listener_status(&gw, &listener, &served(), 0, None)
         };
 
         let http_only = status(&["HTTPRoute"]);
@@ -7112,7 +8030,7 @@ mod tests {
                 allowed_namespaces: AllowedNamespaces::Same,
                 allowed_kinds: None,
             };
-            build_listener_status(&gw, &listener, &served(), 0)
+            build_listener_status(&gw, &listener, &served(), 0, None)
         };
 
         let http = status(80, "HTTP");
@@ -7127,13 +8045,28 @@ mod tests {
         let programmed = condition_of(&other, CONDITION_TYPE_PROGRAMMED);
         assert_eq!(programmed.status, "True");
         assert!(programmed.message.contains("port 80"));
-        // Routes are installed without TLS: an HTTPS listener is not served.
+        // An HTTPS listener terminates TLS on Sōzune's HTTPS port.
         let https = status(8443, "HTTPS");
+        let programmed = condition_of(&https, CONDITION_TYPE_PROGRAMMED);
+        assert_eq!(programmed.status, "True");
+        assert!(programmed.message.contains("port 443"));
+        assert_eq!(https.supported_kinds[0].kind, "HTTPRoute");
+        // Passthrough is for TLS listeners.
+        let passthrough = ListenerInfo {
+            name: "l".into(),
+            port: 8443,
+            hostname: None,
+            protocol: "HTTPS".into(),
+            tls_mode: Some(GatewayListenersTlsMode::Passthrough),
+            allowed_namespaces: AllowedNamespaces::Same,
+            allowed_kinds: None,
+        };
+        let passthrough = build_listener_status(&gw, &passthrough, &served(), 0, None);
         assert_eq!(
-            condition_of(&https, CONDITION_TYPE_ACCEPTED).reason,
+            condition_of(&passthrough, CONDITION_TYPE_ACCEPTED).reason,
             REASON_UNSUPPORTED_PROTOCOL
         );
-        assert!(https.supported_kinds.is_empty());
+        assert!(passthrough.supported_kinds.is_empty());
 
         assert_eq!(
             condition_of(&status(5432, "TCP"), CONDITION_TYPE_PROGRAMMED).status,
@@ -7188,7 +8121,7 @@ mod tests {
             .tcp
             .insert(9050, "Address already in use".into());
 
-        let status = build_listener_status(&gw, &listener, &served, 1);
+        let status = build_listener_status(&gw, &listener, &served, 1, None);
         let programmed = condition_of(&status, CONDITION_TYPE_PROGRAMMED);
         assert_eq!(programmed.status, "False");
         assert!(programmed.message.contains("Address already in use"));
@@ -7199,7 +8132,7 @@ mod tests {
         // Only the port that failed.
         served.unopened.tcp.clear();
         served.unopened.udp.insert(9050, "taken".into());
-        let status = build_listener_status(&gw, &listener, &served, 1);
+        let status = build_listener_status(&gw, &listener, &served, 1, None);
         assert_eq!(
             condition_of(&status, CONDITION_TYPE_PROGRAMMED).status,
             "True"
@@ -7340,14 +8273,14 @@ mod tests {
         let terminate = li_tls("tls", 5432, None, GatewayListenersTlsMode::Terminate);
         let passthrough = li_tls("tls", 5432, None, GatewayListenersTlsMode::Passthrough);
 
-        let status = build_listener_status(&gw, &terminate, &served(), 0);
+        let status = build_listener_status(&gw, &terminate, &served(), 0, None);
         let accepted = condition_of(&status, CONDITION_TYPE_ACCEPTED);
         assert_eq!(accepted.status, "False");
         assert_eq!(accepted.reason, REASON_UNSUPPORTED_PROTOCOL);
         assert!(accepted.message.contains("Passthrough"));
         assert!(status.supported_kinds.is_empty());
 
-        let status = build_listener_status(&gw, &passthrough, &served(), 0);
+        let status = build_listener_status(&gw, &passthrough, &served(), 0, None);
         assert_eq!(
             condition_of(&status, CONDITION_TYPE_PROGRAMMED).status,
             "True"
@@ -7464,7 +8397,7 @@ mod tests {
     fn unchanged_listener_conditions_keep_their_transition_time() {
         let gw = gateway("default", "gw", "sozune");
         let listener = li("web", 80, None);
-        let mut previous = build_listener_status(&gw, &listener, &served(), 1);
+        let mut previous = build_listener_status(&gw, &listener, &served(), 1, None);
         for condition in &mut previous.conditions {
             condition.last_transition_time =
                 Time(k8s_openapi::chrono::DateTime::from_timestamp(1_000, 0).unwrap());
@@ -7472,14 +8405,14 @@ mod tests {
 
         let (merged, changed) = merge_listener_statuses(
             Some(std::slice::from_ref(&previous)),
-            vec![build_listener_status(&gw, &listener, &served(), 1)],
+            vec![build_listener_status(&gw, &listener, &served(), 1, None)],
         );
         assert!(!changed);
         assert_eq!(merged[0].conditions, previous.conditions);
 
         let (_, changed) = merge_listener_statuses(
             Some(std::slice::from_ref(&previous)),
-            vec![build_listener_status(&gw, &listener, &served(), 2)],
+            vec![build_listener_status(&gw, &listener, &served(), 2, None)],
         );
         assert!(changed, "a new attached route is a change");
     }

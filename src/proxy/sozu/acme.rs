@@ -7,8 +7,8 @@ use sozu_command_lib::{
     channel::Channel,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms,
-        LoadBalancingParams, SocketAddress, TlsVersion, WorkerRequest, WorkerResponse,
-        request::RequestType,
+        LoadBalancingParams, RemoveCertificate, ReplaceCertificate, SocketAddress, TlsVersion,
+        WorkerRequest, WorkerResponse, request::RequestType,
     },
 };
 use tracing::info;
@@ -92,4 +92,51 @@ pub(super) fn add_certificate(
 
     info!("Certificate added for {:?}", names);
     Ok(())
+}
+
+/// Send a RemoveCertificate command to the HTTPS worker, for the certificate
+/// `cert_pem` holds.
+pub(super) fn remove_certificate(
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    https_addr: SocketAddress,
+    cert_pem: &str,
+) -> anyhow::Result<()> {
+    let fingerprint = crate::acme::certificate_fingerprint(cert_pem)?;
+    send_to_worker(
+        command_channel_https,
+        format!("remove-cert-{}", fingerprint),
+        RequestType::RemoveCertificate(RemoveCertificate {
+            address: https_addr,
+            fingerprint,
+        }),
+    )
+}
+
+/// Send a ReplaceCertificate command to the HTTPS worker: the certificate
+/// `cert_pem` holds keeps its fingerprint, and takes this chain and key.
+pub(super) fn replace_certificate(
+    command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
+    https_addr: SocketAddress,
+    cert_pem: &str,
+    chain: &[String],
+    key_pem: &str,
+    names: &[String],
+) -> anyhow::Result<()> {
+    let fingerprint = crate::acme::certificate_fingerprint(cert_pem)?;
+    send_to_worker(
+        command_channel_https,
+        format!("replace-cert-{}", fingerprint),
+        RequestType::ReplaceCertificate(ReplaceCertificate {
+            address: https_addr,
+            new_certificate: CertificateAndKey {
+                certificate: cert_pem.to_string(),
+                certificate_chain: chain.to_vec(),
+                key: key_pem.to_string(),
+                versions: vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
+                names: names.to_vec(),
+            },
+            old_fingerprint: fingerprint,
+            new_expired_at: None,
+        }),
+    )
 }

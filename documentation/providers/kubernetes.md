@@ -149,6 +149,12 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes/status", "gateways/status", "gatewayclasses/status"]
     verbs: ["update", "patch"]
+  # Optional: only needed for Gateway HTTPS listeners, which read their
+  # certificates from the `kubernetes.io/tls` Secrets their certificateRefs
+  # name. Sōzune only watches Secrets of that type.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
 ```
 
 `namespaces` is only used for the start-up sanity check; if you want a strictly minimal role, drop it (Sōzune logs a warning instead of an info line).
@@ -239,6 +245,40 @@ spec:
           port: 80
 ```
 
+### HTTPS listeners
+
+An `HTTPS` listener terminates TLS for the HTTPRoutes attached to it, with the certificates its `tls.certificateRefs` name: `kubernetes.io/tls` Secrets in the Gateway's namespace.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gw
+  namespace: default
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "*.example.com"
+      tls:
+        mode: Terminate   # the default
+        certificateRefs:
+          - name: example-com-tls   # a kubernetes.io/tls Secret
+```
+
+- Its routes are served on `proxy.https.listen_address`, as an `HTTP` listener's are on `proxy.http.listen_address`. Sōzu picks the certificate by the SNI of each handshake.
+- A hostname the route's `HTTPS` listeners admit and its `HTTP` listeners do too is served over both. One only an `HTTPS` listener admits is served over HTTPS, and its plain HTTP requests are redirected there, to the listener's `port` (none in the URL for `443`).
+- A Secret that is renewed, by cert-manager for instance, is picked up live. A certificate no Gateway references any more, because its Secret, listener or Gateway went away, is no longer served.
+- ACME never orders a certificate for a Gateway route: its certificate comes from the Secret.
+- Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). It only watches those of type `kubernetes.io/tls`.
+
+A listener whose certificateRefs cannot be used says so in its status (see [Status conditions](#status-conditions)): `ResolvedRefs=False` with `InvalidCertificateRef` for a missing Secret, one of another type or kind, or one whose certificate is expired (checked every minute, so a certificate expiring unrenewed is caught), does not match its key or does not cover the listener's `hostname`, and `RefNotPermitted` for a Secret in another namespace, which Sōzune does not support yet. The references that resolve are still served. A listener left with no usable certificate serves no route over HTTPS, and redirects none there: its routes come back once a Secret it names is fixed.
+
 Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
 
 ### What's supported
@@ -268,7 +308,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Route is in scope (parent owned), filters are OK |
 | `Accepted` | `False` (`UnsupportedValue`) | Route declares unsupported filters |
-| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)). No `ResolvedRefs` is reported for that parent |
+| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` or `HTTPS` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)). No `ResolvedRefs` is reported for that parent |
 | `Accepted` | `False` (`NoMatchingParent`) | The `parentRef`'s `sectionName` / `port` names no listener of a Gateway Sōzune owns |
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | All backendRefs resolved to ready endpoints |
 | `ResolvedRefs` | `False` (`BackendNotFound`) | One or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
@@ -285,16 +325,17 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 
 **Gateway listeners** (`status.listeners[]`), one entry per listener:
 
-- `supportedKinds` — the route kind the listener carries: `HTTPRoute` for `HTTP`, `TLSRoute` for `TLS`, `TCPRoute` for `TCP`, `UDPRoute` for `UDP`; none when its `allowedRoutes.kinds` leaves that kind out.
+- `supportedKinds` — the route kind the listener carries: `HTTPRoute` for `HTTP` and `HTTPS`, `TLSRoute` for `TLS`, `TCPRoute` for `TCP`, `UDPRoute` for `UDP`; none when its `allowedRoutes.kinds` leaves that kind out.
 - `attachedRoutes` — how many routes select the listener through their `parentRefs` (by `sectionName`/`port`, or all of a Gateway's listeners when neither is set) and are admitted by its `allowedRoutes` and its `hostname`, whether or not the routes are accepted.
 
 | Condition | Status | Reason | When |
 |---|---|---|---|
-| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener, whatever its port: its routes are served on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry or of `proxy.gateway_ports.tcp`, a `UDP` one on the port of a `proxy.udp` entry or of `proxy.gateway_ports.udp` |
+| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener, whatever its port: its routes are served on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. An `HTTPS` listener likewise, on `proxy.https.listen_address`, when its certificateRefs resolve. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry or of `proxy.gateway_ports.tcp`, a `UDP` one on the port of a `proxy.udp` entry or of `proxy.gateway_ports.udp` |
 | `Accepted`, `Programmed` | `False` (`PortUnavailable`, `Invalid`) | A `TLS`, `TCP` or `UDP` listener on a port no `proxy.tcp` / `proxy.udp` entry listens on and `proxy.gateway_ports` does not list — the message names the settings to change — or a port of `proxy.gateway_ports` Sōzune could not open, with the reason |
-| `ResolvedRefs` | `True` (`ResolvedRefs`) | The listener's `allowedRoutes.kinds` is unset, or only lists the kind it carries |
+| `ResolvedRefs` | `True` (`ResolvedRefs`) | The listener's `allowedRoutes.kinds` is unset, or only lists the kind it carries, and an `HTTPS` listener's certificateRefs all resolve |
 | `ResolvedRefs` | `False` (`InvalidRouteKinds`) | `allowedRoutes.kinds` lists a kind the listener's protocol cannot carry. If it leaves out the one it can, `Programmed` is `False` (`Invalid`) too: no route attaches |
-| `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | An `HTTPS` listener: a Gateway's HTTPRoutes are served over HTTP only, so it would hand them to plain HTTP. A `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`), or any other protocol |
+| `ResolvedRefs` | `False` (`InvalidCertificateRef`, `RefNotPermitted`) | An `HTTPS` listener's certificateRef cannot be used (see [HTTPS listeners](#https-listeners)); `Programmed` is `False` (`Invalid`) too |
+| `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | An `HTTPS` listener in `Passthrough` mode (that belongs on a `TLS` listener), a `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`), or any other protocol |
 
 **GatewayClass** (`status.conditions[]`):
 
@@ -358,6 +399,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 - Listener-driven port binding — a `parentRef`'s `sectionName`/`port` selects a listener and a listener `hostname` narrows route hostnames (both honoured), but traffic is still served on the ports from `proxy.http.listen_address` / `proxy.https.listen_address`, not on each listener's own `port`. The listener's status names the port its routes are served on. Serving multiple live HTTP ports from one Gateway is a separate, planned enhancement.
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`.
+- An `HTTPS` listener's certificateRefs to a Secret in another namespace, even with a `ReferenceGrant`: reported `RefNotPermitted`.
 - A `backendRef` that is invalid (an unsupported kind, a cross-namespace ref with no `ReferenceGrant`) is left out of the rule, and its share of the traffic goes to the other backends. The spec asks for that share to be answered with `500`.
 
 ### HTTPRoute filters
@@ -531,7 +573,7 @@ A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which 
 
 | Aspect | Behaviour |
 |---|---|
-| `tls.mode` | `Passthrough` only. `Terminate` means the Gateway decrypts, which is what HTTPS entrypoints do — such a listener is ignored here. |
+| `tls.mode` | `Passthrough` only. `Terminate` means the Gateway decrypts, which is what [`HTTPS` listeners](#https-listeners) do for HTTPRoutes — such a `TLS` listener is ignored here. |
 | `hostnames` | Each becomes one SNI route. Exact names and a single leading `*.` wildcard label, per spec. A route with no hostname serves nothing: there is no name to match a ClientHello against. |
 | Listener `hostname` | Intersected with the route's hostnames, exactly as for HTTPRoute. |
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
@@ -653,7 +695,7 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
 - **Gateway API: `GRPCRoute` and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
-- **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what HTTPS entrypoints are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
+- **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what [`HTTPS` listeners](#https-listeners) are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables
 

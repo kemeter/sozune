@@ -134,6 +134,20 @@ pub struct CertCommand {
     /// written to disk, and would leave the hostname unable to serve TLS until
     /// a restart reloaded the file.
     pub accepted: Option<oneshot::Sender<bool>>,
+    /// What to do with the certificate.
+    pub action: CertAction,
+}
+
+/// What a [`CertCommand`] asks of the HTTPS worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CertAction {
+    #[default]
+    Add,
+    /// Swap the material the worker holds for this certificate (same leaf, a
+    /// new chain or key) for the one sent.
+    Replace,
+    /// Take the certificate back. Only `cert_pem` is read, to find it.
+    Remove,
 }
 
 /// What the certificate file on disk says about a hostname.
@@ -338,7 +352,11 @@ impl AcmeManager {
         let mut certs = collect_resolver_managed_domains(&self.config.resolvers);
 
         for entrypoint in storage.values() {
-            if !entrypoint.config.tls {
+            // A Gateway route is served with the certificates its listener's
+            // certificateRefs name, never with one ordered here.
+            if !entrypoint.config.tls
+                || crate::provider::kubernetes::gateway::is_gateway_route(entrypoint)
+            {
                 continue;
             }
             let resolver_name = entrypoint.config.acme.as_ref().map(|a| a.resolver.clone());
@@ -501,6 +519,7 @@ impl AcmeManager {
                 key_pem,
                 chain,
                 accepted: Some(accepted_tx),
+                action: CertAction::Add,
             })
             .await?;
 
@@ -834,6 +853,7 @@ impl AcmeManager {
                     // Startup load: a refusal here is picked up by the first
                     // provisioning pass, which reads the same file.
                     accepted: None,
+                    action: CertAction::Add,
                 })
                 .await
             {
@@ -904,6 +924,23 @@ pub(crate) fn split_pem_chain(pem_chain: &str) -> (String, Vec<String>) {
         .collect();
 
     (leaf, chain)
+}
+
+/// The fingerprint Sōzu knows a certificate by: the hex SHA-256 of the leaf's
+/// DER, the first certificate of `cert_pem`.
+pub(crate) fn certificate_fingerprint(cert_pem: &str) -> anyhow::Result<String> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot parse the certificate: {e}"))?;
+    Ok(Sha256::digest(der.as_ref())
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        }))
 }
 
 /// Build an ACME account builder for `server_url`, trusting a test CA when

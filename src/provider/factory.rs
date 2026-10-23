@@ -7,7 +7,7 @@ use crate::provider::{
     consul::ConsulProvider,
     docker::DockerProvider,
     http::HttpProvider,
-    kubernetes::{KubernetesProvider, gateway},
+    kubernetes::{KubernetesProvider, gateway, gateway_tls},
     nomad::NomadProvider,
     podman::PodmanProvider,
     ring::RingProvider,
@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_services(
     config: &AppConfig,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -28,6 +29,8 @@ pub async fn start_services(
     unopened_gateway_ports: tokio::sync::watch::Receiver<
         crate::proxy::backend::UnopenedGatewayPorts,
     >,
+    cert_tx: mpsc::Sender<crate::acme::CertCommand>,
+    file_certificates: std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     info!("Loading initial entrypoints and starting provider services");
 
@@ -289,6 +292,24 @@ pub async fn start_services(
                     error!("Gateway API: Gateway watcher failed: {}", e);
                 }
             });
+
+            // HTTPS listeners terminate TLS with the certificates their
+            // certificateRefs name: watch the TLS Secrets, and hand the
+            // referenced certificates to the HTTPS worker.
+            let secret_client = client.clone();
+            let secret_scope = scope.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    gateway_tls::run_tls_secret_watcher(secret_client, secret_scope).await
+                {
+                    error!("Gateway API: TLS Secret watcher failed: {}", e);
+                }
+            });
+            tokio::spawn(gateway_tls::run_certificate_sync(
+                scope.clone(),
+                cert_tx,
+                file_certificates,
+            ));
 
             let rg_client = client.clone();
             let rg_scope = scope.clone();
