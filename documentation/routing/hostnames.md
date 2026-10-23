@@ -69,7 +69,7 @@ labels:
 
 For `admin.example.com`, the `specific` entrypoint wins. Other subdomains hit `catchall`.
 
-The default priority is `0`. Higher numbers win. Among routes of the same priority, the more specific one is tried first: an exact hostname before a regex, a wildcard (the longer first), then any host; then an exact path before a prefix, the longer prefix first (a regex counts as the literal text it starts with). A route listing several hostnames is placed by its most specific one: give a wildcard its own route for it to be tried after other routes' exact names. Gateway API routes are split that way on their own.
+The default priority is `0`. Higher numbers win. Among routes of the same priority, the more specific one is tried first: an exact hostname before a regex, a wildcard (the longer first), then any host; then an exact path before a prefix, the longer prefix first (a regex counts as the literal text it starts with); then a route on `methods` before one on any method, and the one with more `matchHeaders` conditions first. A route listing several hostnames is placed by its most specific one: give a wildcard its own route for it to be tried after other routes' exact names. Gateway API routes are split that way on their own.
 
 One exception: a route whose [header conditions](/documentation/routing/header-query-matching) hold is tried before every route without header conditions, whatever their priority. This applies to conditions on any header but `Host` and `Cookie`, which Sōzu cannot route on. Priority still orders routes with header conditions among themselves.
 

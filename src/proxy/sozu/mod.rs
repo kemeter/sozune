@@ -1429,25 +1429,37 @@ fn skipped_on_sni_clash(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<Stri
 pub(crate) fn routing_order(storage: &BTreeMap<String, Entrypoint>) -> Vec<(&String, &Entrypoint)> {
     let mut ordered: Vec<(&String, &Entrypoint)> = storage.iter().collect();
     // Stable sort over the BTreeMap's id order: ties keep their ids ascending.
-    ordered.sort_by_key(|(_, ep)| {
-        (
-            std::cmp::Reverse(ep.config.priority),
-            host_specificity(&ep.config.hostnames),
-            path_specificity(ep.config.path.as_ref()),
-        )
-    });
+    ordered.sort_by_key(|(_, ep)| (std::cmp::Reverse(ep.config.priority), specificity(ep)));
     ordered
 }
+
+/// A hostname's or a path's rank: its kind, then its length, the longest
+/// first.
+type Rank = (u8, std::cmp::Reverse<usize>);
 
 /// Whether `a` is tried before `b` for being more specific, their priority
 /// being equal.
 pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
+    specificity(a) < specificity(b)
+}
+
+/// How specific a route is, the most specific first: by hostname, then path,
+/// then a route on methods before one on any method, then the more header
+/// conditions Sōzu routes on. Query conditions do not count: the middleware
+/// answers `404` when they fail, so trying such a route first would take the
+/// requests of a wider one.
+fn specificity(ep: &Entrypoint) -> (Rank, Rank, bool, std::cmp::Reverse<usize>) {
+    let header_predicates = ep
+        .config
+        .match_headers
+        .iter()
+        .filter(|condition| header_predicate(condition).is_some())
+        .count();
     (
-        host_specificity(&a.config.hostnames),
-        path_specificity(a.config.path.as_ref()),
-    ) < (
-        host_specificity(&b.config.hostnames),
-        path_specificity(b.config.path.as_ref()),
+        host_specificity(&ep.config.hostnames),
+        path_specificity(ep.config.path.as_ref()),
+        ep.config.methods.is_empty(),
+        std::cmp::Reverse(header_predicates),
     )
 }
 
@@ -1455,7 +1467,7 @@ pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
 /// name, then a regex, then a wildcard (the longer, the more specific), then
 /// any host (`*`, or no hostname at all). A route is as specific as its most
 /// specific hostname.
-fn host_specificity(hostnames: &[String]) -> (u8, std::cmp::Reverse<usize>) {
+fn host_specificity(hostnames: &[String]) -> Rank {
     hostnames
         .iter()
         .map(|h| {
@@ -1478,7 +1490,7 @@ fn host_specificity(hostnames: &[String]) -> (u8, std::cmp::Reverse<usize>) {
 /// then a prefix, the longer first. A regex counts as the literal prefix it
 /// starts with: its length says nothing of the paths it matches. No path is
 /// the `/` prefix.
-fn path_specificity(path: Option<&crate::model::PathConfig>) -> (u8, std::cmp::Reverse<usize>) {
+fn path_specificity(path: Option<&crate::model::PathConfig>) -> Rank {
     use crate::model::PathRuleType;
     match path {
         Some(p) if p.rule_type == PathRuleType::Exact => (0, std::cmp::Reverse(p.value.len())),
@@ -3821,6 +3833,57 @@ mod tests {
                 "g-regex",
                 "b-wildcard",
                 "a-any"
+            ]
+        );
+    }
+
+    /// On the same host and path, a route on methods goes first, then the
+    /// one with more header conditions Sōzu routes on. Query conditions and
+    /// headers left to the middleware do not count.
+    #[test]
+    fn methods_and_headers_break_ties_on_host_and_path() {
+        use crate::model::MatchCondition;
+        let condition = |key: &str, value: &str| MatchCondition {
+            key: key.into(),
+            value: value.into(),
+        };
+        let route = |id: &str, methods: &[&str], headers: Vec<MatchCondition>, query: usize| {
+            let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+            ep.id = id.into();
+            ep.config.hostnames = vec!["app.example.com".into()];
+            ep.config.methods = methods.iter().map(|m| m.to_string()).collect();
+            ep.config.match_headers = headers;
+            ep.config.match_query = (0..query)
+                .map(|i| condition(&format!("q{i}"), "1"))
+                .collect();
+            (id.to_string(), ep)
+        };
+        let storage: BTreeMap<String, Entrypoint> = [
+            route("a-plain", &[], Vec::new(), 2),
+            route("b-one-header", &[], vec![condition("Version", "two")], 0),
+            route(
+                "c-two-headers",
+                &[],
+                vec![condition("Version", "two"), condition("Color", "orange")],
+                0,
+            ),
+            route("d-cookie", &[], vec![condition("Cookie", "beta=1")], 0),
+            route("e-method", &["GET"], Vec::new(), 0),
+        ]
+        .into_iter()
+        .collect();
+        let order: Vec<&str> = routing_order(&storage)
+            .into_iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "e-method",
+                "c-two-headers",
+                "b-one-header",
+                "a-plain",
+                "d-cookie"
             ]
         );
     }

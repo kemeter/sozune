@@ -580,7 +580,7 @@ fn shadowed_reason(winner: &Entrypoint, loser: &Entrypoint) -> String {
     } else if crate::proxy::sozu::more_specific(winner, loser) {
         format!(
             "matches too, but `{}` has the same priority ({}) and a more specific \
-             hostname or path, which Sōzune tries first",
+             hostname, path, method or headers, which Sōzune tries first",
             winner.name, winner.config.priority
         )
     } else {
