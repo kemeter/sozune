@@ -199,6 +199,13 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let (cert_tx, cert_rx) = mpsc::channel(64);
 
     let cert_tx_manual = cert_tx.clone();
+    let cert_tx_providers = cert_tx.clone();
+    // Fingerprints of the certificates from files, which Gateway Secrets
+    // never replace or take back.
+    let file_fingerprints: std::collections::HashSet<String> = manual_certs
+        .iter()
+        .filter_map(|c| acme::certificate_fingerprint(&c.cert_pem).ok())
+        .collect();
     tokio::spawn(async move {
         for cert in manual_certs {
             if cert_tx_manual.send(cert.to_command()).await.is_err() {
@@ -329,6 +336,8 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 acme_notify_providers,
                 diagnostics_providers,
                 unopened_gateway_ports,
+                cert_tx_providers,
+                file_fingerprints,
             )
             .await
         }

@@ -40,6 +40,7 @@ impl ManualCertificate {
             key_pem: self.key_pem.clone(),
             chain: self.chain.clone(),
             accepted: None,
+            action: crate::acme::CertAction::Add,
         }
     }
 }
@@ -77,7 +78,7 @@ fn read(path: &str, field: &str) -> anyhow::Result<String> {
 
 /// Check that the certificate parses, is not expired, names at least one host
 /// and matches the key. Returns the names it covers.
-fn check(cert_chain_pem: &str, key_pem: &str) -> anyhow::Result<Vec<String>> {
+pub(crate) fn check(cert_chain_pem: &str, key_pem: &str) -> anyhow::Result<Vec<String>> {
     let life = cheti::cert_lifetime(cert_chain_pem)
         .map_err(|e| anyhow::anyhow!("cannot parse the certificate: {e}"))?;
 

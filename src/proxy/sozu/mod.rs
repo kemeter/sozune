@@ -5,6 +5,7 @@ mod channel;
 mod gateway_listeners;
 mod worker;
 
+use crate::acme::{CertAction, CertCommand};
 use crate::config::{ProxyConfig, ProxyTimeouts, TcpRateLimit};
 use crate::middleware::ip_allow_list::IpAllowList;
 use crate::middleware::rate_limit::{RateLimitResult, RateLimiter};
@@ -14,7 +15,9 @@ use crate::proxy::backend::ProxyInputs;
 use crate::proxy::health::{UnhealthyMap, probe_key};
 use crate::proxy::metrics_snapshot;
 use crate::proxy::tls_alpn_gate;
-use acme::{add_certificate, register_acme_challenge_cluster};
+use acme::{
+    add_certificate, register_acme_challenge_cluster, remove_certificate, replace_certificate,
+};
 use addr::{l4_backend_id, parse_backend_address};
 pub(crate) use builders::header_predicate;
 use builders::{
@@ -193,6 +196,10 @@ struct Channels {
     /// The TCP and UDP listeners opened for Gateways, whose workers are in
     /// `tcp` and `udp` alongside the declared ones.
     gateway: GatewayListeners,
+    /// How many senders added each certificate the HTTPS worker holds, by
+    /// fingerprint. The worker keeps one copy however many add it, so it is
+    /// only taken back when the last of them removes it.
+    certificate_holders: HashMap<String, usize>,
 }
 
 impl Channels {
@@ -766,6 +773,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
             WorkerSettings::from_config(config),
             unopened_gateway_ports,
         ),
+        certificate_holders: HashMap::new(),
     };
 
     let reload_handle = thread::spawn(move || {
@@ -802,29 +810,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     },
                     cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                         Some(cmd) => {
-                            info!("Adding certificate for {}", cmd.names.join(", "));
-                            let https_addr = channels.https_addr();
-                            let added = add_certificate(
-                                &mut channels.https,
-                                https_addr,
-                                &cmd.cert_pem,
-                                &cmd.chain,
-                                &cmd.key_pem,
-                                &cmd.names,
-                            );
-
-                            // The sender wrote the certificate to disk before
-                            // handing it over, so only this answer tells it
-                            // whether the hostname can actually serve TLS.
-                            if let Some(accepted) = cmd.accepted {
-                                let _ = accepted.send(added.is_ok());
-                            }
-
-                            if let Err(e) = added {
-                                error!(
-                                    "Failed to add certificate for {}: {}",
-                                    cmd.names.join(", "), e
-                                );
+                            if !apply_certificate(&mut channels, cmd) {
                                 continue 'outer;
                             }
                         }
@@ -912,21 +898,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                             },
                             cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                                 Some(cmd) => {
-                                    info!("Adding certificate for {}", cmd.names.join(", "));
-                                    let https_addr = channels.https_addr();
-                                    if let Err(e) = add_certificate(
-                                        &mut channels.https,
-                                        https_addr,
-                                        &cmd.cert_pem,
-                                        &cmd.chain,
-                                        &cmd.key_pem,
-                                        &cmd.names,
-                                    ) {
-                                        error!(
-                                            "Failed to add certificate for {}: {}",
-                                            cmd.names.join(", "), e
-                                        );
-                                    }
+                                    apply_certificate(&mut channels, cmd);
                                     deadline = tokio::time::Instant::now() + reload_debounce;
                                 }
                                 None => {
@@ -994,6 +966,93 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
 
     info!("All Sōzu workers stopped gracefully");
     Ok(())
+}
+
+/// Hand a certificate to the HTTPS worker, or take one back. Returns whether
+/// the worker did it.
+fn apply_certificate(channels: &mut Channels, cmd: CertCommand) -> bool {
+    let https_addr = channels.https_addr();
+    let names = cmd.names.join(", ");
+    let applied = match cmd.action {
+        CertAction::Add => {
+            info!("Adding certificate for {}", names);
+            add_certificate(
+                &mut channels.https,
+                https_addr,
+                &cmd.cert_pem,
+                &cmd.chain,
+                &cmd.key_pem,
+                &cmd.names,
+            )
+        }
+        CertAction::Replace => {
+            info!("Replacing certificate for {}", names);
+            replace_certificate(
+                &mut channels.https,
+                https_addr,
+                &cmd.cert_pem,
+                &cmd.chain,
+                &cmd.key_pem,
+                &cmd.names,
+            )
+        }
+        CertAction::Remove => {
+            let fingerprint = crate::acme::certificate_fingerprint(&cmd.cert_pem).ok();
+            if fingerprint
+                .as_deref()
+                .is_some_and(|f| !release_certificate(&mut channels.certificate_holders, f))
+            {
+                debug!("Certificate for {} is still added by another sender", names);
+                Ok(())
+            } else {
+                info!("Removing certificate for {}", names);
+                let removed = remove_certificate(&mut channels.https, https_addr, &cmd.cert_pem);
+                // Its last holder lets go once the worker dropped it: a
+                // removal retried after a failure must still find it held.
+                if removed.is_ok()
+                    && let Some(fingerprint) = &fingerprint
+                {
+                    channels.certificate_holders.remove(fingerprint);
+                }
+                removed
+            }
+        }
+    };
+    if applied.is_ok()
+        && cmd.action == CertAction::Add
+        && let Ok(fingerprint) = crate::acme::certificate_fingerprint(&cmd.cert_pem)
+    {
+        *channels.certificate_holders.entry(fingerprint).or_default() += 1;
+    }
+
+    // The sender wrote the certificate to disk before handing it over, so
+    // only this answer tells it whether the hostname can actually serve TLS.
+    if let Some(accepted) = cmd.accepted {
+        let _ = accepted.send(applied.is_ok());
+    }
+    if let Err(e) = &applied {
+        let action = match cmd.action {
+            CertAction::Add => "add",
+            CertAction::Replace => "replace",
+            CertAction::Remove => "remove",
+        };
+        error!("Failed to {} certificate for {}: {}", action, names, e);
+    }
+    applied.is_ok()
+}
+
+/// Count one sender fewer for the certificate `fingerprint`, unless it is
+/// the last one. Returns whether it is, so the worker should drop it — also
+/// when none was counted. The last holder stays counted until the worker
+/// confirms.
+fn release_certificate(holders: &mut HashMap<String, usize>, fingerprint: &str) -> bool {
+    match holders.get_mut(fingerprint) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        _ => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3612,6 +3671,18 @@ mod tests {
     fn tcp_idle_timeout_zero_is_refused() {
         let err = tcp_listener_with_idle_timeout(Some(0)).unwrap_err();
         assert!(err.to_string().contains("greater than zero"), "{err}");
+    }
+
+    /// A certificate two senders added stays until both removed it.
+    #[test]
+    fn a_certificate_is_dropped_by_its_last_holder() {
+        let mut holders = HashMap::from([("ab".to_string(), 2)]);
+        assert!(!release_certificate(&mut holders, "ab"));
+        assert!(release_certificate(&mut holders, "ab"));
+        // Still counted until the worker confirms the removal.
+        assert_eq!(holders.get("ab"), Some(&1));
+        // One no sender was counted for is dropped.
+        assert!(release_certificate(&mut holders, "cd"));
     }
 
     /// A declared listener cannot take the name of one a Gateway opens, or a
