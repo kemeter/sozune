@@ -1,0 +1,105 @@
+# Sōzune for the Gateway API conformance suite: hostNetwork, so the suite
+# reaches it on the kind node's address, which it publishes in the status of
+# its Gateways (__NODE_IP__ is filled in by run.sh).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sozune-conformance
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sozune
+  namespace: sozune-conformance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sozune-conformance
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "services", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - httproutes/status
+      - gateways/status
+      - gatewayclasses/status
+    verbs: ["update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sozune-conformance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sozune-conformance
+subjects:
+  - kind: ServiceAccount
+    name: sozune
+    namespace: sozune-conformance
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sozune-config
+  namespace: sozune-conformance
+data:
+  config.yaml: |
+    providers:
+      kubernetes:
+        enabled: true
+        publish_addresses: ["__NODE_IP__"]
+    api:
+      enabled: false
+    proxy:
+      http:
+        listen_address: 80
+      https:
+        listen_address: 443
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sozune
+  namespace: sozune-conformance
+  labels:
+    app: sozune
+spec:
+  serviceAccountName: sozune
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+    - name: sozune
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: CONFIG_PATH
+          value: /etc/sozune/config.yaml
+        - name: RUST_LOG
+          value: __LOG__
+      volumeMounts:
+        - name: config
+          mountPath: /etc/sozune/config.yaml
+          subPath: config.yaml
+  volumes:
+    - name: config
+      configMap:
+        name: sozune-config
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: sozune
+spec:
+  controllerName: kemeter.io/sozune
