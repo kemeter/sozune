@@ -1,0 +1,8 @@
+Sōzune is running as {{ include "sozune.fullname" . }} in {{ .Release.Namespace }}.
+
+Ingresses with `ingressClassName: {{ .Values.ingressClass.name }}` are served
+{{- if .Values.gatewayClass.create }}, and so are the Gateways of the
+`{{ .Values.gatewayClass.name }}` GatewayClass{{ end }}.
+
+Its address:
+  kubectl get service {{ include "sozune.fullname" . }} -n {{ .Release.Namespace }}
