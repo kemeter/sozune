@@ -38,6 +38,17 @@ const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 /// stale endpoints across events.
 type EndpointsCache = Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>;
 
+/// The ports of each Service, by `namespace/name`, and of its EndpointSlices:
+/// what turns a Service port into the port its pods listen on.
+#[derive(Default)]
+struct PortsCache {
+    /// Each Service's ports, as `(port, name, protocol)`.
+    services: HashMap<String, Vec<(i32, String, String)>>,
+    /// Each EndpointSlice's ports by Service then slice, as `(name, port)`:
+    /// a Service port's `targetPort`, resolved, under the same name.
+    slices: HashMap<String, HashMap<String, Vec<(String, i32)>>>,
+}
+
 /// Maps `namespace/ingress` → set of entrypoint keys it owns. Lets us remove
 /// only the entrypoints belonging to a deleted/updated Ingress without
 /// touching what other Ingresses or annotated Services produced.
@@ -58,6 +69,7 @@ pub struct KubernetesProvider {
     config: KubernetesConfig,
     name: &'static str,
     endpoints: EndpointsCache,
+    ports: Arc<RwLock<PortsCache>>,
     ingress_keys: IngressOwnership,
     /// Where an Ingress's `spec.tls[].secretName` goes: the scope serving
     /// the Secrets' certificates, and the hostnames ACME must leave alone.
@@ -137,6 +149,7 @@ impl KubernetesProvider {
             config,
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
+            ports: Arc::new(RwLock::new(PortsCache::default())),
             ingress_keys: Arc::new(RwLock::new(HashMap::new())),
             tls_secrets: None,
         })
@@ -287,6 +300,103 @@ impl KubernetesProvider {
     /// across every EndpointSlice attached to that service. IPs are
     /// deduplicated to avoid double-listing if two slices overlap (rare but
     /// permitted by the API).
+    /// The ready pods of Service `svc_id` behind its `protocol` port `port`,
+    /// each with the port it listens on: its `targetPort`, as its
+    /// EndpointSlice gives it under the port's name. `port` itself when the
+    /// Service or the slice does not say.
+    pub fn pod_addresses_for(&self, svc_id: &str, port: u16, protocol: &str) -> Vec<(String, u16)> {
+        let name = self.ports.read().ok().and_then(|cache| {
+            cache
+                .services
+                .get(svc_id)?
+                .iter()
+                .find(|(p, _, proto)| *p == i32::from(port) && proto.eq_ignore_ascii_case(protocol))
+                .map(|(_, name, _)| name.clone())
+        });
+        self.addresses(svc_id, name.as_deref(), port)
+    }
+
+    /// The ready pods of Service `svc_id` behind its port named `name`, each
+    /// with the port it listens on. Empty when no slice names that port.
+    pub fn pod_addresses_named(&self, svc_id: &str, name: &str) -> Vec<(String, u16)> {
+        self.addresses(svc_id, Some(name), 0)
+            .into_iter()
+            .filter(|(_, port)| *port != 0)
+            .collect()
+    }
+
+    /// Each ready pod of `svc_id` with the port its EndpointSlice gives the
+    /// port named `name`, or `fallback`. Ports are read per slice: pods
+    /// exposing a named `targetPort` on different numbers land in different
+    /// slices.
+    fn addresses(&self, svc_id: &str, name: Option<&str>, fallback: u16) -> Vec<(String, u16)> {
+        let (Ok(endpoints), Ok(ports)) = (self.endpoints.read(), self.ports.read()) else {
+            return Vec::new();
+        };
+        let Some(slices) = endpoints.get(svc_id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, u16)> = Vec::new();
+        for (slice, ips) in slices {
+            let listed = ports.slices.get(svc_id).and_then(|s| s.get(slice));
+            let port = match (name, listed) {
+                // A slice listing its ports without this one does not serve
+                // it: its pods are left out rather than sent to another port.
+                (Some(name), Some(listed)) if !listed.is_empty() => {
+                    match listed
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .and_then(|(_, p)| u16::try_from(*p).ok())
+                    {
+                        Some(port) => port,
+                        None => continue,
+                    }
+                }
+                _ => fallback,
+            };
+            for ip in ips {
+                if !out.iter().any(|(a, p)| a == ip && *p == port) {
+                    out.push((ip.clone(), port));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Record the ports of a Service, or forget them once it is gone.
+    /// Returns whether they changed.
+    fn record_service_ports(&self, svc: &Service, present: bool) -> bool {
+        let (Some(ns), Some(name)) = (
+            svc.metadata.namespace.as_deref(),
+            svc.metadata.name.as_deref(),
+        ) else {
+            return false;
+        };
+        let svc_id = format!("{ns}/{name}");
+        if let Ok(mut cache) = self.ports.write() {
+            if present {
+                let ports: Vec<(i32, String, String)> = svc
+                    .spec
+                    .iter()
+                    .flat_map(|s| s.ports.iter().flatten())
+                    .map(|p| {
+                        (
+                            p.port,
+                            p.name.clone().unwrap_or_default(),
+                            p.protocol.clone().unwrap_or_else(|| "TCP".to_string()),
+                        )
+                    })
+                    .collect();
+                cache.services.insert(svc_id, ports.clone()) != Some(ports)
+            } else {
+                cache.services.remove(&svc_id).is_some()
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn pod_ips_for(&self, svc_id: &str) -> Vec<String> {
         let Ok(cache) = self.endpoints.read() else {
             return Vec::new();
@@ -438,10 +548,29 @@ impl KubernetesProvider {
             diagnostics: &diagnostics,
         };
 
+        // Whether a relist changed some Service's ports: the Ingresses are
+        // then applied again once, when it is done, rather than per Service.
+        let mut relist_changed_ports = false;
         while let Some(event) = stream.next().await {
             match event {
-                Ok(Event::Apply(svc)) | Ok(Event::InitApply(svc)) => {
+                Ok(Event::InitApply(svc)) => {
+                    relist_changed_ports |= self.record_service_ports(&svc, true);
                     self.upsert_service(&svc, &ctx).await;
+                }
+                Ok(Event::Apply(svc)) => {
+                    let ports_changed = self.record_service_ports(&svc, true);
+                    self.upsert_service(&svc, &ctx).await;
+                    // Ingresses built before the Service's ports were known
+                    // sent their traffic to the Service port.
+                    if ports_changed
+                        && let (Some(ns), Some(name)) = (
+                            svc.metadata.namespace.as_deref(),
+                            svc.metadata.name.as_deref(),
+                        )
+                    {
+                        self.refresh_ingresses_for_service(&client, ns, name, &ctx)
+                            .await;
+                    }
                 }
                 Ok(Event::Delete(svc)) => {
                     self.remove_service(&svc, &ctx).await;
@@ -451,6 +580,9 @@ impl KubernetesProvider {
                 }
                 Ok(Event::InitDone) => {
                     debug!("Service watcher initial sync complete");
+                    if std::mem::take(&mut relist_changed_ports) {
+                        self.refresh_all_ingresses(&client, &ctx).await;
+                    }
                 }
                 Err(e) => {
                     error!("Service watcher error: {}", e);
@@ -530,6 +662,20 @@ impl KubernetesProvider {
 
         let slice_name = slice.metadata.name.as_deref()?.to_string();
 
+        if let Ok(mut ports) = self.ports.write() {
+            let slice_ports = slice
+                .ports
+                .iter()
+                .flatten()
+                .filter_map(|p| Some((p.name.clone().unwrap_or_default(), p.port?)))
+                .collect();
+            ports
+                .slices
+                .entry(svc_id.clone())
+                .or_default()
+                .insert(slice_name.clone(), slice_ports);
+        }
+
         let mut cache = match self.endpoints.write() {
             Ok(guard) => guard,
             Err(e) => {
@@ -593,6 +739,14 @@ impl KubernetesProvider {
                 cache.remove(&svc_id);
             }
         }
+        if let Ok(mut ports) = self.ports.write()
+            && let Some(slices) = ports.slices.get_mut(&svc_id)
+        {
+            slices.remove(slice_name);
+            if slices.is_empty() {
+                ports.slices.remove(&svc_id);
+            }
+        }
 
         Some(svc_id)
     }
@@ -653,6 +807,19 @@ impl KubernetesProvider {
                 continue;
             }
             self.apply_ingress(&ing, ctx).await;
+        }
+    }
+
+    /// Apply every Ingress again, with one list.
+    async fn refresh_all_ingresses(&self, client: &Client, ctx: &WatchCtx<'_>) {
+        let api: Api<Ingress> = self.scoped_api(client);
+        match api.list(&ListParams::default()).await {
+            Ok(list) => {
+                for ing in list.items {
+                    self.apply_ingress(&ing, ctx).await;
+                }
+            }
+            Err(e) => debug!("Failed to list ingresses after the Service sync: {}", e),
         }
     }
 
@@ -730,6 +897,7 @@ impl KubernetesProvider {
     }
 
     async fn remove_service(&self, svc: &Service, ctx: &WatchCtx<'_>) {
+        self.record_service_ports(svc, false);
         let Some(candidate) = self.service_to_candidate(svc) else {
             return;
         };
@@ -1086,23 +1254,26 @@ impl IngressParseCtx<'_> {
         tls: bool,
     ) -> Option<(String, Entrypoint)> {
         let svc_ref = backend.service.as_ref()?;
-        let port = match svc_ref.port.as_ref() {
-            Some(p) => p.number.unwrap_or(80) as u16,
-            None => 80,
-        };
         let svc_id = format!("{}/{}", self.namespace, svc_ref.name);
-
-        let pod_ips = self.provider.pod_ips_for(&svc_id);
-        let backends: Vec<Backend> = if pod_ips.is_empty() {
+        // The ready pods behind the Service port, by number or by name, each
+        // on the port it listens on (the Service's `targetPort`).
+        let pods = match svc_ref.port.as_ref().map(|p| (p.number, p.name.as_deref())) {
+            Some((Some(number), _)) => {
+                self.provider
+                    .pod_addresses_for(&svc_id, u16::try_from(number).ok()?, "TCP")
+            }
+            Some((None, Some(name))) => self.provider.pod_addresses_named(&svc_id, name),
+            _ => self.provider.pod_addresses_for(&svc_id, 80, "TCP"),
+        };
+        let backends: Vec<Backend> = if pods.is_empty() {
             warn!(
                 "Ingress {} references service {} but no ready endpoints are known yet",
                 self.ing_id, svc_id
             );
             Vec::new()
         } else {
-            pod_ips
-                .into_iter()
-                .map(|ip| Backend::new(ip, port))
+            pods.into_iter()
+                .map(|(ip, port)| Backend::new(ip, port))
                 .collect()
         };
 
@@ -1235,6 +1406,7 @@ mod tests {
             },
             name: PROVIDER_NAME,
             endpoints: Arc::new(RwLock::new(HashMap::new())),
+            ports: Arc::new(RwLock::new(PortsCache::default())),
             ingress_keys: Arc::new(RwLock::new(HashMap::new())),
             tls_secrets: None,
             published: Arc::new(RwLock::new(None)),
@@ -1297,6 +1469,103 @@ mod tests {
                 .collect(),
             ports: None,
         }
+    }
+
+    /// A Service port leads each pod to the port it listens on, through the
+    /// name its EndpointSlice gives it, by number and protocol or by name,
+    /// slice by slice.
+    #[test]
+    fn a_service_port_resolves_to_each_pod_target_port() {
+        use k8s_openapi::api::core::v1::ServicePort;
+        use k8s_openapi::api::discovery::v1::EndpointPort;
+
+        let provider = make_provider(false);
+        let mut svc = make_service("web", "default", &[], Some("10.96.0.1"));
+        svc.spec.as_mut().unwrap().ports = Some(vec![
+            ServicePort {
+                name: Some("http".into()),
+                port: 8080,
+                ..Default::default()
+            },
+            ServicePort {
+                name: Some("dns".into()),
+                port: 8080,
+                protocol: Some("UDP".into()),
+                ..Default::default()
+            },
+        ]);
+        let slice = |name: &str, ip: &str, http: i32| {
+            let mut slice = make_slice(name, "default", "web", vec![(vec![ip], Some(true))]);
+            slice.ports = Some(vec![
+                EndpointPort {
+                    name: Some("http".into()),
+                    port: Some(http),
+                    ..Default::default()
+                },
+                EndpointPort {
+                    name: Some("dns".into()),
+                    port: Some(5353),
+                    protocol: Some("UDP".into()),
+                    ..Default::default()
+                },
+            ]);
+            slice
+        };
+        provider.apply_slice(&slice("web-a", "10.0.0.5", 3000));
+        // The Service not seen yet: the Service port itself.
+        assert_eq!(
+            provider.pod_addresses_for("default/web", 8080, "TCP"),
+            [("10.0.0.5".to_string(), 8080)]
+        );
+
+        provider.record_service_ports(&svc, true);
+        // A named targetPort can stand for another number on other pods.
+        provider.apply_slice(&slice("web-b", "10.0.0.6", 3001));
+        assert_eq!(
+            provider.pod_addresses_for("default/web", 8080, "TCP"),
+            [
+                ("10.0.0.5".to_string(), 3000),
+                ("10.0.0.6".to_string(), 3001)
+            ]
+        );
+        assert_eq!(
+            provider.pod_addresses_for("default/web", 8080, "UDP"),
+            [
+                ("10.0.0.5".to_string(), 5353),
+                ("10.0.0.6".to_string(), 5353)
+            ]
+        );
+        assert_eq!(
+            provider.pod_addresses_named("default/web", "http"),
+            [
+                ("10.0.0.5".to_string(), 3000),
+                ("10.0.0.6".to_string(), 3001)
+            ]
+        );
+        assert!(
+            provider
+                .pod_addresses_named("default/web", "nope")
+                .is_empty()
+        );
+        // A slice that does not list the port serves none of its pods on it.
+        let mut other = make_slice(
+            "web-c",
+            "default",
+            "web",
+            vec![(vec!["10.0.0.7"], Some(true))],
+        );
+        other.ports = Some(vec![EndpointPort {
+            name: Some("metrics".into()),
+            port: Some(9100),
+            ..Default::default()
+        }]);
+        provider.apply_slice(&other);
+        assert!(
+            !provider
+                .pod_addresses_for("default/web", 8080, "TCP")
+                .iter()
+                .any(|(ip, _)| ip == "10.0.0.7")
+        );
     }
 
     #[test]

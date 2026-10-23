@@ -577,6 +577,12 @@ fn shadowed_reason(winner: &Entrypoint, loser: &Entrypoint) -> String {
             "matches too, but `{}` has a higher priority ({} > {})",
             winner.name, winner.config.priority, loser.config.priority
         )
+    } else if crate::proxy::sozu::more_specific(winner, loser) {
+        format!(
+            "matches too, but `{}` has the same priority ({}) and a more specific \
+             hostname or path, which Sōzune tries first",
+            winner.name, winner.config.priority
+        )
     } else {
         format!(
             "matches too, but `{}` has the same priority ({}) and comes first by id; \
@@ -1007,12 +1013,11 @@ mod tests {
         assert!(resolution.candidates[0].reason.contains("higher priority"));
     }
 
-    /// Sōzu tries routes of equal priority by id, first match wins: a `/`
-    /// route sorting first captures `/api/...` from an `/api` route of the
-    /// same priority. The answer must say so rather than pretend one was
-    /// preferred on purpose.
+    /// At equal priority the more specific route is tried first: an `/api`
+    /// route serves `/api/...` over a `/` route sorting first by id, and the
+    /// answer says why.
     #[tokio::test]
-    async fn at_equal_priority_the_first_id_wins_even_over_a_longer_path() {
+    async fn at_equal_priority_the_longer_path_wins() {
         let resolution = resolve_in(
             vec![
                 route("a-web", &["app.example.com"], serde_json::json!({})),
@@ -1026,9 +1031,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(served_by(&resolution), Some("a-web"));
+        assert_eq!(served_by(&resolution), Some("b-api"));
         assert_eq!(resolution.candidates[0].verdict, Verdict::Shadowed);
-        assert!(resolution.candidates[0].reason.contains("same priority"));
+        assert!(resolution.candidates[0].reason.contains("more specific"));
     }
 
     /// Two routes claiming the same host, path and method: Sōzu refuses the

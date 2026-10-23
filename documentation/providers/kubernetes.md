@@ -375,7 +375,7 @@ spec:
 - ACME never orders a certificate for a Gateway route: its certificate comes from the Secret.
 - Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). It only watches those of type `kubernetes.io/tls`.
 
-A listener whose certificateRefs cannot be used says so in its status (see [Status conditions](#status-conditions)): `ResolvedRefs=False` with `InvalidCertificateRef` for a missing Secret, one of another type or kind, or one whose certificate is expired (checked every minute, so a certificate expiring unrenewed is caught), does not match its key or does not cover the listener's `hostname`, and `RefNotPermitted` for a Secret in another namespace that no `ReferenceGrant` opens to the Gateway. The references that resolve are still served. A listener left with no usable certificate serves no route over HTTPS, and redirects none there: its routes come back once a Secret it names is fixed.
+A listener whose certificateRefs cannot be used says so in its status (see [Status conditions](#status-conditions)): `ResolvedRefs=False` with `InvalidCertificateRef` for a missing Secret, one of another type or kind, or one whose certificate is expired (checked every minute, so a certificate expiring unrenewed is caught) or does not match its key, and `RefNotPermitted` for a Secret in another namespace that no `ReferenceGrant` opens to the Gateway. The references that resolve are still served. A listener left with no usable certificate serves no route over HTTPS, and redirects none there: its routes come back once a Secret it names is fixed.
 
 Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
 
@@ -383,7 +383,8 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 - Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
-- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix).
+- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). A route with none, on a listener with none, serves every host, after the routes naming theirs.
+- `backendRef.port` — the Service port; requests go to the port its pods listen on (its `targetPort`), as its EndpointSlices give it.
 - `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
 - Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
