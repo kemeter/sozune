@@ -105,7 +105,38 @@ spec:
 - `spec.tls[].hosts` enables HTTPS termination for those hostnames. With a `secretName`, they are served with the certificate of that `kubernetes.io/tls` Secret in the Ingress's namespace — the one cert-manager writes, for instance — picked up live when it is renewed, and ACME orders nothing for them. Without one, ACME provisions their certificate. A Secret that is missing or unusable (expired, key not matching) leaves those hostnames without a certificate: their handshakes fail, and ACME does not step in. Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). An ACME wildcard declared in a resolver's `domains` still covers such a hostname: Sōzu then presents whichever of the two certificates expires later.
 - `spec.defaultBackend` is supported as a catch-all entrypoint with no host filter.
 - Backend Services must live in the **same namespace** as the Ingress (Kubernetes spec).
-- Ingresses cannot express middleware (auth, rate-limit, headers, compression…). Use Service annotations when you need those.
+- Middleware (auth, rate limit, headers, compression…) goes in `sozune.*` annotations on the Ingress: see below.
+
+### Ingress annotations
+
+The `Ingress` API has no field for middleware, so its annotations carry it. They take the keys of a [Service annotation](#service-annotations) without the `http.<service>` part — `sozune.http.<service>.auth.basic` becomes `sozune.auth.basic` — and apply to every route of the Ingress:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    sozune.auth.basic: "admin:$2y$05$..."
+    sozune.ratelimit.average: "20"
+    sozune.headers.response.X-Frame-Options: DENY
+    sozune.compress: "true"
+spec:
+  ingressClassName: sozune
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+```
+
+The route itself comes from the spec: `sozune.host`, `port`, `path`, `prefix`, `pathRegex`, `tls`, `entrypoint`, `sni` and `weight` are ignored with a `W013` warning. An unknown or malformed annotation is reported like a label, under its own name, in `GET /diagnostics`.
 
 ### Ingress status
 
@@ -740,7 +771,6 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **Multi-cluster.** A single Sōzune instance watches a single API server. Run one Sōzune per cluster.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
-- **Ingress middleware not supported.** The `Ingress` API has no portable way to express auth, rate-limit, or headers. Use Service annotations when you need middleware.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
 - **Gateway API: `GRPCRoute` and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
 - **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what [`HTTPS` listeners](#https-listeners) are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).

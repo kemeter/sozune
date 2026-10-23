@@ -2,6 +2,7 @@ pub mod gateway;
 pub mod gateway_filters;
 pub mod gateway_matches;
 pub mod gateway_tls;
+mod ingress_annotations;
 mod ingress_status;
 
 use crate::config::KubernetesConfig;
@@ -836,7 +837,16 @@ impl KubernetesProvider {
         }
 
         let secret_hosts_changed = self.record_ingress_secrets(&ing_id, Some(ing));
-        let new_entries = self.ingress_to_entrypoints(ing);
+        let mut new_entries = self.ingress_to_entrypoints(ing);
+        // Middleware from the `sozune.*` annotations, on every route.
+        let candidate_id = format!("ingress:{ing_id}");
+        let (settings, diags) = ingress_annotations::ingress_settings(ing, &candidate_id);
+        crate::diagnostics::set(ctx.diagnostics, &candidate_id, diags);
+        if let Some(settings) = settings {
+            for (_, entrypoint) in &mut new_entries {
+                ingress_annotations::apply_settings(entrypoint, &settings);
+            }
+        }
         let new_keys: HashSet<String> = new_entries.iter().map(|(k, _)| k.clone()).collect();
 
         let old_keys = self
@@ -922,6 +932,7 @@ impl KubernetesProvider {
         if self.record_ingress_secrets(&ing_id, None) {
             ctx.acme_notify.notify_one();
         }
+        crate::diagnostics::remove(ctx.diagnostics, &format!("ingress:{ing_id}"));
         let keys = match self.ingress_keys.write() {
             Ok(mut owned) => owned.remove(&ing_id).unwrap_or_default(),
             Err(e) => {
