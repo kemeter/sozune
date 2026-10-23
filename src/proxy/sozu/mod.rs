@@ -1801,6 +1801,7 @@ pub(crate) fn build_http_frontends(
                 name: middleware::ROUTE_HEADER.to_string(),
                 value: cluster_id.to_string(),
                 direction: HeaderDirection::Request,
+                append: false,
             }]));
         }
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
@@ -4651,11 +4652,13 @@ mod tests {
                 name: "Sozune-Route".into(),
                 value: "other".into(),
                 direction: HeaderDirection::Request,
+                append: false,
             },
             HeaderConfig {
                 name: "Sozune-Route".into(),
                 value: "shown".into(),
                 direction: HeaderDirection::Both,
+                append: false,
             },
         ];
         let fronts =
@@ -4684,6 +4687,7 @@ mod tests {
             name: "X-Foo".into(),
             value: "bar".into(),
             direction: HeaderDirection::Request,
+            append: false,
         }];
         assert!(!frontend_unchanged(&old, &new));
     }

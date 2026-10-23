@@ -507,7 +507,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 | Filter | Supported | Notes |
 |---|---|---|
 | `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` and `302` are dropped (see below) |
-| `requestHeaderModifier` | Yes | `set`/`remove` map directly; `add` is applied as `set` (see below) |
+| `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
 | `requestMirror` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
@@ -605,7 +605,9 @@ rules:
 |---|---|---|
 | `set` | header set | overwrites the header with the given value |
 | `remove` | header delete | maps to an empty-value frontend edit, which deletes the header |
-| `add` | header set | **caveat**: Sōzu has no frontend append-without-replace, so `add` is applied as `set` (existing values are replaced, not appended) and a `WARN` is logged. The route is **not** dropped — set-semantics is what most `add` users want |
+| `add` | header append | adds the value next to the header's existing ones, which the backend reads as `existing,added` |
+
+A `set` or `add` with an empty value cannot be represented — Sōzu reads an empty value as a delete — so it drops the route (`Accepted=False reason=UnsupportedValue`).
 
 ### How resolution works
 

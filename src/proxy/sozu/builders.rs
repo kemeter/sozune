@@ -30,7 +30,8 @@ pub(super) fn methods_for_frontend(methods: &[String]) -> Vec<Option<String>> {
 /// Sōzu appends a header edit next to any header of the same name and reads
 /// an empty value as a delete, applying every delete of a batch before any
 /// insert. A set is therefore sent as a delete followed by the new value, so
-/// the label value replaces what the client or backend sent.
+/// the label value replaces what the client or backend sent; an append is
+/// sent as the value alone.
 pub(super) fn build_frontend_headers(edits: &[HeaderConfig]) -> Vec<Header> {
     let mut headers = Vec::with_capacity(edits.len() * 2);
     for edit in edits {
@@ -39,11 +40,13 @@ pub(super) fn build_frontend_headers(edits: &[HeaderConfig]) -> Vec<Header> {
             HeaderDirection::Response => HeaderPosition::Response as i32,
             HeaderDirection::Both => HeaderPosition::Both as i32,
         };
-        headers.push(Header {
-            position,
-            key: edit.name.clone(),
-            val: String::new(),
-        });
+        if !edit.append || edit.value.is_empty() {
+            headers.push(Header {
+                position,
+                key: edit.name.clone(),
+                val: String::new(),
+            });
+        }
         if !edit.value.is_empty() {
             headers.push(Header {
                 position,
@@ -481,7 +484,19 @@ mod tests {
             name: name.into(),
             value: value.into(),
             direction,
+            append: false,
         }
+    }
+
+    #[test]
+    fn an_appended_header_keeps_the_existing_one() {
+        let built = build_frontend_headers(&[HeaderConfig {
+            append: true,
+            ..header("X-Foo", "bar", HeaderDirection::Request)
+        }]);
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].key, "X-Foo");
+        assert_eq!(built[0].val, "bar");
     }
 
     #[test]

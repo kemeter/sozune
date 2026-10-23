@@ -337,6 +337,10 @@ pub struct HeaderConfig {
     pub value: String,
     #[serde(default)]
     pub direction: HeaderDirection,
+    /// Add the value next to any header of the same name instead of
+    /// replacing it.
+    #[serde(default)]
+    pub append: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Default)]
