@@ -309,13 +309,10 @@ pub struct ScopeState {
     /// `sectionName`/`port`, and lets a listener's `hostname` narrow which
     /// route hostnames it serves.
     gateways: HashMap<(String, String), Vec<ListenerInfo>>,
-    /// Cross-namespace backendRef authorisations, keyed by
-    /// `(from_namespace, to_namespace)`: the namespace of the referencing
-    /// HTTPRoute and the namespace of the referenced Service. A pair is
-    /// present iff a `ReferenceGrant` in `to_namespace` permits an
-    /// `HTTPRoute` from `from_namespace` to reach a `Service`. Same-namespace
-    /// refs never need a grant and are not stored here.
-    reference_grants: HashSet<(String, String)>,
+    /// Cross-namespace backendRef authorisations: what each ReferenceGrant,
+    /// keyed by its namespace and name, lets routes reference among the
+    /// Services of its namespace. Same-namespace refs never need a grant.
+    reference_grants: HashMap<(String, String), ServiceGrant>,
     /// The last Gateway object seen for each accepted Gateway, so its status
     /// can be rewritten when the routes attached to it change.
     gateway_objects: HashMap<(String, String), Gateway>,
@@ -1563,7 +1560,7 @@ impl GatewayScope {
     /// when a `ReferenceGrant` in `to_ns` trusts `from_ns` — without one it
     /// is refused, per the Gateway API spec (a namespace must opt in to
     /// being referenced).
-    pub fn allows_backend_ref(&self, from_ns: &str, to_ns: &str) -> bool {
+    pub fn allows_backend_ref(&self, from_ns: &str, to_ns: &str, service: &str) -> bool {
         // Grants are keyed by `(from_ns, to_ns)`, not by route kind, so a grant
         // authorising e.g. HTTPRoute→Service also lets a TLSRoute/TCPRoute/
         // UDPRoute in the same namespace reach that target. This is slightly
@@ -1575,7 +1572,8 @@ impl GatewayScope {
         match self.state.read() {
             Ok(g) => g
                 .reference_grants
-                .contains(&(from_ns.to_string(), to_ns.to_string())),
+                .iter()
+                .any(|((ns, _), grant)| ns == to_ns && grant.allows(from_ns, service)),
             Err(e) => {
                 error!("Gateway API: scope lock poisoned: {}", e);
                 // Fail closed: a poisoned lock must not widen access.
@@ -1766,17 +1764,17 @@ impl GatewayScope {
                 return;
             }
         };
-        let pairs: HashSet<(String, String)> = kept
+        let grants: HashMap<(String, String), ServiceGrant> = kept
             .iter()
             .filter_map(|grant| {
-                let to_ns = grant.metadata.namespace.clone()?;
-                Some(
-                    trusted_route_from_namespaces(grant)
-                        .into_iter()
-                        .map(move |from| (from, to_ns.clone())),
-                )
+                Some((
+                    (
+                        grant.metadata.namespace.clone()?,
+                        grant.metadata.name.clone()?,
+                    ),
+                    ServiceGrant::of(grant)?,
+                ))
             })
-            .flatten()
             .collect();
         let keys: HashSet<(String, String)> = kept
             .iter()
@@ -1789,8 +1787,8 @@ impl GatewayScope {
             .collect();
         let before = g.secret_grants.len();
         g.secret_grants.retain(|key, _| keys.contains(key));
-        let changed = g.reference_grants != pairs || g.secret_grants.len() != before;
-        g.reference_grants = pairs;
+        let changed = g.reference_grants != grants || g.secret_grants.len() != before;
+        g.reference_grants = grants;
         if changed {
             for gateway in g.gateway_objects.values() {
                 queue_status_write(
@@ -1809,12 +1807,14 @@ impl GatewayScope {
     /// `Service`; every such `from.namespace` is authorised to reference
     /// this grant's namespace. Returns true iff the authorised set changed.
     pub fn upsert_reference_grant(&self, grant: &ReferenceGrant) -> bool {
-        let Some(to_ns) = grant.metadata.namespace.as_deref() else {
+        let (Some(ns), Some(name)) = (
+            grant.metadata.namespace.as_deref(),
+            grant.metadata.name.as_deref(),
+        ) else {
             return false;
         };
         self.update_secret_grant(grant, SecretGrant::of(grant));
-        let froms = trusted_route_from_namespaces(grant);
-
+        let key = (ns.to_string(), name.to_string());
         let mut g = match self.state.write() {
             Ok(g) => g,
             Err(e) => {
@@ -1822,48 +1822,25 @@ impl GatewayScope {
                 return false;
             }
         };
-        // Recompute this grant's contribution from scratch: drop every pair
-        // targeting `to_ns` that this grant could have added, then re-insert
-        // the current `from` set. A single grant per (from,to) pair is the
-        // common case; on the rare overlap of two grants trusting the same
-        // pair, a delete of one still leaves the pair authorised only if the
-        // survivor re-adds it — which it does on its own next apply/relist.
-        let before: HashSet<(String, String)> = g
-            .reference_grants
-            .iter()
-            .filter(|(_, t)| t == to_ns)
-            .cloned()
-            .collect();
-        let after: HashSet<(String, String)> = froms
-            .iter()
-            .map(|f| (f.clone(), to_ns.to_string()))
-            .collect();
-        if before == after {
-            return false;
-        }
-        for pair in &before {
-            g.reference_grants.remove(pair);
-        }
-        for pair in after {
-            g.reference_grants.insert(pair);
-        }
+        let changed = match ServiceGrant::of(grant) {
+            Some(service_grant) => {
+                g.reference_grants.insert(key, service_grant.clone()) != Some(service_grant)
+            }
+            None => g.reference_grants.remove(&key).is_some(),
+        };
         drop(g);
-        self.fire_if(true)
+        self.fire_if(changed)
     }
 
-    /// Mutates the scope on a ReferenceGrant delete: drop every authorised
-    /// pair this grant contributed (all pairs targeting its namespace and
-    /// listing one of its trusted `from` namespaces).
+    /// Mutates the scope on a ReferenceGrant delete: drop what it authorised.
     pub fn remove_reference_grant(&self, grant: &ReferenceGrant) -> bool {
-        let Some(to_ns) = grant.metadata.namespace.as_deref() else {
+        let (Some(ns), Some(name)) = (
+            grant.metadata.namespace.as_deref(),
+            grant.metadata.name.as_deref(),
+        ) else {
             return false;
         };
         self.update_secret_grant(grant, None);
-        let froms = trusted_route_from_namespaces(grant);
-        if froms.is_empty() {
-            return false;
-        }
-
         let mut g = match self.state.write() {
             Ok(g) => g,
             Err(e) => {
@@ -1871,31 +1848,66 @@ impl GatewayScope {
                 return false;
             }
         };
-        let mut changed = false;
-        for f in froms {
-            changed |= g.reference_grants.remove(&(f, to_ns.to_string()));
-        }
+        let changed = g
+            .reference_grants
+            .remove(&(ns.to_string(), name.to_string()))
+            .is_some();
         drop(g);
         self.fire_if(changed)
     }
 }
 
-/// Extract the namespaces of `HTTPRoute` `from` entries in a ReferenceGrant
-/// that grants access `to` a `Service`. Only these (route → service)
-/// grants are relevant to backendRef resolution; grants for other
-/// kind pairs (e.g. Secret references) are ignored.
+/// What a ReferenceGrant lets routes reference among the Services of its
+/// namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceGrant {
+    /// The namespaces of the routes it trusts.
+    from: HashSet<String>,
+    /// The Services it opens, `None` for all of them.
+    names: Option<HashSet<String>>,
+}
+
+impl ServiceGrant {
+    /// `None` when the grant opens no Service to any route.
+    fn of(grant: &ReferenceGrant) -> Option<Self> {
+        let from = trusted_route_from_namespaces(grant);
+        let mut names = Some(HashSet::new());
+        for to in grant
+            .spec
+            .to
+            .iter()
+            .filter(|t| t.group.is_empty() && t.kind == "Service")
+        {
+            match (&to.name, names.as_mut()) {
+                (Some(name), Some(names)) => {
+                    names.insert(name.clone());
+                }
+                (None, _) => names = None,
+                (Some(_), None) => {}
+            }
+        }
+        let opens_any = names.as_ref().is_none_or(|n| !n.is_empty());
+        (!from.is_empty() && opens_any).then_some(Self { from, names })
+    }
+
+    fn allows(&self, from_ns: &str, service: &str) -> bool {
+        self.from.contains(from_ns) && self.names.as_ref().is_none_or(|n| n.contains(service))
+    }
+}
+
 /// Decides whether a cross-namespace backendRef is authorised. Abstracted
 /// behind a trait so `route_to_entrypoints` stays testable without a live
 /// [`GatewayScope`]: production passes the scope (grant-aware), tests can
 /// pass a stub.
 pub trait BackendRefAuthorizer {
-    /// True iff an HTTPRoute in `from_ns` may reference a Service in `to_ns`.
-    fn allows(&self, from_ns: &str, to_ns: &str) -> bool;
+    /// True iff a route in `from_ns` may reference Service `service` in
+    /// `to_ns`.
+    fn allows(&self, from_ns: &str, to_ns: &str, service: &str) -> bool;
 }
 
 impl BackendRefAuthorizer for GatewayScope {
-    fn allows(&self, from_ns: &str, to_ns: &str) -> bool {
-        self.allows_backend_ref(from_ns, to_ns)
+    fn allows(&self, from_ns: &str, to_ns: &str, service: &str) -> bool {
+        self.allows_backend_ref(from_ns, to_ns, service)
     }
 }
 
@@ -1907,7 +1919,7 @@ pub struct AllowAllBackendRefs;
 
 #[cfg(test)]
 impl BackendRefAuthorizer for AllowAllBackendRefs {
-    fn allows(&self, _from_ns: &str, _to_ns: &str) -> bool {
+    fn allows(&self, _from_ns: &str, _to_ns: &str, _service: &str) -> bool {
         true
     }
 }
@@ -3903,7 +3915,7 @@ fn check_backend_ref(
     // Cross-namespace backendRefs require a ReferenceGrant in the target
     // namespace trusting this route's namespace: a namespace must opt in to
     // being referenced. Same-namespace refs never consult the grant set.
-    if !grants.allows(namespace, target_ns) {
+    if !grants.allows(namespace, target_ns, &backend.name) {
         return Err(InvalidRef::NotPermitted);
     }
     if resolver.service_exists(target_ns, &backend.name) == Some(false) {
@@ -4705,7 +4717,7 @@ fn tcp_rule_backends(
                 return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
-            if !grants.allows(namespace, target_ns) {
+            if !grants.allows(namespace, target_ns, &b.name) {
                 warn!(
                     "Gateway API: TCPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
@@ -5058,7 +5070,7 @@ fn udp_rule_backends(
                 return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
-            if !grants.allows(namespace, target_ns) {
+            if !grants.allows(namespace, target_ns, &b.name) {
                 warn!(
                     "Gateway API: UDPRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
@@ -5503,7 +5515,7 @@ fn tls_rule_backends(
                 return None;
             }
             let target_ns = b.namespace.as_deref().unwrap_or(namespace);
-            if !grants.allows(namespace, target_ns) {
+            if !grants.allows(namespace, target_ns, &b.name) {
                 warn!(
                     "Gateway API: TLSRoute {}/{} references Service {}/{} across namespaces with no ReferenceGrant — dropping the backend",
                     namespace, route_name, target_ns, b.name
@@ -6758,16 +6770,36 @@ mod tests {
         let scope = GatewayScope::new();
         let grant = reference_grant("other", "default");
         assert!(scope.upsert_reference_grant(&grant));
-        assert!(scope.allows_backend_ref("default", "other"));
+        assert!(scope.allows_backend_ref("default", "other", "api"));
         assert!(scope.remove_reference_grant(&grant));
-        assert!(!scope.allows_backend_ref("default", "other"));
+        assert!(!scope.allows_backend_ref("default", "other", "api"));
+    }
+
+    /// A grant naming a Service opens that one only, and two grants of a
+    /// namespace each keep their own.
+    #[test]
+    fn a_grant_naming_a_service_opens_that_one_only() {
+        let scope = GatewayScope::new();
+        let mut v1 = reference_grant("other", "default");
+        v1.spec.to[0].name = Some("v1".into());
+        assert!(scope.upsert_reference_grant(&v1));
+        assert!(scope.allows_backend_ref("default", "other", "v1"));
+        assert!(!scope.allows_backend_ref("default", "other", "v2"));
+        let mut v2 = reference_grant("other", "default");
+        v2.metadata.name = Some("grant-v2".into());
+        v2.spec.to[0].name = Some("v2".into());
+        assert!(scope.upsert_reference_grant(&v2));
+        assert!(scope.allows_backend_ref("default", "other", "v2"));
+        assert!(scope.remove_reference_grant(&v2));
+        assert!(scope.allows_backend_ref("default", "other", "v1"));
+        assert!(!scope.allows_backend_ref("default", "other", "v2"));
     }
 
     #[test]
     fn same_namespace_backend_never_needs_grant() {
         let scope = GatewayScope::new();
         // No grant at all, yet same-namespace is always allowed.
-        assert!(scope.allows_backend_ref("app", "app"));
+        assert!(scope.allows_backend_ref("app", "app", "api"));
     }
 
     #[test]
@@ -6799,7 +6831,7 @@ mod tests {
         let scope = GatewayScope::new();
         // Nothing changed: the grant doesn't authorise any Service ref.
         assert!(!scope.upsert_reference_grant(&grant));
-        assert!(!scope.allows_backend_ref("default", "other"));
+        assert!(!scope.allows_backend_ref("default", "other", "api"));
     }
 
     #[test]
@@ -6830,7 +6862,7 @@ mod tests {
         };
         let scope = GatewayScope::new();
         assert!(scope.upsert_reference_grant(&grant));
-        assert!(scope.allows_backend_ref("default", "other"));
+        assert!(scope.allows_backend_ref("default", "other", "api"));
     }
 
     #[test]
@@ -8573,11 +8605,11 @@ mod tests {
         let scope = GatewayScope::new();
         let grant = reference_grant("backend", "frontend");
         scope.upsert_reference_grant(&grant);
-        assert!(scope.allows_backend_ref("frontend", "backend"));
+        assert!(scope.allows_backend_ref("frontend", "backend", "api"));
         scope.retain_reference_grants(std::slice::from_ref(&grant));
-        assert!(scope.allows_backend_ref("frontend", "backend"));
+        assert!(scope.allows_backend_ref("frontend", "backend", "api"));
         scope.retain_reference_grants(&[]);
-        assert!(!scope.allows_backend_ref("frontend", "backend"));
+        assert!(!scope.allows_backend_ref("frontend", "backend", "api"));
     }
 
     /// Only an accepted Gateway's certificates are served, and only while

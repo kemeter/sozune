@@ -498,7 +498,7 @@ spec:
       kind: Service
 ```
 
-With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` with `RefNotPermitted` once the backend is dropped, and a rule left without backend answers `500`). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs.
+With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` with `RefNotPermitted` once the backend is dropped, and a rule left without backend answers `500`). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs. A `to` entry with a `name` opens that Service only.
 
 ### What's not supported (yet)
 

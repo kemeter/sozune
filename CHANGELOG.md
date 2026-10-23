@@ -44,6 +44,7 @@ All notable changes to this project will be documented in this file.
 - An HTTPRoute none of whose hostnames a listener of its Gateway admits was reported `Accepted`. It is now `Accepted=False` with `NoMatchingListenerHostname`.
 - An HTTPRoute `requestRedirect` with `statusCode: 302` dropped the route. It now answers a temporary redirect.
 - An HTTPRoute header modifier's `add` replaced the header's existing value, as `set` does. It now adds its value next to it.
+- A `ReferenceGrant` naming a Service in its `to` opened every Service of its namespace to the routes it trusts. It now opens that Service only. Two grants of the same namespace no longer take each other's authorisations away when one of them changes.
 - A `ReferenceGrant` deleted while Sōzune's watcher was reconnecting kept authorising the cross-namespace backends it had opened. The list sent on reconnection now drops it.
 - A Gateway API route deleted while Sōzune's watcher was reconnecting to the API server kept routing traffic: no deletion event comes for it, and the list sent on reconnection was not compared with the routes Sōzune held. It is now removed when that list does not include it.
 - An unknown label (`W013`) is reported without its value: a misspelt label can carry a secret, and the diagnostic reaches the logs and the API.
