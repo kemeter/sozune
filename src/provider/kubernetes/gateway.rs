@@ -3782,8 +3782,10 @@ fn specificity_groups(hostnames: Vec<String>) -> Vec<Vec<String>> {
 /// shape, e.g. no `requestRedirect`). Once we implement filters this
 /// rejection lifts. See [`route_has_unsupported_filters`].
 ///
+/// A rule with no backendRef, or none it can use, answers 500; a redirect
+/// rule needs none.
+///
 /// Other silent skips:
-/// - rules with no backends
 /// - rules with backends that resolve to zero pod IPs
 /// - matches that aren't `Path` (header/query/method-only matches)
 /// - `RegularExpression` path type — not yet supported by the routing layer
@@ -4195,9 +4197,11 @@ fn rule_to_entrypoints(
         _ => (None, Vec::new(), None),
     };
 
-    let Some(backend_refs) = rule.backend_refs.as_ref() else {
-        return Vec::new();
-    };
+    // A redirect answers every request itself, backend or not.
+    let answers = redirect
+        .as_ref()
+        .is_some_and(|r| r.policy.answers_without_backend());
+    let backend_refs = rule.backend_refs.as_deref().unwrap_or_default();
     let mut resolved: Vec<ResolvedRef> = Vec::new();
     let mut invalid = 0;
     for b in backend_refs {
@@ -4218,15 +4222,13 @@ fn rule_to_entrypoints(
             pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
         });
     }
-    // Gateway API: a rule whose backendRefs are all invalid answers 500.
-    // A redirect answers without them.
-    let invalid_backends = invalid > 0
-        && invalid == backend_refs.len()
-        && !redirect
-            .as_ref()
-            .is_some_and(|r| r.policy.answers_without_backend());
+    // Gateway API: a rule with no backendRef, or none it can use, answers
+    // 500.
+    let invalid_backends = !answers && invalid == backend_refs.len();
     let backends = if invalid_backends {
         Vec::new()
+    } else if answers {
+        weigh_backend_refs(resolved).unwrap_or_default()
     } else {
         let Some(backends) = weigh_backend_refs(resolved) else {
             return Vec::new();
@@ -6590,7 +6592,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_without_backends_is_skipped() {
+    fn a_rule_without_backends_answers_500() {
         let r = route_with(
             vec![HTTPRouteRules {
                 backend_refs: None,
@@ -6598,7 +6600,34 @@ mod tests {
             }],
             vec!["app.example.com".into()],
         );
-        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].config.invalid_backends);
+    }
+
+    /// A redirect answers by itself: its rule needs no backend.
+    #[test]
+    fn a_redirect_rule_without_backends_redirects() {
+        use gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersRequestRedirect;
+        let r = route_with(
+            vec![HTTPRouteRules {
+                filters: Some(vec![HTTPRouteRulesFilters {
+                    request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                        hostname: Some("example.org".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                backend_refs: None,
+                ..Default::default()
+            }],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_to_entrypoints(&r, &r0(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].backends.is_empty());
+        assert!(!eps[0].config.invalid_backends);
+        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
     }
 
     #[test]
@@ -7218,18 +7247,15 @@ mod tests {
         apply_route(&v1, &storage, &index, &r1(), &scope, None);
         assert_eq!(storage.read().unwrap().len(), 1);
 
-        // v2 has rules but no usable backends — the entrypoint must
+        // v2's backends have no ready endpoint — the entrypoint must
         // disappear from storage, but the route stays in the index so the
         // periodic re-resolve can revive it once endpoints come back.
         let v2 = route_with_uid(
             "uid-1",
-            vec![HTTPRouteRules {
-                backend_refs: None,
-                ..Default::default()
-            }],
+            vec![rule(None, vec![backend("api", 80)])],
             vec!["app.example.com".into()],
         );
-        let changed = apply_route(&v2, &storage, &index, &r1(), &scope, None);
+        let changed = apply_route(&v2, &storage, &index, &r0(), &scope, None);
         assert!(changed);
         assert!(storage.read().unwrap().is_empty());
         assert_eq!(
