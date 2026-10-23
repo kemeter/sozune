@@ -254,7 +254,7 @@ pub fn redirect_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<Redirec
 ///
 /// `None` means "we can't faithfully represent this redirect", so the rule
 /// is dropped rather than emitting a misleading `Location`. That's the case
-/// for a `302` status (Sōzu has no temporary-redirect policy) and for a
+/// for a status other than `301` and `302`, and for a
 /// `replacePrefixMatch` path rewrite (it must keep the request's trailing
 /// segments, which needs a `$PATH[n]` capture defined at routing time —
 /// Sōzune doesn't set one up for redirect rules).
@@ -267,13 +267,12 @@ fn redirect_from_redirect_filter(
         None => None,
     };
 
-    // Gateway API core status values are 301 and 302. 301 maps to Sōzu's
-    // `Permanent`; 302 (temporary) has no distinct frontend policy, so we
-    // refuse rather than silently emit a 301.
-    match rr.status_code {
-        None | Some(301) => {}
+    // Gateway API core status values are 301 and 302.
+    let policy = match rr.status_code {
+        None | Some(301) => RedirectPolicy::Permanent,
+        Some(302) => RedirectPolicy::Found,
         _ => return None,
-    }
+    };
 
     let path = match rr.path.as_ref() {
         // A full-path replacement is a literal target — maps directly.
@@ -291,7 +290,7 @@ fn redirect_from_redirect_filter(
     };
 
     Some(RedirectMapping {
-        policy: RedirectPolicy::Permanent,
+        policy,
         scheme,
         host: rr.hostname.clone(),
         path,
@@ -395,13 +394,21 @@ mod tests {
     }
 
     #[test]
-    fn status_302_is_unsupported() {
+    fn status_302_is_a_temporary_redirect() {
         let f = vec![redirect_filter(
             Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             Some(302),
         )];
+        assert!(rule_filters_supported(&f));
+        let mapping = redirect_from_filter(&f).expect("a redirect");
+        assert_eq!(mapping.policy, RedirectPolicy::Found);
+    }
+
+    #[test]
+    fn status_other_than_301_and_302_is_unsupported() {
+        let f = vec![redirect_filter(None, None, None, Some(307))];
         assert!(!rule_filters_supported(&f));
     }
 

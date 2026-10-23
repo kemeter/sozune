@@ -3181,7 +3181,7 @@ fn apply_route(
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported; requestMirror and extensionRef are not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect — excluding its prefix-rewrite form — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported; requestMirror and extensionRef are not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -3995,7 +3995,7 @@ fn build_route_status(
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect — excluding its path-rewrite and 302 forms — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect — excluding its prefix-rewrite form — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
         ),
         RouteOutcome::NoMatchingListenerHostname => (
             "False",

@@ -511,7 +511,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 | Filter | Supported | Notes |
 |---|---|---|
-| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` and `302` are dropped (see below) |
+| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` is dropped (see below) |
 | `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
@@ -544,13 +544,13 @@ rules:
 | `requestRedirect` field | Mapped to | Notes |
 |---|---|---|
 | `scheme` (`http` / `https`) | redirect scheme | omitted → preserve the request scheme |
-| `statusCode` | redirect policy | `301` (default) → permanent redirect. `302` is **not** supported — the route is dropped rather than emit a 301 |
+| `statusCode` | redirect policy | `301` (default) → permanent redirect, `302` → temporary redirect |
 | `hostname` | `rewrite_host` | rewrites the `Location` authority |
 | `port` | `rewrite_port` | rewrites the `Location` port |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
 | `path.replacePrefixMatch` | — | **not supported**: keeping the request's trailing segments needs a path capture Sōzune doesn't set up for redirect rules, so the route is dropped |
 
-A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` or a `302` status is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
+A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
 
 #### urlRewrite
 

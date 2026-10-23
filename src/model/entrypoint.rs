@@ -362,6 +362,8 @@ pub enum HeaderDirection {
 pub enum RedirectPolicy {
     Forward,
     Permanent,
+    /// A temporary redirect, answered `302`.
+    Found,
     Unauthorized,
     /// Close the connection without answering, like nginx's 444.
     Close,
@@ -371,7 +373,10 @@ impl RedirectPolicy {
     /// Whether a route with this policy answers every request itself, and so
     /// needs no backend.
     pub fn answers_without_backend(self) -> bool {
-        matches!(self, Self::Permanent | Self::Unauthorized | Self::Close)
+        matches!(
+            self,
+            Self::Permanent | Self::Found | Self::Unauthorized | Self::Close
+        )
     }
 }
 
