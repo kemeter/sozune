@@ -56,6 +56,45 @@ pub(super) fn addresses_of_service(service: &Service) -> Vec<IngressLoadBalancer
         .collect()
 }
 
+/// The `status.addresses` of a Gateway for the published addresses: each IP
+/// and hostname, as the Gateway API takes them (a lowercase DNS name, an IP;
+/// 16 at most). Anything else is left out, so it cannot get the whole status
+/// refused.
+fn gateway_addresses(addresses: &[IngressLoadBalancerIngress]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for a in addresses {
+        if let Some(ip) = a.ip.as_deref().filter(|ip| ip.parse::<IpAddr>().is_ok()) {
+            out.push(("IPAddress".to_string(), ip.to_string()));
+        }
+        if let Some(hostname) = a.hostname.as_deref().map(str::to_ascii_lowercase)
+            && is_dns_name(&hostname)
+        {
+            out.push(("Hostname".to_string(), hostname));
+        }
+    }
+    out.truncate(16);
+    out
+}
+
+/// Whether `name` is a DNS name the Gateway API takes as an address: labels
+/// of lowercase letters, digits and inner hyphens, a leading `*.` allowed.
+fn is_dns_name(name: &str) -> bool {
+    if name.len() > 253 {
+        return false;
+    }
+    let name = name.strip_prefix("*.").unwrap_or(name);
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
 /// What an Ingress's status says it is reachable at.
 fn published_on(ing: &Ingress) -> Vec<IngressLoadBalancerIngress> {
     ing.status
@@ -223,8 +262,19 @@ impl KubernetesProvider {
             };
             if changed {
                 self.republish_all();
+                self.publish_gateway_addresses().await;
             }
         }
+    }
+
+    /// Hand the published addresses to the Gateways Sōzune owns, for their
+    /// `status.addresses`.
+    pub(super) async fn publish_gateway_addresses(&self) {
+        let (Some((scope, _)), Some(addresses)) = (&self.tls_secrets, self.published_addresses())
+        else {
+            return;
+        };
+        scope.set_addresses(gateway_addresses(&addresses)).await;
     }
 
     /// Queue the status of every Ingress Sōzune serves for writing.
@@ -289,6 +339,59 @@ mod tests {
         ing.status = None;
         provider.queue_ingress_status(&ing);
         assert!(queued(&provider));
+    }
+
+    /// The published addresses go to the Gateways too, typed.
+    #[test]
+    fn published_addresses_reach_the_gateways() {
+        let config = crate::config::KubernetesConfig {
+            enabled: true,
+            publish_addresses: vec!["192.0.2.10".into(), "lb.example.com".into()],
+            ..Default::default()
+        };
+        let scope = super::super::gateway::GatewayScope::new();
+        let hosts: crate::acme::SecretHosts = Default::default();
+        let provider = KubernetesProvider::new(config)
+            .unwrap()
+            .with_tls_secrets(scope.clone(), hosts);
+        futures_util::FutureExt::now_or_never(provider.publish_gateway_addresses());
+        assert_eq!(
+            scope.published_addresses_for_tests(),
+            Some(vec![
+                ("IPAddress".to_string(), "192.0.2.10".to_string()),
+                ("Hostname".to_string(), "lb.example.com".to_string()),
+            ])
+        );
+    }
+
+    /// Both fields of a load balancer's entry are published; what the
+    /// Gateway API would refuse is not, and 16 at most are.
+    #[test]
+    fn gateway_addresses_follow_the_gateway_api() {
+        let both = IngressLoadBalancerIngress {
+            ip: Some("198.51.100.7".into()),
+            hostname: Some("LB.Example.com".into()),
+            ..Default::default()
+        };
+        let invalid = IngressLoadBalancerIngress {
+            hostname: Some("not a name".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            gateway_addresses(&[both, invalid]),
+            vec![
+                ("IPAddress".to_string(), "198.51.100.7".to_string()),
+                ("Hostname".to_string(), "lb.example.com".to_string()),
+            ]
+        );
+        // The wildcard counts in the length.
+        let long = format!(
+            "*.{}",
+            vec!["a".repeat(63); 4].join(".").get(..252).unwrap()
+        );
+        assert!(!is_dns_name(&long));
+        let many: Vec<String> = (0..20).map(|i| format!("192.0.2.{i}")).collect();
+        assert_eq!(gateway_addresses(&addresses_from_config(&many)).len(), 16);
     }
 
     #[test]
