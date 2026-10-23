@@ -1471,6 +1471,10 @@ fn host_specificity(hostnames: &[String]) -> Rank {
     hostnames
         .iter()
         .map(|h| {
+            if let Some(suffix) = h.strip_prefix(crate::model::ANY_LABELS_PREFIX) {
+                // Ranked as the `*.` wildcard it stands for.
+                return (2, std::cmp::Reverse(suffix.len() + 2));
+            }
             let rank = if h == "*" {
                 3
             } else if h.starts_with("*.") {
@@ -3834,6 +3838,15 @@ mod tests {
                 "b-wildcard",
                 "a-any"
             ]
+        );
+    }
+
+    /// A wildcard taking any number of labels ranks as the `*.` one.
+    #[test]
+    fn an_any_labels_wildcard_ranks_as_a_wildcard() {
+        assert_eq!(
+            host_specificity(&[crate::model::any_labels_wildcard("*.example.com")]),
+            host_specificity(&["*.example.com".to_string()])
         );
     }
 

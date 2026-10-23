@@ -444,6 +444,19 @@ pub struct ForwardAuthConfig {
     pub trust_forward_header: bool,
 }
 
+/// What a hostname taking any number of leading labels starts with, the
+/// suffix following: a regex label, as Sōzu's `*.` takes exactly one.
+pub const ANY_LABELS_PREFIX: &str = "/.+/.";
+
+/// `hostname` with a leading `*.` taking one or more labels, as a Gateway API
+/// wildcard does: `*.example.com` matches `a.b.example.com` too.
+pub fn any_labels_wildcard(hostname: &str) -> String {
+    match hostname.strip_prefix("*.") {
+        Some(suffix) => format!("{ANY_LABELS_PREFIX}{suffix}"),
+        None => hostname.to_string(),
+    }
+}
+
 /// Why an SNI pattern cannot be used for routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SniRejection {

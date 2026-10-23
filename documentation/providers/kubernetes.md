@@ -383,7 +383,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 - Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
-- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). A route with none, on a listener with none, serves every host, after the routes naming theirs.
+- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). A route with none, on a listener with none, serves every host, after the routes naming theirs. A wildcard takes one or more labels, as the spec says: `*.example.com` serves `a.b.example.com` too, unlike a Sōzune label's `*.`.
 - `backendRef.port` — the Service port; requests go to the port its pods listen on (its `targetPort`), as its EndpointSlices give it.
 - `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
 - Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).

@@ -3668,6 +3668,11 @@ pub fn route_entrypoints_by_scheme(
             } else {
                 suffix.to_string()
             };
+            // A Gateway API wildcard takes any number of labels.
+            let hostnames: Vec<String> = hostnames
+                .iter()
+                .map(|h| crate::model::any_labels_wildcard(h))
+                .collect();
             for mut ep in route_to_entrypoints_with_hostnames(route, resolver, grants, &hostnames) {
                 ep.id.push_str(&suffix);
                 ep.name.push_str(&suffix);
@@ -8534,7 +8539,12 @@ mod tests {
         assert_eq!(
             schemes(host(&["*.example.com"]), host(&["api.example.com"])),
             [
-                (id.clone(), vec!["*.example.com".to_string()], false, false),
+                (
+                    id.clone(),
+                    vec!["/.+/.example.com".to_string()],
+                    false,
+                    false
+                ),
                 (
                     format!("{id}-tls"),
                     vec!["api.example.com".to_string()],
@@ -8554,7 +8564,7 @@ mod tests {
                 ),
                 (
                     format!("{id}-https"),
-                    vec!["*.example.com".to_string()],
+                    vec!["/.+/.example.com".to_string()],
                     true,
                     true
                 ),
@@ -8619,7 +8629,8 @@ mod tests {
                     format!("{id}-h0"),
                     vec!["a.example.com".to_string(), "b.example.com".to_string()]
                 ),
-                (format!("{id}-h1"), vec!["*.example.com".to_string()]),
+                // A Gateway API wildcard takes any number of labels.
+                (format!("{id}-h1"), vec!["/.+/.example.com".to_string()]),
             ]
         );
     }
