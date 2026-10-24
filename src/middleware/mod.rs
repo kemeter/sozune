@@ -19,7 +19,7 @@ use hyper_util::rt::TokioExecutor;
 use tracing::{error, info, warn};
 
 use crate::model::{Backend, EntrypointConfig, MatchCondition};
-use crate::proxy::sozu::header_predicate;
+use crate::proxy::sozu::{header_predicate, routes_on_query};
 use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
@@ -164,6 +164,8 @@ pub struct MiddlewareRoute {
     /// have a weight. Tried when the picked backend gives no response.
     pub backups: Vec<usize>,
     pub backend_timeout: Option<u64>,
+    /// Milliseconds the whole request may take, from its arrival.
+    pub request_timeout: Option<u64>,
     /// Total forward attempts (first try + retries) on a connection-level
     /// failure or timeout. `1` (or `0`) means no retry — the default.
     pub retry_attempts: u32,
@@ -171,6 +173,9 @@ pub struct MiddlewareRoute {
     /// `None` when the route doesn't configure one.
     pub circuit_breaker: Option<Arc<circuit_breaker::CircuitBreaker>>,
     pub middlewares: Vec<Arc<dyn Middleware>>,
+    /// The `Host` the backend gets instead of the client's, the client's
+    /// going in `X-Forwarded-Host`.
+    pub rewrite_host: Option<String>,
 }
 
 impl std::fmt::Debug for MiddlewareRoute {
@@ -531,17 +536,40 @@ pub fn middleware_header_conditions(config: &EntrypointConfig) -> Vec<MatchCondi
         .collect()
 }
 
+/// The query conditions left for the middleware to enforce, `None` when
+/// there are none: Sōzu routes on them when it can (see `routes_on_query`).
+pub fn middleware_query_conditions(config: &EntrypointConfig) -> Option<Vec<MatchCondition>> {
+    (!config.match_query.is_empty() && !routes_on_query(config)).then(|| config.match_query.clone())
+}
+
+/// Whether `error`, or one it wraps, is a timeout.
+pub(crate) fn timed_out(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.invalid_backends
+        || url_rewrite_host(config).is_some()
         || config.backend_timeout.is_some()
+        || config.request_timeout.is_some()
         || config.rate_limit.is_some()
         || config.in_flight_req.is_some()
         || config.compress
         || config.forward_auth.is_some()
         || !config.plugins.is_empty()
         || !middleware_header_conditions(config).is_empty()
-        || !config.match_query.is_empty()
+        || middleware_query_conditions(config).is_some()
         || !config.match_client_ip.is_empty()
         || !config.ip_allow_list.is_empty()
         // Retry is enforced in the middleware proxy handler, so a route that
@@ -614,10 +642,11 @@ pub fn build_middleware_route(
         }
     };
     let match_headers = middleware_header_conditions(config);
-    if !match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
+    let match_query = middleware_query_conditions(config).unwrap_or_default();
+    if !match_headers.is_empty() || !match_query.is_empty() || client_ip.is_some() {
         middlewares.push(Arc::new(RequestMatchMiddleware::new(
             match_headers,
-            config.match_query.clone(),
+            match_query,
             client_ip,
             trusted_proxies.clone(),
         )));
@@ -682,10 +711,19 @@ pub fn build_middleware_route(
         balancer: WeightedRoundRobin::new(&weights),
         backups: backup_indexes(&weights),
         backend_timeout: config.backend_timeout,
+        request_timeout: config.request_timeout,
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
         circuit_breaker,
         middlewares,
+        rewrite_host: url_rewrite_host(config).map(str::to_string),
     })
+}
+
+/// The host a route's URL rewrite gives the request. The middleware applies
+/// it: Sōzu's own host rewrite sends the backend two `Host` headers, which
+/// many servers refuse.
+pub fn url_rewrite_host(config: &EntrypointConfig) -> Option<&str> {
+    config.rewrite.as_ref()?.hostname.as_deref()
 }
 
 /// Start the middleware reverse proxy server
@@ -729,9 +767,11 @@ mod route_key_tests {
             balancer: WeightedRoundRobin::new(weights),
             backups: backup_indexes(weights),
             backend_timeout: None,
+            request_timeout: None,
             retry_attempts: 1,
             circuit_breaker: None,
             middlewares: Vec::new(),
+            rewrite_host: None,
         }
     }
 
@@ -909,9 +949,11 @@ mod route_key_tests {
             balancer: WeightedRoundRobin::new(&[100]),
             backups: Vec::new(),
             backend_timeout: None,
+            request_timeout: None,
             retry_attempts: 1,
             circuit_breaker: None,
             middlewares: Vec::new(),
+            rewrite_host: None,
         })
     }
 

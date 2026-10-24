@@ -912,6 +912,13 @@ async fn buffer_or_stream(mut body: Body) -> (Vec<u8>, Option<Body>) {
                 }
             }
             Some(Err(e)) => {
+                // A body cut short by the route's timeout stays cut short: it
+                // goes on as the error it ended with, not as a whole body.
+                if super::timed_out(&e) {
+                    warn!("wasm middleware: body cut short by the route's timeout");
+                    let failed = futures_util::stream::once(async move { Err::<Bytes, _>(e) });
+                    return (Vec::new(), Some(Body::from_stream(failed)));
+                }
                 warn!("wasm middleware: failed to read body: {e}");
                 // Hand back whatever we have; the guest sees a (possibly partial)
                 // body and it is re-sent as-is.
@@ -1160,6 +1167,22 @@ mod tests {
         let (buffered, oversize) = buffer_or_stream(Body::from("hello world")).await;
         assert_eq!(buffered, b"hello world");
         assert!(oversize.is_none());
+    }
+
+    /// A body cut short by the timeout goes on as an error, not as the
+    /// partial bytes read so far.
+    #[tokio::test]
+    async fn buffer_or_stream_keeps_a_timeout_an_error() {
+        let cut = futures_util::stream::iter([
+            Ok(axum::body::Bytes::from_static(b"partial")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "past the route's timeout",
+            )),
+        ]);
+        let (buffered, rest) = buffer_or_stream(Body::from_stream(cut)).await;
+        assert!(buffered.is_empty());
+        assert!(rest.expect("an error body").collect().await.is_err());
     }
 
     #[tokio::test]

@@ -24,6 +24,19 @@ fn monotonic_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Give the request `new_host` as its `Host`, the client's going in
+/// `X-Forwarded-Host`.
+fn rewrite_host(headers: &mut axum::http::HeaderMap, new_host: &str) {
+    let Ok(value) = axum::http::HeaderValue::from_str(new_host) else {
+        warn!("Ignoring the invalid rewritten host {:?}", new_host);
+        return;
+    };
+    if let Some(original) = headers.remove(axum::http::header::HOST) {
+        headers.insert("x-forwarded-host", original);
+    }
+    headers.insert(axum::http::header::HOST, value);
+}
+
 /// Main proxy handler: identifies the route by Host header,
 /// applies middleware stack, and forwards to the real backend.
 pub async fn handle_proxy(
@@ -136,244 +149,343 @@ pub async fn handle_proxy(
             in_flight_guards: Vec::new(),
         };
 
-        // Request phase: run the middleware stack in order. A middleware may mutate
-        // the request (e.g. forward-auth stamping headers) or short-circuit (e.g.
-        // forward-auth deny, rate limit).
-        if let Err(response) =
-            chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await
-        {
-            let duration = start.elapsed();
-            let status = response.status().as_u16();
-            state.request_metrics.record(duration, status);
-            access_log(
-                &source_ip,
-                &method,
-                &host,
-                &path,
-                status,
-                duration,
-                "middleware",
+        // The whole request's deadline, from its arrival: the middleware
+        // stack, the client's body, every attempt and the response body all
+        // come within it.
+        let request_deadline = route
+            .request_timeout
+            .filter(|ms| *ms > 0)
+            .map(|ms| tokio::time::Instant::from_std(start) + std::time::Duration::from_millis(ms));
+
+        // Whether a request reached a backend, and whether a deadline cut the
+        // response body short: the breaker then hears of a failure.
+        let forwarded = std::sync::atomic::AtomicBool::new(false);
+        // Whether the breaker let the request through: a half-open one then
+        // waits on its outcome.
+        let admitted = std::sync::atomic::AtomicBool::new(false);
+        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Everything up to the response bounded by the request's deadline.
+        let handled = async {
+            // Request phase: run the middleware stack in order. A middleware may mutate
+            // the request (e.g. forward-auth stamping headers) or short-circuit (e.g.
+            // forward-auth deny, rate limit).
+            if let Err(response) =
+                chain::run_request_phase(&route.middlewares, &mut ctx, &mut req).await
+            {
+                let duration = start.elapsed();
+                let status = response.status().as_u16();
+                state.request_metrics.record(duration, status);
+                access_log(
+                    &source_ip,
+                    &method,
+                    &host,
+                    &path,
+                    status,
+                    duration,
+                    "middleware",
+                );
+                return response.into_response();
+            }
+
+            // Circuit breaker: if the route's breaker is open, short-circuit with
+            // 503 before touching the backend. `should_allow` also handles the
+            // open→half-open transition after the cooldown.
+            let cb_now = monotonic_ms();
+            if let Some(cb) = route.circuit_breaker.as_ref()
+                && !cb.should_allow(cb_now)
+            {
+                warn!("circuit breaker open for host '{}', short-circuiting", host);
+                // Not admitted: no outcome owed.
+                let resp = diag::circuit_open(&host).into_response();
+                state
+                    .request_metrics
+                    .record(start.elapsed(), resp.status().as_u16());
+                return resp;
+            }
+            admitted.store(
+                route.circuit_breaker.is_some(),
+                std::sync::atomic::Ordering::Relaxed,
             );
-            return response.into_response();
-        }
 
-        // Circuit breaker: if the route's breaker is open, short-circuit with
-        // 503 before touching the backend. `should_allow` also handles the
-        // open→half-open transition after the cooldown.
-        let cb_now = monotonic_ms();
-        if let Some(cb) = route.circuit_breaker.as_ref()
-            && !cb.should_allow(cb_now)
-        {
-            warn!("circuit breaker open for host '{}', short-circuiting", host);
-            let resp = diag::circuit_open(&host).into_response();
-            state
-                .request_metrics
-                .record(start.elapsed(), resp.status().as_u16());
-            return resp;
-        }
+            let is_websocket = req
+                .headers()
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
-        let is_websocket = req
-            .headers()
-            .get("upgrade")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-
-        // The backends this request tries, in order; a WebSocket upgrade is
-        // never retried, but still fails over to the other backends.
-        let attempts = if is_websocket {
-            1
-        } else {
-            route.retry_attempts.max(1)
-        };
-        let mut plan = route.attempts(attempts);
-        let (backend_host, backend_port) = match plan.next() {
-            Some(b) => b.clone(),
-            None => {
-                error!("No backends configured for host '{}'", host);
-                let resp = diag::no_healthy_backend(&host, &route.backends).into_response();
-                state
-                    .request_metrics
-                    .record(start.elapsed(), resp.status().as_u16());
-                return resp;
-            }
-        };
-
-        // Build the forwarded URI.
-        let original_path = req.uri().path().to_string();
-        let query = req
-            .uri()
-            .query()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default();
-
-        let forwarded_path = original_path.clone();
-
-        let target_uri = format!(
-            "http://{}:{}{}{}",
-            backend_host, backend_port, forwarded_path, query
-        );
-
-        debug!(
-            "Proxying {} {} -> {}",
-            req.method(),
-            original_path,
-            target_uri
-        );
-
-        if is_websocket {
-            // WebSocket tunnels live for the whole connection (minutes to hours),
-            // so their duration is not a request latency — deliberately excluded
-            // from the request-duration histogram to avoid skewing the distribution.
-            let candidates: Vec<(String, u16)> =
-                std::iter::once((backend_host.clone(), backend_port))
-                    .chain(plan.cloned())
-                    .collect();
-            let timeout = backend_timeout(route.backend_timeout);
-            return handle_websocket(req, &candidates, &forwarded_path, &query, timeout).await;
-        }
-
-        // Build the forwarded request.
-        let (mut parts, body) = req.into_parts();
-
-        // Propagate the trace downstream: write this span's context as the
-        // outgoing `traceparent` so the backend joins the same trace. No-op when
-        // tracing is disabled (the context is invalid/empty).
-        crate::tracing_otel::inject_context(
-            &tracing::Span::current().context(),
-            &mut parts.headers,
-        );
-
-        let primary_uri = match target_uri.parse::<Uri>() {
-            Ok(uri) => uri,
-            Err(e) => {
-                error!("Failed to parse target URI '{}': {}", target_uri, e);
-                let resp =
-                    diag::forwarding_failed("invalid-target-uri", &e.to_string()).into_response();
-                state
-                    .request_metrics
-                    .record(start.elapsed(), resp.status().as_u16());
-                return resp;
-            }
-        };
-
-        let timeout = backend_timeout(route.backend_timeout);
-
-        // Buffer the request body up front so each retry can replay it. The
-        // body has to be owned bytes — a streaming body can only be sent once.
-        // With no retry (`attempts <= 1`) this is still a single send.
-        let body_bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                error!("Failed to buffer request body for {}: {}", target_uri, e);
-                let resp = diag::forwarding_failed("request-body", &e.to_string()).into_response();
-                state
-                    .request_metrics
-                    .record(start.elapsed(), resp.status().as_u16());
-                return resp;
-            }
-        };
-
-        // Send to the backend, retrying connection-level failures and timeouts
-        // (the backend produced no response). A response that arrives — even a
-        // 5xx — is returned as-is and never retried, so a side effect is not
-        // replayed.
-        //
-        // The backends come from `plan`, one per failed attempt: retries go to
-        // the backends this request has not tried, and a backup (weight 0)
-        // only takes over once every other backend failed.
-        let uri_of = |(host, port): &(String, u16)| {
-            format!("http://{host}:{port}{forwarded_path}{query}")
-                .parse::<Uri>()
-                .ok()
-        };
-        let mut last_err = String::new();
-        let mut last_was_timeout = false;
-        let mut backend_response = None;
-        let mut target_uri = target_uri;
-        let mut tries = 0u32;
-        let mut uri = Some(primary_uri);
-        while let Some(current) = uri.take() {
-            tries += 1;
-            target_uri = current.to_string();
-            parts.uri = current;
-            let forwarded_req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
-            let response_future = state.http_client.request(forwarded_req);
-
-            // `Ok(resp)` on success, `Err((msg, is_timeout))` otherwise.
-            let result = if let Some(limit) = timeout {
-                match tokio::time::timeout(limit, response_future).await {
-                    Ok(result) => result.map_err(|e| (e.to_string(), false)),
-                    Err(_) => Err((format!("timed out after {}ms", limit.as_millis()), true)),
-                }
+            // The backends this request tries, in order; a WebSocket upgrade is
+            // never retried, but still fails over to the other backends.
+            let attempts = if is_websocket {
+                1
             } else {
-                response_future.await.map_err(|e| (e.to_string(), false))
+                route.retry_attempts.max(1)
+            };
+            let mut plan = route.attempts(attempts);
+            let (backend_host, backend_port) = match plan.next() {
+                Some(b) => b.clone(),
+                None => {
+                    error!("No backends configured for host '{}'", host);
+                    let resp = diag::no_healthy_backend(&host, &route.backends).into_response();
+                    state
+                        .request_metrics
+                        .record(start.elapsed(), resp.status().as_u16());
+                    return resp;
+                }
             };
 
-            match result {
-                Ok(resp) => {
-                    let (parts, body) = resp.into_parts();
-                    let body =
-                        Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
-                    backend_response = Some(Response::from_parts(parts, body));
+            // Build the forwarded URI.
+            let original_path = req.uri().path().to_string();
+            let query = req
+                .uri()
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default();
+
+            let forwarded_path = original_path.clone();
+
+            let target_uri = format!(
+                "http://{}:{}{}{}",
+                backend_host, backend_port, forwarded_path, query
+            );
+
+            debug!(
+                "Proxying {} {} -> {}",
+                req.method(),
+                original_path,
+                target_uri
+            );
+
+            if let Some(new_host) = route.rewrite_host.as_deref() {
+                rewrite_host(req.headers_mut(), new_host);
+            }
+
+            if is_websocket {
+                // WebSocket tunnels live for the whole connection (minutes to hours),
+                // so their duration is not a request latency — deliberately excluded
+                // from the request-duration histogram to avoid skewing the distribution.
+                let candidates: Vec<(String, u16)> =
+                    std::iter::once((backend_host.clone(), backend_port))
+                        .chain(plan.cloned())
+                        .collect();
+                // The request's deadline bounds the handshakes, not the tunnel.
+                let timeout = backend_timeout(route.backend_timeout);
+                return handle_websocket(req, &candidates, &forwarded_path, &query, timeout).await;
+            }
+
+            // Build the forwarded request.
+            let (mut parts, body) = req.into_parts();
+
+            // Propagate the trace downstream: write this span's context as the
+            // outgoing `traceparent` so the backend joins the same trace. No-op when
+            // tracing is disabled (the context is invalid/empty).
+            crate::tracing_otel::inject_context(
+                &tracing::Span::current().context(),
+                &mut parts.headers,
+            );
+
+            let primary_uri = match target_uri.parse::<Uri>() {
+                Ok(uri) => uri,
+                Err(e) => {
+                    error!("Failed to parse target URI '{}': {}", target_uri, e);
+                    let resp = diag::forwarding_failed("invalid-target-uri", &e.to_string())
+                        .into_response();
+                    state
+                        .request_metrics
+                        .record(start.elapsed(), resp.status().as_u16());
+                    return resp;
                 }
-                Err((msg, is_timeout)) => {
-                    last_err = msg;
-                    last_was_timeout = is_timeout;
-                    uri = plan.by_ref().find_map(uri_of);
-                    if uri.is_some() {
-                        debug!(
-                            "Backend {} attempt {} failed ({}); retrying",
-                            target_uri, tries, last_err
-                        );
+            };
+
+            let timeout = backend_timeout(route.backend_timeout);
+
+            // Buffer the request body up front so each retry can replay it. The
+            // body has to be owned bytes — a streaming body can only be sent once.
+            // With no retry (`attempts <= 1`) this is still a single send.
+            let collected = body.collect().await;
+            let body_bytes = match collected {
+                Ok(collected) => collected.to_bytes(),
+                Err(e) => {
+                    error!("Failed to buffer request body for {}: {}", target_uri, e);
+                    let resp =
+                        diag::forwarding_failed("request-body", &e.to_string()).into_response();
+                    state
+                        .request_metrics
+                        .record(start.elapsed(), resp.status().as_u16());
+                    return resp;
+                }
+            };
+
+            // Send to the backend, retrying connection-level failures and timeouts
+            // (the backend produced no response). A response that arrives — even a
+            // 5xx — is returned as-is and never retried, so a side effect is not
+            // replayed.
+            //
+            // The backends come from `plan`, one per failed attempt: retries go to
+            // the backends this request has not tried, and a backup (weight 0)
+            // only takes over once every other backend failed.
+            let uri_of = |(host, port): &(String, u16)| {
+                format!("http://{host}:{port}{forwarded_path}{query}")
+                    .parse::<Uri>()
+                    .ok()
+            };
+            let mut last_err = String::new();
+            let mut last_was_timeout = false;
+            let mut backend_response = None;
+            let mut target_uri = target_uri;
+            let mut tries = 0u32;
+            let mut uri = Some(primary_uri);
+            while let Some(current) = uri.take() {
+                tries += 1;
+                target_uri = current.to_string();
+                parts.uri = current;
+                let forwarded_req =
+                    Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+                let attempt_start = tokio::time::Instant::now();
+                forwarded.store(true, std::sync::atomic::Ordering::Relaxed);
+                let response_future = state.http_client.request(forwarded_req);
+
+                // The attempt ends at the backend timeout or the request's
+                // deadline, whichever comes first.
+                let attempt_deadline = timeout.map(|limit| attempt_start + limit);
+
+                // `Ok(resp)` on success, `Err((msg, is_timeout))` otherwise.
+                let result = if let Some(deadline) = attempt_deadline {
+                    match tokio::time::timeout_at(deadline, response_future).await {
+                        Ok(result) => result.map_err(|e| (e.to_string(), false)),
+                        Err(_) => Err(("timed out".to_string(), true)),
+                    }
+                } else {
+                    response_future.await.map_err(|e| (e.to_string(), false))
+                };
+
+                match result {
+                    Ok(resp) => {
+                        let (parts, body) = resp.into_parts();
+                        let body = body.map_err(|e| axum::Error::new(std::io::Error::other(e)));
+                        // A backend timeout the route sets caps the whole response,
+                        // its body included; the default one only the wait for it.
+                        let body = match (route.backend_timeout, timeout) {
+                            (Some(ms), Some(limit)) if ms > 0 => body_before(
+                                Body::new(body),
+                                attempt_start + limit,
+                                timed_out.clone(),
+                            ),
+                            _ => Body::new(body),
+                        };
+                        backend_response = Some(Response::from_parts(parts, body));
+                    }
+                    Err((msg, is_timeout)) => {
+                        last_err = msg;
+                        last_was_timeout = is_timeout;
+                        // Past the request's deadline, no other attempt.
+                        let expired = request_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+                        uri = if expired {
+                            None
+                        } else {
+                            plan.by_ref().find_map(uri_of)
+                        };
+                        if uri.is_some() {
+                            debug!(
+                                "Backend {} attempt {} failed ({}); retrying",
+                                target_uri, tries, last_err
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        let backend_response = match backend_response {
-            Some(resp) => resp,
-            None => {
-                error!(
-                    "Failed to forward request to {} after {} attempt(s): {}",
-                    target_uri, tries, last_err
-                );
-                // All attempts failed: count it as a backend failure for the
-                // circuit breaker.
-                if let Some(cb) = route.circuit_breaker.as_ref() {
-                    cb.record(true, monotonic_ms());
+            let backend_response = match backend_response {
+                Some(resp) => resp,
+                None => {
+                    error!(
+                        "Failed to forward request to {} after {} attempt(s): {}",
+                        target_uri, tries, last_err
+                    );
+                    // All attempts failed: count it as a backend failure for the
+                    // circuit breaker.
+                    if let Some(cb) = route.circuit_breaker.as_ref() {
+                        cb.record(true, monotonic_ms());
+                    }
+                    // Preserve the distinct 504 for a timeout; 502 otherwise.
+                    let resp = if last_was_timeout {
+                        diag::backend_timeout(&target_uri, timeout).into_response()
+                    } else {
+                        diag::backend_unreachable(&format!("backend at {target_uri}: {last_err}"))
+                            .into_response()
+                    };
+                    state
+                        .request_metrics
+                        .record(start.elapsed(), resp.status().as_u16());
+                    return resp;
                 }
-                // Preserve the distinct 504 for a timeout; 502 otherwise.
-                let resp = if last_was_timeout {
-                    diag::backend_timeout(&target_uri, timeout).into_response()
-                } else {
-                    diag::backend_unreachable(&format!("backend at {target_uri}: {last_err}"))
-                        .into_response()
-                };
-                state
-                    .request_metrics
-                    .record(start.elapsed(), resp.status().as_u16());
-                return resp;
+            };
+
+            // Response phase: run the middleware stack in reverse (onion model). This is
+            // where compression applies.
+            let response =
+                chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
+
+            let duration = start.elapsed();
+            let status = response.status().as_u16();
+            state.request_metrics.record(duration, status);
+            tracing::Span::current().record("http.response.status_code", status);
+            access_log(
+                &source_ip, &method, &host, &path, status, duration, "backend",
+            );
+
+            // Feed the circuit breaker: a 5xx is a backend fault, anything else
+            // is a success for breaker purposes (4xx is the client's fault).
+            // When a deadline bounds the response body, once the body has gone
+            // through, as it can still fail or be cut short; on the status
+            // otherwise, so an endless stream does not hold the breaker.
+            let response = response.into_response();
+            let bounded =
+                request_deadline.is_some() || route.backend_timeout.is_some_and(|ms| ms > 0);
+            match route.circuit_breaker.clone() {
+                Some(breaker) if bounded => {
+                    let (parts, body) = response.into_parts();
+                    let body = record_outcome(body, breaker, status >= 500, timed_out.clone());
+                    Response::from_parts(parts, body)
+                }
+                Some(breaker) => {
+                    breaker.record(status >= 500, monotonic_ms());
+                    response
+                }
+                None => response,
             }
         };
 
-        // Response phase: run the middleware stack in reverse (onion model). This is
-        // where compression applies.
-        let response = chain::run_response_phase(&route.middlewares, &ctx, backend_response).await;
-
-        let duration = start.elapsed();
-        let status = response.status().as_u16();
-        state.request_metrics.record(duration, status);
-        // Feed the circuit breaker: a 5xx is a backend fault, anything else is
-        // a success for breaker purposes (4xx is the client's fault).
-        if let Some(cb) = route.circuit_breaker.as_ref() {
-            cb.record(status >= 500, monotonic_ms());
+        let Some(deadline) = request_deadline else {
+            return handled.await;
+        };
+        match tokio::time::timeout_at(deadline, handled).await {
+            Ok(response) => {
+                // The body still to stream is bounded by the deadline too.
+                let (parts, body) = response.into_parts();
+                Response::from_parts(parts, body_before(body, deadline, timed_out.clone()))
+            }
+            Err(_) => {
+                warn!("Request to '{}' past the route's request timeout", host);
+                // A request the breaker let through owes it an outcome, or a
+                // half-open one would wait forever: a backend failure once a
+                // backend was asked, a success before (the client was slow).
+                if let Some(cb) = route.circuit_breaker.as_ref()
+                    && admitted.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    cb.record(
+                        forwarded.load(std::sync::atomic::Ordering::Relaxed),
+                        monotonic_ms(),
+                    );
+                }
+                let resp = diag::backend_timeout(&host, None).into_response();
+                state
+                    .request_metrics
+                    .record(start.elapsed(), resp.status().as_u16());
+                resp
+            }
         }
-        tracing::Span::current().record("http.response.status_code", status);
-        access_log(
-            &source_ip, &method, &host, &path, status, duration, "backend",
-        );
-
-        response.into_response()
     };
 
     fut.instrument(span).await
@@ -596,6 +708,101 @@ async fn handle_websocket(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// `body`, cut short with an error once `deadline` passes: the client then
+/// sees the response end early rather than wait past the route's timeout.
+/// `timed_out` is set when it does, before the body it wraps is dropped.
+fn body_before(
+    body: Body,
+    deadline: tokio::time::Instant,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Body {
+    use futures_util::StreamExt;
+    use http_body_util::{BodyStream, StreamBody};
+
+    let frames = futures_util::stream::unfold(Some(BodyStream::new(body)), move |state| {
+        let timed_out = timed_out.clone();
+        async move {
+            let mut frames = state?;
+            match tokio::time::timeout_at(deadline, frames.next()).await {
+                Ok(Some(frame)) => Some((frame, Some(frames))),
+                Ok(None) => None,
+                Err(_) => {
+                    warn!("Backend response cut short: past the route's timeout");
+                    timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Some((
+                        Err(axum::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "past the route's timeout",
+                        ))),
+                        None,
+                    ))
+                }
+            }
+        }
+    });
+    Body::new(StreamBody::new(frames))
+}
+
+/// `body`, telling `breaker` its outcome once: a failure at an error frame,
+/// `failed` at its end, and when dropped unfinished (the client gone) a
+/// failure if a deadline cut it short (`timed_out`), `failed` otherwise, so a
+/// half-open breaker always hears back.
+fn record_outcome(
+    body: Body,
+    breaker: std::sync::Arc<super::circuit_breaker::CircuitBreaker>,
+    failed: bool,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Body {
+    use futures_util::StreamExt;
+    use http_body_util::{BodyStream, StreamBody};
+
+    let outcome = BreakerOutcome {
+        breaker: Some(breaker),
+        failed,
+        timed_out,
+    };
+    let frames =
+        futures_util::stream::unfold(Some((BodyStream::new(body), outcome)), |state| async move {
+            let (mut frames, mut outcome) = state?;
+            match frames.next().await {
+                Some(frame) => {
+                    if frame.is_err() {
+                        outcome.record(true);
+                    }
+                    Some((frame, Some((frames, outcome))))
+                }
+                None => {
+                    let failed = outcome.failed;
+                    outcome.record(failed);
+                    None
+                }
+            }
+        });
+    Body::new(StreamBody::new(frames))
+}
+
+/// The outcome a response body still owes its route's circuit breaker.
+struct BreakerOutcome {
+    breaker: Option<std::sync::Arc<super::circuit_breaker::CircuitBreaker>>,
+    failed: bool,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BreakerOutcome {
+    fn record(&mut self, failed: bool) {
+        if let Some(breaker) = self.breaker.take() {
+            breaker.record(failed, monotonic_ms());
+        }
+    }
+}
+
+impl Drop for BreakerOutcome {
+    fn drop(&mut self) {
+        let failed = self.failed || self.timed_out.load(std::sync::atomic::Ordering::Relaxed);
+        self.record(failed);
+    }
+}
+
 /// How long to wait on a backend, from the label's millisecond value.
 ///
 /// `None` means no timeout at all, which a route asks for with `0`. Everything
@@ -654,5 +861,123 @@ mod timeout_tests {
             backend_timeout(Some(250)),
             Some(std::time::Duration::from_millis(250))
         );
+    }
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+
+    fn breaker() -> std::sync::Arc<super::super::circuit_breaker::CircuitBreaker> {
+        std::sync::Arc::new(super::super::circuit_breaker::CircuitBreaker::new(
+            crate::model::CircuitBreakerConfig {
+                threshold: 0.5,
+                min_requests: 1,
+                cooldown_secs: 60,
+            },
+        ))
+    }
+
+    fn flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// A body read to its end records the response's outcome.
+    #[tokio::test]
+    async fn a_finished_body_records_its_status() {
+        let ok = breaker();
+        let body = record_outcome(Body::from("done"), ok.clone(), false, flag());
+        assert!(body.collect().await.is_ok());
+        assert!(ok.should_allow(monotonic_ms()));
+
+        let failed = breaker();
+        let body = record_outcome(Body::from("oops"), failed.clone(), true, flag());
+        assert!(body.collect().await.is_ok());
+        assert!(!failed.should_allow(monotonic_ms()));
+    }
+
+    /// A body dropped unfinished still tells the breaker: a failure if a
+    /// deadline cut it short.
+    #[tokio::test]
+    async fn a_dropped_body_still_records_its_outcome() {
+        let timed_out = flag();
+        let cb = breaker();
+        let body = record_outcome(Body::from("unread"), cb.clone(), false, timed_out.clone());
+        timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(body);
+        assert!(!cb.should_allow(monotonic_ms()));
+    }
+
+    /// A deadline wrapping the recorder fails its outcome when it cuts the
+    /// body short.
+    #[tokio::test]
+    async fn a_deadline_cutting_the_body_records_a_failure() {
+        let timed_out = flag();
+        let cb = breaker();
+        let stalled = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        let recorded = record_outcome(
+            Body::from_stream(stalled),
+            cb.clone(),
+            false,
+            timed_out.clone(),
+        );
+        let cut = body_before(
+            recorded,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+            timed_out,
+        );
+        assert!(cut.collect().await.is_err());
+        assert!(!cb.should_allow(monotonic_ms()));
+    }
+
+    /// A body error frame is a backend failure, whatever the status said.
+    #[tokio::test]
+    async fn a_body_error_records_a_failure() {
+        let cb = breaker();
+        let failing = futures_util::stream::iter([Err::<axum::body::Bytes, _>(
+            std::io::Error::other("backend reset"),
+        )]);
+        let body = record_outcome(Body::from_stream(failing), cb.clone(), false, flag());
+        assert!(body.collect().await.is_err());
+        assert!(!cb.should_allow(monotonic_ms()));
+    }
+
+    /// A body still streaming past the deadline ends with an error.
+    #[tokio::test]
+    async fn a_body_past_the_deadline_is_cut_short() {
+        let slow = futures_util::stream::unfold(0u8, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            (n < 10).then(|| {
+                (
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")),
+                    n + 1,
+                )
+            })
+        });
+        let timed_out = flag();
+        let body = body_before(
+            Body::from_stream(slow),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(120),
+            timed_out.clone(),
+        );
+        assert!(body.collect().await.is_err());
+        assert!(timed_out.load(std::sync::atomic::Ordering::Relaxed));
+
+        let fast = body_before(
+            Body::from("done"),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(120),
+            flag(),
+        );
+        assert_eq!(fast.collect().await.unwrap().to_bytes(), "done");
+    }
+
+    #[test]
+    fn a_rewritten_host_replaces_the_client_one() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "rewrite.example".parse().unwrap());
+        rewrite_host(&mut headers, "one.example.org");
+        let hosts: Vec<_> = headers.get_all(axum::http::header::HOST).iter().collect();
+        assert_eq!(hosts, ["one.example.org"]);
+        assert_eq!(headers["x-forwarded-host"], "rewrite.example");
     }
 }

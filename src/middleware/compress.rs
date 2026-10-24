@@ -154,6 +154,10 @@ impl Middleware for CompressMiddleware {
             },
             Err(e) => {
                 error!("Failed to read response body for compression: {}", e);
+                // A body cut short by the route's timeout is a timeout.
+                if super::timed_out(&e) {
+                    return diag::backend_timeout("the backend", None).into_response();
+                }
                 diag::forwarding_failed("response-body-read-failed", &e.to_string()).into_response()
             }
         }
@@ -175,6 +179,31 @@ mod tests {
             HeaderValue::from_str(value).unwrap(),
         );
         headers
+    }
+
+    /// A body cut short by the route's timeout answers 504, not 502.
+    #[tokio::test]
+    async fn a_body_cut_short_by_the_timeout_is_a_timeout() {
+        let ctx = RequestCtx {
+            host: "example.com".to_string(),
+            client_addr: None,
+            is_tls: false,
+            method: axum::http::Method::GET,
+            path: "/".to_string(),
+            client_encoding: Some(Encoding::Gzip),
+            pending_response_headers: Vec::new(),
+            in_flight_guards: Vec::new(),
+        };
+        let cut = futures_util::stream::iter([Err::<axum::body::Bytes, _>(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "past the route's timeout",
+        ))]);
+        let resp = Response::builder()
+            .header("content-type", "text/plain")
+            .body(Body::from_stream(cut))
+            .unwrap();
+        let resp = CompressMiddleware.on_response(&ctx, resp).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

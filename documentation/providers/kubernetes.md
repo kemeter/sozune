@@ -388,10 +388,12 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
 - Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
-- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. Among rules on the same host and path, one with a method is tried first, then the one with more header matches. A request that fails a query or method condition, or a header match on `Host` or `Cookie` (which Sōzu cannot route on), gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
+- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. Among rules on the same host and path, one with a method is tried first, then the one with more header matches. Query matches are routing conditions too, for up to three per match on a rule without a path rewrite. A request that fails a method condition, a header match on `Host` or `Cookie` (which Sōzu cannot route on), or a query match Sōzu does not route on, gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
 - `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below). A backendRef that cannot be used — another kind, another namespace without a grant, a Service that does not exist — is left out of its rule, and a rule left with none, or declaring none, answers `500`, as the spec requires — unless it redirects, which needs no backend; the route's `ResolvedRefs` says why (see [Status conditions](#status-conditions)).
+- `backendRef.filters` — `requestHeaderModifier` and `responseHeaderModifier`, when every backendRef of the rule that can take traffic carries the same ones: they then apply to the whole rule, Sōzu editing headers per route rather than per backend. Different filters on the backendRefs of a rule, or another kind, drop the route (`Accepted=False reason=UnsupportedValue`).
 - `backendRef.weight` — the Service's share of the rule's traffic, as the spec defines it: `weight / Σ weights`, however many pods each Service runs (a Service of 3 pods weighted 90 against one of 1 pod weighted 10 is a 90/10 split). An unset weight is `1`; a weight of `0` sends the Service no traffic, and a rule whose backendRefs all weigh `0` forwards nothing (`503`). Each pod carries an integer weight of at most 2³¹−1, so a Service cannot outweigh another by more than 2³¹−1 times the other's pod count: a ratio past that is capped.
+- `spec.rules[].timeouts` — `request` caps the whole request, from its arrival to the end of the response: the middleware, the client's body, every attempt, the response body, and a WebSocket handshake but not the tunnel after it. `backendRequest` caps each attempt on a backend, its response body included, as [`backendTimeout`](../middleware/backend-timeout.md) does. Past either, the client gets `504`, or a response cut short once it has started. `request: 0s` sets no request timeout, `backendRequest: 0s` no backend timeout. Such a rule goes through the middleware.
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — Sōzune writes standard conditions back onto the resources it owns, visible via `kubectl describe` / `kubectl get`:
@@ -511,7 +513,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 | Filter | Supported | Notes |
 |---|---|---|
-| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` is dropped (see below) |
+| `requestRedirect` | Yes | Native frontend redirect (see below) |
 | `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
@@ -548,9 +550,9 @@ rules:
 | `hostname` | `rewrite_host` | rewrites the `Location` authority |
 | `port` | `rewrite_port` | rewrites the `Location` port |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
-| `path.replacePrefixMatch` | — | **not supported**: keeping the request's trailing segments needs a path capture Sōzune doesn't set up for redirect rules, so the route is dropped |
+| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix in the `Location` path and keeps the rest, as [`urlRewrite`](#urlrewrite) does. On a match that is not a `PathPrefix`, the route is dropped, as the spec says |
 
-A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
+A `requestRedirect` with a `statusCode` other than `301` and `302`, or on a match with query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on `Host` or `Cookie`), is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`): Sōzu answers a redirect itself, so these conditions would not be checked.
 
 #### urlRewrite
 
@@ -576,9 +578,9 @@ rules:
 
 | `urlRewrite` field | Mapped to | Notes |
 |---|---|---|
-| `hostname` | `rewrite_host` | rewrites the forwarded request's `Host` header to a fixed authority |
+| `hostname` | middleware | rewrites the forwarded request's `Host` header to a fixed authority, the client's going in `X-Forwarded-Host`. Such a rule goes through the middleware |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole request path with a fixed value, regardless of trailing segments (`/api/users` with `ReplaceFullPath: /new` → `/new`) |
-| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix and **keeps** the trailing segments (`/api/users` with prefix `/api`, `ReplacePrefixMatch: /v2` → `/v2/users`; `/api` exactly → `/v2`). Only meaningful with a `PathPrefix` match |
+| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix and **keeps** the trailing segments (`/api/users` with prefix `/api`, `ReplacePrefixMatch: /v2` → `/v2/users`; `/api` exactly → `/v2`). Allowed with a `PathPrefix` match only: on another, the route is dropped |
 
 When set, `urlRewrite` takes precedence over the `strip_prefix` / `add_prefix` Service-annotation knobs. `urlRewrite` cannot be combined with `requestRedirect` on the same rule (the route is dropped).
 

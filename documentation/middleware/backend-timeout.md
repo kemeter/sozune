@@ -13,7 +13,7 @@ labels:
 
 | Value | Behaviour |
 |---|---|
-| omitted | 30 seconds (`30000`) |
+| omitted | 30 seconds (`30000`) to get the response's headers; its body is not bounded |
 | `0` | **No timeout** — wait indefinitely |
 | any positive integer | Timeout in milliseconds |
 
@@ -37,7 +37,7 @@ labels:
 
 ## Behaviour
 
-- The timer covers the full request: connecting to the backend, sending the request, and reading the response.
+- A `backendTimeout` you set covers each attempt: connecting to the backend, sending the request, and reading the whole response, its body included. A body still streaming past it is cut short. The default 30 seconds only bound the wait for the response's headers.
 - On timeout, the client receives `504 Gateway Timeout`.
 - On a WebSocket upgrade, the timeout covers only the handshake (connecting and getting the backend's first answer); the tunnel that follows is not bounded by it — see [WebSocket](/documentation/advanced/websocket).
 - The listener's own timeouts still apply. A backend that sends nothing for longer than [`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy) (30 s by default) is cut with a `504`, and so is a client left waiting longer than `proxy.timeouts.client_idle` (60 s), whatever `backendTimeout` says. They are listener-wide, not per route: raise them to let a route wait longer than that. `sozune validate`, `GET /diagnostics` and the dashboard flag a route whose `backendTimeout` the listener cuts short with `W030`.

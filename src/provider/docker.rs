@@ -956,6 +956,7 @@ pub(super) mod merge_tests {
                 forward_auth: None,
                 headers: Vec::new(),
                 backend_timeout: None,
+                request_timeout: None,
                 health_check: None,
                 load_balancer: LoadBalancer::default(),
                 retry: None,

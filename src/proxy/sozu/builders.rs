@@ -5,8 +5,8 @@
 //! its lifecycle.
 
 use crate::model::{
-    AuthConfig, HeaderConfig, HeaderDirection, MatchCondition, PathConfig, PathRewrite,
-    PathRuleType, RedirectPolicy, RedirectScheme, UrlRewrite,
+    AuthConfig, EntrypointConfig, HeaderConfig, HeaderDirection, MatchCondition, PathConfig,
+    PathRewrite, PathRuleType, RedirectPolicy, RedirectScheme, UrlRewrite,
 };
 use sozu_command_lib::config::validate_header_predicate;
 use sozu_command_lib::proto::command::{
@@ -200,6 +200,131 @@ pub(super) fn build_path_and_rewrite(
     }
 }
 
+/// The most query conditions Sōzu routes on: the rule tries each of their
+/// orders, which grow as their factorial.
+const MAX_ROUTED_QUERY_CONDITIONS: usize = 3;
+
+/// Whether Sōzu routes on the query conditions of a route, in its path rule:
+/// a request failing them then goes on to the next route. Not with a path
+/// rewrite, whose rule captures parts of the path, nor a path regex, nor a
+/// condition holding `%`, which the middleware reads as written or as the
+/// start of an encoding depending on what follows; the middleware then
+/// answers `404` when they fail.
+pub(crate) fn routes_on_query(config: &EntrypointConfig) -> bool {
+    !config.match_query.is_empty()
+        && !config
+            .match_query
+            .iter()
+            .any(|c| c.key.contains('%') || c.value.contains('%'))
+        && config.match_query.len() <= MAX_ROUTED_QUERY_CONDITIONS
+        && config.rewrite.as_ref().is_none_or(|r| r.path.is_none())
+        && !config.strip_prefix
+        && config.add_prefix.is_none()
+        && config
+            .path
+            .as_ref()
+            .is_none_or(|p| p.rule_type != PathRuleType::Regex)
+}
+
+/// The path rule of a route whose query conditions Sōzu routes on (see
+/// [`routes_on_query`]): its path, then a query holding every condition, in
+/// any order.
+pub(crate) fn query_path_rule(config: &EntrypointConfig) -> Option<PathRule> {
+    if !routes_on_query(config) {
+        return None;
+    }
+    let path = match &config.path {
+        None => "/[^?]*".to_string(),
+        Some(p) if p.rule_type == PathRuleType::Exact => regex_escape(&p.value),
+        Some(p) => {
+            let trimmed = p.value.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/[^?]*".to_string()
+            } else {
+                format!("{}(?:/[^?]*)?", regex_escape(trimmed))
+            }
+        }
+    };
+    // One parameter can meet several conditions: a repeated one, or a
+    // presence check next to a value on the same key. Each must not ask for
+    // an occurrence of its own.
+    let mut kept: Vec<&crate::model::MatchCondition> = Vec::new();
+    for c in &config.match_query {
+        let covered = kept
+            .iter()
+            .any(|k| k.key == c.key && (c.value.is_empty() || k.value == c.value));
+        if covered {
+            continue;
+        }
+        if !c.value.is_empty() {
+            kept.retain(|k| !(k.key == c.key && k.value.is_empty()));
+        }
+        kept.push(c);
+    }
+    let conditions: Vec<String> = kept
+        .iter()
+        .map(|c| {
+            if c.value.is_empty() {
+                format!("{}(?:=[^&]*)?", query_literal(&c.key, false))
+            } else {
+                format!(
+                    "{}={}",
+                    query_literal(&c.key, false),
+                    query_literal(&c.value, true)
+                )
+            }
+        })
+        .collect();
+    let orders: Vec<String> = permutations(&conditions)
+        .into_iter()
+        .map(|order| order.join("&(?:.*&)?"))
+        .collect();
+    Some(PathRule {
+        value: format!(r"^{path}\?(?:.*&)?(?:{})(?:&.*)?$", orders.join("|")),
+        kind: 1,
+    })
+}
+
+/// A regex matching `text` in a query as written or percent-encoded, as the
+/// middleware compares it decoded: `2` matches `2` and `%32`. A character
+/// that would end the parameter (`&`, `#`, and `=` in a key) or start an
+/// encoding (`%`) only matches encoded; a value may hold a raw `=`, as the
+/// middleware splits a parameter on its first one.
+fn query_literal(text: &str, value: bool) -> String {
+    text.chars()
+        .map(|c| {
+            let mut bytes = [0u8; 4];
+            let encoded: String = c
+                .encode_utf8(&mut bytes)
+                .bytes()
+                .map(|b| format!("%{b:02x}"))
+                .collect();
+            if matches!(c, '&' | '#' | '%') || (c == '=' && !value) {
+                format!("(?i:{encoded})")
+            } else {
+                format!("(?:{}|(?i:{encoded}))", regex_escape(&c.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Every order of `items`.
+fn permutations(items: &[String]) -> Vec<Vec<String>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for (i, first) in items.iter().enumerate() {
+        let mut rest = items.to_vec();
+        rest.remove(i);
+        for mut order in permutations(&rest) {
+            order.insert(0, first.clone());
+            out.push(order);
+        }
+    }
+    out
+}
+
 /// Sōzu matches a path rule against the request path *with* its query
 /// (`/login?next=/`), and a rewrite replaces both. Every anchored rule below
 /// therefore accepts an optional query, and every rewrite carries it over.
@@ -339,9 +464,9 @@ fn build_add_prefix_rewrite(
 ///   a regex that also matches sub-paths so the whole match collapses to
 ///   `new`; for an Exact path it's an exact match.
 /// - `ReplacePrefixMatch(new)`: match the route prefix and keep the trailing
-///   segments, swapping only the prefix. Mirrors strip_prefix's capture
-///   (`^/api(?:/(.*))?$` → `{new}/$PATH[1]`), so `/api/users` → `/v2/users`
-///   and a bare `/api` → `/v2/` (empty capture, same as strip_prefix).
+///   segments, swapping only the prefix: `/api/users` → `/v2/users`, and a
+///   bare `/api` → exactly `/v2`. A replacement of `/` strips the prefix as
+///   strip_prefix does, a bare `/api` giving `/`.
 fn build_url_rewrite_path(
     path_config: Option<&PathConfig>,
     mode: &PathRewrite,
@@ -397,24 +522,44 @@ fn build_replace_prefix_match(
     // stripped, leaving the suffix (`/$PATH[1]`), matching strip_prefix.
     let normalized = normalize_add_prefix(new);
     let suffix_rewrite = format!("{normalized}/$PATH[1]");
+    // A replacement ending in `/` keeps it on a bare prefix (`/v2/`); one
+    // without gives exactly itself (`/v2`).
+    let keeps_no_slash = !normalized.is_empty() && !new.trim().ends_with('/');
 
-    let Some(pc) = path_config else {
-        // ReplacePrefixMatch is only meaningful with a PathPrefix match; with
-        // no route path we have no prefix to swap, so match any path and
-        // prepend the replacement (the whole path is the "suffix").
-        return (
-            PathRule {
-                value: "^/?(.*)$".to_string(),
-                kind: 1,
-            },
-            Some(suffix_rewrite),
-        );
+    // No path match is the `/` prefix, as Gateway API reads it.
+    let root = PathConfig {
+        rule_type: PathRuleType::Prefix,
+        value: "/".to_string(),
     };
+    let pc = path_config.unwrap_or(&root);
 
     match pc.rule_type {
         // Same capture as strip_prefix: the trailing segments (if any) land in
         // $PATH[1], the query in $PATH[2]. `/api/users` → `/v2/users`; a bare
-        // `/api` (empty capture) → `/v2/`, mirroring strip_prefix's `/`.
+        // `/api` (empty capture) → `/v2/` for a replacement ending in `/`, or
+        // `/` for `/`, as strip_prefix does.
+        // Any other replacement keeps the slash of the trailing
+        // segments in the capture: a bare `/api` becomes exactly `/v2`, as
+        // the spec says, not `/v2/`.
+        // On the `/` prefix, a bare `/` is the prefix itself: it becomes
+        // exactly the replacement, `/x` its replacement followed by `/x`.
+        PathRuleType::Prefix if keeps_no_slash && pc.value.trim_end_matches('/').is_empty() => (
+            PathRule {
+                value: format!("^(/[^?]+)?/?{QUERY}$"),
+                kind: 1,
+            },
+            Some(format!("{normalized}$PATH[1]$PATH[2]")),
+        ),
+        PathRuleType::Prefix if keeps_no_slash => (
+            PathRule {
+                value: format!(
+                    "^{}(/[^?]*)?{QUERY}$",
+                    regex_escape(pc.value.trim_end_matches('/'))
+                ),
+                kind: 1,
+            },
+            Some(format!("{normalized}$PATH[1]$PATH[2]")),
+        ),
         PathRuleType::Prefix => (
             prefix_rule_capturing_rest(&pc.value),
             Some(format!("{suffix_rewrite}$PATH[2]")),
@@ -698,7 +843,7 @@ mod tests {
     #[test]
     fn url_rewrite_replace_prefix_keeps_suffix() {
         // `/api` (Prefix) → ReplacePrefixMatch("/v2"): suffix preserved.
-        // `/api/users` → `/v2/users`; a bare `/api` → `/v2/` (empty capture).
+        // `/api/users` → `/v2/users`; a bare `/api` → exactly `/v2`.
         let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
         let built = || {
             build_path_and_rewrite(
@@ -713,8 +858,45 @@ mod tests {
             forwarded(built(), "/api/users").as_deref(),
             Some("/v2/users")
         );
-        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/v2/"));
-        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/v2/?x=1"));
+        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(built(), "/api/").as_deref(), Some("/v2/"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/v2?x=1"));
+        assert_eq!(forwarded(built(), "/apix"), None);
+
+        // A replacement ending in `/` keeps it, and adds no second one.
+        let slash = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2/".into())), None);
+        let with_slash = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/api")),
+                false,
+                None,
+                Some(&slash),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(with_slash(), "/api").as_deref(), Some("/v2/"));
+        assert_eq!(
+            forwarded(with_slash(), "/api/users").as_deref(),
+            Some("/v2/users")
+        );
+
+        // On the `/` prefix, `/` itself becomes exactly the replacement.
+        let root = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/")),
+                false,
+                None,
+                Some(&rw),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(root(), "/").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(root(), "/users").as_deref(), Some("/v2/users"));
+        assert_eq!(forwarded(root(), "/?x=1").as_deref(), Some("/v2?x=1"));
+        // No path match reads as the `/` prefix.
+        let none = || build_path_and_rewrite(None, false, None, Some(&rw), "test");
+        assert_eq!(forwarded(none(), "/").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(none(), "/users").as_deref(), Some("/v2/users"));
         assert_eq!(
             forwarded(built(), "/api/users?x=1").as_deref(),
             Some("/v2/users?x=1")
