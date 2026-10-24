@@ -278,7 +278,27 @@ pub async fn handle_proxy(
         // Buffer the request body up front so each retry can replay it. The
         // body has to be owned bytes — a streaming body can only be sent once.
         // With no retry (`attempts <= 1`) this is still a single send.
-        let body_bytes = match body.collect().await {
+        // A timeout the route sets covers the client's upload too.
+        let collected = match (route.backend_timeout, timeout) {
+            (Some(ms), Some(limit)) if ms > 0 => {
+                match tokio::time::timeout(limit, body.collect()).await {
+                    Ok(collected) => collected,
+                    Err(_) => {
+                        warn!(
+                            "Request body for {} not received within the route's timeout",
+                            target_uri
+                        );
+                        let resp = diag::backend_timeout(&target_uri, timeout).into_response();
+                        state
+                            .request_metrics
+                            .record(start.elapsed(), resp.status().as_u16());
+                        return resp;
+                    }
+                }
+            }
+            _ => body.collect().await,
+        };
+        let body_bytes = match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
                 error!("Failed to buffer request body for {}: {}", target_uri, e);
@@ -314,6 +334,7 @@ pub async fn handle_proxy(
             target_uri = current.to_string();
             parts.uri = current;
             let forwarded_req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+            let attempt_start = tokio::time::Instant::now();
             let response_future = state.http_client.request(forwarded_req);
 
             // `Ok(resp)` on success, `Err((msg, is_timeout))` otherwise.
@@ -329,8 +350,15 @@ pub async fn handle_proxy(
             match result {
                 Ok(resp) => {
                     let (parts, body) = resp.into_parts();
-                    let body =
-                        Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
+                    let body = body.map_err(|e| axum::Error::new(std::io::Error::other(e)));
+                    // A timeout the route sets caps the whole response, its
+                    // body included; the default one only the wait for it.
+                    let body = match (route.backend_timeout, timeout) {
+                        (Some(ms), Some(limit)) if ms > 0 => {
+                            body_before(Body::new(body), attempt_start + limit)
+                        }
+                        _ => Body::new(body),
+                    };
                     backend_response = Some(Response::from_parts(parts, body));
                 }
                 Err((msg, is_timeout)) => {
@@ -613,6 +641,33 @@ async fn handle_websocket(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// `body`, cut short with an error once `deadline` passes: the client then
+/// sees the response end early rather than wait past the route's timeout.
+fn body_before(body: Body, deadline: tokio::time::Instant) -> Body {
+    use futures_util::StreamExt;
+    use http_body_util::{BodyStream, StreamBody};
+
+    let frames =
+        futures_util::stream::unfold(Some(BodyStream::new(body)), move |state| async move {
+            let mut frames = state?;
+            match tokio::time::timeout_at(deadline, frames.next()).await {
+                Ok(Some(frame)) => Some((frame, Some(frames))),
+                Ok(None) => None,
+                Err(_) => {
+                    warn!("Backend response cut short: past the route's timeout");
+                    Some((
+                        Err(axum::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "past the route's timeout",
+                        ))),
+                        None,
+                    ))
+                }
+            }
+        });
+    Body::new(StreamBody::new(frames))
+}
+
 /// How long to wait on a backend, from the label's millisecond value.
 ///
 /// `None` means no timeout at all, which a route asks for with `0`. Everything
@@ -675,8 +730,33 @@ mod timeout_tests {
 }
 
 #[cfg(test)]
-mod rewrite_host_tests {
+mod forwarding_tests {
     use super::*;
+
+    /// A body still streaming past the deadline ends with an error.
+    #[tokio::test]
+    async fn a_body_past_the_deadline_is_cut_short() {
+        let slow = futures_util::stream::unfold(0u8, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            (n < 10).then(|| {
+                (
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")),
+                    n + 1,
+                )
+            })
+        });
+        let body = body_before(
+            Body::from_stream(slow),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(120),
+        );
+        assert!(body.collect().await.is_err());
+
+        let fast = body_before(
+            Body::from("done"),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(120),
+        );
+        assert_eq!(fast.collect().await.unwrap().to_bytes(), "done");
+    }
 
     #[test]
     fn a_rewritten_host_replaces_the_client_one() {
