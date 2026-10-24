@@ -321,15 +321,30 @@ impl KubernetesProvider {
 
     /// Whether Service `svc_id` exists, `None` until every Service was
     /// listed once, and for a namespace the Service watcher does not cover.
+    /// A Service missing from the cache while it has EndpointSlices is
+    /// `None` too: the watcher may not have seen it yet.
     pub fn service_exists(&self, svc_id: &str) -> Option<bool> {
         let namespace = svc_id.split_once('/').map_or(svc_id, |(ns, _)| ns);
         if !self.config.namespace.is_empty() && namespace != self.config.namespace {
             return None;
         }
-        let cache = self.ports.read().ok()?;
-        cache
-            .services_listed
-            .then(|| cache.services.contains_key(svc_id))
+        {
+            // Released before `endpoints` is read: `addresses` takes the two
+            // the other way round.
+            let cache = self.ports.read().ok()?;
+            if !cache.services_listed {
+                return None;
+            }
+            if cache.services.contains_key(svc_id) {
+                return Some(true);
+            }
+        }
+        let has_slices = self.endpoints.read().is_ok_and(|endpoints| {
+            endpoints
+                .get(svc_id)
+                .is_some_and(|slices| !slices.is_empty())
+        });
+        (!has_slices).then_some(false)
     }
 
     /// The ready pods of Service `svc_id` behind its port named `name`, each
@@ -1445,6 +1460,23 @@ mod tests {
         provider.config.namespace = "apps".into();
         assert_eq!(provider.service_exists("apps/ghost"), Some(false));
         assert_eq!(provider.service_exists("other/api"), None);
+
+        // A Service the watcher has not seen, with slices, is not known.
+        provider
+            .endpoints
+            .write()
+            .unwrap()
+            .insert("apps/late".into(), Default::default());
+        // An empty bucket is no slice.
+        assert_eq!(provider.service_exists("apps/late"), Some(false));
+        provider
+            .endpoints
+            .write()
+            .unwrap()
+            .get_mut("apps/late")
+            .unwrap()
+            .insert("late-abc".into(), Vec::new());
+        assert_eq!(provider.service_exists("apps/late"), None);
     }
 
     fn make_provider(expose_by_default: bool) -> KubernetesProvider {
