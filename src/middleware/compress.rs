@@ -104,21 +104,6 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     zstd::encode_all(std::io::Cursor::new(data), 3)
 }
 
-/// Whether `error`, or one it wraps, is a timeout.
-fn timed_out(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(err) = current {
-        if err
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return true;
-        }
-        current = err.source();
-    }
-    false
-}
-
 /// Middleware wrapper: compresses the response body when the client accepts a
 /// supported encoding and the content is compressible. The encoding is
 /// negotiated from the request (`ctx.client_encoding`) and applied here on the
@@ -170,7 +155,7 @@ impl Middleware for CompressMiddleware {
             Err(e) => {
                 error!("Failed to read response body for compression: {}", e);
                 // A body cut short by the route's timeout is a timeout.
-                if timed_out(&e) {
+                if super::timed_out(&e) {
                     return diag::backend_timeout("the backend", None).into_response();
                 }
                 diag::forwarding_failed("response-body-read-failed", &e.to_string()).into_response()

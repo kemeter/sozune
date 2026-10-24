@@ -164,6 +164,8 @@ pub struct MiddlewareRoute {
     /// have a weight. Tried when the picked backend gives no response.
     pub backups: Vec<usize>,
     pub backend_timeout: Option<u64>,
+    /// Milliseconds the whole request may take, from its arrival.
+    pub request_timeout: Option<u64>,
     /// Total forward attempts (first try + retries) on a connection-level
     /// failure or timeout. `1` (or `0`) means no retry — the default.
     pub retry_attempts: u32,
@@ -540,11 +542,27 @@ pub fn middleware_query_conditions(config: &EntrypointConfig) -> Option<Vec<Matc
     (!config.match_query.is_empty() && !routes_on_query(config)).then(|| config.match_query.clone())
 }
 
+/// Whether `error`, or one it wraps, is a timeout.
+pub(crate) fn timed_out(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.invalid_backends
         || url_rewrite_host(config).is_some()
         || config.backend_timeout.is_some()
+        || config.request_timeout.is_some()
         || config.rate_limit.is_some()
         || config.in_flight_req.is_some()
         || config.compress
@@ -693,6 +711,7 @@ pub fn build_middleware_route(
         balancer: WeightedRoundRobin::new(&weights),
         backups: backup_indexes(&weights),
         backend_timeout: config.backend_timeout,
+        request_timeout: config.request_timeout,
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
         circuit_breaker,
         middlewares,
@@ -748,6 +767,7 @@ mod route_key_tests {
             balancer: WeightedRoundRobin::new(weights),
             backups: backup_indexes(weights),
             backend_timeout: None,
+            request_timeout: None,
             retry_attempts: 1,
             circuit_breaker: None,
             middlewares: Vec::new(),
@@ -929,6 +949,7 @@ mod route_key_tests {
             balancer: WeightedRoundRobin::new(&[100]),
             backups: Vec::new(),
             backend_timeout: None,
+            request_timeout: None,
             retry_attempts: 1,
             circuit_breaker: None,
             middlewares: Vec::new(),

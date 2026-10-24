@@ -128,6 +128,10 @@ pub struct EntrypointConfig {
     pub headers: Vec<HeaderConfig>,
     #[serde(default)]
     pub backend_timeout: Option<u64>,
+    /// Milliseconds the whole request may take, from its arrival to the end
+    /// of the response: the client's body, every attempt, the response body.
+    #[serde(default)]
+    pub request_timeout: Option<u64>,
     /// Active HTTP health check. When set, the health checker issues a
     /// `GET <path>` against each backend and judges health on the status code
     /// instead of a bare TCP connect. `None` (default) keeps the TCP probe.

@@ -4310,7 +4310,7 @@ fn rule_to_entrypoints(
         backends
     };
 
-    let timeout = rule_timeout_ms(rule);
+    let (request_timeout, backend_timeout) = rule_timeouts_ms(rule);
 
     // Gateway API: matches inside a rule are OR'd. Emit one entrypoint
     // per match. A rule with no matches at all is "match anything" —
@@ -4398,7 +4398,8 @@ fn rule_to_entrypoints(
                     auth: None,
                     forward_auth: None,
                     headers: header_edits.clone(),
-                    backend_timeout: timeout,
+                    backend_timeout,
+                    request_timeout,
                     health_check: None,
                     load_balancer: LoadBalancer::default(),
                     retry: None,
@@ -4427,26 +4428,25 @@ fn rule_to_entrypoints(
         .collect()
 }
 
-/// The rule's timeout in milliseconds: the shorter of its `request` and
-/// `backendRequest` timeouts, Sōzune retrying nothing on its own. A zero
-/// duration disables a timeout, as the spec says.
-fn rule_timeout_ms(rule: &HTTPRouteRules) -> Option<u64> {
-    let timeouts = rule.timeouts.as_ref()?;
-    [
-        timeouts.request.as_deref(),
-        timeouts.backend_request.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|raw| {
+/// The rule's `request` and `backendRequest` timeouts in milliseconds.
+/// `backendRequest: 0s` stays `Some(0)`, which disables the backend timeout;
+/// `request: 0s` sets no request timeout. An invalid duration is ignored.
+fn rule_timeouts_ms(rule: &HTTPRouteRules) -> (Option<u64>, Option<u64>) {
+    let parse = |raw: Option<&str>| {
+        let raw = raw?;
         let ms = gateway_duration_ms(raw);
         if ms.is_none() {
             warn!("Gateway API: ignoring the invalid timeout {:?}", raw);
         }
         ms
-    })
-    .filter(|ms| *ms > 0)
-    .min()
+    };
+    let Some(timeouts) = rule.timeouts.as_ref() else {
+        return (None, None);
+    };
+    (
+        parse(timeouts.request.as_deref()).filter(|ms| *ms > 0),
+        parse(timeouts.backend_request.as_deref()),
+    )
 }
 
 /// A Gateway API duration (`1h`, `30s`, `500ms`, `1m30s`) in milliseconds.
@@ -5699,6 +5699,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         forward_auth: None,
         headers: Vec::new(),
         backend_timeout: None,
+        request_timeout: None,
         health_check: None,
         retry: None,
         circuit_breaker: None,
@@ -6743,9 +6744,10 @@ mod tests {
         }
     }
 
-    /// The shorter of the two timeouts applies; a zero one is no timeout.
+    /// `request` bounds the whole request, `backendRequest` each attempt; a
+    /// zero `backendRequest` disables the backend timeout.
     #[test]
-    fn a_rule_timeout_becomes_the_backend_timeout() {
+    fn rule_timeouts_map_to_request_and_backend_timeouts() {
         use gateway_api::apis::standard::httproutes::HTTPRouteRulesTimeouts;
         let with = |request: Option<&str>, backend_request: Option<&str>| {
             let mut r = rule(None, vec![backend("api", 80)]);
@@ -6754,13 +6756,13 @@ mod tests {
                 backend_request: backend_request.map(String::from),
             });
             let route = route_with(vec![r], vec!["app.example.com".into()]);
-            route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs)[0]
-                .config
-                .backend_timeout
+            let config = &route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs)[0].config;
+            (config.request_timeout, config.backend_timeout)
         };
-        assert_eq!(with(Some("2s"), Some("500ms")), Some(500));
-        assert_eq!(with(Some("0s"), None), None);
-        assert_eq!(with(None, Some("1m")), Some(60_000));
+        assert_eq!(with(Some("2s"), Some("500ms")), (Some(2_000), Some(500)));
+        assert_eq!(with(Some("0s"), None), (None, None));
+        assert_eq!(with(None, Some("0s")), (None, Some(0)));
+        assert_eq!(with(None, Some("1m")), (None, Some(60_000)));
     }
 
     /// A redirect on a condition only the middleware checks would skip it:
