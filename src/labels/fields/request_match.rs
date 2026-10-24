@@ -53,6 +53,7 @@ fn parse_conditions(labels: &HashMap<String, String>, key: &str) -> Vec<MatchCon
         let cond = MatchCondition {
             key: k.to_string(),
             value: v.to_string(),
+            regex: false,
         };
         if !out.contains(&cond) {
             out.push(cond);

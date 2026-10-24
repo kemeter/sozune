@@ -3895,6 +3895,7 @@ mod tests {
         ep.config.match_headers = vec![crate::model::MatchCondition {
             key: "Cookie".into(),
             value: "beta=1".into(),
+            regex: false,
         }];
         assert!(middleware::needs_middleware(&ep.config));
         let route = middleware::build_middleware_route(
@@ -3920,6 +3921,7 @@ mod tests {
         let condition = |key: &str, value: &str| MatchCondition {
             key: key.into(),
             value: value.into(),
+            regex: false,
         };
         let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
         ep.config.match_query = vec![condition("animal", "dolphin"), condition("color", "blue")];
@@ -4004,6 +4006,7 @@ mod tests {
         let condition = |key: &str, value: &str| MatchCondition {
             key: key.into(),
             value: value.into(),
+            regex: false,
         };
         let route = |id: &str, methods: &[&str], headers: Vec<MatchCondition>, query: usize| {
             let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
@@ -4842,6 +4845,7 @@ mod tests {
         a.config.match_headers = vec![crate::model::MatchCondition {
             key: "X-Canary".into(),
             value: String::new(),
+            regex: false,
         }];
         let twins = build_acme_twins(&a, 80);
         assert_eq!(twins.len(), a.config.hostnames.len());

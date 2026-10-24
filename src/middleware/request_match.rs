@@ -23,9 +23,39 @@ fn decode(raw: &str) -> String {
         .into_owned()
 }
 
+/// A condition, its regex compiled once. A regex that does not compile
+/// matches nothing: the route is refused rather than served too widely.
+struct Condition {
+    key: String,
+    value: String,
+    regex: Option<Option<regex::Regex>>,
+}
+
+impl Condition {
+    fn new(c: MatchCondition) -> Self {
+        let regex = c
+            .regex
+            .then(|| regex::Regex::new(&format!("^(?:{})$", c.value)).ok());
+        Self {
+            key: c.key,
+            value: c.value,
+            regex,
+        }
+    }
+
+    /// Whether `value` meets the condition: the regex, or the exact value, or
+    /// anything when the condition only asks for the key.
+    fn holds(&self, value: &str) -> bool {
+        match &self.regex {
+            Some(regex) => regex.as_ref().is_some_and(|r| r.is_match(value)),
+            None => self.value.is_empty() || value == self.value,
+        }
+    }
+}
+
 pub struct RequestMatchMiddleware {
-    headers: Vec<MatchCondition>,
-    query: Vec<MatchCondition>,
+    headers: Vec<Condition>,
+    query: Vec<Condition>,
     /// Client-IP allow-list for routing. `None` when no `matchClientIP` was set
     /// (or every entry was invalid) — in that case the IP is not constrained.
     client_ip: Option<IpAllowList>,
@@ -40,23 +70,24 @@ impl RequestMatchMiddleware {
         trusted: TrustedProxies,
     ) -> Self {
         Self {
-            headers,
-            query,
+            headers: headers.into_iter().map(Condition::new).collect(),
+            query: query.into_iter().map(Condition::new).collect(),
             client_ip,
             trusted,
         }
     }
 
     /// Every header condition must hold: the header is present and, when the
-    /// condition's `value` is non-empty, equals it (case-insensitive name,
-    /// exact value). An empty `value` matches on presence alone.
+    /// condition's `value` is non-empty, equals it, or matches it whole for a
+    /// regex (case-insensitive name). An empty `value` matches on presence
+    /// alone.
     fn headers_match(&self, req: &Request<Body>) -> bool {
         self.headers.iter().all(|cond| {
             req.headers()
                 .get_all(&cond.key)
                 .iter()
                 .filter_map(|v| v.to_str().ok())
-                .any(|v| cond.value.is_empty() || v == cond.value)
+                .any(|v| cond.holds(v))
         })
     }
 
@@ -76,11 +107,9 @@ impl RequestMatchMiddleware {
                 None => (decode(pair), String::new()),
             })
             .collect();
-        self.query.iter().all(|cond| {
-            pairs
-                .iter()
-                .any(|(k, v)| *k == cond.key && (cond.value.is_empty() || *v == cond.value))
-        })
+        self.query
+            .iter()
+            .all(|cond| pairs.iter().any(|(k, v)| *k == cond.key && cond.holds(v)))
     }
 
     /// The client-IP condition holds when no `matchClientIP` is set, or when
@@ -120,10 +149,33 @@ impl Middleware for RequestMatchMiddleware {
 mod tests {
     use super::*;
 
+    fn regex(key: &str, value: &str) -> MatchCondition {
+        MatchCondition {
+            regex: true,
+            ..cond(key, value)
+        }
+    }
+
+    #[test]
+    fn regex_conditions_match_the_whole_value() {
+        let m = mw(
+            vec![regex("Cookie", "beta=[0-9]+")],
+            vec![regex("v", "[23]")],
+        );
+        assert!(m.headers_match(&req(&[("cookie", "beta=12")], "/")));
+        assert!(!m.headers_match(&req(&[("cookie", "beta=12; x=1")], "/")));
+        assert!(m.query_match(&req(&[], "/?v=2")));
+        assert!(!m.query_match(&req(&[], "/?v=23")));
+        // A regex that does not compile matches nothing.
+        let broken = mw(Vec::new(), vec![regex("v", "(")]);
+        assert!(!broken.query_match(&req(&[], "/?v=(")));
+    }
+
     fn cond(key: &str, value: &str) -> MatchCondition {
         MatchCondition {
             key: key.to_string(),
             value: value.to_string(),
+            regex: false,
         }
     }
 

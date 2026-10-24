@@ -63,7 +63,13 @@ pub(super) fn build_frontend_headers(edits: &[HeaderConfig]) -> Vec<Header> {
 /// with the middleware, which answers 404 when they fail; a predicate instead
 /// lets the request fall through to the next route.
 pub(crate) fn header_predicate(condition: &MatchCondition) -> Option<HeaderPredicate> {
-    let predicate = if condition.value.is_empty() {
+    let predicate = if condition.regex {
+        HeaderPredicate {
+            name: condition.key.clone(),
+            kind: HeaderMatchKind::Regex as i32,
+            value: Some(condition.value.clone()),
+        }
+    } else if condition.value.is_empty() {
         HeaderPredicate {
             name: condition.key.clone(),
             kind: HeaderMatchKind::Present as i32,
@@ -207,11 +213,12 @@ const MAX_ROUTED_QUERY_CONDITIONS: usize = 3;
 /// Whether Sōzu routes on the query conditions of a route, in its path rule:
 /// a request failing them then goes on to the next route. Not with a path
 /// rewrite, whose rule captures parts of the path, nor a path regex, nor a
-/// condition holding `%`, which the middleware reads as written or as the
+/// regex condition, nor a condition holding `%`, which the middleware reads as written or as the
 /// start of an encoding depending on what follows; the middleware then
 /// answers `404` when they fail.
 pub(crate) fn routes_on_query(config: &EntrypointConfig) -> bool {
     !config.match_query.is_empty()
+        && !config.match_query.iter().any(|c| c.regex)
         && !config
             .match_query
             .iter()
@@ -595,6 +602,7 @@ mod tests {
         MatchCondition {
             key: key.into(),
             value: value.into(),
+            regex: false,
         }
     }
 
