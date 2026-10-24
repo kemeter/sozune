@@ -4236,6 +4236,8 @@ fn rule_to_entrypoints(
         backends
     };
 
+    let timeout = rule_timeout_ms(rule);
+
     // Gateway API: matches inside a rule are OR'd. Emit one entrypoint
     // per match. A rule with no matches at all is "match anything" —
     // emit a single entrypoint with no path constraint to preserve that
@@ -4312,7 +4314,7 @@ fn rule_to_entrypoints(
                     auth: None,
                     forward_auth: None,
                     headers: header_edits.clone(),
-                    backend_timeout: None,
+                    backend_timeout: timeout,
                     health_check: None,
                     load_balancer: LoadBalancer::default(),
                     retry: None,
@@ -4339,6 +4341,61 @@ fn rule_to_entrypoints(
             }
         })
         .collect()
+}
+
+/// The rule's timeout in milliseconds: the shorter of its `request` and
+/// `backendRequest` timeouts, Sōzune retrying nothing on its own. A zero
+/// duration disables a timeout, as the spec says.
+fn rule_timeout_ms(rule: &HTTPRouteRules) -> Option<u64> {
+    let timeouts = rule.timeouts.as_ref()?;
+    [
+        timeouts.request.as_deref(),
+        timeouts.backend_request.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|raw| {
+        let ms = gateway_duration_ms(raw);
+        if ms.is_none() {
+            warn!("Gateway API: ignoring the invalid timeout {:?}", raw);
+        }
+        ms
+    })
+    .filter(|ms| *ms > 0)
+    .min()
+}
+
+/// A Gateway API duration (`1h`, `30s`, `500ms`, `1m30s`) in milliseconds.
+fn gateway_duration_ms(raw: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut rest = raw;
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let value: u64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let (unit, len) = if rest.starts_with("ms") {
+            (1, 2)
+        } else if rest.starts_with('h') {
+            (3_600_000, 1)
+        } else if rest.starts_with('m') {
+            (60_000, 1)
+        } else if rest.starts_with('s') {
+            (1_000, 1)
+        } else {
+            return None;
+        };
+        rest = &rest[len..];
+        total = total.checked_add(value.checked_mul(unit)?)?;
+    }
+    Some(total)
 }
 
 struct TrackedTlsRoute {
@@ -6589,6 +6646,37 @@ mod tests {
             status: Default::default(),
         };
         assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
+    }
+
+    #[test]
+    fn gateway_durations_are_read_in_milliseconds() {
+        assert_eq!(gateway_duration_ms("500ms"), Some(500));
+        assert_eq!(gateway_duration_ms("1s"), Some(1_000));
+        assert_eq!(gateway_duration_ms("1h2m3s4ms"), Some(3_723_004));
+        assert_eq!(gateway_duration_ms("0s"), Some(0));
+        for invalid in ["", "1", "s", "1d", "1.5s"] {
+            assert_eq!(gateway_duration_ms(invalid), None, "{invalid}");
+        }
+    }
+
+    /// The shorter of the two timeouts applies; a zero one is no timeout.
+    #[test]
+    fn a_rule_timeout_becomes_the_backend_timeout() {
+        use gateway_api::apis::standard::httproutes::HTTPRouteRulesTimeouts;
+        let with = |request: Option<&str>, backend_request: Option<&str>| {
+            let mut r = rule(None, vec![backend("api", 80)]);
+            r.timeouts = Some(HTTPRouteRulesTimeouts {
+                request: request.map(String::from),
+                backend_request: backend_request.map(String::from),
+            });
+            let route = route_with(vec![r], vec!["app.example.com".into()]);
+            route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs)[0]
+                .config
+                .backend_timeout
+        };
+        assert_eq!(with(Some("2s"), Some("500ms")), Some(500));
+        assert_eq!(with(Some("0s"), None), None);
+        assert_eq!(with(None, Some("1m")), Some(60_000));
     }
 
     #[test]
