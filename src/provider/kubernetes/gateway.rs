@@ -3886,7 +3886,7 @@ fn replaces_prefix_off_a_prefix_match(
 /// answers a redirect itself, before the middleware could refuse the request.
 fn redirect_skips_conditions(ep: &Entrypoint) -> bool {
     ep.answers_without_backend()
-        && (!ep.config.match_query.is_empty()
+        && (crate::middleware::middleware_query_conditions(&ep.config).is_some()
             || !crate::middleware::middleware_header_conditions(&ep.config).is_empty())
 }
 

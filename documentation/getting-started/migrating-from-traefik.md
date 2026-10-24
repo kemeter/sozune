@@ -66,7 +66,7 @@ A Traefik rule becomes one label per matcher. All the matchers of a route must m
 
 `matchHeaders` chooses between routes, as `Header()` does: two routers on the same host and path that differ only by a header translate one to one, and a request without the header goes to the other route. A route whose header conditions hold comes before every route without any, whatever their priority.
 
-`matchQuery` and `matchClientIP` filter a route, they do not choose between routes. Sōzune picks the route on host, path, method and headers, then answers `404` when one of these conditions fails, without trying another route. Two Traefik routers on the same host and path that differ only by a query parameter or a client IP need distinct paths in Sōzune. See [Header & query matching](/documentation/routing/header-query-matching).
+`matchQuery` chooses between routes too, as `Query()` does, for up to three conditions on a route without `pathRegex`, `stripPrefix` or `addPrefix`. `matchClientIP` filters a route, it does not choose between routes: Sōzune picks the route, then answers `404` when the client IP is not listed, without trying another route. Two Traefik routers on the same host and path that differ only by a client IP need distinct paths in Sōzune. See [Header & query matching](/documentation/routing/header-query-matching).
 
 A rule that mixes `||` across different matcher types has no single-route equivalent: declare one service per alternative. Each of them needs a `host`, so an alternative on a path alone, on any host, cannot be expressed with labels.
 

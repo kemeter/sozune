@@ -5,8 +5,8 @@
 //! its lifecycle.
 
 use crate::model::{
-    AuthConfig, HeaderConfig, HeaderDirection, MatchCondition, PathConfig, PathRewrite,
-    PathRuleType, RedirectPolicy, RedirectScheme, UrlRewrite,
+    AuthConfig, EntrypointConfig, HeaderConfig, HeaderDirection, MatchCondition, PathConfig,
+    PathRewrite, PathRuleType, RedirectPolicy, RedirectScheme, UrlRewrite,
 };
 use sozu_command_lib::config::validate_header_predicate;
 use sozu_command_lib::proto::command::{
@@ -198,6 +198,131 @@ pub(super) fn build_path_and_rewrite(
             (user_regex_rule(&path_config.value), None)
         }
     }
+}
+
+/// The most query conditions Sōzu routes on: the rule tries each of their
+/// orders, which grow as their factorial.
+const MAX_ROUTED_QUERY_CONDITIONS: usize = 3;
+
+/// Whether Sōzu routes on the query conditions of a route, in its path rule:
+/// a request failing them then goes on to the next route. Not with a path
+/// rewrite, whose rule captures parts of the path, nor a path regex, nor a
+/// condition holding `%`, which the middleware reads as written or as the
+/// start of an encoding depending on what follows; the middleware then
+/// answers `404` when they fail.
+pub(crate) fn routes_on_query(config: &EntrypointConfig) -> bool {
+    !config.match_query.is_empty()
+        && !config
+            .match_query
+            .iter()
+            .any(|c| c.key.contains('%') || c.value.contains('%'))
+        && config.match_query.len() <= MAX_ROUTED_QUERY_CONDITIONS
+        && config.rewrite.as_ref().is_none_or(|r| r.path.is_none())
+        && !config.strip_prefix
+        && config.add_prefix.is_none()
+        && config
+            .path
+            .as_ref()
+            .is_none_or(|p| p.rule_type != PathRuleType::Regex)
+}
+
+/// The path rule of a route whose query conditions Sōzu routes on (see
+/// [`routes_on_query`]): its path, then a query holding every condition, in
+/// any order.
+pub(crate) fn query_path_rule(config: &EntrypointConfig) -> Option<PathRule> {
+    if !routes_on_query(config) {
+        return None;
+    }
+    let path = match &config.path {
+        None => "/[^?]*".to_string(),
+        Some(p) if p.rule_type == PathRuleType::Exact => regex_escape(&p.value),
+        Some(p) => {
+            let trimmed = p.value.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/[^?]*".to_string()
+            } else {
+                format!("{}(?:/[^?]*)?", regex_escape(trimmed))
+            }
+        }
+    };
+    // One parameter can meet several conditions: a repeated one, or a
+    // presence check next to a value on the same key. Each must not ask for
+    // an occurrence of its own.
+    let mut kept: Vec<&crate::model::MatchCondition> = Vec::new();
+    for c in &config.match_query {
+        let covered = kept
+            .iter()
+            .any(|k| k.key == c.key && (c.value.is_empty() || k.value == c.value));
+        if covered {
+            continue;
+        }
+        if !c.value.is_empty() {
+            kept.retain(|k| !(k.key == c.key && k.value.is_empty()));
+        }
+        kept.push(c);
+    }
+    let conditions: Vec<String> = kept
+        .iter()
+        .map(|c| {
+            if c.value.is_empty() {
+                format!("{}(?:=[^&]*)?", query_literal(&c.key, false))
+            } else {
+                format!(
+                    "{}={}",
+                    query_literal(&c.key, false),
+                    query_literal(&c.value, true)
+                )
+            }
+        })
+        .collect();
+    let orders: Vec<String> = permutations(&conditions)
+        .into_iter()
+        .map(|order| order.join("&(?:.*&)?"))
+        .collect();
+    Some(PathRule {
+        value: format!(r"^{path}\?(?:.*&)?(?:{})(?:&.*)?$", orders.join("|")),
+        kind: 1,
+    })
+}
+
+/// A regex matching `text` in a query as written or percent-encoded, as the
+/// middleware compares it decoded: `2` matches `2` and `%32`. A character
+/// that would end the parameter (`&`, `#`, and `=` in a key) or start an
+/// encoding (`%`) only matches encoded; a value may hold a raw `=`, as the
+/// middleware splits a parameter on its first one.
+fn query_literal(text: &str, value: bool) -> String {
+    text.chars()
+        .map(|c| {
+            let mut bytes = [0u8; 4];
+            let encoded: String = c
+                .encode_utf8(&mut bytes)
+                .bytes()
+                .map(|b| format!("%{b:02x}"))
+                .collect();
+            if matches!(c, '&' | '#' | '%') || (c == '=' && !value) {
+                format!("(?i:{encoded})")
+            } else {
+                format!("(?:{}|(?i:{encoded}))", regex_escape(&c.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Every order of `items`.
+fn permutations(items: &[String]) -> Vec<Vec<String>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for (i, first) in items.iter().enumerate() {
+        let mut rest = items.to_vec();
+        rest.remove(i);
+        for mut order in permutations(&rest) {
+            order.insert(0, first.clone());
+            out.push(order);
+        }
+    }
+    out
 }
 
 /// Sōzu matches a path rule against the request path *with* its query

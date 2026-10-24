@@ -2,7 +2,7 @@
 
 Scope a route to requests coming from specific client IPs or CIDR ranges, on top of the usual host/path matching. Use it to serve an admin route only to your office network, or to pin a route to a known set of upstreams.
 
-`matchClientIP` is a **routing matcher**: when the client IP is not in the list, the request gets `404 Not Found` — the route simply *does not apply*, exactly like [header & query matching](./header-query-matching.md). This is what distinguishes it from the [IP allow-list middleware](../middleware/ip-allow-list.md), which is an *access filter* that returns `403 Forbidden`. Pick the matcher when "this IP shouldn't see this route at all"; pick the middleware when "this IP is forbidden from a route it would otherwise reach".
+`matchClientIP` is a **routing matcher**: when the client IP is not in the list, the request gets `404 Not Found` — the route simply *does not apply*. Unlike [header & query matching](./header-query-matching.md), it does not go on to another route. This is what distinguishes it from the [IP allow-list middleware](../middleware/ip-allow-list.md), which is an *access filter* that returns `403 Forbidden`. Pick the matcher when "this IP shouldn't see this route at all"; pick the middleware when "this IP is forbidden from a route it would otherwise reach".
 
 ## Labels
 

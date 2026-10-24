@@ -19,7 +19,7 @@ use hyper_util::rt::TokioExecutor;
 use tracing::{error, info, warn};
 
 use crate::model::{Backend, EntrypointConfig, MatchCondition};
-use crate::proxy::sozu::header_predicate;
+use crate::proxy::sozu::{header_predicate, routes_on_query};
 use chain::Middleware;
 use compress::CompressMiddleware;
 use forward_auth::ForwardAuthMiddleware;
@@ -534,6 +534,12 @@ pub fn middleware_header_conditions(config: &EntrypointConfig) -> Vec<MatchCondi
         .collect()
 }
 
+/// The query conditions left for the middleware to enforce, `None` when
+/// there are none: Sōzu routes on them when it can (see `routes_on_query`).
+pub fn middleware_query_conditions(config: &EntrypointConfig) -> Option<Vec<MatchCondition>> {
+    (!config.match_query.is_empty() && !routes_on_query(config)).then(|| config.match_query.clone())
+}
+
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.invalid_backends
@@ -545,7 +551,7 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.forward_auth.is_some()
         || !config.plugins.is_empty()
         || !middleware_header_conditions(config).is_empty()
-        || !config.match_query.is_empty()
+        || middleware_query_conditions(config).is_some()
         || !config.match_client_ip.is_empty()
         || !config.ip_allow_list.is_empty()
         // Retry is enforced in the middleware proxy handler, so a route that
@@ -618,10 +624,11 @@ pub fn build_middleware_route(
         }
     };
     let match_headers = middleware_header_conditions(config);
-    if !match_headers.is_empty() || !config.match_query.is_empty() || client_ip.is_some() {
+    let match_query = middleware_query_conditions(config).unwrap_or_default();
+    if !match_headers.is_empty() || !match_query.is_empty() || client_ip.is_some() {
         middlewares.push(Arc::new(RequestMatchMiddleware::new(
             match_headers,
-            config.match_query.clone(),
+            match_query,
             client_ip,
             trusted_proxies.clone(),
         )));

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::config::{AcmeConfig, ProxyTimeouts};
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
-use crate::proxy::sozu::header_predicate;
+use crate::proxy::sozu::{header_predicate, routes_on_query};
 
 /// Run per-entrypoint lints. Called immediately after parsing one candidate.
 /// `prefix` is `sozune.<protocol>.<service>.`, so labels name the full key.
@@ -46,6 +46,16 @@ pub fn lint_entrypoint(ep: &Entrypoint, prefix: &str, diagnostics: &mut Vec<Diag
 /// A route's header conditions Sōzu routes on, as lowercase name and value.
 type HeaderConditions = Vec<(String, String)>;
 
+/// What tells a route from another on the same host and path: its priority,
+/// and the header and query conditions Sōzu routes on.
+struct RouteConditions {
+    priority: i32,
+    /// Whether it routes on methods, tried before a route on any method.
+    on_methods: bool,
+    headers: HeaderConditions,
+    query: Vec<(String, String)>,
+}
+
 /// Run lints that need to look at the full set of routed entrypoints (e.g.
 /// host+path collisions across services).
 ///
@@ -54,9 +64,12 @@ type HeaderConditions = Vec<(String, String)>;
 /// one without: Sōzu tries it first, and the other serves the requests it
 /// leaves. Two routes with header conditions collide unless one header
 /// requires different values on each, which no request can carry at once.
+/// Query conditions Sōzu routes on keep a route without any from colliding
+/// with one with them, unless its priority is higher. Two routes with query
+/// conditions collide: a request can repeat a parameter with each value.
 pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diagnostic)> {
     let mut out = Vec::new();
-    let mut routes: HashMap<(String, String), Vec<(&str, HeaderConditions)>> = HashMap::new();
+    let mut routes: HashMap<(String, String), Vec<(&str, RouteConditions)>> = HashMap::new();
 
     for (cand_id, ep) in entrypoints {
         if !matches!(ep.protocol, Protocol::Http) {
@@ -77,20 +90,37 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
             .filter(|c| header_predicate(c).is_some())
             .map(|c| (c.key.to_ascii_lowercase(), c.value.clone()))
             .collect();
+        let query: Vec<(String, String)> = if routes_on_query(&ep.config) {
+            ep.config
+                .match_query
+                .iter()
+                .map(|c| (c.key.clone(), c.value.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for host in &ep.config.hostnames {
             routes
                 .entry((host.clone(), path.clone()))
                 .or_default()
-                .push((cand_id, headers.clone()));
+                .push((
+                    cand_id,
+                    RouteConditions {
+                        priority: ep.config.priority,
+                        on_methods: !ep.config.methods.is_empty(),
+                        headers: headers.clone(),
+                        query: query.clone(),
+                    },
+                ));
         }
     }
 
     for ((host, path), declared) in &routes {
-        for (cand_id, headers) in declared {
+        for (cand_id, conditions) in declared {
             let mut others: Vec<&str> = declared
                 .iter()
-                .filter(|(other, other_headers)| {
-                    other != cand_id && can_overlap(headers, other_headers)
+                .filter(|(other, other_conditions)| {
+                    other != cand_id && conditions_overlap(conditions, other_conditions)
                 })
                 .map(|(other, _)| *other)
                 .collect();
@@ -100,13 +130,13 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
             others.sort();
             others.dedup();
             let others_str = others.join(", ");
-            let message = if headers.is_empty() {
+            let message = if conditions.headers.is_empty() && conditions.query.is_empty() {
                 format!(
                     "route ({host}{path}) is also defined by: {others_str}; only the highest-priority candidate is reachable"
                 )
             } else {
                 format!(
-                    "route ({host}{path}) is also defined by: {others_str}, with header conditions a request can meet for both; the highest-priority candidate serves it"
+                    "route ({host}{path}) is also defined by: {others_str}, with conditions a request can meet for both; the highest-priority candidate serves it"
                 )
             };
             out.push((
@@ -120,6 +150,24 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
     }
 
     out
+}
+
+/// Whether one request can match both routes and only one serves it.
+fn conditions_overlap(a: &RouteConditions, b: &RouteConditions) -> bool {
+    if !can_overlap(&a.headers, &b.headers) {
+        return false;
+    }
+    // A route without query conditions is tried after one with them, unless
+    // its priority is higher, or at equal priority it routes on methods and
+    // the other does not, or has more header conditions. Two routes with query conditions always overlap: Sōzu
+    // takes any occurrence of a parameter, and a request can repeat one with
+    // each value (`?v=2&v=3`).
+    if a.query.is_empty() != b.query.is_empty() {
+        let (with, without) = if a.query.is_empty() { (b, a) } else { (a, b) };
+        let rank = |r: &RouteConditions| (r.priority, r.on_methods, r.headers.len());
+        return rank(without) > rank(with);
+    }
+    true
 }
 
 /// Whether one request can match both sets of header conditions, given that
@@ -414,6 +462,57 @@ mod tests {
         assert_eq!(lint_collection(&pairs).len(), 2);
     }
 
+    /// Query conditions Sōzu routes on tell routes apart, unless a route
+    /// without any outranks the one with them.
+    #[test]
+    fn query_conditions_tell_routes_apart() {
+        let a = ep("example.com", Some("/api"), false, false);
+        let mut b = ep("example.com", Some("/api"), false, false);
+        b.config.match_query = vec![MatchCondition {
+            key: "v".into(),
+            value: "2".into(),
+        }];
+        assert!(lint_collection(&[("cand-a", &a), ("cand-b", &b)]).is_empty());
+
+        // `?v=2&v=3` matches both.
+        let mut c = b.clone();
+        c.config.match_query[0].value = "3".into();
+        assert_eq!(lint_collection(&[("cand-b", &b), ("cand-c", &c)]).len(), 2);
+
+        let mut high = a.clone();
+        high.config.priority = 10;
+        assert_eq!(
+            lint_collection(&[("cand-high", &high), ("cand-b", &b)]).len(),
+            2
+        );
+
+        // More header conditions put a route without query conditions first.
+        let header = |key: &str| MatchCondition {
+            key: key.into(),
+            value: String::new(),
+        };
+        let mut two_headers = a.clone();
+        two_headers.config.match_headers = vec![header("X-A"), header("X-B")];
+        let mut header_and_query = b.clone();
+        header_and_query.config.match_headers = vec![header("X-A")];
+        assert_eq!(
+            lint_collection(&[
+                ("cand-headers", &two_headers),
+                ("cand-query", &header_and_query)
+            ])
+            .len(),
+            2
+        );
+
+        // So does a method: `GET /api` comes before `/api?v=2`.
+        let mut get = a.clone();
+        get.config.methods = vec!["GET".into()];
+        assert_eq!(
+            lint_collection(&[("cand-get", &get), ("cand-b", &b)]).len(),
+            2
+        );
+    }
+
     /// A request can carry `X-Env: prod` and match both a route on that
     /// value and one on the header's presence; it cannot carry two values.
     #[test]
@@ -434,9 +533,8 @@ mod tests {
         assert_eq!(owners, ["any", "prod", "staging"]);
         let prod_message = &out.iter().find(|(c, _)| c == "prod").unwrap().1.message;
         assert!(
-            prod_message.contains(
-                "also defined by: any, with header conditions a request can meet for both"
-            )
+            prod_message
+                .contains("also defined by: any, with conditions a request can meet for both")
         );
 
         assert!(lint_collection(&[("prod", &prod), ("staging", &staging)]).is_empty());

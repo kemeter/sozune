@@ -19,11 +19,11 @@ use acme::{
     add_certificate, register_acme_challenge_cluster, remove_certificate, replace_certificate,
 };
 use addr::{l4_backend_id, parse_backend_address};
-pub(crate) use builders::header_predicate;
 use builders::{
     build_authorized_hashes, build_frontend_headers, build_header_predicates,
     build_path_and_rewrite, map_redirect_policy, map_redirect_scheme, methods_for_frontend,
 };
+pub(crate) use builders::{header_predicate, routes_on_query};
 use channel::{send_to_worker, wait_for_worker_ready, with_reload_budget};
 use gateway_listeners::{GatewayListeners, close_unused_gateway_listeners, open_gateway_listeners};
 use sozu_command_lib::{
@@ -1449,10 +1449,18 @@ pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
 
 /// How specific a route is, the most specific first: by hostname, then path,
 /// then a route on methods before one on any method, then the more header
-/// conditions Sōzu routes on. Query conditions do not count: the middleware
-/// answers `404` when they fail, so trying such a route first would take the
-/// requests of a wider one.
-fn specificity(ep: &Entrypoint) -> (Rank, Rank, bool, std::cmp::Reverse<usize>) {
+/// conditions Sōzu routes on, then the more query conditions it routes on.
+/// Conditions left to the middleware do not count: it answers `404` when they
+/// fail, so trying such a route first would take the requests of a wider one.
+fn specificity(
+    ep: &Entrypoint,
+) -> (
+    Rank,
+    Rank,
+    bool,
+    std::cmp::Reverse<usize>,
+    std::cmp::Reverse<usize>,
+) {
     let header_predicates = ep
         .config
         .match_headers
@@ -1464,6 +1472,11 @@ fn specificity(ep: &Entrypoint) -> (Rank, Rank, bool, std::cmp::Reverse<usize>) 
         path_specificity(ep.config.path.as_ref()),
         ep.config.methods.is_empty(),
         std::cmp::Reverse(header_predicates),
+        std::cmp::Reverse(if routes_on_query(&ep.config) {
+            ep.config.match_query.len()
+        } else {
+            0
+        }),
     )
 }
 
@@ -1794,6 +1807,7 @@ pub(crate) fn build_http_frontends(
             entrypoint.config.rewrite.as_ref(),
             cluster_id,
         );
+        let path_rule = builders::query_path_rule(&entrypoint.config).unwrap_or(path_rule);
 
         // `Sozune-Route` is reserved on requests: an edit of it could reach
         // the middleware ahead of the route it names. Its response side stays.
@@ -2596,6 +2610,7 @@ fn remove_http_frontends(
         entrypoint.config.rewrite.as_ref(),
         cluster_id,
     );
+    let path_rule = builders::query_path_rule(&entrypoint.config).unwrap_or(path_rule);
 
     let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
     for hostname in &entrypoint.config.hostnames {
@@ -3876,9 +3891,10 @@ mod tests {
     fn invalid_backends_answer_after_the_match_check() {
         let mut ep = base_ep(Vec::new());
         ep.config.invalid_backends = true;
-        ep.config.match_query = vec![crate::model::MatchCondition {
-            key: "v".into(),
-            value: "1".into(),
+        // A condition Sōzu cannot route on, left to the middleware.
+        ep.config.match_headers = vec![crate::model::MatchCondition {
+            key: "Cookie".into(),
+            value: "beta=1".into(),
         }];
         assert!(middleware::needs_middleware(&ep.config));
         let route = middleware::build_middleware_route(
@@ -3893,6 +3909,81 @@ mod tests {
         let matched = names.iter().position(|n| *n == "request-match");
         let invalid = names.iter().position(|n| *n == "invalid-backends");
         assert!(matched.is_some() && matched < invalid, "{names:?}");
+    }
+
+    /// Sōzu routes on query conditions in the path rule, in any order and
+    /// whatever other parameters the query carries.
+    #[test]
+    fn query_conditions_are_routed_by_sozu() {
+        use crate::model::{MatchCondition, PathConfig, PathRewrite, PathRuleType, UrlRewrite};
+        use sozu_lib::router::{PathRule as SozuPathRule, PathRuleResult};
+        let condition = |key: &str, value: &str| MatchCondition {
+            key: key.into(),
+            value: value.into(),
+        };
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        ep.config.match_query = vec![condition("animal", "dolphin"), condition("color", "blue")];
+        let matches = |config: &crate::model::EntrypointConfig, path: &str| {
+            let rule = builders::query_path_rule(config).expect("routed by Sōzu");
+            SozuPathRule::from_config(rule)
+                .is_some_and(|r| r.matches(path.as_bytes()) != PathRuleResult::None)
+        };
+        assert!(matches(&ep.config, "/?animal=dolphin&color=blue"));
+        assert!(matches(&ep.config, "/x?color=blue&animal=dolphin"));
+        assert!(matches(
+            &ep.config,
+            "/?a=1&color=blue&b=2&animal=dolphin&c=3"
+        ));
+        assert!(!matches(&ep.config, "/?animal=dolphin"));
+        assert!(!matches(&ep.config, "/?animal=dolphins&color=blue"));
+        assert!(!matches(&ep.config, "/?ANIMAL=dolphin&color=blue"));
+        assert!(!matches(&ep.config, "/"));
+        // Compared decoded, as the middleware does.
+        assert!(matches(&ep.config, "/?animal=dolph%69n&%63olor=blue"));
+        assert!(matches(&ep.config, "/?animal=dolph%69n&color=blu%65"));
+
+        // One parameter meets a repeated condition, and a presence check on
+        // its key.
+        ep.config.match_query = vec![condition("v", "2"), condition("v", "2"), condition("v", "")];
+        assert!(matches(&ep.config, "/?v=2"));
+        ep.config.match_query = vec![condition("v", ""), condition("v", "2")];
+        assert!(matches(&ep.config, "/?v=2"));
+        assert!(!matches(&ep.config, "/?v=3"));
+
+        // A value may hold a raw `=`, as the middleware splits on the first.
+        ep.config.match_query = vec![condition("token", "a=b")];
+        assert!(matches(&ep.config, "/?token=a=b"));
+        assert!(matches(&ep.config, "/?token=a%3Db"));
+
+        ep.config.match_query = vec![condition("q", "a&b")];
+        assert!(matches(&ep.config, "/?q=a%26b"));
+        assert!(!matches(&ep.config, "/?q=a&b"));
+
+        ep.config.match_query = vec![condition("debug", "")];
+        ep.config.path = Some(PathConfig {
+            rule_type: PathRuleType::Prefix,
+            value: "/api".into(),
+        });
+        assert!(matches(&ep.config, "/api/x?debug"));
+        assert!(matches(&ep.config, "/api?debug=1"));
+        assert!(!matches(&ep.config, "/apix?debug"));
+        assert!(!matches(&ep.config, "/api?debugger=1"));
+        assert!(routes_on_query(&ep.config));
+        assert!(!middleware::needs_middleware(&ep.config));
+
+        // A `%` in a condition: the middleware keeps the query conditions.
+        ep.config.match_query = vec![condition("q", "100%")];
+        assert!(builders::query_path_rule(&ep.config).is_none());
+        ep.config.match_query = vec![condition("debug", "")];
+
+        // A path rewrite captures parts of the path: the middleware keeps
+        // the query conditions.
+        ep.config.rewrite = Some(UrlRewrite {
+            path: Some(PathRewrite::ReplacePrefixMatch("/v2".into())),
+            hostname: None,
+        });
+        assert!(builders::query_path_rule(&ep.config).is_none());
+        assert!(middleware::needs_middleware(&ep.config));
     }
 
     /// A wildcard taking any number of labels ranks as the `*.` one.
