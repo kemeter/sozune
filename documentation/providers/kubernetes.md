@@ -577,7 +577,7 @@ rules:
 
 | `urlRewrite` field | Mapped to | Notes |
 |---|---|---|
-| `hostname` | `rewrite_host` | rewrites the forwarded request's `Host` header to a fixed authority |
+| `hostname` | middleware | rewrites the forwarded request's `Host` header to a fixed authority, the client's going in `X-Forwarded-Host`. Such a rule goes through the middleware |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole request path with a fixed value, regardless of trailing segments (`/api/users` with `ReplaceFullPath: /new` → `/new`) |
 | `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix and **keeps** the trailing segments (`/api/users` with prefix `/api`, `ReplacePrefixMatch: /v2` → `/v2/users`; `/api` exactly → `/v2`). Only meaningful with a `PathPrefix` match |
 

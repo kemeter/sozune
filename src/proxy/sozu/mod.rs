@@ -1836,18 +1836,9 @@ pub(crate) fn build_http_frontends(
             .rewrite_path
             .clone()
             .or(frontend_rewrite_path);
-        // A urlRewrite hostname is a transparent rewrite of the forwarded
-        // request's Host header (Sōzu's native frontend rewrite_host). It
-        // shares the field with a redirect's rewrite_host; the two never
-        // co-exist on one rule (redirect+urlRewrite is rejected upstream),
-        // so the redirect value takes the field when present.
-        let frontend_rewrite_host = entrypoint.config.rewrite_host.clone().or_else(|| {
-            entrypoint
-                .config
-                .rewrite
-                .as_ref()
-                .and_then(|r| r.hostname.clone())
-        });
+        // A redirect's host. A urlRewrite hostname is applied by the
+        // middleware instead (see `middleware::url_rewrite_host`).
+        let frontend_rewrite_host = entrypoint.config.rewrite_host.clone();
         let frontend_rewrite_port = entrypoint.config.rewrite_port.map(|p| p as u32);
         let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
 

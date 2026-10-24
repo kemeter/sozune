@@ -24,6 +24,19 @@ fn monotonic_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Give the request `new_host` as its `Host`, the client's going in
+/// `X-Forwarded-Host`.
+fn rewrite_host(headers: &mut axum::http::HeaderMap, new_host: &str) {
+    let Ok(value) = axum::http::HeaderValue::from_str(new_host) else {
+        warn!("Ignoring the invalid rewritten host {:?}", new_host);
+        return;
+    };
+    if let Some(original) = headers.remove(axum::http::header::HOST) {
+        headers.insert("x-forwarded-host", original);
+    }
+    headers.insert(axum::http::header::HOST, value);
+}
+
 /// Main proxy handler: identifies the route by Host header,
 /// applies middleware stack, and forwards to the real backend.
 pub async fn handle_proxy(
@@ -219,6 +232,10 @@ pub async fn handle_proxy(
             original_path,
             target_uri
         );
+
+        if let Some(new_host) = route.rewrite_host.as_deref() {
+            rewrite_host(req.headers_mut(), new_host);
+        }
 
         if is_websocket {
             // WebSocket tunnels live for the whole connection (minutes to hours),
@@ -654,5 +671,20 @@ mod timeout_tests {
             backend_timeout(Some(250)),
             Some(std::time::Duration::from_millis(250))
         );
+    }
+}
+
+#[cfg(test)]
+mod rewrite_host_tests {
+    use super::*;
+
+    #[test]
+    fn a_rewritten_host_replaces_the_client_one() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "rewrite.example".parse().unwrap());
+        rewrite_host(&mut headers, "one.example.org");
+        let hosts: Vec<_> = headers.get_all(axum::http::header::HOST).iter().collect();
+        assert_eq!(hosts, ["one.example.org"]);
+        assert_eq!(headers["x-forwarded-host"], "rewrite.example");
     }
 }

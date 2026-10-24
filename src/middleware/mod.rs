@@ -171,6 +171,9 @@ pub struct MiddlewareRoute {
     /// `None` when the route doesn't configure one.
     pub circuit_breaker: Option<Arc<circuit_breaker::CircuitBreaker>>,
     pub middlewares: Vec<Arc<dyn Middleware>>,
+    /// The `Host` the backend gets instead of the client's, the client's
+    /// going in `X-Forwarded-Host`.
+    pub rewrite_host: Option<String>,
 }
 
 impl std::fmt::Debug for MiddlewareRoute {
@@ -534,6 +537,7 @@ pub fn middleware_header_conditions(config: &EntrypointConfig) -> Vec<MatchCondi
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
     config.invalid_backends
+        || url_rewrite_host(config).is_some()
         || config.backend_timeout.is_some()
         || config.rate_limit.is_some()
         || config.in_flight_req.is_some()
@@ -685,7 +689,15 @@ pub fn build_middleware_route(
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
         circuit_breaker,
         middlewares,
+        rewrite_host: url_rewrite_host(config).map(str::to_string),
     })
+}
+
+/// The host a route's URL rewrite gives the request. The middleware applies
+/// it: Sōzu's own host rewrite sends the backend two `Host` headers, which
+/// many servers refuse.
+pub fn url_rewrite_host(config: &EntrypointConfig) -> Option<&str> {
+    config.rewrite.as_ref()?.hostname.as_deref()
 }
 
 /// Start the middleware reverse proxy server
@@ -732,6 +744,7 @@ mod route_key_tests {
             retry_attempts: 1,
             circuit_breaker: None,
             middlewares: Vec::new(),
+            rewrite_host: None,
         }
     }
 
@@ -912,6 +925,7 @@ mod route_key_tests {
             retry_attempts: 1,
             circuit_breaker: None,
             middlewares: Vec::new(),
+            rewrite_host: None,
         })
     }
 
