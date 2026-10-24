@@ -240,6 +240,10 @@ pub struct MatchCondition {
     pub key: String,
     #[serde(default)]
     pub value: String,
+    /// `value` is a regular expression the whole value must match, not the
+    /// value itself.
+    #[serde(default)]
+    pub regex: bool,
 }
 
 /// Load-balancing algorithm across an entrypoint's backends. Mirrors the

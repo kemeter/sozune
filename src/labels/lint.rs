@@ -88,7 +88,16 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
             .match_headers
             .iter()
             .filter(|c| header_predicate(c).is_some())
-            .map(|c| (c.key.to_ascii_lowercase(), c.value.clone()))
+            // A regex can match the value another condition asks for: it
+            // tells routes apart no better than the header's presence.
+            .map(|c| {
+                let value = if c.regex {
+                    String::new()
+                } else {
+                    c.value.clone()
+                };
+                (c.key.to_ascii_lowercase(), value)
+            })
             .collect();
         let query: Vec<(String, String)> = if routes_on_query(&ep.config) {
             ep.config
@@ -453,6 +462,7 @@ mod tests {
         b.config.match_headers = vec![MatchCondition {
             key: "X-Canary".into(),
             value: String::new(),
+            regex: false,
         }];
         let pairs = vec![("cand-a", &a), ("cand-b", &b)];
         assert!(lint_collection(&pairs).is_empty());
@@ -472,6 +482,7 @@ mod tests {
         b.config.match_query = vec![MatchCondition {
             key: "v".into(),
             value: "2".into(),
+            regex: false,
         }];
         assert!(lint_collection(&[("cand-a", &a), ("cand-b", &b)]).is_empty());
 
@@ -491,6 +502,7 @@ mod tests {
         let header = |key: &str| MatchCondition {
             key: key.into(),
             value: String::new(),
+            regex: false,
         };
         let mut two_headers = a.clone();
         two_headers.config.match_headers = vec![header("X-A"), header("X-B")];
@@ -523,6 +535,7 @@ mod tests {
             e.config.match_headers = vec![MatchCondition {
                 key: "X-Env".into(),
                 value: value.into(),
+                regex: false,
             }];
             e
         };
@@ -550,6 +563,7 @@ mod tests {
         beta.config.match_headers = vec![MatchCondition {
             key: "Cookie".into(),
             value: "beta=1".into(),
+            regex: false,
         }];
 
         assert_eq!(

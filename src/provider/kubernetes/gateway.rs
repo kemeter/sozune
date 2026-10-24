@@ -3202,10 +3202,10 @@ fn apply_route(
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares a RegularExpression header/query match sōzune cannot represent (Exact and presence-only header/query matches, and all method matches, are supported) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares a RegularExpression path match, or a header or query one that does not compile — dropping the route",
             ns, name
         );
-        (RouteOutcome::UnsupportedFilters, Vec::new())
+        (RouteOutcome::UnsupportedMatches, Vec::new())
     } else {
         // Narrow the route's hostnames by the listener(s) it binds to, over
         // HTTP and over HTTPS: a listener with a `hostname` only serves
@@ -3798,7 +3798,7 @@ fn specificity_groups(hostnames: Vec<String>) -> Vec<Vec<String>> {
 /// Other silent skips:
 /// - rules with backends that resolve to zero pod IPs
 /// - matches that aren't `Path` (header/query/method-only matches)
-/// - `RegularExpression` path type — not yet supported by the routing layer
+/// - a `RegularExpression` path match (the route is rejected upstream)
 pub fn route_to_entrypoints_with_hostnames(
     route: &HTTPRoute,
     resolver: &dyn ServiceResolver,
@@ -3891,12 +3891,11 @@ fn redirect_skips_conditions(ep: &Entrypoint) -> bool {
 }
 
 /// True iff any match in the route declares a condition sōzune can't
-/// represent — a `type: RegularExpression` header or query match. Treated
-/// like an unsupported filter: the route is rejected (logged, and reflected
-/// as `ResolvedRefs=False reason=UnsupportedValue`) rather than served with
-/// the regex condition silently dropped, which would route more traffic
-/// than the author asked for. Exact and presence-only header/query matches,
-/// and all method matches, are supported and don't trip this.
+/// represent — a `type: RegularExpression` path match, or a header or query
+/// one that does not compile. Treated like an unsupported filter: the route is
+/// rejected (logged, and reflected as `ResolvedRefs=False
+/// reason=UnsupportedValue`) rather than served with the condition dropped,
+/// which would route more traffic than the author asked for.
 pub fn route_has_unsupported_matches(route: &HTTPRoute) -> bool {
     route
         .spec
@@ -4027,6 +4026,11 @@ pub enum RouteOutcome {
     /// the entire route. Reflected as `ResolvedRefs=False
     /// reason=UnsupportedValue`.
     UnsupportedFilters,
+    /// A match sōzune cannot represent (a `RegularExpression` path, or a
+    /// header or query regex that does not compile) dropped the route.
+    /// Reflected as `Accepted=False reason=UnsupportedValue`; its
+    /// backendRefs are reported on as usual.
+    UnsupportedMatches,
     /// In scope, no filters, but every backendRef resolved to zero
     /// ready endpoints. Surfaces as `ResolvedRefs=False
     /// reason=BackendNotFound` so users can distinguish "I'm waiting
@@ -4081,6 +4085,11 @@ fn build_route_status(
             "False",
             REASON_UNSUPPORTED_VALUE,
             "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect, requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
+        ),
+        RouteOutcome::UnsupportedMatches => (
+            "False",
+            REASON_UNSUPPORTED_VALUE,
+            "Route declares a match sōzune cannot represent: a RegularExpression path match, or a header or query regular expression that does not compile".to_string(),
         ),
         RouteOutcome::NoMatchingListenerHostname => (
             "False",
@@ -4331,6 +4340,7 @@ fn rule_to_entrypoints(
                 let rule_type = match p.r#type {
                     Some(HTTPRouteRulesMatchesPathType::Exact) => PathRuleType::Exact,
                     Some(HTTPRouteRulesMatchesPathType::PathPrefix) | None => PathRuleType::Prefix,
+                    // Refused upstream (see `route_has_unsupported_matches`).
                     Some(HTTPRouteRulesMatchesPathType::RegularExpression) => return None,
                 };
                 Some(PathConfig { rule_type, value })
@@ -6783,6 +6793,7 @@ mod tests {
         ep.config.match_headers = vec![crate::model::MatchCondition {
             key: "Cookie".into(),
             value: "beta=1".into(),
+            regex: false,
         }];
         assert!(redirect_skips_conditions(&ep));
     }
@@ -7245,21 +7256,52 @@ mod tests {
     }
 
     #[test]
-    fn regex_path_match_is_skipped() {
+    fn regex_path_match_is_reported_unsupported() {
         let r = route_with(
             vec![rule(
                 Some(vec![path_match(
-                    "^/api/v[0-9]+",
+                    "/api/v[0-9]+",
                     HTTPRouteRulesMatchesPathType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
             vec!["app.example.com".into()],
         );
-        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
-        // Backend still produces an entrypoint, but without a path config.
-        assert_eq!(eps.len(), 1);
-        assert!(eps[0].config.path.is_none());
+        assert!(route_has_unsupported_matches(&r));
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_is_reported_unsupported() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![header_match(
+                    "X-Canary",
+                    "v(",
+                    HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_has_unsupported_matches(&r));
+    }
+
+    /// A regex is checked as it is served, anchored: a trailing extended-mode
+    /// comment would swallow the anchors.
+    #[test]
+    fn a_regex_is_checked_anchored() {
+        let r = route_with(
+            vec![rule(
+                Some(vec![header_match(
+                    "X-Canary",
+                    "(?x)v # comment",
+                    HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["app.example.com".into()],
+        );
+        assert!(route_has_unsupported_matches(&r));
     }
 
     #[test]
@@ -7337,35 +7379,41 @@ mod tests {
     }
 
     #[test]
-    fn regex_header_match_is_reported_unsupported() {
+    fn regex_header_match_is_a_regex_condition() {
         let r = route_with(
             vec![rule(
                 Some(vec![header_match(
                     "X-Canary",
-                    "^v[0-9]+$",
+                    "v[0-9]+",
                     HTTPRouteRulesMatchesHeadersType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
             vec!["app.example.com".into()],
         );
-        assert!(route_has_unsupported_matches(&r));
+        assert!(!route_has_unsupported_matches(&r));
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert!(eps[0].config.match_headers[0].regex);
     }
 
     #[test]
-    fn regex_query_match_is_reported_unsupported() {
+    fn regex_query_match_is_a_regex_condition() {
         let r = route_with(
             vec![rule(
                 Some(vec![query_match(
                     "v",
-                    "^[0-9]+$",
+                    "[0-9]+",
                     HTTPRouteRulesMatchesQueryParamsType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
             vec!["app.example.com".into()],
         );
-        assert!(route_has_unsupported_matches(&r));
+        assert!(!route_has_unsupported_matches(&r));
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert!(eps[0].config.match_query[0].regex);
+        // Left to the middleware: Sōzu routes on literal query values only.
+        assert!(crate::middleware::needs_middleware(&eps[0].config));
     }
 
     #[test]
@@ -8325,6 +8373,25 @@ mod tests {
             assert_eq!(conditions[1].status, "False");
             assert_eq!(conditions[1].reason, reason);
         }
+    }
+
+    /// An unsupported match refuses the route, without blaming its refs.
+    #[test]
+    fn build_status_reports_an_unsupported_match() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        scope.upsert_gateway(&gateway("default", "gw", "sozune"));
+        let r = route_with_uid_parents(
+            "uid-1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        let parents = build_route_status(&r, &scope, RouteOutcome::UnsupportedMatches, None);
+        let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+        assert_eq!(conditions[0].status, "False");
+        assert_eq!(conditions[0].reason, REASON_UNSUPPORTED_VALUE);
+        assert_eq!(conditions[1].status, "True");
     }
 
     #[test]
