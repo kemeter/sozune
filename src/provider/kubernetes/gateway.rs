@@ -31,7 +31,8 @@ use super::gateway_filters;
 use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
 use crate::model::{
-    Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRuleType, Protocol,
+    Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRewrite, PathRuleType,
+    Protocol, UrlRewrite,
 };
 use futures_util::StreamExt;
 use gateway_api::apis::experimental::tcproutes::{TCPRoute, TCPRouteParentRefs, TCPRouteRules};
@@ -3193,7 +3194,7 @@ fn apply_route(
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect — excluding its prefix-rewrite form — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported; requestMirror and extensionRef are not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect, requestHeaderModifier, responseHeaderModifier and urlRewrite are supported; requestMirror and extensionRef are not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -3232,12 +3233,21 @@ fn apply_route(
                 secure,
                 scope.https_redirect_port(route),
             );
-            let outcome = if eps.is_empty() {
-                RouteOutcome::NoResolvableBackends
+            if eps.iter().any(redirect_skips_conditions) {
+                warn!(
+                    "Gateway API: HTTPRoute {}/{} redirects on a match whose query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on Host or Cookie…) — dropping the route",
+                    route.metadata.namespace.as_deref().unwrap_or("default"),
+                    route.metadata.name.as_deref().unwrap_or("<no-name>")
+                );
+                (RouteOutcome::UnsupportedFilters, Vec::new())
             } else {
-                RouteOutcome::Accepted
-            };
-            (outcome, eps)
+                let outcome = if eps.is_empty() {
+                    RouteOutcome::NoResolvableBackends
+                } else {
+                    RouteOutcome::Accepted
+                };
+                (outcome, eps)
+            }
         }
     };
 
@@ -3838,11 +3848,46 @@ pub fn route_has_unsupported_filters(
         .any(
             |rule| match gateway_filters::effective_rule_filters(rule, &usable) {
                 Some(filters) => {
-                    !filters.is_empty() && !gateway_filters::rule_filters_supported(&filters)
+                    (!filters.is_empty() && !gateway_filters::rule_filters_supported(&filters))
+                        || replaces_prefix_off_a_prefix_match(rule, &filters)
                 }
                 None => true,
             },
         )
+}
+
+/// Whether a rule replaces the matched prefix (a `replacePrefixMatch` in a
+/// `requestRedirect` or `urlRewrite`) on a match that is not a path prefix:
+/// Gateway API allows it with a `PathPrefix` match only.
+fn replaces_prefix_off_a_prefix_match(
+    rule: &HTTPRouteRules,
+    filters: &[gateway_api::apis::standard::httproutes::HTTPRouteRulesFilters],
+) -> bool {
+    let replaces_prefix = filters.iter().any(|f| {
+        f.request_redirect
+            .as_ref()
+            .and_then(|r| r.path.as_ref())
+            .is_some_and(|p| p.replace_prefix_match.is_some())
+            || f.url_rewrite
+                .as_ref()
+                .and_then(|r| r.path.as_ref())
+                .is_some_and(|p| p.replace_prefix_match.is_some())
+    });
+    replaces_prefix
+        && rule.matches.iter().flatten().any(|m| {
+            m.path
+                .as_ref()
+                .and_then(|p| p.r#type.as_ref())
+                .is_some_and(|t| *t != HTTPRouteRulesMatchesPathType::PathPrefix)
+        })
+}
+
+/// Whether `ep` redirects on conditions only the middleware checks: Sōzu
+/// answers a redirect itself, before the middleware could refuse the request.
+fn redirect_skips_conditions(ep: &Entrypoint) -> bool {
+    ep.answers_without_backend()
+        && (!ep.config.match_query.is_empty()
+            || !crate::middleware::middleware_header_conditions(&ep.config).is_empty())
 }
 
 /// True iff any match in the route declares a condition sōzune can't
@@ -4035,7 +4080,7 @@ fn build_route_status(
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect — excluding its prefix-rewrite form — requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect, requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
         ),
         RouteOutcome::NoMatchingListenerHostname => (
             "False",
@@ -4337,7 +4382,17 @@ fn rule_to_entrypoints(
                     rewrite_host: redirect.as_ref().and_then(|r| r.host.clone()),
                     rewrite_path: redirect.as_ref().and_then(|r| r.path.clone()),
                     rewrite_port: redirect.as_ref().and_then(|r| r.port),
-                    rewrite: url_rewrite.clone(),
+                    rewrite: url_rewrite.clone().or_else(|| {
+                        // A redirect replacing the matched prefix builds its
+                        // `Location` as this rewrite does.
+                        redirect
+                            .as_ref()
+                            .and_then(|r| r.prefix.clone())
+                            .map(|prefix| UrlRewrite {
+                                path: Some(PathRewrite::ReplacePrefixMatch(prefix)),
+                                hostname: None,
+                            })
+                    }),
                     www_authenticate: None,
                     priority: 0,
                     auth: None,
@@ -6706,6 +6761,103 @@ mod tests {
         assert_eq!(with(Some("2s"), Some("500ms")), Some(500));
         assert_eq!(with(Some("0s"), None), None);
         assert_eq!(with(None, Some("1m")), Some(60_000));
+    }
+
+    /// A redirect on a condition only the middleware checks would skip it:
+    /// such an entrypoint is flagged, so the route is refused.
+    #[test]
+    fn a_redirect_on_middleware_conditions_is_flagged() {
+        let mut ep = route_to_entrypoints(
+            &route_with(
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["app.example.com".into()],
+            ),
+            &r1(),
+            &AllowAllBackendRefs,
+        )
+        .remove(0);
+        ep.config.redirect = Some(RedirectPolicy::Permanent);
+        assert!(!redirect_skips_conditions(&ep));
+        ep.config.match_headers = vec![crate::model::MatchCondition {
+            key: "Cookie".into(),
+            value: "beta=1".into(),
+        }];
+        assert!(redirect_skips_conditions(&ep));
+    }
+
+    /// A prefix replacement on an exact match is refused, as Gateway API says.
+    #[test]
+    fn a_prefix_replacement_on_an_exact_match_is_refused() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectPath,
+            HTTPRouteRulesFiltersRequestRedirectPathType,
+        };
+        let redirect = |path_type| {
+            let mut r = rule(
+                Some(vec![path_match("/original", path_type)]),
+                vec![backend("api", 80)],
+            );
+            r.filters = Some(vec![HTTPRouteRulesFilters {
+                request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                    path: Some(HTTPRouteRulesFiltersRequestRedirectPath {
+                        replace_full_path: None,
+                        replace_prefix_match: Some("/replacement".into()),
+                        r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]);
+            route_with(vec![r], vec!["app.example.com".into()])
+        };
+        assert!(route_has_unsupported_filters(
+            &redirect(HTTPRouteRulesMatchesPathType::Exact),
+            &r1(),
+            &AllowAllBackendRefs
+        ));
+        assert!(!route_has_unsupported_filters(
+            &redirect(HTTPRouteRulesMatchesPathType::PathPrefix),
+            &r1(),
+            &AllowAllBackendRefs
+        ));
+    }
+
+    /// A redirect replacing the matched prefix carries it as a rewrite, which
+    /// builds the `Location` path.
+    #[test]
+    fn a_prefix_redirect_rewrites_the_location_path() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectPath,
+            HTTPRouteRulesFiltersRequestRedirectPathType,
+        };
+        let mut r = rule(
+            Some(vec![path_match(
+                "/original",
+                HTTPRouteRulesMatchesPathType::PathPrefix,
+            )]),
+            vec![backend("api", 80)],
+        );
+        r.filters = Some(vec![HTTPRouteRulesFilters {
+            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                path: Some(HTTPRouteRulesFiltersRequestRedirectPath {
+                    replace_full_path: None,
+                    replace_prefix_match: Some("/replacement".into()),
+                    r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let route = route_with(vec![r], vec!["app.example.com".into()]);
+        let ep = &route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs)[0];
+        assert_eq!(ep.config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(
+            ep.config.rewrite,
+            Some(UrlRewrite {
+                path: Some(PathRewrite::ReplacePrefixMatch("/replacement".into())),
+                hostname: None,
+            })
+        );
     }
 
     /// Only the backendRefs that can take traffic must agree on filters: a

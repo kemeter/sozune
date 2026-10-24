@@ -513,7 +513,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 | Filter | Supported | Notes |
 |---|---|---|
-| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` is dropped (see below) |
+| `requestRedirect` | Yes | Native frontend redirect (see below) |
 | `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
@@ -550,9 +550,9 @@ rules:
 | `hostname` | `rewrite_host` | rewrites the `Location` authority |
 | `port` | `rewrite_port` | rewrites the `Location` port |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
-| `path.replacePrefixMatch` | — | **not supported**: keeping the request's trailing segments needs a path capture Sōzune doesn't set up for redirect rules, so the route is dropped |
+| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix in the `Location` path and keeps the rest, as [`urlRewrite`](#urlrewrite) does. On a match that is not a `PathPrefix`, the route is dropped, as the spec says |
 
-A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
+A `requestRedirect` with a `statusCode` other than `301` and `302`, or on a match with query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on `Host` or `Cookie`), is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`): Sōzu answers a redirect itself, so these conditions would not be checked.
 
 #### urlRewrite
 
@@ -580,7 +580,7 @@ rules:
 |---|---|---|
 | `hostname` | middleware | rewrites the forwarded request's `Host` header to a fixed authority, the client's going in `X-Forwarded-Host`. Such a rule goes through the middleware |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole request path with a fixed value, regardless of trailing segments (`/api/users` with `ReplaceFullPath: /new` → `/new`) |
-| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix and **keeps** the trailing segments (`/api/users` with prefix `/api`, `ReplacePrefixMatch: /v2` → `/v2/users`; `/api` exactly → `/v2`). Only meaningful with a `PathPrefix` match |
+| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix and **keeps** the trailing segments (`/api/users` with prefix `/api`, `ReplacePrefixMatch: /v2` → `/v2/users`; `/api` exactly → `/v2`). Allowed with a `PathPrefix` match only: on another, the route is dropped |
 
 When set, `urlRewrite` takes precedence over the `strip_prefix` / `add_prefix` Service-annotation knobs. `urlRewrite` cannot be combined with `requestRedirect` on the same rule (the route is dropped).
 

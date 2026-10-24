@@ -33,6 +33,8 @@ pub struct RedirectMapping {
     pub scheme: Option<RedirectScheme>,
     pub host: Option<String>,
     pub path: Option<String>,
+    /// What the matched prefix becomes, the rest of the path kept.
+    pub prefix: Option<String>,
     pub port: Option<u16>,
 }
 
@@ -314,11 +316,8 @@ pub fn redirect_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<Redirec
 /// Map a single `requestRedirect` filter onto a [`RedirectMapping`].
 ///
 /// `None` means "we can't faithfully represent this redirect", so the rule
-/// is dropped rather than emitting a misleading `Location`. That's the case
-/// for a status other than `301` and `302`, and for a
-/// `replacePrefixMatch` path rewrite (it must keep the request's trailing
-/// segments, which needs a `$PATH[n]` capture defined at routing time —
-/// Sōzune doesn't set one up for redirect rules).
+/// is dropped rather than emitting a misleading `Location`: a status other
+/// than `301` and `302`, or an empty path block.
 fn redirect_from_redirect_filter(
     rr: &HTTPRouteRulesFiltersRequestRedirect,
 ) -> Option<RedirectMapping> {
@@ -335,14 +334,18 @@ fn redirect_from_redirect_filter(
         _ => return None,
     };
 
-    let path = match rr.path.as_ref() {
-        // A full-path replacement is a literal target — maps directly.
-        Some(p) => {
-            // replacePrefixMatch (or an empty path block) can't be honoured.
-            let full = p.replace_full_path.as_deref()?;
-            Some(full.to_string())
-        }
-        None => None,
+    // A full-path replacement is a literal target; a prefix replacement
+    // keeps the rest of the path, as a urlRewrite does.
+    let (path, prefix) = match rr.path.as_ref() {
+        Some(p) => match (
+            p.replace_full_path.as_deref(),
+            p.replace_prefix_match.as_deref(),
+        ) {
+            (Some(full), _) => (Some(full.to_string()), None),
+            (None, Some(prefix)) => (None, Some(prefix.to_string())),
+            (None, None) => return None,
+        },
+        None => (None, None),
     };
 
     let port = match rr.port {
@@ -355,6 +358,7 @@ fn redirect_from_redirect_filter(
         scheme,
         host: rr.hostname.clone(),
         path,
+        prefix,
         port,
     })
 }
@@ -437,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_prefix_match_is_unsupported() {
+    fn replace_prefix_match_keeps_the_rest_of_the_path() {
         let mut f = redirect_filter(
             Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
             None,
@@ -451,7 +455,10 @@ mod tests {
                 r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
             });
         let filters = vec![f];
-        assert!(!rule_filters_supported(&filters));
+        assert!(rule_filters_supported(&filters));
+        let m = redirect_from_filter(&filters).unwrap();
+        assert_eq!(m.path, None);
+        assert_eq!(m.prefix.as_deref(), Some("/new"));
     }
 
     #[test]
