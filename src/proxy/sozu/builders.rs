@@ -339,9 +339,9 @@ fn build_add_prefix_rewrite(
 ///   a regex that also matches sub-paths so the whole match collapses to
 ///   `new`; for an Exact path it's an exact match.
 /// - `ReplacePrefixMatch(new)`: match the route prefix and keep the trailing
-///   segments, swapping only the prefix. Mirrors strip_prefix's capture
-///   (`^/api(?:/(.*))?$` → `{new}/$PATH[1]`), so `/api/users` → `/v2/users`
-///   and a bare `/api` → `/v2/` (empty capture, same as strip_prefix).
+///   segments, swapping only the prefix: `/api/users` → `/v2/users`, and a
+///   bare `/api` → exactly `/v2`. A replacement of `/` strips the prefix as
+///   strip_prefix does, a bare `/api` giving `/`.
 fn build_url_rewrite_path(
     path_config: Option<&PathConfig>,
     mode: &PathRewrite,
@@ -397,24 +397,44 @@ fn build_replace_prefix_match(
     // stripped, leaving the suffix (`/$PATH[1]`), matching strip_prefix.
     let normalized = normalize_add_prefix(new);
     let suffix_rewrite = format!("{normalized}/$PATH[1]");
+    // A replacement ending in `/` keeps it on a bare prefix (`/v2/`); one
+    // without gives exactly itself (`/v2`).
+    let keeps_no_slash = !normalized.is_empty() && !new.trim().ends_with('/');
 
-    let Some(pc) = path_config else {
-        // ReplacePrefixMatch is only meaningful with a PathPrefix match; with
-        // no route path we have no prefix to swap, so match any path and
-        // prepend the replacement (the whole path is the "suffix").
-        return (
-            PathRule {
-                value: "^/?(.*)$".to_string(),
-                kind: 1,
-            },
-            Some(suffix_rewrite),
-        );
+    // No path match is the `/` prefix, as Gateway API reads it.
+    let root = PathConfig {
+        rule_type: PathRuleType::Prefix,
+        value: "/".to_string(),
     };
+    let pc = path_config.unwrap_or(&root);
 
     match pc.rule_type {
         // Same capture as strip_prefix: the trailing segments (if any) land in
         // $PATH[1], the query in $PATH[2]. `/api/users` → `/v2/users`; a bare
-        // `/api` (empty capture) → `/v2/`, mirroring strip_prefix's `/`.
+        // `/api` (empty capture) → `/v2/` for a replacement ending in `/`, or
+        // `/` for `/`, as strip_prefix does.
+        // Any other replacement keeps the slash of the trailing
+        // segments in the capture: a bare `/api` becomes exactly `/v2`, as
+        // the spec says, not `/v2/`.
+        // On the `/` prefix, a bare `/` is the prefix itself: it becomes
+        // exactly the replacement, `/x` its replacement followed by `/x`.
+        PathRuleType::Prefix if keeps_no_slash && pc.value.trim_end_matches('/').is_empty() => (
+            PathRule {
+                value: format!("^(/[^?]+)?/?{QUERY}$"),
+                kind: 1,
+            },
+            Some(format!("{normalized}$PATH[1]$PATH[2]")),
+        ),
+        PathRuleType::Prefix if keeps_no_slash => (
+            PathRule {
+                value: format!(
+                    "^{}(/[^?]*)?{QUERY}$",
+                    regex_escape(pc.value.trim_end_matches('/'))
+                ),
+                kind: 1,
+            },
+            Some(format!("{normalized}$PATH[1]$PATH[2]")),
+        ),
         PathRuleType::Prefix => (
             prefix_rule_capturing_rest(&pc.value),
             Some(format!("{suffix_rewrite}$PATH[2]")),
@@ -698,7 +718,7 @@ mod tests {
     #[test]
     fn url_rewrite_replace_prefix_keeps_suffix() {
         // `/api` (Prefix) → ReplacePrefixMatch("/v2"): suffix preserved.
-        // `/api/users` → `/v2/users`; a bare `/api` → `/v2/` (empty capture).
+        // `/api/users` → `/v2/users`; a bare `/api` → exactly `/v2`.
         let rw = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2".into())), None);
         let built = || {
             build_path_and_rewrite(
@@ -713,8 +733,45 @@ mod tests {
             forwarded(built(), "/api/users").as_deref(),
             Some("/v2/users")
         );
-        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/v2/"));
-        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/v2/?x=1"));
+        assert_eq!(forwarded(built(), "/api").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(built(), "/api/").as_deref(), Some("/v2/"));
+        assert_eq!(forwarded(built(), "/api?x=1").as_deref(), Some("/v2?x=1"));
+        assert_eq!(forwarded(built(), "/apix"), None);
+
+        // A replacement ending in `/` keeps it, and adds no second one.
+        let slash = url_rewrite(Some(PathRewrite::ReplacePrefixMatch("/v2/".into())), None);
+        let with_slash = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/api")),
+                false,
+                None,
+                Some(&slash),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(with_slash(), "/api").as_deref(), Some("/v2/"));
+        assert_eq!(
+            forwarded(with_slash(), "/api/users").as_deref(),
+            Some("/v2/users")
+        );
+
+        // On the `/` prefix, `/` itself becomes exactly the replacement.
+        let root = || {
+            build_path_and_rewrite(
+                Some(&rule(PathRuleType::Prefix, "/")),
+                false,
+                None,
+                Some(&rw),
+                "test",
+            )
+        };
+        assert_eq!(forwarded(root(), "/").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(root(), "/users").as_deref(), Some("/v2/users"));
+        assert_eq!(forwarded(root(), "/?x=1").as_deref(), Some("/v2?x=1"));
+        // No path match reads as the `/` prefix.
+        let none = || build_path_and_rewrite(None, false, None, Some(&rw), "test");
+        assert_eq!(forwarded(none(), "/").as_deref(), Some("/v2"));
+        assert_eq!(forwarded(none(), "/users").as_deref(), Some("/v2/users"));
         assert_eq!(
             forwarded(built(), "/api/users?x=1").as_deref(),
             Some("/v2/users?x=1")

@@ -47,6 +47,7 @@ All notable changes to this project will be documented in this file.
 - An HTTPRoute rule declaring no `backendRefs` was not served: a redirect-only rule, the usual way to send a host elsewhere, never redirected. It now redirects, and a rule with neither backend nor redirect answers `500`, as the spec requires.
 - An HTTPRoute `requestRedirect` with `statusCode: 302` dropped the route. It now answers a temporary redirect.
 - An HTTPRoute `urlRewrite` with a `hostname` sent the backend two `Host` headers, which many servers refuse with `400` (Go's among them). The middleware now rewrites the `Host`, once.
+- An HTTPRoute `urlRewrite` with `replacePrefixMatch` turned a request for the bare prefix into the replacement with a trailing slash (`/api` → `/v2/` instead of `/v2`), as the documentation already said it did not.
 - An HTTPRoute header modifier's `add` replaced the header's existing value, as `set` does. It now adds its value next to it.
 - A `ReferenceGrant` naming a Service in its `to` opened every Service of its namespace to the routes it trusts. It now opens that Service only. Two grants of the same namespace no longer take each other's authorisations away when one of them changes.
 - A `ReferenceGrant` deleted while Sōzune's watcher was reconnecting kept authorising the cross-namespace backends it had opened. The list sent on reconnection now drops it.
