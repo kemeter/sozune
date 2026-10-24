@@ -383,14 +383,14 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 - Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
-- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). A route with none, on a listener with none, serves every host, after the routes naming theirs.
+- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). A route with none, on a listener with none, serves every host, after the routes naming theirs. A wildcard takes one or more labels, as the spec says: `*.example.com` serves `a.b.example.com` too, unlike a Sōzune label's `*.`.
 - `backendRef.port` — the Service port; requests go to the port its pods listen on (its `targetPort`), as its EndpointSlices give it.
 - `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
 - Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. `RegularExpression` is silently skipped.
-- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. A request that fails a query or method condition, or a header match on `Host` or `Cookie` (which Sōzu cannot route on), gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
+- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. Among rules on the same host and path, one with a method is tried first, then the one with more header matches. A request that fails a query or method condition, or a header match on `Host` or `Cookie` (which Sōzu cannot route on), gets `404`. Header and query matches support `type: Exact` (the default) and presence-only (empty value); `type: RegularExpression` on a header or query match has no faithful representation and the whole route is rejected with `ResolvedRefs=False reason=UnsupportedValue` rather than served too broadly. All nine standard methods are supported.
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
-- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below).
+- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below). A backendRef that cannot be used — another kind, another namespace without a grant, a Service that does not exist — is left out of its rule, and a rule left with none, or declaring none, answers `500`, as the spec requires — unless it redirects, which needs no backend; the route's `ResolvedRefs` says why (see [Status conditions](#status-conditions)).
 - `backendRef.weight` — the Service's share of the rule's traffic, as the spec defines it: `weight / Σ weights`, however many pods each Service runs (a Service of 3 pods weighted 90 against one of 1 pod weighted 10 is a 90/10 split). An unset weight is `1`; a weight of `0` sends the Service no traffic, and a rule whose backendRefs all weigh `0` forwards nothing (`503`). Each pod carries an integer weight of at most 2³¹−1, so a Service cannot outweigh another by more than 2³¹−1 times the other's pod count: a ratio past that is capped.
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
@@ -407,11 +407,16 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Route is in scope (parent owned), filters are OK |
 | `Accepted` | `False` (`UnsupportedValue`) | Route declares unsupported filters |
-| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` or `HTTPS` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)). No `ResolvedRefs` is reported for that parent |
+| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` or `HTTPS` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)) |
 | `Accepted` | `False` (`NoMatchingParent`) | The `parentRef`'s `sectionName` / `port` names no listener of a Gateway Sōzune owns |
+| `Accepted` | `False` (`NoMatchingListenerHostname`) | No listener the route binds to admits any of its `hostnames` |
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | All backendRefs resolved to ready endpoints |
-| `ResolvedRefs` | `False` (`BackendNotFound`) | One or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
+| `ResolvedRefs` | `False` (`InvalidKind`) | A backendRef is not a `Service` |
+| `ResolvedRefs` | `False` (`RefNotPermitted`) | A backendRef names a Service of another namespace that no `ReferenceGrant` opens to the route |
+| `ResolvedRefs` | `False` (`BackendNotFound`) | A backendRef names a Service that does not exist, or one or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
 | `ResolvedRefs` | `False` (`UnsupportedValue`) | Route was rejected because of unsupported filters |
+
+`ResolvedRefs` is reported for a parent that refuses the route too: it speaks of the route's backendRefs, not of the parent.
 
 Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
 
@@ -493,7 +498,7 @@ spec:
       kind: Service
 ```
 
-With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` once the backend is dropped). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs.
+With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` with `RefNotPermitted` once the backend is dropped, and a rule left without backend answers `500`). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs. A `to` entry with a `name` opens that Service only.
 
 ### What's not supported (yet)
 
@@ -506,8 +511,8 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 | Filter | Supported | Notes |
 |---|---|---|
-| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` and `302` are dropped (see below) |
-| `requestHeaderModifier` | Yes | `set`/`remove` map directly; `add` is applied as `set` (see below) |
+| `requestRedirect` | Yes | Native frontend redirect; `replacePrefixMatch` is dropped (see below) |
+| `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
 | `requestMirror` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
@@ -539,13 +544,13 @@ rules:
 | `requestRedirect` field | Mapped to | Notes |
 |---|---|---|
 | `scheme` (`http` / `https`) | redirect scheme | omitted → preserve the request scheme |
-| `statusCode` | redirect policy | `301` (default) → permanent redirect. `302` is **not** supported — the route is dropped rather than emit a 301 |
+| `statusCode` | redirect policy | `301` (default) → permanent redirect, `302` → temporary redirect |
 | `hostname` | `rewrite_host` | rewrites the `Location` authority |
 | `port` | `rewrite_port` | rewrites the `Location` port |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
 | `path.replacePrefixMatch` | — | **not supported**: keeping the request's trailing segments needs a path capture Sōzune doesn't set up for redirect rules, so the route is dropped |
 
-A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` or a `302` status is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
+A `requestRedirect` declaring only supported fields is honoured; one using `replacePrefixMatch` is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`).
 
 #### urlRewrite
 
@@ -605,7 +610,9 @@ rules:
 |---|---|---|
 | `set` | header set | overwrites the header with the given value |
 | `remove` | header delete | maps to an empty-value frontend edit, which deletes the header |
-| `add` | header set | **caveat**: Sōzu has no frontend append-without-replace, so `add` is applied as `set` (existing values are replaced, not appended) and a `WARN` is logged. The route is **not** dropped — set-semantics is what most `add` users want |
+| `add` | header append | adds the value next to the header's existing ones, which the backend reads as `existing,added` |
+
+A `set` or `add` with an empty value cannot be represented — Sōzu reads an empty value as a delete — so it drops the route (`Accepted=False reason=UnsupportedValue`).
 
 ### How resolution works
 

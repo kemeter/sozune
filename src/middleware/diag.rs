@@ -61,6 +61,16 @@ pub fn internal_error(reason: &str) -> Response<Body> {
     )
 }
 
+/// 500 Internal Server Error — the route declares backends none of which
+/// could be resolved.
+pub fn invalid_backends(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "invalid-backends",
+        format!("sozune: the route for host '{host}' has no valid backend.\n"),
+    )
+}
+
 /// 400 Bad Request — request itself is malformed before any routing.
 pub fn bad_request(reason: &str, detail: &str) -> Response<Body> {
     diag_response(

@@ -74,6 +74,7 @@ pub fn parse_headers(
             name: header_name.to_string(),
             value: value.clone(),
             direction,
+            append: false,
         });
     }
 

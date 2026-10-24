@@ -21,7 +21,6 @@ use gateway_api::apis::standard::httproutes::{
     HTTPRouteRulesFiltersResponseHeaderModifier, HTTPRouteRulesFiltersUrlRewrite,
     HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
 };
-use tracing::warn;
 
 /// The redirect settings a `requestRedirect` filter maps onto. These line
 /// up with `EntrypointConfig`'s `redirect`, `redirect_scheme`, and the
@@ -69,10 +68,22 @@ fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
     if let Some(rw) = filter.url_rewrite.as_ref() {
         return url_rewrite_mapping(rw).is_some();
     }
+    // Sōzu reads an empty header value as a delete: a `set` or `add` of one
+    // cannot be represented.
+    let request_values = filter.request_header_modifier.iter().flat_map(|m| {
+        let set = m.set.iter().flatten().map(|h| h.value.as_str());
+        set.chain(m.add.iter().flatten().map(|h| h.value.as_str()))
+    });
+    let response_values = filter.response_header_modifier.iter().flat_map(|m| {
+        let set = m.set.iter().flatten().map(|h| h.value.as_str());
+        set.chain(m.add.iter().flatten().map(|h| h.value.as_str()))
+    });
+    if request_values.chain(response_values).any(str::is_empty) {
+        return false;
+    }
     // A `requestRedirect` must be in a form we can map; an empty filter
     // entry (no variant populated) carries nothing we recognise and is
-    // refused. Header modifiers are always mappable (set/remove map
-    // directly, add is applied as set).
+    // refused. Header modifiers are otherwise always mappable.
     match &filter.request_redirect {
         Some(rr) => redirect_from_redirect_filter(rr).is_some(),
         None => {
@@ -85,42 +96,24 @@ fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
 /// [`HeaderConfig`] entries in the given direction.
 ///
 /// - `set` → `HeaderConfig { name, value, direction }` (replace).
+/// - `add` → the same, appended next to any header of the same name.
 /// - `remove` → `HeaderConfig { name, value: "", direction }` (an empty
 ///   value deletes the header at the Sōzu frontend, HAProxy `del-header`
 ///   parity).
-/// - `add` → applied the same as `set`. Every non-empty header edit reaches
-///   Sōzu as a replace (see `build_frontend_headers`), so we map `add` to a
-///   set and warn: refusing the route would 404 it, and set-semantics is
-///   what the vast majority of `add` users actually want.
 fn header_edits_from_modifier(
     set: Option<&[(String, String)]>,
     add: Option<&[(String, String)]>,
     remove: Option<&[String]>,
     direction: HeaderDirection,
     out: &mut Vec<HeaderConfig>,
-    warned_add: &mut bool,
 ) {
-    if let Some(set) = set {
-        for (name, value) in set {
+    for (list, append) in [(set, false), (add, true)] {
+        for (name, value) in list.unwrap_or_default() {
             out.push(HeaderConfig {
                 name: name.clone(),
                 value: value.clone(),
                 direction,
-            });
-        }
-    }
-    if let Some(add) = add {
-        if !add.is_empty() && !*warned_add {
-            warn!(
-                "Gateway API: HTTPRoute header modifier uses `add`, which Sōzu applies as `set` (no frontend append-without-replace) — existing header values are replaced, not appended"
-            );
-            *warned_add = true;
-        }
-        for (name, value) in add {
-            out.push(HeaderConfig {
-                name: name.clone(),
-                value: value.clone(),
-                direction,
+                append,
             });
         }
     }
@@ -130,6 +123,7 @@ fn header_edits_from_modifier(
                 name: name.clone(),
                 value: String::new(),
                 direction,
+                append: false,
             });
         }
     }
@@ -141,17 +135,15 @@ fn header_edits_from_modifier(
 ///
 /// `requestHeaderModifier` entries map to [`HeaderDirection::Request`],
 /// `responseHeaderModifier` to [`HeaderDirection::Response`]. See
-/// [`header_edits_from_modifier`] for the per-list semantics (including the
-/// `add`-as-`set` caveat, logged once per call).
+/// [`header_edits_from_modifier`] for the per-list semantics.
 pub fn header_edits_from_filters(filters: &[HTTPRouteRulesFilters]) -> Vec<HeaderConfig> {
     let mut out = Vec::new();
-    let mut warned_add = false;
     for filter in filters {
         if let Some(m) = filter.request_header_modifier.as_ref() {
-            push_request_header_edits(m, &mut out, &mut warned_add);
+            push_request_header_edits(m, &mut out);
         }
         if let Some(m) = filter.response_header_modifier.as_ref() {
-            push_response_header_edits(m, &mut out, &mut warned_add);
+            push_response_header_edits(m, &mut out);
         }
     }
     out
@@ -160,7 +152,6 @@ pub fn header_edits_from_filters(filters: &[HTTPRouteRulesFilters]) -> Vec<Heade
 fn push_request_header_edits(
     m: &HTTPRouteRulesFiltersRequestHeaderModifier,
     out: &mut Vec<HeaderConfig>,
-    warned_add: &mut bool,
 ) {
     let set: Option<Vec<(String, String)>> = m.set.as_ref().map(|s| {
         s.iter()
@@ -178,14 +169,12 @@ fn push_request_header_edits(
         m.remove.as_deref(),
         HeaderDirection::Request,
         out,
-        warned_add,
     );
 }
 
 fn push_response_header_edits(
     m: &HTTPRouteRulesFiltersResponseHeaderModifier,
     out: &mut Vec<HeaderConfig>,
-    warned_add: &mut bool,
 ) {
     let set: Option<Vec<(String, String)>> = m.set.as_ref().map(|s| {
         s.iter()
@@ -203,7 +192,6 @@ fn push_response_header_edits(
         m.remove.as_deref(),
         HeaderDirection::Response,
         out,
-        warned_add,
     );
 }
 
@@ -266,7 +254,7 @@ pub fn redirect_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<Redirec
 ///
 /// `None` means "we can't faithfully represent this redirect", so the rule
 /// is dropped rather than emitting a misleading `Location`. That's the case
-/// for a `302` status (Sōzu has no temporary-redirect policy) and for a
+/// for a status other than `301` and `302`, and for a
 /// `replacePrefixMatch` path rewrite (it must keep the request's trailing
 /// segments, which needs a `$PATH[n]` capture defined at routing time —
 /// Sōzune doesn't set one up for redirect rules).
@@ -279,13 +267,12 @@ fn redirect_from_redirect_filter(
         None => None,
     };
 
-    // Gateway API core status values are 301 and 302. 301 maps to Sōzu's
-    // `Permanent`; 302 (temporary) has no distinct frontend policy, so we
-    // refuse rather than silently emit a 301.
-    match rr.status_code {
-        None | Some(301) => {}
+    // Gateway API core status values are 301 and 302.
+    let policy = match rr.status_code {
+        None | Some(301) => RedirectPolicy::Permanent,
+        Some(302) => RedirectPolicy::Found,
         _ => return None,
-    }
+    };
 
     let path = match rr.path.as_ref() {
         // A full-path replacement is a literal target — maps directly.
@@ -303,7 +290,7 @@ fn redirect_from_redirect_filter(
     };
 
     Some(RedirectMapping {
-        policy: RedirectPolicy::Permanent,
+        policy,
         scheme,
         host: rr.hostname.clone(),
         path,
@@ -407,13 +394,21 @@ mod tests {
     }
 
     #[test]
-    fn status_302_is_unsupported() {
+    fn status_302_is_a_temporary_redirect() {
         let f = vec![redirect_filter(
             Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             Some(302),
         )];
+        assert!(rule_filters_supported(&f));
+        let mapping = redirect_from_filter(&f).expect("a redirect");
+        assert_eq!(mapping.policy, RedirectPolicy::Found);
+    }
+
+    #[test]
+    fn status_other_than_301_and_302_is_unsupported() {
+        let f = vec![redirect_filter(None, None, None, Some(307))];
         assert!(!rule_filters_supported(&f));
     }
 
@@ -584,9 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn request_header_modifier_add_maps_as_set() {
-        // Sōzu has no frontend append-without-replace, so `add` is applied
-        // as `set` (value preserved). The route is still supported.
+    fn request_header_modifier_add_appends() {
         let f = vec![req_header_filter(
             HTTPRouteRulesFiltersRequestHeaderModifier {
                 add: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierAdd {
@@ -602,6 +595,21 @@ mod tests {
         assert_eq!(edits[0].name, "X-Trace");
         assert_eq!(edits[0].value, "on");
         assert_eq!(edits[0].direction, HeaderDirection::Request);
+        assert!(edits[0].append);
+    }
+
+    #[test]
+    fn an_empty_header_value_to_set_or_add_is_unsupported() {
+        let f = vec![req_header_filter(
+            HTTPRouteRulesFiltersRequestHeaderModifier {
+                add: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierAdd {
+                    name: "X-Trace".into(),
+                    value: String::new(),
+                }]),
+                ..Default::default()
+            },
+        )];
+        assert!(!rule_filters_supported(&f));
     }
 
     #[test]

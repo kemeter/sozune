@@ -338,7 +338,14 @@ pub async fn resolve(
         .map(Vec::as_slice)
         .unwrap_or_default();
     resolution.backends = backend_states(served, inputs.unhealthy, evicted);
-    if served.backends.is_empty() {
+    if served.config.invalid_backends {
+        resolution.outcome = Outcome::Rejected;
+        resolution.status = Some(500);
+        resolution.summary = format!(
+            "route `{}` declares backends none of which could be resolved",
+            served.name
+        );
+    } else if served.backends.is_empty() {
         // Sōzu and the middleware server both answer 503 for a route with
         // nothing behind it.
         resolution.outcome = Outcome::Rejected;
@@ -580,7 +587,7 @@ fn shadowed_reason(winner: &Entrypoint, loser: &Entrypoint) -> String {
     } else if crate::proxy::sozu::more_specific(winner, loser) {
         format!(
             "matches too, but `{}` has the same priority ({}) and a more specific \
-             hostname or path, which Sōzune tries first",
+             hostname, path, method or headers, which Sōzune tries first",
             winner.name, winner.config.priority
         )
     } else {

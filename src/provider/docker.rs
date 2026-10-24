@@ -974,6 +974,7 @@ pub(super) mod merge_tests {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
+                invalid_backends: false,
                 ip_allow_list: Vec::new(),
             },
             source: None,

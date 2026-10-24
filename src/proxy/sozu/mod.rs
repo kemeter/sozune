@@ -193,6 +193,9 @@ struct Channels {
     /// Loopback port serving the ACME HTTP-01 challenge responder, when
     /// ACME is enabled. `None` disables every ACME-specific code path.
     acme_challenge_port: Option<u16>,
+    /// Loopback port of the middleware server, the only backend of a route
+    /// that goes through it.
+    middleware_port: u16,
     /// The TCP and UDP listeners opened for Gateways, whose workers are in
     /// `tcp` and `udp` alongside the declared ones.
     gateway: GatewayListeners,
@@ -768,6 +771,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         https_port,
         https_ip: https_bind_ip.octets(),
         acme_challenge_port,
+        middleware_port,
         gateway: GatewayListeners::new(
             config.gateway_ports.clone(),
             WorkerSettings::from_config(config),
@@ -1429,25 +1433,37 @@ fn skipped_on_sni_clash(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<Stri
 pub(crate) fn routing_order(storage: &BTreeMap<String, Entrypoint>) -> Vec<(&String, &Entrypoint)> {
     let mut ordered: Vec<(&String, &Entrypoint)> = storage.iter().collect();
     // Stable sort over the BTreeMap's id order: ties keep their ids ascending.
-    ordered.sort_by_key(|(_, ep)| {
-        (
-            std::cmp::Reverse(ep.config.priority),
-            host_specificity(&ep.config.hostnames),
-            path_specificity(ep.config.path.as_ref()),
-        )
-    });
+    ordered.sort_by_key(|(_, ep)| (std::cmp::Reverse(ep.config.priority), specificity(ep)));
     ordered
 }
+
+/// A hostname's or a path's rank: its kind, then its length, the longest
+/// first.
+type Rank = (u8, std::cmp::Reverse<usize>);
 
 /// Whether `a` is tried before `b` for being more specific, their priority
 /// being equal.
 pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
+    specificity(a) < specificity(b)
+}
+
+/// How specific a route is, the most specific first: by hostname, then path,
+/// then a route on methods before one on any method, then the more header
+/// conditions Sōzu routes on. Query conditions do not count: the middleware
+/// answers `404` when they fail, so trying such a route first would take the
+/// requests of a wider one.
+fn specificity(ep: &Entrypoint) -> (Rank, Rank, bool, std::cmp::Reverse<usize>) {
+    let header_predicates = ep
+        .config
+        .match_headers
+        .iter()
+        .filter(|condition| header_predicate(condition).is_some())
+        .count();
     (
-        host_specificity(&a.config.hostnames),
-        path_specificity(a.config.path.as_ref()),
-    ) < (
-        host_specificity(&b.config.hostnames),
-        path_specificity(b.config.path.as_ref()),
+        host_specificity(&ep.config.hostnames),
+        path_specificity(ep.config.path.as_ref()),
+        ep.config.methods.is_empty(),
+        std::cmp::Reverse(header_predicates),
     )
 }
 
@@ -1455,10 +1471,14 @@ pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
 /// name, then a regex, then a wildcard (the longer, the more specific), then
 /// any host (`*`, or no hostname at all). A route is as specific as its most
 /// specific hostname.
-fn host_specificity(hostnames: &[String]) -> (u8, std::cmp::Reverse<usize>) {
+fn host_specificity(hostnames: &[String]) -> Rank {
     hostnames
         .iter()
         .map(|h| {
+            if let Some(suffix) = h.strip_prefix(crate::model::ANY_LABELS_PREFIX) {
+                // Ranked as the `*.` wildcard it stands for.
+                return (2, std::cmp::Reverse(suffix.len() + 2));
+            }
             let rank = if h == "*" {
                 3
             } else if h.starts_with("*.") {
@@ -1478,7 +1498,7 @@ fn host_specificity(hostnames: &[String]) -> (u8, std::cmp::Reverse<usize>) {
 /// then a prefix, the longer first. A regex counts as the literal prefix it
 /// starts with: its length says nothing of the paths it matches. No path is
 /// the `/` prefix.
-fn path_specificity(path: Option<&crate::model::PathConfig>) -> (u8, std::cmp::Reverse<usize>) {
+fn path_specificity(path: Option<&crate::model::PathConfig>) -> Rank {
     use crate::model::PathRuleType;
     match path {
         Some(p) if p.rule_type == PathRuleType::Exact => (0, std::cmp::Reverse(p.value.len())),
@@ -1684,6 +1704,7 @@ fn reinstall_http_frontends(
             &mut channels.https,
             cluster_id,
             entrypoint,
+            channels.middleware_port,
         );
         remove_cluster(&mut channels.http, &mut channels.https, cluster_id);
     }
@@ -1801,6 +1822,7 @@ pub(crate) fn build_http_frontends(
                 name: middleware::ROUTE_HEADER.to_string(),
                 value: cluster_id.to_string(),
                 direction: HeaderDirection::Request,
+                append: false,
             }]));
         }
         let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
@@ -2011,11 +2033,10 @@ fn configure_http_entrypoint(
             "Routing {} through middleware server at 127.0.0.1:{}",
             entrypoint.name, middleware_port
         );
-        let address = SocketAddress::new_v4(127, 0, 0, 1, middleware_port);
         let backend = AddBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: format!("{}-backend-0", cluster_id),
-            address,
+            backend_id: middleware_backend_id(cluster_id),
+            address: SocketAddress::new_v4(127, 0, 0, 1, middleware_port),
             load_balancing_parameters: Some(LoadBalancingParams { weight: 100 }),
             sticky_id: None,
             backup: None,
@@ -2889,30 +2910,52 @@ fn remove_backend_set(
     }
 }
 
+/// The id of the backend standing for the middleware server in a route that
+/// goes through it.
+fn middleware_backend_id(cluster_id: &str) -> String {
+    format!("{cluster_id}-backend-0")
+}
+
+/// Remove the backends of `entrypoint`: its own, or the middleware server
+/// when it goes through it, the only backend Sōzu then holds for it.
 fn remove_backends(
     command_channel: &mut Channel<WorkerRequest, WorkerResponse>,
     command_channel_https: &mut Channel<WorkerRequest, WorkerResponse>,
     cluster_id: &str,
     entrypoint: &Entrypoint,
+    middleware_port: u16,
 ) {
-    for (i, backend_entry) in entrypoint.backends.iter().enumerate() {
-        let address = match parse_backend_address(backend_entry) {
-            Ok(addr) => addr,
-            Err(e) => {
-                debug!(
-                    "Failed to parse backend address {} for removal: {}",
-                    backend_entry, e
-                );
-                continue;
-            }
-        };
-        let backend_id = backend_id(cluster_id, i, backend_entry);
-        let remove = RemoveBackend {
+    let removals: Vec<RemoveBackend> = if middleware::needs_middleware(&entrypoint.config) {
+        vec![RemoveBackend {
             cluster_id: cluster_id.to_string(),
-            backend_id: backend_id.clone(),
-            address,
-        };
-
+            backend_id: middleware_backend_id(cluster_id),
+            address: SocketAddress::new_v4(127, 0, 0, 1, middleware_port),
+        }]
+    } else {
+        entrypoint
+            .backends
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(i, backend_entry)| match parse_backend_address(backend_entry) {
+                    Ok(address) => Some(RemoveBackend {
+                        cluster_id: cluster_id.to_string(),
+                        backend_id: backend_id(cluster_id, i, backend_entry),
+                        address,
+                    }),
+                    Err(e) => {
+                        debug!(
+                            "Failed to parse backend address {} for removal: {}",
+                            backend_entry, e
+                        );
+                        None
+                    }
+                },
+            )
+            .collect()
+    };
+    for (i, remove) in removals.into_iter().enumerate() {
+        let backend_id = remove.backend_id.clone();
         if let Err(e) = send_to_worker(
             command_channel,
             format!("rm-backend-http-{}-{}", cluster_id, i),
@@ -3253,7 +3296,13 @@ fn apply_routing_diff(
                         http_port,
                         https_addr,
                     );
-                    remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    remove_backends(
+                        &mut channels.http,
+                        &mut channels.https,
+                        cluster_id,
+                        old,
+                        channels.middleware_port,
+                    );
                     close_sessions(&mut channels.http, "http", cluster_id, None);
                     if old.config.tls {
                         close_sessions(&mut channels.https, "https", cluster_id, None);
@@ -3316,7 +3365,13 @@ fn apply_routing_diff(
                         http_port,
                         https_addr,
                     );
-                    remove_backends(&mut channels.http, &mut channels.https, cluster_id, old);
+                    remove_backends(
+                        &mut channels.http,
+                        &mut channels.https,
+                        cluster_id,
+                        old,
+                        channels.middleware_port,
+                    );
                     // Only the backends the route no longer has: one it keeps
                     // is re-added, and closing its sessions would cut every
                     // WebSocket on each change to the route. Through the
@@ -3820,6 +3875,91 @@ mod tests {
                 "g-regex",
                 "b-wildcard",
                 "a-any"
+            ]
+        );
+    }
+
+    /// A route with no valid backend answers 500 only to the requests its
+    /// conditions match: the match check runs first.
+    #[test]
+    fn invalid_backends_answer_after_the_match_check() {
+        let mut ep = base_ep(Vec::new());
+        ep.config.invalid_backends = true;
+        ep.config.match_query = vec![crate::model::MatchCondition {
+            key: "v".into(),
+            value: "1".into(),
+        }];
+        assert!(middleware::needs_middleware(&ep.config));
+        let route = middleware::build_middleware_route(
+            "c",
+            &ep.config,
+            &ep.backends,
+            &middleware::build_forward_auth_client(),
+            &middleware::PluginRegistry::new(),
+            &middleware::ip_allow_list::TrustedProxies::default(),
+        );
+        let names: Vec<&str> = route.middlewares.iter().map(|m| m.name()).collect();
+        let matched = names.iter().position(|n| *n == "request-match");
+        let invalid = names.iter().position(|n| *n == "invalid-backends");
+        assert!(matched.is_some() && matched < invalid, "{names:?}");
+    }
+
+    /// A wildcard taking any number of labels ranks as the `*.` one.
+    #[test]
+    fn an_any_labels_wildcard_ranks_as_a_wildcard() {
+        assert_eq!(
+            host_specificity(&[crate::model::any_labels_wildcard("*.example.com")]),
+            host_specificity(&["*.example.com".to_string()])
+        );
+    }
+
+    /// On the same host and path, a route on methods goes first, then the
+    /// one with more header conditions Sōzu routes on. Query conditions and
+    /// headers left to the middleware do not count.
+    #[test]
+    fn methods_and_headers_break_ties_on_host_and_path() {
+        use crate::model::MatchCondition;
+        let condition = |key: &str, value: &str| MatchCondition {
+            key: key.into(),
+            value: value.into(),
+        };
+        let route = |id: &str, methods: &[&str], headers: Vec<MatchCondition>, query: usize| {
+            let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+            ep.id = id.into();
+            ep.config.hostnames = vec!["app.example.com".into()];
+            ep.config.methods = methods.iter().map(|m| m.to_string()).collect();
+            ep.config.match_headers = headers;
+            ep.config.match_query = (0..query)
+                .map(|i| condition(&format!("q{i}"), "1"))
+                .collect();
+            (id.to_string(), ep)
+        };
+        let storage: BTreeMap<String, Entrypoint> = [
+            route("a-plain", &[], Vec::new(), 2),
+            route("b-one-header", &[], vec![condition("Version", "two")], 0),
+            route(
+                "c-two-headers",
+                &[],
+                vec![condition("Version", "two"), condition("Color", "orange")],
+                0,
+            ),
+            route("d-cookie", &[], vec![condition("Cookie", "beta=1")], 0),
+            route("e-method", &["GET"], Vec::new(), 0),
+        ]
+        .into_iter()
+        .collect();
+        let order: Vec<&str> = routing_order(&storage)
+            .into_iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "e-method",
+                "c-two-headers",
+                "b-one-header",
+                "a-plain",
+                "d-cookie"
             ]
         );
     }
@@ -4500,6 +4640,7 @@ mod tests {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
+                invalid_backends: false,
             },
             candidates: Vec::new(),
         }
@@ -4651,11 +4792,13 @@ mod tests {
                 name: "Sozune-Route".into(),
                 value: "other".into(),
                 direction: HeaderDirection::Request,
+                append: false,
             },
             HeaderConfig {
                 name: "Sozune-Route".into(),
                 value: "shown".into(),
                 direction: HeaderDirection::Both,
+                append: false,
             },
         ];
         let fronts =
@@ -4684,6 +4827,7 @@ mod tests {
             name: "X-Foo".into(),
             value: "bar".into(),
             direction: HeaderDirection::Request,
+            append: false,
         }];
         assert!(!frontend_unchanged(&old, &new));
     }

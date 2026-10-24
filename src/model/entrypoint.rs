@@ -222,6 +222,11 @@ pub struct EntrypointConfig {
     /// see `ProxyConfig::trusted_proxies`.
     #[serde(default)]
     pub match_client_ip: Vec<String>,
+    /// The route declares backends none of which could be resolved (a kind
+    /// Sōzune cannot serve, a reference not permitted, a Service that does
+    /// not exist): it answers `500` to every request.
+    #[serde(default)]
+    pub invalid_backends: bool,
 }
 
 /// One key/value match condition used by header and query matching. An empty
@@ -337,6 +342,10 @@ pub struct HeaderConfig {
     pub value: String,
     #[serde(default)]
     pub direction: HeaderDirection,
+    /// Add the value next to any header of the same name instead of
+    /// replacing it.
+    #[serde(default)]
+    pub append: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Default)]
@@ -353,6 +362,8 @@ pub enum HeaderDirection {
 pub enum RedirectPolicy {
     Forward,
     Permanent,
+    /// A temporary redirect, answered `302`.
+    Found,
     Unauthorized,
     /// Close the connection without answering, like nginx's 444.
     Close,
@@ -362,7 +373,10 @@ impl RedirectPolicy {
     /// Whether a route with this policy answers every request itself, and so
     /// needs no backend.
     pub fn answers_without_backend(self) -> bool {
-        matches!(self, Self::Permanent | Self::Unauthorized | Self::Close)
+        matches!(
+            self,
+            Self::Permanent | Self::Found | Self::Unauthorized | Self::Close
+        )
     }
 }
 
@@ -438,6 +452,19 @@ pub struct ForwardAuthConfig {
     pub response_headers: Vec<String>,
     #[serde(default)]
     pub trust_forward_header: bool,
+}
+
+/// What a hostname taking any number of leading labels starts with, the
+/// suffix following: a regex label, as Sōzu's `*.` takes exactly one.
+pub const ANY_LABELS_PREFIX: &str = "/.+/.";
+
+/// `hostname` with a leading `*.` taking one or more labels, as a Gateway API
+/// wildcard does: `*.example.com` matches `a.b.example.com` too.
+pub fn any_labels_wildcard(hostname: &str) -> String {
+    match hostname.strip_prefix("*.") {
+        Some(suffix) => format!("{ANY_LABELS_PREFIX}{suffix}"),
+        None => hostname.to_string(),
+    }
 }
 
 /// Why an SNI pattern cannot be used for routing.
