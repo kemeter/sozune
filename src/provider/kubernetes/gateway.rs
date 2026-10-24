@@ -3189,7 +3189,7 @@ fn apply_route(
     // responseHeaderModifier and urlRewrite are honoured.)
     let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
         (RouteOutcome::NotMine, Vec::new())
-    } else if route_has_unsupported_filters(route) {
+    } else if route_has_unsupported_filters(route, resolver, scope) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
@@ -3822,19 +3822,27 @@ pub fn route_to_entrypoints_with_hostnames(
 /// and `urlRewrite` are supported. The HTTPRoute watcher uses
 /// this as an early reject so the user sees a clear log line and a
 /// `ResolvedRefs=False` status condition rather than wrong behaviour.
-pub fn route_has_unsupported_filters(route: &HTTPRoute) -> bool {
+pub fn route_has_unsupported_filters(
+    route: &HTTPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> bool {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    let usable = |b: &HTTPRouteRulesBackendRefs| backend_ref_usable(namespace, b, resolver, grants);
     route
         .spec
         .rules
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|rule| match rule.filters.as_deref() {
-            Some(filters) if !filters.is_empty() => {
-                !gateway_filters::rule_filters_supported(filters)
-            }
-            _ => false,
-        })
+        .any(
+            |rule| match gateway_filters::effective_rule_filters(rule, &usable) {
+                Some(filters) => {
+                    !filters.is_empty() && !gateway_filters::rule_filters_supported(&filters)
+                }
+                None => true,
+            },
+        )
 }
 
 /// True iff any match in the route declares a condition sōzune can't
@@ -3924,6 +3932,24 @@ fn check_backend_ref(
         return Err(InvalidRef::NotFound);
     }
     Ok(())
+}
+
+/// Whether `backend` can take traffic: weighted, usable, with a ready pod.
+fn backend_ref_usable(
+    namespace: &str,
+    backend: &HTTPRouteRulesBackendRefs,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> bool {
+    let Some(port) = backend.port.and_then(|p| u16::try_from(p).ok()) else {
+        return false;
+    };
+    let target_ns = backend.namespace.as_deref().unwrap_or(namespace);
+    backend.weight != Some(0)
+        && check_backend_ref(namespace, backend, resolver, grants).is_ok()
+        && !resolver
+            .pod_addresses(target_ns, &backend.name, port, "TCP")
+            .is_empty()
 }
 
 /// The first backendRef of `route` that cannot be used, if any.
@@ -4183,18 +4209,21 @@ fn rule_to_entrypoints(
     // `route_has_unsupported_filters` to set the route status, but we
     // re-check here so a direct call can't slip an unsupported filter
     // through.
-    let (redirect, header_edits, url_rewrite) = match rule.filters.as_deref() {
-        Some(filters) if !filters.is_empty() => {
-            if !gateway_filters::rule_filters_supported(filters) {
-                return Vec::new();
-            }
-            (
-                gateway_filters::redirect_from_filter(filters),
-                gateway_filters::header_edits_from_filters(filters),
-                gateway_filters::url_rewrite_from_filter(filters),
-            )
+    let usable = |b: &HTTPRouteRulesBackendRefs| backend_ref_usable(namespace, b, resolver, grants);
+    let Some(filters) = gateway_filters::effective_rule_filters(rule, &usable) else {
+        return Vec::new();
+    };
+    let (redirect, header_edits, url_rewrite) = if filters.is_empty() {
+        (None, Vec::new(), None)
+    } else {
+        if !gateway_filters::rule_filters_supported(&filters) {
+            return Vec::new();
         }
-        _ => (None, Vec::new(), None),
+        (
+            gateway_filters::redirect_from_filter(&filters),
+            gateway_filters::header_edits_from_filters(&filters),
+            gateway_filters::url_rewrite_from_filter(&filters),
+        )
     };
 
     // A redirect answers every request itself, backend or not.
@@ -6679,6 +6708,49 @@ mod tests {
         assert_eq!(with(None, Some("1m")), Some(60_000));
     }
 
+    /// Only the backendRefs that can take traffic must agree on filters: a
+    /// weight-0 one with others does not drop the route.
+    #[test]
+    fn unusable_backend_refs_do_not_have_to_agree_on_filters() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesBackendRefsFilters,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+        };
+        let set = |value: &str| {
+            Some(vec![HTTPRouteRulesBackendRefsFilters {
+                request_header_modifier: Some(
+                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+                        set: Some(vec![
+                            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                                name: "X-Backend".into(),
+                                value: value.into(),
+                            },
+                        ]),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }])
+        };
+        let mut serving = backend("api", 80);
+        serving.filters = set("api");
+        let mut idle = backend("idle", 80);
+        idle.filters = set("idle");
+        idle.weight = Some(0);
+        let route = route_with(
+            vec![rule(None, vec![serving, idle])],
+            vec!["app.example.com".into()],
+        );
+        assert!(!route_has_unsupported_filters(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
+        let eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps[0].config.headers[0].value, "api");
+    }
+
     #[test]
     fn a_rule_without_backends_answers_500() {
         let r = route_with(
@@ -7587,7 +7659,11 @@ mod tests {
             vec!["app.example.com".into()],
         );
         assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
-        assert!(route_has_unsupported_filters(&r));
+        assert!(route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
     }
 
     #[test]
@@ -7605,7 +7681,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![redirect])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
@@ -7631,7 +7711,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].config.headers.len(), 1);
@@ -7656,7 +7740,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps[0].config.headers.len(), 1);
         assert_eq!(
@@ -7685,7 +7773,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
@@ -7702,7 +7794,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(route_has_unsupported_filters(&r));
+        assert!(route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
@@ -7723,7 +7819,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         let rw = eps[0].config.rewrite.as_ref().unwrap();
@@ -7744,7 +7844,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         let rw = eps[0].config.rewrite.as_ref().unwrap();
         assert_eq!(rw.hostname.as_deref(), Some("internal.svc"));
@@ -7776,7 +7880,11 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        assert!(route_has_unsupported_filters(&r));
+        assert!(route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
     }
 
@@ -7788,7 +7896,11 @@ mod tests {
             vec![rule_with_filter(vec![backend("api", 80)], vec![])],
             vec!["app.example.com".into()],
         );
-        assert!(!route_has_unsupported_filters(&r));
+        assert!(!route_has_unsupported_filters(
+            &r,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
         assert_eq!(
             route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).len(),
             1

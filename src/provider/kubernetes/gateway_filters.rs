@@ -16,10 +16,11 @@ use crate::model::entrypoint::{
     HeaderConfig, HeaderDirection, PathRewrite, RedirectPolicy, RedirectScheme, UrlRewrite,
 };
 use gateway_api::apis::standard::httproutes::{
-    HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestHeaderModifier,
-    HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectScheme,
-    HTTPRouteRulesFiltersResponseHeaderModifier, HTTPRouteRulesFiltersUrlRewrite,
-    HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
+    HTTPRouteRules, HTTPRouteRulesBackendRefs, HTTPRouteRulesFilters,
+    HTTPRouteRulesFiltersRequestHeaderModifier, HTTPRouteRulesFiltersRequestRedirect,
+    HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesFiltersResponseHeaderModifier,
+    HTTPRouteRulesFiltersUrlRewrite, HTTPRouteRulesFiltersUrlRewritePath,
+    HTTPRouteRulesFiltersUrlRewritePathType,
 };
 
 /// The redirect settings a `requestRedirect` filter maps onto. These line
@@ -55,6 +56,53 @@ pub fn rule_filters_supported(filters: &[HTTPRouteRulesFilters]) -> bool {
         return false;
     }
     filters.iter().all(filter_supported)
+}
+
+/// A rule's filters with those of its backendRefs, `None` when the latter
+/// cannot be represented. Sōzu edits headers per route, not per backend: the
+/// backendRefs that can take traffic (`usable`) must all carry the same
+/// filters, header modifiers only, which then apply to the whole rule.
+pub fn effective_rule_filters(
+    rule: &HTTPRouteRules,
+    usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
+) -> Option<Vec<HTTPRouteRulesFilters>> {
+    let mut filters = rule.filters.clone().unwrap_or_default();
+    // A redirect forwards nothing: no backend filter runs.
+    if filters.iter().any(|f| f.request_redirect.is_some()) {
+        return Some(filters);
+    }
+    let backend_refs: Vec<&HTTPRouteRulesBackendRefs> = rule
+        .backend_refs
+        .iter()
+        .flatten()
+        .filter(|b| usable(b))
+        .collect();
+    let Some(first) = backend_refs.first() else {
+        return Some(filters);
+    };
+    let shared = first.filters.clone().unwrap_or_default();
+    let same = backend_refs
+        .iter()
+        .all(|b| b.filters.as_deref().unwrap_or_default() == shared.as_slice());
+    if !same {
+        return None;
+    }
+    for filter in &shared {
+        // Same schema as a rule filter: converted through its JSON form.
+        let converted: HTTPRouteRulesFilters =
+            serde_json::from_value(serde_json::to_value(filter).ok()?).ok()?;
+        let headers_only = converted.request_redirect.is_none()
+            && converted.url_rewrite.is_none()
+            && converted.request_mirror.is_none()
+            && converted.extension_ref.is_none()
+            && (converted.request_header_modifier.is_some()
+                || converted.response_header_modifier.is_some());
+        if !headers_only {
+            return None;
+        }
+        filters.push(converted);
+    }
+    Some(filters)
 }
 
 fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
@@ -146,7 +194,20 @@ pub fn header_edits_from_filters(filters: &[HTTPRouteRulesFilters]) -> Vec<Heade
             push_response_header_edits(m, &mut out);
         }
     }
-    out
+    // Filters apply in order: a set or remove replaces what earlier edits did
+    // to the header. Sōzu applies every delete before any insert, so the
+    // earlier edits go rather than stack up.
+    let mut folded: Vec<HeaderConfig> = Vec::with_capacity(out.len());
+    for edit in out {
+        if !edit.append {
+            folded.retain(|earlier| {
+                !(earlier.direction == edit.direction
+                    && earlier.name.eq_ignore_ascii_case(&edit.name))
+            });
+        }
+        folded.push(edit);
+    }
+    folded
 }
 
 fn push_request_header_edits(
@@ -596,6 +657,86 @@ mod tests {
         assert_eq!(edits[0].value, "on");
         assert_eq!(edits[0].direction, HeaderDirection::Request);
         assert!(edits[0].append);
+    }
+
+    /// Header modifiers every backendRef of the rule carries apply to the
+    /// rule; different ones, or another kind of filter, cannot be honoured.
+    #[test]
+    fn backend_ref_header_filters_apply_to_the_rule() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesBackendRefs, HTTPRouteRulesBackendRefsFilters,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+            HTTPRouteRulesBackendRefsFiltersRequestMirror,
+        };
+        let set = |value: &str| HTTPRouteRulesBackendRefsFilters {
+            request_header_modifier: Some(HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+                set: Some(vec![
+                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                        name: "X-Header-Set".into(),
+                        value: value.into(),
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let backend = |filters: Vec<HTTPRouteRulesBackendRefsFilters>| HTTPRouteRulesBackendRefs {
+            name: "svc".into(),
+            port: Some(80),
+            filters: Some(filters),
+            ..Default::default()
+        };
+        let rule = |refs: Vec<HTTPRouteRulesBackendRefs>| HTTPRouteRules {
+            backend_refs: Some(refs),
+            ..Default::default()
+        };
+
+        let filters =
+            effective_rule_filters(&rule(vec![backend(vec![set("v")])]), &|_| true).unwrap();
+        let edits = header_edits_from_filters(&filters);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].name, "X-Header-Set");
+        assert_eq!(edits[0].value, "v");
+
+        assert!(
+            effective_rule_filters(
+                &rule(vec![backend(vec![set("a")]), backend(vec![set("b")])]),
+                &|_| true
+            )
+            .is_none()
+        );
+        let mirror = HTTPRouteRulesBackendRefsFilters {
+            request_mirror: Some(HTTPRouteRulesBackendRefsFiltersRequestMirror::default()),
+            ..Default::default()
+        };
+        assert!(effective_rule_filters(&rule(vec![backend(vec![mirror])]), &|_| true).is_none());
+
+        // A redirect forwards nothing: its backends' filters are left alone.
+        let mut redirect = rule(vec![backend(vec![set("a")]), backend(vec![set("b")])]);
+        redirect.filters = Some(vec![redirect_filter(None, Some("example.org"), None, None)]);
+        assert_eq!(
+            effective_rule_filters(&redirect, &|_| true).unwrap().len(),
+            1
+        );
+    }
+
+    /// A later set of the same header replaces an earlier one instead of
+    /// both reaching the backend.
+    #[test]
+    fn a_later_set_replaces_an_earlier_one() {
+        let set = |value: &str| {
+            req_header_filter(HTTPRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+                    name: "X-Env".into(),
+                    value: value.into(),
+                }]),
+                ..Default::default()
+            })
+        };
+        let edits = header_edits_from_filters(&[set("rule"), set("backend")]);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].value, "backend");
     }
 
     #[test]
