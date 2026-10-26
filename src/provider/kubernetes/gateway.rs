@@ -4025,11 +4025,6 @@ fn own_port_entrypoints(
     eps
 }
 
-/// `eps` kept from the hosts more specific listeners take (`isolated`, see
-/// [`GatewayScope::isolated_hostnames`]): a hostname wholly within one is
-/// dropped, an entrypoint left with none with it; over a broader one, an
-/// entrypoint answering `404` on that host and the entrypoint's path is added,
-/// tried after every route of that host.
 /// A host a listener the route is not attached to takes from it, on `port`
 /// (`None`: the main HTTP port), save within `bound_within`: the hostnames
 /// of the listeners the route binds within that one.
@@ -4040,6 +4035,11 @@ struct IsolatedHost {
     bound_within: Vec<String>,
 }
 
+/// `eps` kept from the hosts more specific listeners take (`isolated`, see
+/// [`GatewayScope::isolated_hostnames`]): a hostname wholly within one is
+/// dropped, an entrypoint left with none with it; over a broader one, an
+/// entrypoint answering `404` on that host and the entrypoint's path is added,
+/// tried after every route of that host.
 fn isolate_from_listeners(eps: Vec<Entrypoint>, isolated: &[IsolatedHost]) -> Vec<Entrypoint> {
     if isolated.is_empty() {
         return eps;
