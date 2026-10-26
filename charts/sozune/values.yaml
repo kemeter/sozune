@@ -47,7 +47,7 @@ service:
   ports:
     http: 80
     https: 443
-  # More ports, for the TCP and UDP listeners of config.proxy.tcp, .udp and
+  # More ports, for the listeners of config.proxy.tcp, .udp and
   # .gateway_ports, e.g. {name: postgres, port: 5432, protocol: TCP}.
   # `targetPort` defaults to `port`.
   extraPorts: []

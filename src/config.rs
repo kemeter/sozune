@@ -872,14 +872,17 @@ pub struct UdpListenerConfig {
 
 /// The ports a Kubernetes Gateway listener may open on its own. A TCP, TLS or
 /// UDP listener whose port no `proxy.tcp` / `proxy.udp` entry declares is
-/// served when its port is listed here, and so is an HTTP listener on a port
-/// other than `proxy.http`'s: Sōzune binds it once a route attaches to the
-/// listener and closes it when none is left.
+/// served when its port is listed here, and so is an HTTP or HTTPS listener on
+/// a port other than `proxy.http`'s or `proxy.https`'s: Sōzune binds it once a
+/// route attaches to the listener and closes it when none is left.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct GatewayPortsConfig {
     /// Ports for HTTP listeners.
     #[serde(default)]
     pub http: Vec<PortRange>,
+    /// Ports for HTTPS listeners.
+    #[serde(default)]
+    pub https: Vec<PortRange>,
     /// Ports for TCP and TLS listeners.
     #[serde(default)]
     pub tcp: Vec<PortRange>,
@@ -891,6 +894,10 @@ pub struct GatewayPortsConfig {
 impl GatewayPortsConfig {
     pub fn allows_http(&self, port: u16) -> bool {
         self.http.iter().any(|r| r.contains(port))
+    }
+
+    pub fn allows_https(&self, port: u16) -> bool {
+        self.https.iter().any(|r| r.contains(port))
     }
 
     pub fn allows_tcp(&self, port: u16) -> bool {
@@ -918,6 +925,16 @@ pub fn gateway_http_port(name: &str) -> Option<u16> {
     name.strip_prefix(GATEWAY_HTTP_PREFIX)?.parse().ok()
 }
 
+/// The HTTPS twin of [`gateway_tcp_listener`].
+pub fn gateway_https_listener(port: u16) -> String {
+    format!("{GATEWAY_HTTPS_PREFIX}{port}")
+}
+
+/// The port of a listener named by [`gateway_https_listener`].
+pub fn gateway_https_port(name: &str) -> Option<u16> {
+    name.strip_prefix(GATEWAY_HTTPS_PREFIX)?.parse().ok()
+}
+
 /// The UDP twin of [`gateway_tcp_listener`].
 pub fn gateway_udp_listener(port: u16) -> String {
     format!("{GATEWAY_UDP_PREFIX}{port}")
@@ -934,6 +951,7 @@ pub fn gateway_udp_port(name: &str) -> Option<u16> {
 }
 
 const GATEWAY_HTTP_PREFIX: &str = "gateway:http:";
+const GATEWAY_HTTPS_PREFIX: &str = "gateway:https:";
 const GATEWAY_TCP_PREFIX: &str = "gateway:tcp:";
 const GATEWAY_UDP_PREFIX: &str = "gateway:udp:";
 
@@ -2593,6 +2611,7 @@ https:
 gateway_ports:
   tcp: [5432, "9000-9099"]
   udp: ["53"]
+  https: [8443]
 "#;
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         let ports = &config.gateway_ports;
@@ -2603,6 +2622,8 @@ gateway_ports:
         assert!(!ports.allows_tcp(53));
         assert!(ports.allows_udp(53));
         assert!(!ports.allows_udp(5432));
+        assert!(ports.allows_https(8443));
+        assert!(!ports.allows_http(8443));
     }
 
     #[test]

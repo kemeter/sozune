@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use crate::config::{AcmeConfig, ProxyTimeouts};
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
-use crate::proxy::sozu::{header_predicate, listener_http_port, routes_on_query};
+use crate::proxy::sozu::{
+    FrontListener, header_predicate, listener_http_port, listener_https_port, routes_on_query,
+};
 
 /// Run per-entrypoint lints. Called immediately after parsing one candidate.
 /// `prefix` is `sozune.<protocol>.<service>.`, so labels name the full key.
@@ -46,9 +48,9 @@ pub fn lint_entrypoint(ep: &Entrypoint, prefix: &str, diagnostics: &mut Vec<Diag
 /// A route's header conditions Sōzu routes on, as lowercase name and value.
 type HeaderConditions = Vec<(String, String)>;
 
-/// Where routes may meet: host, path and listener, an HTTP one by its port
-/// (`Some`), the HTTPS one (`None`).
-type RouteKey = (String, String, Option<u16>);
+/// Where routes may meet: host, path and listener, by its kind and port (`0`
+/// for the main one).
+type RouteKey = (String, String, (FrontListener, u16));
 
 /// What tells a route from another on the same host and path: its priority,
 /// and the header and query conditions Sōzu routes on.
@@ -73,8 +75,8 @@ struct RouteConditions {
 /// conditions collide: a request can repeat a parameter with each value.
 pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diagnostic)> {
     let mut out = Vec::new();
-    // Keyed by host, path and listener: routes on Gateway HTTP listeners of
-    // different ports never meet there, though they can on HTTPS.
+    // Keyed by host, path and listener: routes on Gateway listeners of
+    // different ports never meet there, though they can on another one.
     let mut routes: HashMap<RouteKey, Vec<(&str, RouteConditions)>> = HashMap::new();
 
     for (cand_id, ep) in entrypoints {
@@ -121,10 +123,10 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
         // The listeners it is served on.
         let mut listeners = Vec::new();
         if !ep.config.https_only {
-            listeners.push(Some(listener_http_port(ep, 0)));
+            listeners.push((FrontListener::Http, listener_http_port(ep, 0)));
         }
         if ep.config.tls {
-            listeners.push(None);
+            listeners.push((FrontListener::Https, listener_https_port(ep, 0)));
         }
         for host in &ep.config.hostnames {
             for listener in &listeners {

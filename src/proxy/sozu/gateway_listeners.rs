@@ -7,19 +7,20 @@
 //! more, so a port stays open only while a route is served on it.
 
 use super::{
-    Channels, L4Channels, RoutingSnapshot, WorkerSettings, send_to_worker, serve_tcp_forwarder,
-    spawn_tcp_worker, spawn_udp_worker, stop_worker,
+    Channels, HeldCertificate, L4Channels, RoutingSnapshot, WorkerSettings, send_to_worker,
+    serve_tcp_forwarder, spawn_tcp_worker, spawn_udp_worker, stop_worker,
 };
 use crate::config::{
-    GatewayPortsConfig, TcpListenerConfig, gateway_http_port, gateway_tcp_port, gateway_udp_port,
+    GatewayPortsConfig, TcpListenerConfig, gateway_http_port, gateway_https_port, gateway_tcp_port,
+    gateway_udp_port,
 };
 use crate::model::Protocol;
 use crate::provider::kubernetes::gateway::is_gateway_route;
 use crate::proxy::backend::UnopenedGatewayPorts;
 use sozu_command_lib::channel::Channel;
 use sozu_command_lib::proto::command::{
-    ActivateListener, DeactivateListener, HttpListenerConfig, ListenerType, RemoveListener,
-    SocketAddress, WorkerRequest, WorkerResponse, request::RequestType,
+    ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+    RemoveListener, SocketAddress, WorkerRequest, WorkerResponse, request::RequestType,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -41,6 +42,11 @@ pub(super) struct GatewayListeners {
     http: BTreeMap<String, u16>,
     /// What those are built from: the main HTTP listener's settings.
     http_template: HttpListenerConfig,
+    /// The HTTPS listeners opened on the HTTPS worker, by name, with their
+    /// port.
+    https: BTreeMap<String, u16>,
+    /// What those are built from: the main HTTPS listener's settings.
+    https_template: HttpsListenerConfig,
     /// Where the ports that could not be opened are published, for the
     /// Gateway listener status.
     unopened: watch::Sender<UnopenedGatewayPorts>,
@@ -52,6 +58,7 @@ impl GatewayListeners {
         settings: WorkerSettings,
         unopened: watch::Sender<UnopenedGatewayPorts>,
         http_template: HttpListenerConfig,
+        https_template: HttpsListenerConfig,
     ) -> Self {
         Self {
             ports,
@@ -60,6 +67,8 @@ impl GatewayListeners {
             udp: HashSet::new(),
             http: BTreeMap::new(),
             http_template,
+            https: BTreeMap::new(),
+            https_template,
             unopened,
         }
     }
@@ -68,11 +77,26 @@ impl GatewayListeners {
     pub(super) fn http_open(&self, name: &str) -> bool {
         self.http.contains_key(name)
     }
+
+    /// Whether the Gateway HTTPS listener `name` is open.
+    pub(super) fn https_open(&self, name: &str) -> bool {
+        self.https.contains_key(name)
+    }
+
+    /// The addresses of the Gateway HTTPS listeners open: each holds every
+    /// certificate the main one does.
+    pub(super) fn https_addresses(&self) -> Vec<SocketAddress> {
+        self.https
+            .values()
+            .map(|port| SocketAddress::new_v4(0, 0, 0, 0, *port))
+            .collect()
+    }
 }
 
 /// The Gateway listeners routes are served on, by name, with their port.
 pub(super) struct Referenced {
     http: BTreeMap<String, u16>,
+    https: BTreeMap<String, u16>,
     tcp: BTreeMap<String, u16>,
     udp: BTreeMap<String, u16>,
 }
@@ -81,6 +105,7 @@ pub(super) struct Referenced {
 /// route of another provider naming such a listener opens nothing.
 pub(super) fn referenced(snapshot: &RoutingSnapshot) -> Referenced {
     let mut http = BTreeMap::new();
+    let mut https = BTreeMap::new();
     let mut tcp = BTreeMap::new();
     let mut udp = BTreeMap::new();
     for entrypoint in snapshot.values().filter(|ep| is_gateway_route(ep)) {
@@ -102,10 +127,18 @@ pub(super) fn referenced(snapshot: &RoutingSnapshot) -> Referenced {
                 if let Some(port) = gateway_http_port(name) {
                     http.insert(name.to_string(), port);
                 }
+                if let Some(port) = gateway_https_port(name) {
+                    https.insert(name.to_string(), port);
+                }
             }
         }
     }
-    Referenced { http, tcp, udp }
+    Referenced {
+        http,
+        https,
+        tcp,
+        udp,
+    }
 }
 
 /// Open every Gateway listener of `wanted` (see [`referenced`]) that is not
@@ -115,9 +148,11 @@ pub(super) fn referenced(snapshot: &RoutingSnapshot) -> Referenced {
 pub(super) fn open_gateway_listeners(channels: &mut Channels, wanted: &Referenced) {
     let Channels {
         http,
+        https,
         tcp,
         udp,
         gateway,
+        certificates,
         ..
     } = channels;
     let mut unopened = UnopenedGatewayPorts::default();
@@ -130,6 +165,18 @@ pub(super) fn open_gateway_listeners(channels: &mut Channels, wanted: &Reference
             Err(e) => {
                 error!("Could not open Gateway listener `{}`: {:#}", name, e);
                 unopened.http.insert(port, format!("{e:#}"));
+            }
+        }
+    }
+    for (name, &port) in &wanted.https {
+        if gateway.https.contains_key(name) {
+            continue;
+        }
+        match open_https(gateway, https, certificates, name, port) {
+            Ok(()) => info!("Opened HTTPS port {} for Gateway listener `{}`", port, name),
+            Err(e) => {
+                error!("Could not open Gateway listener `{}`: {:#}", name, e);
+                unopened.https.insert(port, format!("{e:#}"));
             }
         }
     }
@@ -316,6 +363,98 @@ fn remove_http(
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Add an HTTPS listener on `port` to the HTTPS worker, with the main one's
+/// settings, and hand it every certificate the main one holds. One worker
+/// serves every HTTPS port, but each listener holds its own certificates.
+fn open_https(
+    gateway: &mut GatewayListeners,
+    channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    certificates: &BTreeMap<String, HeldCertificate>,
+    name: &str,
+    port: u16,
+) -> anyhow::Result<()> {
+    if !gateway.ports.allows_https(port) {
+        anyhow::bail!("port {} is not in proxy.gateway_ports.https", port);
+    }
+    let address = SocketAddress::new_v4(0, 0, 0, 0, port);
+    let config = HttpsListenerConfig {
+        address,
+        ..gateway.https_template.clone()
+    };
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("add-https-listener-{name}"),
+        RequestType::AddHttpsListener(config),
+    ) {
+        // As for an HTTP listener (see `open_http`).
+        if e.downcast_ref::<super::channel::WorkerRejected>().is_none() {
+            let _ = remove_https(channel, certificates, name, port);
+        }
+        anyhow::bail!("could not add the HTTPS listener: {e}");
+    }
+    // Before it binds, so no handshake finds it without them. One it cannot
+    // take leaves the port unopened, for a later reload to try again.
+    for certificate in certificates.values() {
+        if let Err(e) = certificate.add(channel, address) {
+            let _ = remove_https(channel, certificates, name, port);
+            anyhow::bail!(
+                "could not add the certificate for {}: {e}",
+                certificate.names.join(", ")
+            );
+        }
+    }
+    if let Err(e) = send_to_worker(
+        channel,
+        format!("activate-https-listener-{name}"),
+        RequestType::ActivateListener(ActivateListener {
+            address,
+            proxy: ListenerType::Https.into(),
+            from_scm: false,
+            interface: None,
+        }),
+    ) {
+        let _ = remove_https(channel, certificates, name, port);
+        anyhow::bail!("could not bind port {port}: {e}");
+    }
+    gateway.https.insert(name.to_string(), port);
+    Ok(())
+}
+
+/// The HTTPS twin of [`remove_http`], which takes `certificates` back from
+/// it first: the worker forgets a listener's certificates with it, but keeps
+/// them on record for its address.
+fn remove_https(
+    channel: &mut Channel<WorkerRequest, WorkerResponse>,
+    certificates: &BTreeMap<String, HeldCertificate>,
+    name: &str,
+    port: u16,
+) -> anyhow::Result<()> {
+    let address = SocketAddress::new_v4(0, 0, 0, 0, port);
+    for certificate in certificates.values() {
+        let _ = certificate.remove(channel, address);
+    }
+    let _ = send_to_worker(
+        channel,
+        format!("deactivate-https-listener-{name}"),
+        RequestType::DeactivateListener(DeactivateListener {
+            address,
+            proxy: ListenerType::Https.into(),
+            to_scm: false,
+            interface: None,
+        }),
+    );
+    send_to_worker(
+        channel,
+        format!("remove-https-listener-{name}"),
+        RequestType::RemoveListener(RemoveListener {
+            address,
+            proxy: ListenerType::Https.into(),
+            interface: None,
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn open_udp(
     gateway: &mut GatewayListeners,
     udp: &mut L4Channels,
@@ -341,11 +480,31 @@ fn open_udp(
 pub(super) fn close_unused_gateway_listeners(channels: &mut Channels, wanted: &Referenced) {
     let Channels {
         http,
+        https,
         tcp,
         udp,
         gateway,
+        certificates,
         ..
     } = channels;
+
+    let unused: Vec<(String, u16)> = gateway
+        .https
+        .iter()
+        .filter(|(name, _)| !wanted.https.contains_key(*name))
+        .map(|(name, port)| (name.clone(), *port))
+        .collect();
+    for (name, port) in unused {
+        // Sent once, as for an HTTP listener.
+        if let Err(e) = remove_https(https, certificates, &name, port) {
+            warn!("Could not close Gateway listener `{}`: {}", name, e);
+        }
+        gateway.https.remove(&name);
+        info!(
+            "Closed Gateway listener `{}`: no route is served on it",
+            name
+        );
+    }
 
     let unused: Vec<(String, u16)> = gateway
         .http
@@ -414,7 +573,9 @@ pub(super) fn close_unused_gateway_listeners(channels: &mut Channels, wanted: &R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{gateway_http_listener, gateway_tcp_listener, gateway_udp_listener};
+    use crate::config::{
+        gateway_http_listener, gateway_https_listener, gateway_tcp_listener, gateway_udp_listener,
+    };
     use crate::model::Entrypoint;
 
     fn entrypoint(id: &str, protocol: Protocol, listener: &str) -> (String, Entrypoint) {
@@ -457,6 +618,9 @@ mod tests {
             entrypoint("c", Protocol::Tcp, "postgres"),
             entrypoint("d", Protocol::Udp, &gateway_udp_listener(5353)),
             entrypoint("g", Protocol::Http, &gateway_http_listener(8080)),
+            entrypoint("i", Protocol::Http, &gateway_https_listener(8443)),
+            // An HTTPS name on a TCP route opens nothing.
+            entrypoint("j", Protocol::Tcp, &gateway_https_listener(8444)),
             // An HTTP name on a TCP route opens nothing.
             entrypoint("h", Protocol::Tcp, &gateway_http_listener(8081)),
             // A UDP name on a TCP route opens nothing.
@@ -471,10 +635,19 @@ mod tests {
         .into_iter()
         .collect();
 
-        let Referenced { http, tcp, udp } = referenced(&snapshot);
+        let Referenced {
+            http,
+            https,
+            tcp,
+            udp,
+        } = referenced(&snapshot);
         assert_eq!(
             http.into_iter().collect::<Vec<_>>(),
             vec![(gateway_http_listener(8080), 8080)]
+        );
+        assert_eq!(
+            https.into_iter().collect::<Vec<_>>(),
+            vec![(gateway_https_listener(8443), 8443)]
         );
         assert_eq!(
             tcp.into_iter().collect::<Vec<_>>(),

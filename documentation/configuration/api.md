@@ -297,7 +297,7 @@ Sample response:
       { "name": "postgres", "port": 5432, "ip_allow_list": ["10.0.0.0/8"], "rate_limit": { "max_conns": 20, "per_seconds": 1, "exempt": [] }, "idle_timeout": 3600 }
     ],
     "udp": [{ "name": "dns", "port": 53 }],
-    "gateway_ports": { "tcp": ["9000-9099"], "udp": [] }
+    "gateway_ports": { "http": [], "https": ["8443"], "tcp": ["9000-9099"], "udp": [] }
   },
   "tls": {
     "min_version": "1.3",

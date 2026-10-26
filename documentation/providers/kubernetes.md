@@ -170,7 +170,7 @@ helm install sozune ./charts/sozune --namespace sozune --create-namespace
 | `gatewayClass.create` / `gatewayClass.name` | `false` / `sozune` | Creates the `GatewayClass` (`controllerName: kemeter.io/sozune`). Needs the Gateway API CRDs. |
 | `rbac.gatewayAPI` | `true` | Lets Sōzune watch the Gateway API resources and write their status. |
 | `rbac.secrets` | `true` | Lets Sōzune read `kubernetes.io/tls` Secrets, for Ingress `secretName` and Gateway HTTPS listeners. |
-| `service.extraPorts` | `[]` | More Service ports for TCP and UDP listeners, and HTTP listeners on their own port (`proxy.tcp`, `proxy.udp`, `proxy.gateway_ports`): `{name, port, targetPort, protocol}`. |
+| `service.extraPorts` | `[]` | More Service ports for TCP and UDP listeners, and HTTP and HTTPS listeners on their own port (`proxy.tcp`, `proxy.udp`, `proxy.gateway_ports`): `{name, port, targetPort, protocol}`. |
 | `service.type` | `LoadBalancer` | With `LoadBalancer` and `service.publishAddress`, the Ingresses Sōzune serves get the Service's address in their status ([Ingress status](#ingress-status)). |
 | `persistence.enabled` | `false` | Keeps the ACME certificates (`/etc/sozune/certs`) on a `PersistentVolumeClaim` instead of an `emptyDir`. Turn it on with ACME. |
 | `image.tag` | `edge` | The Sōzune image, from `ghcr.io/kemeter/sozune`. The chart relies on features of the next release: until it is out, it runs `edge`, the current state of `main`, pulled on every start and scheduled on `amd64` nodes (`nodeSelector`), the only architecture it is built for. |
@@ -387,7 +387,19 @@ proxy:
     http: ["8080-8099"]
 ```
 
-A listener on such a port is served there: Sōzune opens the port once a route is attached to the listener and closes it when none is left, and the routes attached to that listener answer on that port only. Two listeners on different ports can then carry routes on the same host and path. A redirect on such a listener that keeps the scheme and names no port keeps the listener's port in its `Location`. A listed port Sōzune cannot open (another process holds it) makes the listener `Accepted=False` with `PortUnavailable` and the reason, and Sōzune tries again on the next reload. `HTTPS` listeners are still all served on `proxy.https.listen_address`; a route attached to one and to an `HTTP` listener on its own port is served over HTTPS there, with no redirect on the main HTTP port for the names that listener admits — and none at all when the `HTTPS` listener admits every host, as a redirect on any host would take those names too.
+A listener on such a port is served there: Sōzune opens the port once a route is attached to the listener and closes it when none is left, and the routes attached to that listener answer on that port only. Two listeners on different ports can then carry routes on the same host and path. A redirect on such a listener that keeps the scheme and names no port keeps the listener's port in its `Location`. A listed port Sōzune cannot open (another process holds it) makes the listener `Accepted=False` with `PortUnavailable` and the reason, and Sōzune tries again on the next reload. A route attached to an `HTTPS` listener on `proxy.https.listen_address` and to an `HTTP` listener on its own port is served over HTTPS there, with no redirect on the main HTTP port for the names that listener admits — and none at all when the `HTTPS` listener admits every host, as a redirect on any host would take those names too.
+
+### HTTPS listeners on their own port
+
+`HTTPS` listeners work the same way with `proxy.gateway_ports.https`: by default they are all served on `proxy.https.listen_address`, and one on a port listed there is served on that port instead.
+
+```yaml
+proxy:
+  gateway_ports:
+    https: ["8443"]
+```
+
+Sōzune opens the port once a route is attached to the listener and closes it when none is left. The port serves every certificate Sōzune holds, its listener's included, with the TLS settings of `proxy.https`. The routes attached to that listener answer there only, over HTTPS alone: their plain HTTP requests are not redirected to it. `HTTPS` listeners on one such port are isolated as `HTTP` listeners are (see `spec.hostnames` below). A listed port Sōzune cannot open makes the listener `PortUnavailable`, as for an `HTTP` listener. The ACME `TLS-ALPN-01` challenge is answered on `proxy.https.listen_address` only.
 
 Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
 
@@ -395,7 +407,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 - Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
-- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). Listeners on one port are isolated: a request goes to the listener whose `hostname` matches its host most closely, and only that listener's routes serve it. A route attached to a `*.example.com` listener therefore answers `404` for `abc.foo.example.com` when another `HTTP` listener of the Gateway, on the same port, takes `abc.foo.example.com` or `*.foo.example.com` — unless the route is attached to that listener too. A header match Sōzu routes on keeps that `404` for the requests carrying the header, even over a route of the more specific listener without one: Sōzu tries the frontends with a header predicate first. A route with none, on a listener with none, serves every host, after the routes naming theirs. A wildcard takes one or more labels, as the spec says: `*.example.com` serves `a.b.example.com` too, unlike a Sōzune label's `*.`.
+- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). `HTTP` listeners on one port, and `HTTPS` listeners on one port of `proxy.gateway_ports.https`, are isolated: a request goes to the listener whose `hostname` matches its host most closely, and only that listener's routes serve it. A route attached to a `*.example.com` listener therefore answers `404` for `abc.foo.example.com` when another `HTTP` listener of the Gateway, on the same port, takes `abc.foo.example.com` or `*.foo.example.com` — unless the route is attached to that listener too. A header match Sōzu routes on keeps that `404` for the requests carrying the header, even over a route of the more specific listener without one: Sōzu tries the frontends with a header predicate first. A route with none, on a listener with none, serves every host, after the routes naming theirs. A wildcard takes one or more labels, as the spec says: `*.example.com` serves `a.b.example.com` too, unlike a Sōzune label's `*.`.
 - `backendRef.port` — the Service port; requests go to the port its pods listen on (its `targetPort`), as its EndpointSlices give it.
 - `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
 - Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).
@@ -450,7 +462,7 @@ With `publish_service` or `publish_addresses` set, `status.addresses` carries S�
 
 | Condition | Status | Reason | When |
 |---|---|---|---|
-| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener: on a port of `proxy.gateway_ports.http`, its routes are served there; on any other, on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. An `HTTPS` listener likewise, on `proxy.https.listen_address`, when its certificateRefs resolve. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry or of `proxy.gateway_ports.tcp`, a `UDP` one on the port of a `proxy.udp` entry or of `proxy.gateway_ports.udp` |
+| `Accepted`, `Programmed` | `True` (`Accepted`, `Programmed`) | An `HTTP` listener: on a port of `proxy.gateway_ports.http`, its routes are served there; on any other, on `proxy.http.listen_address`, which a Service usually maps the listener's port to — the message names that port. An `HTTPS` listener likewise, with `proxy.gateway_ports.https` and `proxy.https.listen_address`, when its certificateRefs resolve. A `TLS`/`TCP` listener on the port of a `proxy.tcp` entry or of `proxy.gateway_ports.tcp`, a `UDP` one on the port of a `proxy.udp` entry or of `proxy.gateway_ports.udp` |
 | `Accepted`, `Programmed` | `False` (`PortUnavailable`, `Invalid`) | A `TLS`, `TCP` or `UDP` listener on a port no `proxy.tcp` / `proxy.udp` entry listens on and `proxy.gateway_ports` does not list — the message names the settings to change — or a listener on a port of `proxy.gateway_ports` Sōzune could not open, with the reason |
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | The listener's `allowedRoutes.kinds` is unset, or only lists the kind it carries, and an `HTTPS` listener's certificateRefs all resolve |
 | `ResolvedRefs` | `False` (`InvalidRouteKinds`) | `allowedRoutes.kinds` lists a kind the listener's protocol cannot carry. If it leaves out the one it can, `Programmed` is `False` (`Invalid`) too: no route attaches |
@@ -516,7 +528,6 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 ### What's not supported (yet)
 
-- `HTTPS` listeners on their own port: they are all served on `proxy.https.listen_address`, and the listener's status names that port. `HTTP` listeners can be (see [HTTP listeners on their own port](#http-listeners-on-their-own-port)).
 - HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`.
 - A `backendRef` that is invalid (an unsupported kind, a cross-namespace ref with no `ReferenceGrant`) is left out of the rule, and its share of the traffic goes to the other backends. The spec asks for that share to be answered with `500`.

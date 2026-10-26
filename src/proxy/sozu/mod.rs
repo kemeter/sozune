@@ -203,6 +203,8 @@ struct Channels {
     /// fingerprint. The worker keeps one copy however many add it, so it is
     /// only taken back when the last of them removes it.
     certificate_holders: HashMap<String, usize>,
+    /// The certificates the HTTPS worker holds, by fingerprint.
+    certificates: BTreeMap<String, HeldCertificate>,
 }
 
 impl Channels {
@@ -663,6 +665,12 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         .to_tls(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTPS listener: {}", e))?;
     check_client_crls_current(&https_listener, unix_now())?;
+    // What a Gateway HTTPS listener on a port of its own is built from. It
+    // binds its port itself, never behind the gate.
+    let https_listener_template = sozu_command_lib::proto::command::HttpsListenerConfig {
+        expect_proxy: false,
+        ..https_listener.clone()
+    };
 
     // Create communication channels
     let command_buffer_max_bytes = config.command_buffer_max_bytes;
@@ -779,8 +787,10 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
             WorkerSettings::from_config(config),
             unopened_gateway_ports,
             http_listener_template,
+            https_listener_template,
         ),
         certificate_holders: HashMap::new(),
+        certificates: BTreeMap::new(),
     };
 
     let reload_handle = thread::spawn(move || {
@@ -975,36 +985,98 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     Ok(())
 }
 
+/// A certificate the HTTPS worker holds, as it was handed over: what a
+/// Gateway HTTPS listener opened later is given too.
+pub(super) struct HeldCertificate {
+    pub(super) names: Vec<String>,
+    cert_pem: String,
+    chain: Vec<String>,
+    key_pem: String,
+}
+
+impl HeldCertificate {
+    /// Hand it to the HTTPS listener at `address`.
+    pub(super) fn add(
+        &self,
+        channel: &mut Channel<WorkerRequest, WorkerResponse>,
+        address: SocketAddress,
+    ) -> anyhow::Result<()> {
+        add_certificate(
+            channel,
+            address,
+            &self.cert_pem,
+            &self.chain,
+            &self.key_pem,
+            &self.names,
+        )
+    }
+
+    /// Take it back from the HTTPS listener at `address`.
+    pub(super) fn remove(
+        &self,
+        channel: &mut Channel<WorkerRequest, WorkerResponse>,
+        address: SocketAddress,
+    ) -> anyhow::Result<()> {
+        remove_certificate(channel, address, &self.cert_pem)
+    }
+}
+
 /// Hand a certificate to the HTTPS worker, or take one back. Returns whether
-/// the worker did it.
+/// the worker did it on the main HTTPS listener; the Gateway HTTPS listeners
+/// follow it.
 fn apply_certificate(channels: &mut Channels, cmd: CertCommand) -> bool {
     let https_addr = channels.https_addr();
+    let gateway_addrs = channels.gateway.https_addresses();
     let names = cmd.names.join(", ");
+    let held = HeldCertificate {
+        names: cmd.names.clone(),
+        cert_pem: cmd.cert_pem.clone(),
+        chain: cmd.chain.clone(),
+        key_pem: cmd.key_pem.clone(),
+    };
+    let fingerprint = crate::acme::certificate_fingerprint(&cmd.cert_pem).ok();
     let applied = match cmd.action {
         CertAction::Add => {
             info!("Adding certificate for {}", names);
-            add_certificate(
-                &mut channels.https,
-                https_addr,
-                &cmd.cert_pem,
-                &cmd.chain,
-                &cmd.key_pem,
-                &cmd.names,
-            )
+            // Every listener, or the sender tries again: adding a
+            // certificate a listener holds already is a no-op.
+            let mut added = held.add(&mut channels.https, https_addr);
+            if added.is_ok() {
+                for address in gateway_addrs {
+                    if let Err(e) = held.add(&mut channels.https, address) {
+                        added = Err(e.context(format!("on port {}", address.port)));
+                    }
+                }
+            }
+            added
         }
         CertAction::Replace => {
             info!("Replacing certificate for {}", names);
-            replace_certificate(
+            let mut replaced = replace_certificate(
                 &mut channels.https,
                 https_addr,
                 &cmd.cert_pem,
                 &cmd.chain,
                 &cmd.key_pem,
                 &cmd.names,
-            )
+            );
+            if replaced.is_ok() {
+                for address in gateway_addrs {
+                    if let Err(e) = replace_certificate(
+                        &mut channels.https,
+                        address,
+                        &cmd.cert_pem,
+                        &cmd.chain,
+                        &cmd.key_pem,
+                        &cmd.names,
+                    ) {
+                        replaced = Err(e.context(format!("on port {}", address.port)));
+                    }
+                }
+            }
+            replaced
         }
         CertAction::Remove => {
-            let fingerprint = crate::acme::certificate_fingerprint(&cmd.cert_pem).ok();
             if fingerprint
                 .as_deref()
                 .is_some_and(|f| !release_certificate(&mut channels.certificate_holders, f))
@@ -1013,23 +1085,45 @@ fn apply_certificate(channels: &mut Channels, cmd: CertCommand) -> bool {
                 Ok(())
             } else {
                 info!("Removing certificate for {}", names);
-                let removed = remove_certificate(&mut channels.https, https_addr, &cmd.cert_pem);
-                // Its last holder lets go once the worker dropped it: a
-                // removal retried after a failure must still find it held.
+                // From every listener before its last holder lets go: a
+                // removal retried after a failure must still find it held,
+                // and removing one a listener no longer has is a no-op.
+                let mut removed =
+                    remove_certificate(&mut channels.https, https_addr, &cmd.cert_pem);
+                if removed.is_ok() {
+                    for address in gateway_addrs {
+                        if let Err(e) =
+                            remove_certificate(&mut channels.https, address, &cmd.cert_pem)
+                        {
+                            removed = Err(e.context(format!("on port {}", address.port)));
+                        }
+                    }
+                }
                 if removed.is_ok()
                     && let Some(fingerprint) = &fingerprint
                 {
                     channels.certificate_holders.remove(fingerprint);
+                    channels.certificates.remove(fingerprint);
                 }
                 removed
             }
         }
     };
     if applied.is_ok()
-        && cmd.action == CertAction::Add
-        && let Ok(fingerprint) = crate::acme::certificate_fingerprint(&cmd.cert_pem)
+        && cmd.action != CertAction::Remove
+        && let Some(fingerprint) = fingerprint
     {
-        *channels.certificate_holders.entry(fingerprint).or_default() += 1;
+        if cmd.action == CertAction::Add {
+            *channels
+                .certificate_holders
+                .entry(fingerprint.clone())
+                .or_default() += 1;
+            // The worker keeps the first material added for a leaf: another
+            // chain for it only lands through a replacement.
+            channels.certificates.entry(fingerprint).or_insert(held);
+        } else {
+            channels.certificates.insert(fingerprint, held);
+        }
     }
 
     // The sender wrote the certificate to disk before handing it over, so
@@ -1601,12 +1695,14 @@ fn configure_sozu_routing(
             continue;
         }
 
-        // A Gateway HTTP listener that could not be opened: a later reload
-        // opens it and retries the route.
+        // A Gateway HTTP or HTTPS listener that could not be opened: a later
+        // reload opens it and retries the route.
         if let Some(name) = entrypoint.config.entrypoint.as_deref()
             && entrypoint.protocol == Protocol::Http
-            && crate::config::gateway_http_port(name).is_some()
-            && !channels.gateway.http_open(name)
+            && ((crate::config::gateway_http_port(name).is_some()
+                && !channels.gateway.http_open(name))
+                || (crate::config::gateway_https_port(name).is_some()
+                    && !channels.gateway.https_open(name)))
         {
             warn!(
                 "HTTP entrypoint `{}` is served on Gateway listener `{}`, which is not open, skipping",
@@ -1820,8 +1916,31 @@ pub(crate) fn listener_http_port(entrypoint: &Entrypoint, http_port: u16) -> u16
         .unwrap_or(http_port)
 }
 
+/// The address an entrypoint's HTTPS frontends go on: that of the Gateway
+/// HTTPS listener it names (see [`crate::config::gateway_https_listener`]), or
+/// the main HTTPS listener's, `https_addr`.
+pub(crate) fn listener_https_addr(
+    entrypoint: &Entrypoint,
+    https_addr: SocketAddress,
+) -> SocketAddress {
+    match listener_https_port(entrypoint, 0) {
+        0 => https_addr,
+        port => SocketAddress::new_v4(0, 0, 0, 0, port),
+    }
+}
+
+/// The HTTPS twin of [`listener_http_port`].
+pub(crate) fn listener_https_port(entrypoint: &Entrypoint, https_port: u16) -> u16 {
+    entrypoint
+        .config
+        .entrypoint
+        .as_deref()
+        .and_then(crate::config::gateway_https_port)
+        .unwrap_or(https_port)
+}
+
 /// The listener a frontend is installed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FrontListener {
     Http,
     Https,
@@ -1928,7 +2047,7 @@ pub(crate) fn build_http_frontends(
             };
             if entrypoint.config.tls {
                 let https_front = RequestHttpFrontend {
-                    address: https_addr,
+                    address: listener_https_addr(entrypoint, https_addr),
                     ..front.clone()
                 };
                 // Served over HTTPS alone: nothing on the HTTP listener.
@@ -2704,7 +2823,7 @@ fn remove_http_frontends(
             if entrypoint.config.tls {
                 let https_front = RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
-                    address: https_addr,
+                    address: listener_https_addr(entrypoint, https_addr),
                     hostname: hostname.clone(),
                     path: path_rule.clone(),
                     method: method.clone(),

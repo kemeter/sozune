@@ -22,6 +22,7 @@ pub type LiveRoutes = Arc<RwLock<BTreeMap<String, Entrypoint>>>;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UnopenedGatewayPorts {
     pub http: BTreeMap<u16, String>,
+    pub https: BTreeMap<u16, String>,
     pub tcp: BTreeMap<u16, String>,
     pub udp: BTreeMap<u16, String>,
 }
