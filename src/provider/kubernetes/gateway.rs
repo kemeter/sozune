@@ -1333,6 +1333,146 @@ impl GatewayScope {
         }
     }
 
+    /// The hostnames a more specific plain HTTP listener of a Gateway the
+    /// route binds takes from it, with the own port of their listeners
+    /// (`None`: the main HTTP port): a listener on the same port, which the
+    /// route is not attached to, whose hostname one the route binds there
+    /// covers. A request for such a host belongs to that listener alone.
+    fn isolated_hostnames(&self, route: &HTTPRoute) -> Vec<IsolatedHost> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(refs) = route.spec.parent_refs.as_ref() else {
+            return Vec::new();
+        };
+        let accepted: Vec<&HTTPRouteParentRefs> = refs
+            .iter()
+            .filter(|p| self.accepts_parent_ref(route_ns, *p))
+            .collect();
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return Vec::new();
+            }
+        };
+        // The listeners the route binds, by Gateway.
+        let mut bound: HashMap<(String, String), Vec<ListenerInfo>> = HashMap::new();
+        for p in accepted {
+            let ns = p.namespace.as_deref().unwrap_or(route_ns).to_string();
+            let Some(listeners) = g.gateways.get(&(ns.clone(), p.name.clone())) else {
+                continue;
+            };
+            bound
+                .entry((ns.clone(), p.name.clone()))
+                .or_default()
+                .extend(
+                    listeners
+                        .iter()
+                        .filter(|l| Self::listener_is_plain_http(l))
+                        .filter(|l| l.admits(&ns, route_ns, "HTTPRoute", &g.namespace_labels))
+                        .filter(|l| {
+                            p.section_name.as_deref().is_none_or(|s| s == l.name)
+                                && p.port.is_none_or(|port| port == l.port)
+                        })
+                        .cloned(),
+                );
+        }
+        // Whether `taken`, a listener's hostname on `port`, is taken from
+        // the listeners the route binds on that Gateway (`attached`).
+        let takes = |listeners: &[ListenerInfo],
+                     attached: &[ListenerInfo],
+                     port: i32,
+                     taken: &str| {
+            let unbound = listeners.iter().any(|l| {
+                Self::listener_is_plain_http(l)
+                    && l.port == port
+                    && l.hostname.as_deref() == Some(taken)
+                    && !attached.iter().any(|a| a.name == l.name)
+            });
+            unbound
+                && attached.iter().any(|l| {
+                    l.port == port
+                        && match l.hostname.as_deref() {
+                            None => true,
+                            Some(broader) => broader != taken && hostname_covers(broader, taken),
+                        }
+                })
+        };
+        let mut isolated: Vec<IsolatedHost> = Vec::new();
+        for (key, attached) in &bound {
+            let Some(listeners) = g.gateways.get(key) else {
+                continue;
+            };
+            for other in listeners.iter().filter(|l| Self::listener_is_plain_http(l)) {
+                let Some(taken) = other.hostname.as_deref() else {
+                    continue;
+                };
+                if !takes(listeners, attached, other.port, taken) {
+                    continue;
+                }
+                // Another Gateway the route binds on the same port, whose
+                // listener for the host is one the route binds, keeps it.
+                let elsewhere = bound.iter().any(|(k, a)| {
+                    k != key
+                        && g.gateways
+                            .get(k)
+                            .is_some_and(|ls| Self::selects(ls, a, other.port, taken))
+                });
+                if elsewhere {
+                    continue;
+                }
+                let port = g.served.own_http_port(other.port);
+                // A listener the route binds within this one takes its
+                // hosts back.
+                let bound_within: Vec<String> = bound
+                    .values()
+                    .flatten()
+                    .filter(|l| l.port == other.port)
+                    .filter_map(|l| l.hostname.clone())
+                    .filter(|narrower| narrower != taken && hostname_covers(taken, narrower))
+                    .collect();
+                if !isolated.iter().any(|i| i.port == port && i.host == taken) {
+                    isolated.push(IsolatedHost {
+                        port,
+                        host: taken.to_string(),
+                        bound_within,
+                    });
+                }
+            }
+        }
+        isolated
+    }
+
+    /// Whether the most specific plain HTTP listener of `listeners` on
+    /// `port` covering `host` is one of `attached`.
+    fn selects(
+        listeners: &[ListenerInfo],
+        attached: &[ListenerInfo],
+        port: i32,
+        host: &str,
+    ) -> bool {
+        let specificity = |l: &ListenerInfo| match l.hostname.as_deref() {
+            None => (0, 0),
+            Some(h) if h.starts_with("*.") => (1, h.len()),
+            Some(h) => (2, h.len()),
+        };
+        let covering: Vec<&ListenerInfo> = listeners
+            .iter()
+            .filter(|l| Self::listener_is_plain_http(l) && l.port == port)
+            .filter(|l| {
+                l.hostname
+                    .as_deref()
+                    .is_none_or(|h| hostname_covers(h, host))
+            })
+            .collect();
+        let Some(best) = covering.iter().map(|l| specificity(l)).max() else {
+            return false;
+        };
+        covering
+            .iter()
+            .filter(|l| specificity(l) == best)
+            .any(|l| attached.iter().any(|a| a.name == l.name))
+    }
+
     /// The own ports of the plain HTTP listeners the route binds.
     fn own_http_ports(&self, route: &HTTPRoute) -> BTreeSet<u16> {
         self.bound_listeners(route, &Self::listener_is_plain_http)
@@ -3312,7 +3452,13 @@ fn apply_route(
                     route, resolver, scope, port, hostnames,
                 ));
             }
-            if eps.iter().any(redirect_skips_conditions) {
+            let isolated = scope.isolated_hostnames(route);
+            // Every host taken by more specific listeners still leaves the
+            // route accepted, its backends resolved.
+            let resolved = !eps.is_empty();
+            let skips_conditions = eps.iter().any(redirect_skips_conditions);
+            let eps = isolate_from_listeners(eps, &isolated);
+            if skips_conditions {
                 warn!(
                     "Gateway API: HTTPRoute {}/{} redirects on a match whose query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on Host or Cookie…) — dropping the route",
                     route.metadata.namespace.as_deref().unwrap_or("default"),
@@ -3320,7 +3466,7 @@ fn apply_route(
                 );
                 (RouteOutcome::UnsupportedFilters, Vec::new())
             } else {
-                let outcome = if eps.is_empty() {
+                let outcome = if !resolved {
                     RouteOutcome::NoResolvableBackends
                 } else {
                     RouteOutcome::Accepted
@@ -3877,6 +4023,168 @@ fn own_port_entrypoints(
         }
     }
     eps
+}
+
+/// `eps` kept from the hosts more specific listeners take (`isolated`, see
+/// [`GatewayScope::isolated_hostnames`]): a hostname wholly within one is
+/// dropped, an entrypoint left with none with it; over a broader one, an
+/// entrypoint answering `404` on that host and the entrypoint's path is added,
+/// tried after every route of that host.
+/// A host a listener the route is not attached to takes from it, on `port`
+/// (`None`: the main HTTP port), save within `bound_within`: the hostnames
+/// of the listeners the route binds within that one.
+#[derive(Debug, Clone, PartialEq)]
+struct IsolatedHost {
+    port: Option<u16>,
+    host: String,
+    bound_within: Vec<String>,
+}
+
+fn isolate_from_listeners(eps: Vec<Entrypoint>, isolated: &[IsolatedHost]) -> Vec<Entrypoint> {
+    if isolated.is_empty() {
+        return eps;
+    }
+    let mut out = Vec::new();
+    for mut ep in eps {
+        let port = ep
+            .config
+            .entrypoint
+            .as_deref()
+            .and_then(crate::config::gateway_http_port);
+        let on_port: Vec<&IsolatedHost> = isolated.iter().filter(|i| i.port == port).collect();
+        let taken: Vec<&str> = on_port.iter().map(|i| i.host.as_str()).collect();
+        if taken.is_empty() {
+            out.push(ep);
+            continue;
+        }
+        if ep.config.https_only {
+            out.push(ep);
+            continue;
+        }
+        // Isolation is a matter of the HTTP listener: served over HTTPS
+        // too, a hostname taken there stays, over HTTPS alone.
+        let (within, kept): (Vec<String>, Vec<String>) = std::mem::take(&mut ep.config.hostnames)
+            .into_iter()
+            .partition(|h| {
+                on_port.iter().any(|i| {
+                    host_within(h, &i.host) && !i.bound_within.iter().any(|b| host_within(h, b))
+                })
+            });
+        if ep.config.tls && !within.is_empty() {
+            let mut secure = ep.clone();
+            secure.id = format!("{}-sec", ep.id);
+            secure.name = format!("{}-sec", ep.name);
+            secure.source = Some(secure.id.clone());
+            secure.config.hostnames = within;
+            secure.config.https_only = true;
+            secure.config.https_redirect = false;
+            secure.config.https_redirect_port = None;
+            out.push(secure);
+        }
+        ep.config.hostnames = kept;
+        if ep.config.hostnames.is_empty() {
+            continue;
+        }
+        let shadows = other_listener_entrypoints(&ep, &taken);
+        // The hosts of the listeners it binds within a taken one, ahead of
+        // that one's shadow.
+        let mut reclaimed: Vec<String> = Vec::new();
+        for i in on_port
+            .iter()
+            .filter(|i| ep.config.hostnames.iter().any(|h| serves_host(h, &i.host)))
+        {
+            for host in i
+                .bound_within
+                .iter()
+                .map(|b| crate::model::any_labels_wildcard(b))
+            {
+                if !ep.config.hostnames.contains(&host) && !reclaimed.contains(&host) {
+                    reclaimed.push(host);
+                }
+            }
+        }
+        if !reclaimed.is_empty() {
+            let mut bound = ep.clone();
+            bound.id = format!("{}-bound", ep.id);
+            bound.name = format!("{}-bound", ep.name);
+            bound.source = Some(bound.id.clone());
+            bound.config.hostnames = reclaimed;
+            out.push(bound);
+        }
+        out.push(ep);
+        out.extend(shadows);
+    }
+    out
+}
+
+/// Whether an entrypoint hostname (`*`, an any-labels wildcard, or a name)
+/// only takes hosts within `taken`, a Gateway API hostname.
+fn host_within(entrypoint_host: &str, taken: &str) -> bool {
+    if entrypoint_host == "*" {
+        return false;
+    }
+    // The hosts it takes end with `.base`, or are `base` itself.
+    let (base, wildcard) = match entrypoint_host.strip_prefix(crate::model::ANY_LABELS_PREFIX) {
+        Some(suffix) => (suffix, true),
+        None => (entrypoint_host, false),
+    };
+    match taken.strip_prefix("*.") {
+        Some(suffix) => base.ends_with(&format!(".{suffix}")) || (wildcard && base == suffix),
+        None => !wildcard && base == taken,
+    }
+}
+
+/// The entrypoints answering `404` on the hosts of `taken` `ep` is broader
+/// than, on `ep`'s path, tried after every route of those hosts.
+fn other_listener_entrypoints(ep: &Entrypoint, taken: &[&str]) -> Vec<Entrypoint> {
+    taken
+        .iter()
+        .filter(|host| ep.config.hostnames.iter().any(|h| serves_host(h, host)))
+        .enumerate()
+        .map(|(i, host)| {
+            let mut shadow = ep.clone();
+            shadow.id = format!("{}-iso{i}", ep.id);
+            shadow.name = format!("{}-iso{i}", ep.name);
+            shadow.source = Some(shadow.id.clone());
+            shadow.backends = Vec::new();
+            let config = &mut shadow.config;
+            config.hostnames = vec![crate::model::any_labels_wildcard(host)];
+            config.answer = Some(crate::model::FixedAnswer::OtherListener);
+            // The route's matches, so its frontends take no precedence
+            // over the shadow (a header predicate is tried first): whatever
+            // else the route asks, the request is not its listener's.
+            config.tls = false;
+            config.https_only = false;
+            config.https_redirect = false;
+            config.https_redirect_port = None;
+            config.redirect = None;
+            config.redirect_scheme = None;
+            config.redirect_template = None;
+            config.rewrite_host = None;
+            config.rewrite_path = None;
+            config.rewrite_port = None;
+            config.rewrite = None;
+            config.headers = Vec::new();
+            config.backend_timeout = None;
+            config.request_timeout = None;
+            shadow
+        })
+        .collect()
+}
+
+/// Whether an entrypoint hostname (`*`, an any-labels wildcard, or a name)
+/// takes `host`, a Gateway API hostname, a wildcard or not.
+fn serves_host(entrypoint_host: &str, host: &str) -> bool {
+    if entrypoint_host == "*" || entrypoint_host == host {
+        return true;
+    }
+    match entrypoint_host.strip_prefix(crate::model::ANY_LABELS_PREFIX) {
+        Some(suffix) => host
+            .strip_prefix("*.")
+            .unwrap_or(host)
+            .ends_with(&format!(".{suffix}")),
+        None => false,
+    }
 }
 
 /// Hostnames split by how specific they are: the exact names together, then
@@ -4556,7 +4864,7 @@ fn rule_to_entrypoints(
                     match_headers,
                     match_query,
                     match_client_ip: Vec::new(),
-                    invalid_backends,
+                    answer: invalid_backends.then_some(crate::model::FixedAnswer::InvalidBackends),
                     ip_allow_list: Vec::new(),
                 },
                 source: Some(id),
@@ -5857,7 +6165,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         match_headers: Vec::new(),
         match_query: Vec::new(),
         match_client_ip: Vec::new(),
-        invalid_backends: false,
+        answer: None,
         ip_allow_list: Vec::new(),
     }
 }
@@ -7057,7 +7365,10 @@ mod tests {
         );
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
-        assert!(eps[0].config.invalid_backends);
+        assert_eq!(
+            eps[0].config.answer,
+            Some(crate::model::FixedAnswer::InvalidBackends)
+        );
     }
 
     /// A redirect answers by itself: its rule needs no backend.
@@ -7081,7 +7392,7 @@ mod tests {
         let eps = route_to_entrypoints(&r, &r0(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert!(eps[0].backends.is_empty());
-        assert!(!eps[0].config.invalid_backends);
+        assert!(eps[0].config.answer.is_none());
         assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
     }
 
@@ -7220,7 +7531,10 @@ mod tests {
         let eps = route_to_entrypoints(&r, &CrossNsResolver, &scope);
         assert_eq!(eps.len(), 1);
         assert!(eps[0].backends.is_empty());
-        assert!(eps[0].config.invalid_backends);
+        assert_eq!(
+            eps[0].config.answer,
+            Some(crate::model::FixedAnswer::InvalidBackends)
+        );
         assert_eq!(
             route_invalid_ref(&r, &CrossNsResolver, &scope),
             Some(InvalidRef::NotPermitted)
@@ -7569,7 +7883,10 @@ mod tests {
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert!(eps[0].backends.is_empty());
-        assert!(eps[0].config.invalid_backends);
+        assert_eq!(
+            eps[0].config.answer,
+            Some(crate::model::FixedAnswer::InvalidBackends)
+        );
         assert_eq!(
             route_invalid_ref(&r, &r1(), &AllowAllBackendRefs),
             Some(InvalidRef::Kind)
@@ -7589,7 +7906,7 @@ mod tests {
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
         assert!(!eps[0].backends.is_empty());
-        assert!(!eps[0].config.invalid_backends);
+        assert!(eps[0].config.answer.is_none());
     }
 
     /// A Service known not to exist is invalid; one not known yet is not.
@@ -7610,7 +7927,10 @@ mod tests {
         );
         let eps = route_to_entrypoints(&r, &Known(Some(false)), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
-        assert!(eps[0].config.invalid_backends);
+        assert_eq!(
+            eps[0].config.answer,
+            Some(crate::model::FixedAnswer::InvalidBackends)
+        );
         assert!(route_to_entrypoints(&r, &Known(None), &AllowAllBackendRefs).is_empty());
         assert_eq!(
             route_invalid_ref(&r, &Known(None), &AllowAllBackendRefs),
@@ -9706,6 +10026,232 @@ mod tests {
                 ..Default::default()
             }),
             Some(9090)
+        );
+    }
+
+    /// A route attached to a general listener is kept from the hosts a more
+    /// specific listener of the same Gateway and port takes, after that
+    /// listener's routes; one attached to both is not.
+    #[tokio::test]
+    async fn a_route_is_kept_from_the_hosts_of_more_specific_listeners() {
+        let scope = GatewayScope::new();
+        let (tx, _rx) = mpsc::channel(64);
+        scope.configure_status(served(), tx);
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut wildcard = gw_listener("wildcard", 80, "HTTP");
+        wildcard.hostname = Some("*.example.com".into());
+        let mut abc = gw_listener("abc", 80, "HTTP");
+        abc.hostname = Some("abc.foo.example.com".into());
+        gw.spec.listeners = vec![gw_listener("empty", 80, "HTTP"), wildcard, abc];
+        scope.upsert_gateway(&gw);
+
+        let on = |sections: &[&str]| {
+            let parents = sections
+                .iter()
+                .map(|section| {
+                    let mut parent = parent("gw");
+                    parent.section_name = Some(section.to_string());
+                    parent
+                })
+                .collect();
+            let r = route_with_uid_parents(
+                "uid-1",
+                vec![rule(
+                    Some(vec![path_match(
+                        "/x",
+                        HTTPRouteRulesMatchesPathType::PathPrefix,
+                    )]),
+                    vec![backend("api", 80)],
+                )],
+                Vec::new(),
+                parents,
+            );
+            let storage = Arc::new(RwLock::new(BTreeMap::new()));
+            let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+            apply_route(&r, &storage, &index, &r1(), &scope, None);
+            let mut kept: Vec<String> = storage
+                .read()
+                .unwrap()
+                .values()
+                .filter(|ep: &&Entrypoint| {
+                    ep.config.answer == Some(crate::model::FixedAnswer::OtherListener)
+                })
+                .map(|ep| ep.config.hostnames[0].clone())
+                .collect();
+            kept.sort();
+            kept
+        };
+        // On the listener without hostname: both others take hosts from it.
+        assert_eq!(
+            on(&["empty"]),
+            vec!["/.+/.example.com", "abc.foo.example.com"]
+        );
+        // On the wildcard one: abc.foo.example.com is taken from it.
+        assert_eq!(on(&["wildcard"]), vec!["abc.foo.example.com"]);
+        // Attached to abc too: it serves that host itself.
+        assert!(on(&["wildcard", "abc"]).is_empty());
+        // On the most specific one: nothing to keep from.
+        assert!(on(&["abc"]).is_empty());
+
+        // Served by another Gateway the route binds on the same port, the
+        // host stays.
+        let mut other = gateway("default", "other", "sozune");
+        let mut abc = gw_listener("abc", 80, "HTTP");
+        abc.hostname = Some("abc.foo.example.com".into());
+        other.spec.listeners = vec![abc];
+        scope.upsert_gateway(&other);
+        let mut on_wildcard = parent("gw");
+        on_wildcard.section_name = Some("wildcard".into());
+        let r = route_with_uid_parents(
+            "uid-2",
+            vec![rule(None, vec![backend("api", 80)])],
+            Vec::new(),
+            vec![on_wildcard, parent("other")],
+        );
+        assert!(scope.isolated_hostnames(&r).is_empty());
+
+        // Taken on each Gateway, by listeners of their own: it goes; one
+        // the first Gateway still selects the route for stays.
+        let mut parents = Vec::new();
+        for (name, host) in [("one", "abc.foo.example.com"), ("two", "*.foo.example.com")] {
+            let mut gw = gateway("default", name, "sozune");
+            let mut taker = gw_listener("taker", 80, "HTTP");
+            taker.hostname = Some(host.into());
+            gw.spec.listeners = vec![gw_listener("empty", 80, "HTTP"), taker];
+            scope.upsert_gateway(&gw);
+            let mut p = parent(name);
+            p.section_name = Some("empty".into());
+            parents.push(p);
+        }
+        let r = route_with_uid_parents(
+            "uid-3",
+            vec![rule(None, vec![backend("api", 80)])],
+            Vec::new(),
+            parents,
+        );
+        let mut hosts: Vec<String> = scope
+            .isolated_hostnames(&r)
+            .into_iter()
+            .map(|i| i.host)
+            .collect();
+        hosts.sort();
+        assert_eq!(hosts, vec!["abc.foo.example.com"]);
+    }
+
+    fn taken_host(host: &str) -> IsolatedHost {
+        IsolatedHost {
+            port: None,
+            host: host.into(),
+            bound_within: Vec::new(),
+        }
+    }
+
+    /// A hostname within a listener the route binds, itself within the one
+    /// taking it, stays: that listener is the most specific for it.
+    #[test]
+    fn hostnames_within_a_bound_listener_are_kept() {
+        let mut ep = route_to_entrypoints(
+            &route_with(
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["app.example.com".into()],
+            ),
+            &r1(),
+            &AllowAllBackendRefs,
+        )
+        .remove(0);
+        ep.config.hostnames = vec!["/.+/.example.com".into(), "abc.foo.example.com".into()];
+        let out = isolate_from_listeners(
+            vec![ep.clone()],
+            &[IsolatedHost {
+                bound_within: vec!["abc.foo.example.com".into()],
+                ..taken_host("*.example.com")
+            }],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].config.hostnames,
+            vec!["abc.foo.example.com".to_string()]
+        );
+
+        // Broader than the taken one, the route serves the bound host on an
+        // entrypoint of its own, ahead of the shadow.
+        ep.config.hostnames = vec!["*".into()];
+        let out = isolate_from_listeners(
+            vec![ep],
+            &[IsolatedHost {
+                bound_within: vec!["abc.foo.example.com".into()],
+                ..taken_host("*.example.com")
+            }],
+        );
+        let hosts: Vec<(&str, Option<crate::model::FixedAnswer>)> = out
+            .iter()
+            .map(|ep| (ep.config.hostnames[0].as_str(), ep.config.answer))
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                ("abc.foo.example.com", None),
+                ("*", None),
+                (
+                    "/.+/.example.com",
+                    Some(crate::model::FixedAnswer::OtherListener)
+                ),
+            ]
+        );
+    }
+
+    /// A hostname wholly within a more specific listener's is dropped, and
+    /// the entrypoint with it when none is left; a broader one is kept from
+    /// it by a `404` entrypoint.
+    #[test]
+    fn hostnames_within_a_more_specific_listener_are_dropped() {
+        assert!(host_within("abc.foo.example.com", "abc.foo.example.com"));
+        assert!(host_within("abc.foo.example.com", "*.foo.example.com"));
+        assert!(host_within("/.+/.foo.example.com", "*.foo.example.com"));
+        assert!(host_within("/.+/.bar.foo.example.com", "*.foo.example.com"));
+        assert!(!host_within("/.+/.example.com", "*.foo.example.com"));
+        assert!(!host_within("*", "abc.foo.example.com"));
+
+        let mut ep = route_to_entrypoints(
+            &route_with(
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["app.example.com".into()],
+            ),
+            &r1(),
+            &AllowAllBackendRefs,
+        )
+        .remove(0);
+        ep.config.hostnames = vec!["abc.foo.example.com".into(), "/.+/.example.com".into()];
+        let out = isolate_from_listeners(vec![ep.clone()], &[taken_host("abc.foo.example.com")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].config.hostnames,
+            vec!["/.+/.example.com".to_string()]
+        );
+        assert_eq!(
+            out[1].config.hostnames,
+            vec!["abc.foo.example.com".to_string()]
+        );
+        assert_eq!(
+            out[1].config.answer,
+            Some(crate::model::FixedAnswer::OtherListener)
+        );
+
+        ep.config.hostnames = vec!["abc.foo.example.com".into()];
+        assert!(
+            isolate_from_listeners(vec![ep.clone()], &[taken_host("abc.foo.example.com")])
+                .is_empty()
+        );
+
+        // Served over HTTPS too: the host stays, over HTTPS alone.
+        ep.config.tls = true;
+        let out = isolate_from_listeners(vec![ep], &[taken_host("abc.foo.example.com")]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].config.https_only);
+        assert_eq!(
+            out[0].config.hostnames,
+            vec!["abc.foo.example.com".to_string()]
         );
     }
 

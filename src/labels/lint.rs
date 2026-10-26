@@ -78,7 +78,11 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
     let mut routes: HashMap<RouteKey, Vec<(&str, RouteConditions)>> = HashMap::new();
 
     for (cand_id, ep) in entrypoints {
-        if !matches!(ep.protocol, Protocol::Http) {
+        // A route keeping another from a Gateway listener's hosts overlaps it
+        // on purpose.
+        if !matches!(ep.protocol, Protocol::Http)
+            || ep.config.answer == Some(crate::model::FixedAnswer::OtherListener)
+        {
             continue;
         }
         let path = ep
@@ -408,7 +412,7 @@ mod tests {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
-                invalid_backends: false,
+                answer: None,
                 ip_allow_list: Vec::new(),
             },
             source: None,
