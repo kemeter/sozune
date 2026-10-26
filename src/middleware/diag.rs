@@ -71,6 +71,16 @@ pub fn invalid_backends(host: &str) -> Response<Body> {
     )
 }
 
+/// 404 Not Found — the host belongs to another listener of the Gateway,
+/// none of whose routes served the request.
+pub fn other_listener(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::NOT_FOUND,
+        "other-listener",
+        format!("sozune: no route of the listener taking host '{host}' serves this request.\n"),
+    )
+}
+
 /// 400 Bad Request — request itself is malformed before any routing.
 pub fn bad_request(reason: &str, detail: &str) -> Response<Body> {
     diag_response(

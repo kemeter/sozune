@@ -3,19 +3,24 @@ use axum::http::Request;
 
 use super::chain::{Flow, Middleware, RequestCtx};
 use super::diag;
+use crate::model::FixedAnswer;
 
-/// Answers `500` to every request of a route that declares backends none of
-/// which could be resolved, as Gateway API requires of such a rule.
-pub struct InvalidBackends;
+/// Answers every request of a route that answers them itself (see
+/// [`FixedAnswer`]): `500` for a route with no valid backend, as Gateway API
+/// requires of such a rule, `404` for a host another listener takes.
+pub struct FixedAnswerMiddleware(pub FixedAnswer);
 
 #[async_trait::async_trait]
-impl Middleware for InvalidBackends {
+impl Middleware for FixedAnswerMiddleware {
     fn name(&self) -> &'static str {
-        "invalid-backends"
+        "fixed-answer"
     }
 
     async fn on_request(&self, ctx: &mut RequestCtx, _req: &mut Request<Body>) -> Flow {
-        Flow::ShortCircuit(diag::invalid_backends(&ctx.host))
+        Flow::ShortCircuit(match self.0 {
+            FixedAnswer::InvalidBackends => diag::invalid_backends(&ctx.host),
+            FixedAnswer::OtherListener => diag::other_listener(&ctx.host),
+        })
     }
 }
 
@@ -36,7 +41,10 @@ mod tests {
             in_flight_guards: Vec::new(),
         };
         let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
-        match InvalidBackends.on_request(&mut ctx, &mut req).await {
+        match FixedAnswerMiddleware(FixedAnswer::InvalidBackends)
+            .on_request(&mut ctx, &mut req)
+            .await
+        {
             Flow::ShortCircuit(resp) => {
                 assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
             }

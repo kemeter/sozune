@@ -1447,6 +1447,16 @@ pub(crate) fn routing_order(storage: &BTreeMap<String, Entrypoint>) -> Vec<(&Str
 /// first.
 type Rank = (u8, std::cmp::Reverse<usize>);
 
+/// How specific a route is, as [`specificity`] ranks it.
+type Specificity = (
+    Rank,
+    bool,
+    Rank,
+    bool,
+    std::cmp::Reverse<usize>,
+    std::cmp::Reverse<usize>,
+);
+
 /// Whether `a` is tried before `b` for being more specific, their priority
 /// being equal.
 pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
@@ -1458,15 +1468,7 @@ pub(crate) fn more_specific(a: &Entrypoint, b: &Entrypoint) -> bool {
 /// conditions Sōzu routes on, then the more query conditions it routes on.
 /// Conditions left to the middleware do not count: it answers `404` when they
 /// fail, so trying such a route first would take the requests of a wider one.
-fn specificity(
-    ep: &Entrypoint,
-) -> (
-    Rank,
-    Rank,
-    bool,
-    std::cmp::Reverse<usize>,
-    std::cmp::Reverse<usize>,
-) {
+fn specificity(ep: &Entrypoint) -> Specificity {
     let header_predicates = ep
         .config
         .match_headers
@@ -1475,6 +1477,10 @@ fn specificity(
         .count();
     (
         host_specificity(&ep.config.hostnames),
+        // On its host, a route keeping it from a Gateway listener it is not
+        // attached to comes after every route of that listener, whatever
+        // their paths.
+        ep.config.answer == Some(crate::model::FixedAnswer::OtherListener),
         path_specificity(ep.config.path.as_ref()),
         ep.config.methods.is_empty(),
         std::cmp::Reverse(header_predicates),
@@ -3952,9 +3958,9 @@ mod tests {
     /// A route with no valid backend answers 500 only to the requests its
     /// conditions match: the match check runs first.
     #[test]
-    fn invalid_backends_answer_after_the_match_check() {
+    fn a_fixed_answer_comes_after_the_match_check() {
         let mut ep = base_ep(Vec::new());
-        ep.config.invalid_backends = true;
+        ep.config.answer = Some(crate::model::FixedAnswer::InvalidBackends);
         // A condition Sōzu cannot route on, left to the middleware.
         ep.config.match_headers = vec![crate::model::MatchCondition {
             key: "Cookie".into(),
@@ -3972,7 +3978,7 @@ mod tests {
         );
         let names: Vec<&str> = route.middlewares.iter().map(|m| m.name()).collect();
         let matched = names.iter().position(|n| *n == "request-match");
-        let invalid = names.iter().position(|n| *n == "invalid-backends");
+        let invalid = names.iter().position(|n| *n == "fixed-answer");
         assert!(matched.is_some() && matched < invalid, "{names:?}");
     }
 
@@ -4806,7 +4812,7 @@ mod tests {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
-                invalid_backends: false,
+                answer: None,
             },
             candidates: Vec::new(),
         }

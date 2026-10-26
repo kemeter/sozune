@@ -2,9 +2,9 @@ pub mod chain;
 pub mod circuit_breaker;
 mod compress;
 mod diag;
+mod fixed_answer;
 mod forward_auth;
 pub mod in_flight_req;
-mod invalid_backends;
 pub mod ip_allow_list;
 mod proxy;
 pub mod rate_limit;
@@ -22,9 +22,9 @@ use crate::model::{Backend, EntrypointConfig, MatchCondition};
 use crate::proxy::sozu::{header_predicate, routes_on_query};
 use chain::Middleware;
 use compress::CompressMiddleware;
+use fixed_answer::FixedAnswerMiddleware;
 use forward_auth::ForwardAuthMiddleware;
 use in_flight_req::{InFlightLimiter, InFlightReqMiddleware};
-use invalid_backends::InvalidBackends;
 use ip_allow_list::{IpAllowList, IpAllowListMiddleware, TrustedProxies};
 use rate_limit::{RateLimitMiddleware, RateLimiter};
 use request_match::RequestMatchMiddleware;
@@ -559,7 +559,7 @@ pub(crate) fn timed_out(error: &(dyn std::error::Error + 'static)) -> bool {
 
 /// Check if an entrypoint needs middleware processing
 pub fn needs_middleware(config: &EntrypointConfig) -> bool {
-    config.invalid_backends
+    config.answer.is_some()
         || url_rewrite_host(config).is_some()
         || config.backend_timeout.is_some()
         || config.request_timeout.is_some()
@@ -654,8 +654,8 @@ pub fn build_middleware_route(
 
     // A route with no valid backend answers the requests it matches, and
     // nothing else runs.
-    if config.invalid_backends {
-        middlewares.push(Arc::new(InvalidBackends));
+    if let Some(answer) = config.answer {
+        middlewares.push(Arc::new(FixedAnswerMiddleware(answer)));
     }
 
     if let Some(cfg) = config.forward_auth.as_ref() {

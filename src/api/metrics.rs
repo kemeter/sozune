@@ -509,7 +509,7 @@ mod tests {
                 match_headers: Vec::new(),
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
-                invalid_backends: false,
+                answer: None,
                 ip_allow_list: Vec::new(),
             },
             source: Some("api".to_string()),

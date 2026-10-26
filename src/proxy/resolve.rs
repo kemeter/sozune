@@ -345,11 +345,18 @@ pub async fn resolve(
         .map(Vec::as_slice)
         .unwrap_or_default();
     resolution.backends = backend_states(served, inputs.unhealthy, evicted);
-    if served.config.invalid_backends {
+    if served.config.answer == Some(crate::model::FixedAnswer::InvalidBackends) {
         resolution.outcome = Outcome::Rejected;
         resolution.status = Some(500);
         resolution.summary = format!(
             "route `{}` declares backends none of which could be resolved",
+            served.name
+        );
+    } else if served.config.answer == Some(crate::model::FixedAnswer::OtherListener) {
+        resolution.outcome = Outcome::Rejected;
+        resolution.status = Some(404);
+        resolution.summary = format!(
+            "the host belongs to another listener of the Gateway of route `{}`, none of whose routes serves the request",
             served.name
         );
     } else if served.backends.is_empty() {

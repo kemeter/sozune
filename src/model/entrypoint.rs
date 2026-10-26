@@ -231,11 +231,10 @@ pub struct EntrypointConfig {
     /// see `ProxyConfig::trusted_proxies`.
     #[serde(default)]
     pub match_client_ip: Vec<String>,
-    /// The route declares backends none of which could be resolved (a kind
-    /// Sōzune cannot serve, a reference not permitted, a Service that does
-    /// not exist): it answers `500` to every request.
+    /// The route answers every request itself, whatever its backends, for
+    /// the reason given.
     #[serde(default)]
-    pub invalid_backends: bool,
+    pub answer: Option<FixedAnswer>,
 }
 
 /// One key/value match condition used by header and query matching. An empty
@@ -249,6 +248,20 @@ pub struct MatchCondition {
     /// value itself.
     #[serde(default)]
     pub regex: bool,
+}
+
+/// Why a route answers every request itself.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedAnswer {
+    /// It declares backends none of which could be resolved (a kind Sōzune
+    /// cannot serve, a reference not permitted, a Service that does not
+    /// exist): `500`.
+    InvalidBackends,
+    /// The request's host belongs to a more specific listener of its
+    /// Gateway, which this route is not attached to: `404`, as no route of
+    /// that listener served it.
+    OtherListener,
 }
 
 /// Load-balancing algorithm across an entrypoint's backends. Mirrors the
