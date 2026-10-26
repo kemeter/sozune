@@ -63,6 +63,8 @@ data:
     api:
       enabled: false
     proxy:
+      gateway_ports:
+        http: ["8080-8099"]
       http:
         listen_address: 80
       https:

@@ -21,6 +21,7 @@ pub type LiveRoutes = Arc<RwLock<BTreeMap<String, Entrypoint>>>;
 /// reload, read by the Gateway listener status.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UnopenedGatewayPorts {
+    pub http: BTreeMap<u16, String>,
     pub tcp: BTreeMap<u16, String>,
     pub udp: BTreeMap<u16, String>,
 }

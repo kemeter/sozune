@@ -469,6 +469,10 @@ async fn resolve_route(
         acme_enabled: state.acme_enabled,
         trusted_proxies: &trusted_proxies,
         plugins: &state.plugins,
+        http_ports: Some((
+            state.config.proxy.http.listen_address,
+            &state.config.proxy.gateway_ports,
+        )),
     };
     match crate::proxy::resolve::resolve(&inputs, &request).await {
         Ok(resolution) => Json(resolution).into_response(),
@@ -1567,6 +1571,7 @@ mod tests {
                         add_prefix: None,
                         https_redirect: false,
                         https_redirect_port: None,
+                        https_only: false,
                         redirect: None,
                         redirect_scheme: None,
                         redirect_template: None,
@@ -2169,6 +2174,7 @@ mod tests {
                         add_prefix: None,
                         https_redirect: false,
                         https_redirect_port: None,
+                        https_only: false,
                         redirect: None,
                         redirect_scheme: None,
                         redirect_template: None,
@@ -2283,6 +2289,7 @@ mod tests {
                         add_prefix: None,
                         https_redirect: false,
                         https_redirect_port: None,
+                        https_only: false,
                         redirect: None,
                         redirect_scheme: None,
                         redirect_template: None,
@@ -2360,6 +2367,7 @@ mod tests {
                 add_prefix: None,
                 https_redirect: false,
                 https_redirect_port: None,
+                https_only: false,
                 redirect: None,
                 redirect_scheme: None,
                 redirect_template: None,

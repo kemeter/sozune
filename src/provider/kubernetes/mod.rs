@@ -1341,6 +1341,7 @@ impl IngressParseCtx<'_> {
                 add_prefix: None,
                 https_redirect: false,
                 https_redirect_port: None,
+                https_only: false,
                 redirect: None,
                 redirect_scheme: None,
                 redirect_template: None,

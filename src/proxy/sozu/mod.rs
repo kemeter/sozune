@@ -628,6 +628,8 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     let http_listener = http_builder
         .to_http(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
+    // What a Gateway HTTP listener on a port of its own is built from.
+    let http_listener_template = http_listener.clone();
 
     // With the ALPN gate active, the HTTPS worker steps off the public 443 onto
     // loopback and the gate owns 443, prereading each connection's ALPN. Bound
@@ -776,6 +778,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
             config.gateway_ports.clone(),
             WorkerSettings::from_config(config),
             unopened_gateway_ports,
+            http_listener_template,
         ),
         certificate_holders: HashMap::new(),
     };
@@ -1090,8 +1093,7 @@ fn handle_reload(
     let (storage_read, _) =
         routes_as_applied(&storage_read, client_certificate_redirect, &unhealthy);
     let mut current_snapshot = snapshot_from_storage(&storage_read);
-    // Before any route is installed on them.
-    let wanted_gateway_listeners = open_gateway_listeners(channels, &current_snapshot);
+    let wanted_gateway_listeners = gateway_listeners::referenced(&current_snapshot);
 
     // Run the reload under a shared consecutive-timeout counter. A worker that
     // goes silent is given up on after a few failed acks, so it can't stall the
@@ -1100,6 +1102,11 @@ fn handle_reload(
     // only a genuinely unresponsive worker trips the short-circuit.
     with_reload_budget(|| {
         let departed = apply_routing_diff(previous_snapshot, &current_snapshot, channels);
+        // Once the departed routes are off them, and before any route is
+        // installed: the listeners no route wants let their ports go, so one
+        // of another protocol can take them.
+        close_unused_gateway_listeners(channels, &wanted_gateway_listeners);
+        open_gateway_listeners(channels, &wanted_gateway_listeners);
 
         // Update middleware route table
         update_middleware_routes(&storage_read, middleware_state, plugins, trusted_proxies);
@@ -1140,7 +1147,6 @@ fn handle_reload(
             }
         }
     });
-    close_unused_gateway_listeners(channels, &wanted_gateway_listeners);
 
     current_snapshot
 }
@@ -1589,6 +1595,21 @@ fn configure_sozu_routing(
             continue;
         }
 
+        // A Gateway HTTP listener that could not be opened: a later reload
+        // opens it and retries the route.
+        if let Some(name) = entrypoint.config.entrypoint.as_deref()
+            && entrypoint.protocol == Protocol::Http
+            && crate::config::gateway_http_port(name).is_some()
+            && !channels.gateway.http_open(name)
+        {
+            warn!(
+                "HTTP entrypoint `{}` is served on Gateway listener `{}`, which is not open, skipping",
+                entrypoint.name, name
+            );
+            skipped.insert(cluster_id.clone());
+            continue;
+        }
+
         // Only process HTTP entrypoints for Sozu
         match entrypoint.protocol {
             Protocol::Http => {
@@ -1599,7 +1620,10 @@ fn configure_sozu_routing(
                 // ACME path must be registered first to take priority over "/"
                 if channels.acme_challenge_port.is_some() {
                     for hostname in acme_hostnames(&entrypoint.config.hostnames) {
-                        let acme_front = build_acme_frontend(hostname, channels.http_port);
+                        let acme_front = build_acme_frontend(
+                            hostname,
+                            listener_http_port(entrypoint, channels.http_port),
+                        );
                         if let Err(e) = send_to_worker(
                             &mut channels.http,
                             format!("add-frontend-acme-{}", hostname),
@@ -1759,6 +1783,8 @@ pub(crate) fn build_acme_twins(
     if header_predicates.is_empty() {
         return Vec::new();
     }
+    // On the route's own listener: challenges reach it there.
+    let http_port = listener_http_port(entrypoint, http_port);
     acme_hostnames(&entrypoint.config.hostnames)
         .map(|hostname| RequestHttpFrontend {
             header_predicates: header_predicates.clone(),
@@ -1774,6 +1800,18 @@ fn acme_hostnames(hostnames: &[String]) -> impl Iterator<Item = &String> {
     hostnames
         .iter()
         .filter(|h| !h.starts_with('*') && !h.contains('/'))
+}
+
+/// The HTTP port an entrypoint's frontends go on: the port of the Gateway
+/// listener it names (see [`crate::config::gateway_http_listener`]), or the
+/// main HTTP port.
+pub(crate) fn listener_http_port(entrypoint: &Entrypoint, http_port: u16) -> u16 {
+    entrypoint
+        .config
+        .entrypoint
+        .as_deref()
+        .and_then(crate::config::gateway_http_port)
+        .unwrap_or(http_port)
 }
 
 /// The listener a frontend is installed on.
@@ -1859,7 +1897,13 @@ pub(crate) fn build_http_frontends(
         for method in methods_for_frontend(&entrypoint.config.methods) {
             let front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
-                address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+                address: SocketAddress::new_v4(
+                    0,
+                    0,
+                    0,
+                    0,
+                    listener_http_port(entrypoint, http_port),
+                ),
                 hostname: hostname.clone(),
                 path: path_rule.clone(),
                 method: method.clone(),
@@ -1881,7 +1925,10 @@ pub(crate) fn build_http_frontends(
                     address: https_addr,
                     ..front.clone()
                 };
-                frontends.push((FrontListener::Http, front));
+                // Served over HTTPS alone: nothing on the HTTP listener.
+                if !entrypoint.config.https_only {
+                    frontends.push((FrontListener::Http, front));
+                }
                 frontends.push((FrontListener::Https, https_front));
             } else {
                 frontends.push((FrontListener::Http, front));
@@ -2618,7 +2665,13 @@ fn remove_http_frontends(
             let method_tag = method.as_deref().unwrap_or("any");
             let http_front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
-                address: SocketAddress::new_v4(0, 0, 0, 0, http_port),
+                address: SocketAddress::new_v4(
+                    0,
+                    0,
+                    0,
+                    0,
+                    listener_http_port(entrypoint, http_port),
+                ),
                 hostname: hostname.clone(),
                 path: path_rule.clone(),
                 method: method.clone(),
@@ -3005,7 +3058,7 @@ fn remove_cluster(
 
 /// What identifies an ACME twin to Sōzu: its hostname and its predicates,
 /// whatever their order and the case of the header names.
-fn acme_twin_key(twin: &RequestHttpFrontend) -> (String, Vec<(String, i32, Option<String>)>) {
+fn acme_twin_key(twin: &RequestHttpFrontend) -> AcmeTwinKey {
     let mut predicates: Vec<_> = twin
         .header_predicates
         .iter()
@@ -3013,8 +3066,17 @@ fn acme_twin_key(twin: &RequestHttpFrontend) -> (String, Vec<(String, i32, Optio
         .collect();
     predicates.sort();
     predicates.dedup();
-    (twin.hostname.to_ascii_lowercase(), predicates)
+    // The listener too: twins on two ports are two frontends.
+    (
+        twin.address.port,
+        twin.hostname.to_ascii_lowercase(),
+        predicates,
+    )
 }
+
+/// What tells two ACME twins apart: listener port, hostname and header
+/// predicates.
+type AcmeTwinKey = (u32, String, Vec<(String, i32, Option<String>)>);
 
 /// The ACME twins of `entrypoint` no route in `still_needed` uses: two routes
 /// with the same hostname and header predicates share one.
@@ -3325,7 +3387,7 @@ fn apply_routing_diff(
                         remove_acme_frontends(
                             &mut channels.http,
                             &old.config.hostnames,
-                            channels.http_port,
+                            listener_http_port(old, channels.http_port),
                         );
                     }
                 }
@@ -3395,12 +3457,14 @@ fn apply_routing_diff(
                         );
                     }
                     if channels.acme_challenge_port.is_some()
-                        && old.config.hostnames != new.config.hostnames
+                        && (old.config.hostnames != new.config.hostnames
+                            || listener_http_port(old, channels.http_port)
+                                != listener_http_port(new, channels.http_port))
                     {
                         remove_acme_frontends(
                             &mut channels.http,
                             &old.config.hostnames,
-                            channels.http_port,
+                            listener_http_port(old, channels.http_port),
                         );
                     }
                 }
@@ -3986,6 +4050,21 @@ mod tests {
         });
         assert!(builders::query_path_rule(&ep.config).is_none());
         assert!(middleware::needs_middleware(&ep.config));
+    }
+
+    /// An HTTPS-only route has no frontend on the HTTP listener.
+    #[test]
+    fn an_https_only_route_skips_the_http_listener() {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        ep.config.tls = true;
+        ep.config.https_only = true;
+        let listeners: Vec<FrontListener> =
+            build_http_frontends("c", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443))
+                .into_iter()
+                .map(|(listener, _)| listener)
+                .collect();
+        assert!(!listeners.is_empty());
+        assert!(listeners.iter().all(|l| *l == FrontListener::Https));
     }
 
     /// A wildcard taking any number of labels ranks as the `*.` one.
@@ -4693,6 +4772,7 @@ mod tests {
                 add_prefix: None,
                 https_redirect: false,
                 https_redirect_port: None,
+                https_only: false,
                 redirect: None,
                 redirect_scheme: None,
                 redirect_template: None,
@@ -4855,6 +4935,13 @@ mod tests {
         let mut b = a.clone();
         b.config.match_headers[0].key = "x-canary".into();
         assert!(stale_acme_twins(&a, 80, &build_acme_twins(&b, 80)).is_empty());
+        // A twin on another listener does not keep one on this listener.
+        let mut moved = b.clone();
+        moved.config.entrypoint = Some("gateway:http:8080".into());
+        assert_eq!(
+            stale_acme_twins(&a, 80, &build_acme_twins(&moved, 80)).len(),
+            1
+        );
         assert_eq!(stale_acme_twins(&a, 80, &[]), twins);
     }
 

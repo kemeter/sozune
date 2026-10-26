@@ -53,7 +53,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{Patch, PatchParams};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
@@ -419,6 +419,25 @@ impl ServedPorts {
         }
     }
 
+    /// The port an HTTP listener on `port` is served on when it is its own:
+    /// a port of `gateway.http` other than the main HTTP one. `None` serves it
+    /// on the main HTTP port.
+    pub fn own_http_port(&self, port: i32) -> Option<u16> {
+        u16::try_from(port)
+            .ok()
+            .filter(|p| *p != self.http && self.gateway.allows_http(*p))
+    }
+
+    /// Why an HTTP listener on `port` is not served, if it is not: one on a
+    /// port of its own that could not be opened.
+    fn http_problem(&self, port: i32) -> Option<String> {
+        let p = self.own_http_port(port)?;
+        self.unopened
+            .http
+            .get(&p)
+            .map(|e| format!("Sōzune could not open port {p}: {e}"))
+    }
+
     /// Why a TCP or TLS listener on `port` is not served, if it is not.
     fn tcp_problem(&self, port: i32) -> Option<String> {
         match u16::try_from(port).ok() {
@@ -627,6 +646,7 @@ impl GatewayScope {
                     .copied()
                     .collect::<HashSet<u16>>()
             };
+            let http = changed(&g.served.unopened.http, &ports.http);
             let tcp = changed(&g.served.unopened.tcp, &ports.tcp);
             let udp = changed(&g.served.unopened.udp, &ports.udp);
             g.served.unopened = ports;
@@ -635,6 +655,7 @@ impl GatewayScope {
                     return false;
                 };
                 match listener.protocol.to_ascii_uppercase().as_str() {
+                    "HTTP" => http.contains(&port),
                     "TLS" | "TCP" => tcp.contains(&port),
                     "UDP" => udp.contains(&port),
                     _ => false,
@@ -1275,7 +1296,7 @@ impl GatewayScope {
     fn effective_hostnames_for_route(
         &self,
         route: &HTTPRoute,
-        listener_ok: fn(&ListenerInfo) -> bool,
+        listener_ok: &dyn Fn(&ListenerInfo) -> bool,
     ) -> Option<Vec<String>> {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
         if route.spec.parent_refs.is_none() {
@@ -1300,10 +1321,31 @@ impl GatewayScope {
     /// The port to redirect plain HTTP requests to, for a route only served
     /// over HTTPS: the port of the `HTTPS` listeners it binds, when they all
     /// share one other than 443. `None` keeps the default port.
+    /// The port an HTTP listener is served on when it is its own (see
+    /// [`ServedPorts::own_http_port`]).
+    fn own_http_port(&self, listener: &ListenerInfo) -> Option<u16> {
+        match self.state.read() {
+            Ok(g) => g.served.own_http_port(listener.port),
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                None
+            }
+        }
+    }
+
+    /// The own ports of the plain HTTP listeners the route binds.
+    fn own_http_ports(&self, route: &HTTPRoute) -> BTreeSet<u16> {
+        self.bound_listeners(route, &Self::listener_is_plain_http)
+            .into_iter()
+            .flatten()
+            .filter_map(|l| self.own_http_port(&l))
+            .collect()
+    }
+
     fn https_redirect_port(&self, route: &HTTPRoute) -> Option<u16> {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
         let ports: HashSet<i32> = self
-            .bound_listeners(route, Self::listener_serves_https)
+            .bound_listeners(route, &Self::listener_serves_https)
             .into_iter()
             .flatten()
             .filter(|l| intersect_hostnames(&route_hostnames, std::slice::from_ref(l)).is_some())
@@ -1319,7 +1361,7 @@ impl GatewayScope {
     /// `HTTPS` listener counting whether it has a certificate or not.
     fn listener_hostname_matches(&self, route: &HTTPRoute) -> bool {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
-        self.bound_listeners_where(route, Self::listener_serves_http, false)
+        self.bound_listeners_where(route, &Self::listener_serves_http, false)
             .iter()
             .any(|selected| intersect_hostnames(&route_hostnames, selected).is_some())
     }
@@ -1329,7 +1371,7 @@ impl GatewayScope {
     fn bound_listeners(
         &self,
         route: &HTTPRoute,
-        listener_ok: fn(&ListenerInfo) -> bool,
+        listener_ok: &dyn Fn(&ListenerInfo) -> bool,
     ) -> Vec<Vec<ListenerInfo>> {
         self.bound_listeners_where(route, listener_ok, true)
     }
@@ -1339,7 +1381,7 @@ impl GatewayScope {
     fn bound_listeners_where(
         &self,
         route: &HTTPRoute,
-        listener_ok: fn(&ListenerInfo) -> bool,
+        listener_ok: &dyn Fn(&ListenerInfo) -> bool,
         need_certificate: bool,
     ) -> Vec<Vec<ListenerInfo>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -2720,11 +2762,11 @@ fn build_listener_status(
     let port = u16::try_from(listener.port).ok();
     let protocol = listener.protocol.to_ascii_uppercase();
     let (kind, problem) = match protocol.as_str() {
-        // HTTP routing does not depend on the listener's port: every HTTP
-        // route is served on Sōzune's HTTP port, which a Service commonly
-        // maps the listener's port to. So an HTTP listener is served on any
-        // port, and its status says where.
-        "HTTP" => (Some("HTTPRoute"), None),
+        // An HTTP listener on a port of `gateway_ports.http` is served there,
+        // once opened. Any other is served on Sōzune's HTTP port, which a
+        // Service commonly maps the listener's port to: served whatever its
+        // port, its status says where.
+        "HTTP" => (Some("HTTPRoute"), served.http_problem(listener.port)),
         // Likewise on Sōzune's HTTPS port, when the listener terminates TLS.
         "HTTPS" if GatewayScope::listener_serves_https(listener) => (Some("HTTPRoute"), None),
         // A TLS listener carries TLSRoutes in Passthrough mode only.
@@ -2784,7 +2826,7 @@ fn build_listener_status(
         ],
         (Some(_), None) => {
             let served_on = match protocol.as_str() {
-                "HTTP" => served.http,
+                "HTTP" => served.own_http_port(listener.port).unwrap_or(served.http),
                 "HTTPS" => served.https,
                 _ => port.unwrap_or_default(),
             };
@@ -3211,11 +3253,24 @@ fn apply_route(
         // HTTP and over HTTPS: a listener with a `hostname` only serves
         // matching route hostnames. `None` means no bound listener of that
         // kind admits any of the route's hostnames.
-        let plain =
-            scope.effective_hostnames_for_route(route, GatewayScope::listener_is_plain_http);
+        // A plain HTTP listener on a port of its own serves the route there;
+        // the others, on the main HTTP port.
+        let plain = scope.effective_hostnames_for_route(route, &|l| {
+            GatewayScope::listener_is_plain_http(l) && scope.own_http_port(l).is_none()
+        });
         let secure =
-            scope.effective_hostnames_for_route(route, GatewayScope::listener_serves_https);
-        if plain.is_none() && secure.is_none() {
+            scope.effective_hostnames_for_route(route, &GatewayScope::listener_serves_https);
+        let own_ports: Vec<(u16, Vec<String>)> = scope
+            .own_http_ports(route)
+            .into_iter()
+            .filter_map(|port| {
+                let hostnames = scope.effective_hostnames_for_route(route, &|l| {
+                    GatewayScope::listener_is_plain_http(l) && scope.own_http_port(l) == Some(port)
+                })?;
+                Some((port, hostnames))
+            })
+            .collect();
+        if plain.is_none() && secure.is_none() && own_ports.is_empty() {
             // A hostname may match an HTTPS listener that has no usable
             // certificate yet: its own status says so.
             let outcome = if scope.listener_hostname_matches(route) {
@@ -3225,14 +3280,38 @@ fn apply_route(
             };
             (outcome, Vec::new())
         } else {
-            let eps = route_entrypoints_by_scheme(
-                route,
-                resolver,
-                scope,
-                plain,
-                secure,
-                scope.https_redirect_port(route),
-            );
+            // The names served over plain HTTP on a listener of its own port,
+            // every host when one admits any.
+            let plain_elsewhere: Option<Vec<String>> = if own_ports.is_empty() {
+                None
+            } else if own_ports.iter().any(|(_, names)| names.is_empty()) {
+                Some(Vec::new())
+            } else {
+                Some(
+                    own_ports
+                        .iter()
+                        .flat_map(|(_, names)| names.clone())
+                        .collect(),
+                )
+            };
+            let mut eps = if plain.is_none() && secure.is_none() {
+                Vec::new()
+            } else {
+                route_entrypoints_by_scheme(
+                    route,
+                    resolver,
+                    scope,
+                    plain,
+                    secure,
+                    scope.https_redirect_port(route),
+                    plain_elsewhere.as_deref(),
+                )
+            };
+            for (port, hostnames) in own_ports {
+                eps.extend(own_port_entrypoints(
+                    route, resolver, scope, port, hostnames,
+                ));
+            }
             if eps.iter().any(redirect_skips_conditions) {
                 warn!(
                     "Gateway API: HTTPRoute {}/{} redirects on a match whose query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on Host or Cookie…) — dropping the route",
@@ -3658,6 +3737,7 @@ pub fn route_entrypoints_by_scheme(
     plain: Option<Vec<String>>,
     secure: Option<Vec<String>>,
     https_port: Option<u16>,
+    plain_elsewhere: Option<&[String]>,
 ) -> Vec<Entrypoint> {
     // An empty set is every host: what the other scheme names, it admits.
     let plain_all = plain.as_ref().is_some_and(Vec::is_empty);
@@ -3693,11 +3773,24 @@ pub fn route_entrypoints_by_scheme(
         .cloned()
         .collect();
 
-    // (hostnames, served over HTTPS, plain HTTP redirected, id suffix)
+    // A name served over plain HTTP on a listener of its own port gets
+    // nothing on the main HTTP port, not even a redirect (`plain_elsewhere`:
+    // every host when empty).
+    let elsewhere = |name: &str| {
+        plain_elsewhere.is_some_and(|names| {
+            // Either way round: a wildcard over such a name takes it too.
+            names.is_empty() || names.iter().any(|other| hostnames_compatible(other, name))
+        })
+    };
+    let (secure_alone, secure_only): (Vec<String>, Vec<String>) =
+        secure_only.into_iter().partition(|h| elsewhere(h));
+    // (hostnames, served over HTTPS, plain HTTP redirected, id suffix); one
+    // served over HTTPS without being redirected is served over HTTPS alone.
     let mut sets: Vec<(Vec<String>, bool, bool, &str)> = [
         (plain_only, false, false, ""),
         (both, true, false, "-tls"),
         (secure_only, true, true, "-https"),
+        (secure_alone, true, false, "-https-only"),
     ]
     .into_iter()
     .filter(|(hostnames, ..)| !hostnames.is_empty())
@@ -3708,6 +3801,10 @@ pub fn route_entrypoints_by_scheme(
     match (plain_all, secure_all) {
         (true, true) => sets.push((any(), true, false, "-tls")),
         (true, false) => sets.push((any(), false, false, "")),
+        // A redirect on any host would take those served elsewhere too.
+        (false, true) if plain_elsewhere.is_some() => {
+            sets.push((any(), true, false, "-https-only"))
+        }
         (false, true) => sets.push((any(), true, true, "-https")),
         (false, false) => {}
     }
@@ -3741,6 +3838,7 @@ pub fn route_entrypoints_by_scheme(
                 ep.id.push_str(&suffix);
                 ep.name.push_str(&suffix);
                 ep.config.tls = tls;
+                ep.config.https_only = suffix.starts_with("-https-only");
                 ep.config.https_redirect = redirect;
                 if redirect {
                     ep.config.https_redirect_port = https_port;
@@ -3750,6 +3848,35 @@ pub fn route_entrypoints_by_scheme(
         }
     }
     entrypoints
+}
+
+/// The entrypoints of a route on the plain HTTP listeners it binds on `port`,
+/// a port of their own: served on that port's listener, plain HTTP only.
+fn own_port_entrypoints(
+    route: &HTTPRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+    port: u16,
+    hostnames: Vec<String>,
+) -> Vec<Entrypoint> {
+    let mut eps =
+        route_entrypoints_by_scheme(route, resolver, grants, Some(hostnames), None, None, None);
+    for ep in &mut eps {
+        let suffix = format!("-p{port}");
+        ep.id.push_str(&suffix);
+        ep.name.push_str(&suffix);
+        ep.config.entrypoint = Some(crate::config::gateway_http_listener(port));
+        // A redirect keeping the scheme and naming no port keeps the
+        // listener's: Gateway API sends the client back to the port it came
+        // on.
+        if ep.config.redirect.is_some()
+            && ep.config.redirect_scheme.is_none()
+            && ep.config.rewrite_port.is_none()
+        {
+            ep.config.rewrite_port = Some(port);
+        }
+    }
+    eps
 }
 
 /// Hostnames split by how specific they are: the exact names together, then
@@ -4386,6 +4513,7 @@ fn rule_to_entrypoints(
                     add_prefix: None,
                     https_redirect: false,
                     https_redirect_port: None,
+                    https_only: false,
                     redirect: redirect.as_ref().map(|r| r.policy),
                     redirect_scheme: redirect.as_ref().and_then(|r| r.scheme),
                     redirect_template: None,
@@ -5696,6 +5824,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         add_prefix: None,
         https_redirect: false,
         https_redirect_port: None,
+        https_only: false,
         redirect: None,
         redirect_scheme: None,
         redirect_template: None,
@@ -6294,7 +6423,7 @@ mod tests {
         }];
         let gateway_ports = crate::config::GatewayPortsConfig {
             tcp: vec!["5000-5500".parse().unwrap()],
-            udp: Vec::new(),
+            ..Default::default()
         };
         let ports = tcp_listener_ports(&listeners, &gateway_ports);
         // A declared listener wins over opening its port.
@@ -6583,6 +6712,7 @@ mod tests {
         let gateway_ports = crate::config::GatewayPortsConfig {
             tcp: vec!["5353".parse().unwrap()],
             udp: vec!["5353".parse().unwrap()],
+            ..Default::default()
         };
         let ports = udp_listener_ports(&listeners, &gateway_ports);
         assert_eq!(ports.get(53).as_deref(), Some("dns"));
@@ -8802,6 +8932,7 @@ mod tests {
             gateway: crate::config::GatewayPortsConfig {
                 tcp: vec!["9000-9099".parse().unwrap()],
                 udp: vec!["5353".parse().unwrap()],
+                ..Default::default()
             },
             unopened: Default::default(),
         }
@@ -9208,17 +9339,25 @@ mod tests {
         );
         let host = |hosts: &[&str]| Some(hosts.iter().map(|h| h.to_string()).collect());
         let schemes = |plain, secure| -> Vec<(String, Vec<String>, bool, bool)> {
-            route_entrypoints_by_scheme(&route, &r1(), &AllowAllBackendRefs, plain, secure, None)
-                .into_iter()
-                .map(|ep| {
-                    (
-                        ep.id,
-                        ep.config.hostnames,
-                        ep.config.tls,
-                        ep.config.https_redirect,
-                    )
-                })
-                .collect()
+            route_entrypoints_by_scheme(
+                &route,
+                &r1(),
+                &AllowAllBackendRefs,
+                plain,
+                secure,
+                None,
+                None,
+            )
+            .into_iter()
+            .map(|ep| {
+                (
+                    ep.id,
+                    ep.config.hostnames,
+                    ep.config.tls,
+                    ep.config.https_redirect,
+                )
+            })
+            .collect()
         };
         let id = format!("{SOURCE_TAG}-default-web-0");
 
@@ -9338,6 +9477,7 @@ mod tests {
             ]),
             None,
             None,
+            None,
         )
         .into_iter()
         .map(|ep| (ep.id, ep.config.hostnames))
@@ -9398,16 +9538,16 @@ mod tests {
         assert!(scope.accepts_route(&route));
         // Not over HTTPS until the listener has a certificate to serve.
         assert_eq!(
-            scope.effective_hostnames_for_route(&route, GatewayScope::listener_serves_https),
+            scope.effective_hostnames_for_route(&route, &GatewayScope::listener_serves_https),
             None
         );
         store_secret(&scope, "default", "shop-tls", "*.shop.example");
         assert_eq!(
-            scope.effective_hostnames_for_route(&route, GatewayScope::listener_serves_https),
+            scope.effective_hostnames_for_route(&route, &GatewayScope::listener_serves_https),
             Some(vec!["www.shop.example".to_string()])
         );
         assert_eq!(
-            scope.effective_hostnames_for_route(&route, GatewayScope::listener_is_plain_http),
+            scope.effective_hostnames_for_route(&route, &GatewayScope::listener_is_plain_http),
             Some(vec![
                 "www.shop.example".to_string(),
                 "blog.example".to_string()
@@ -9426,9 +9566,193 @@ mod tests {
         let mut only_https = route.clone();
         only_https.spec.parent_refs.as_mut().unwrap()[0].section_name = Some("tls".into());
         assert_eq!(
-            scope.effective_hostnames_for_route(&only_https, GatewayScope::listener_is_plain_http),
+            scope.effective_hostnames_for_route(&only_https, &GatewayScope::listener_is_plain_http),
             None
         );
+    }
+
+    /// An HTTP listener on a port of `gateway_ports.http` is served there,
+    /// and says so; an unopened one is unavailable; any other is served on
+    /// the main HTTP port.
+    #[test]
+    fn an_http_listener_on_a_port_of_its_own_is_served_there() {
+        let gw = gateway("default", "gw", "sozune");
+        let mut served = served();
+        served.gateway.http = vec!["8080".parse().unwrap()];
+        let programmed = |served: &ServedPorts, port: i32| {
+            let status = build_listener_status(&gw, &li("l", port, None), served, 0, None);
+            let c = condition_of(&status, CONDITION_TYPE_PROGRAMMED);
+            (c.status.clone(), c.message.clone())
+        };
+        assert_eq!(
+            programmed(&served, 8080),
+            ("True".to_string(), "Sōzune serves port 8080".to_string())
+        );
+        assert!(programmed(&served, 8090).1.contains("map port 8090"));
+        served.unopened.http.insert(8080, "address in use".into());
+        let (status, message) = programmed(&served, 8080);
+        assert_eq!(status, "False");
+        assert!(message.contains("could not open port 8080"), "{message}");
+    }
+
+    /// A route served over plain HTTP on a listener of its own port gets no
+    /// redirect on the main HTTP port for the names only HTTPS admits there.
+    #[test]
+    fn a_route_with_plain_http_elsewhere_is_https_only() {
+        let route = route_with(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["app.example.com".into()],
+        );
+        let eps = route_entrypoints_by_scheme(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs,
+            None,
+            Some(vec!["app.example.com".into(), "public.example.com".into()]),
+            None,
+            Some(&["app.example.com".to_string()]),
+        );
+        let by_host = |host: &str| {
+            eps.iter()
+                .find(|ep| ep.config.hostnames.iter().any(|h| h == host))
+                .unwrap()
+        };
+        // Its plain HTTP is elsewhere: HTTPS alone.
+        assert!(by_host("app.example.com").config.https_only);
+        assert!(!by_host("app.example.com").config.https_redirect);
+        // Not this one: still redirected from the main HTTP port.
+        assert!(!by_host("public.example.com").config.https_only);
+        assert!(by_host("public.example.com").config.https_redirect);
+    }
+
+    /// A wildcard over a name served over plain HTTP elsewhere takes it too:
+    /// no redirect for it either.
+    #[test]
+    fn a_wildcard_over_a_name_served_elsewhere_is_https_only() {
+        let route = route_with(vec![rule(None, vec![backend("api", 80)])], Vec::new());
+        let eps = route_entrypoints_by_scheme(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs,
+            None,
+            Some(vec!["*.example.com".into()]),
+            None,
+            Some(&["admin.example.com".to_string()]),
+        );
+        assert!(
+            eps.iter()
+                .all(|ep| ep.config.https_only && !ep.config.https_redirect)
+        );
+    }
+
+    /// HTTPS on any host next to plain HTTP elsewhere for one name: no
+    /// redirect on any host, which would take that name too.
+    #[test]
+    fn https_on_any_host_with_plain_http_elsewhere_redirects_nothing() {
+        let route = route_with(vec![rule(None, vec![backend("api", 80)])], Vec::new());
+        let eps = route_entrypoints_by_scheme(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs,
+            None,
+            Some(Vec::new()),
+            None,
+            Some(&["admin.example.com".to_string()]),
+        );
+        assert!(
+            eps.iter()
+                .all(|ep| !ep.config.https_redirect && ep.config.https_only)
+        );
+    }
+
+    /// A redirect on a port of its own keeps the port, unless it changes the
+    /// scheme or names one.
+    #[test]
+    fn a_redirect_on_its_own_port_keeps_it() {
+        use gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersRequestRedirect;
+        let route = |redirect: HTTPRouteRulesFiltersRequestRedirect| {
+            route_with(
+                vec![HTTPRouteRules {
+                    filters: Some(vec![HTTPRouteRulesFilters {
+                        request_redirect: Some(redirect),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }],
+                vec!["app.example.com".into()],
+            )
+        };
+        let port_of = |redirect| {
+            own_port_entrypoints(
+                &route(redirect),
+                &r0(),
+                &AllowAllBackendRefs,
+                8080,
+                Vec::new(),
+            )[0]
+            .config
+            .rewrite_port
+        };
+        assert_eq!(
+            port_of(HTTPRouteRulesFiltersRequestRedirect {
+                hostname: Some("example.org".into()),
+                ..Default::default()
+            }),
+            Some(8080)
+        );
+        assert_eq!(
+            port_of(HTTPRouteRulesFiltersRequestRedirect {
+                port: Some(9090),
+                ..Default::default()
+            }),
+            Some(9090)
+        );
+    }
+
+    /// A route on an HTTP listener with a port of its own is served on that
+    /// port's listener; one on another listener, on the main port.
+    #[tokio::test]
+    async fn routes_follow_their_listener_port() {
+        let scope = GatewayScope::new();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut served = served();
+        served.gateway.http = vec!["8080".parse().unwrap()];
+        scope.configure_status(served, tx);
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners = vec![
+            gw_listener("web", 80, "HTTP"),
+            gw_listener("admin", 8080, "HTTP"),
+        ];
+        scope.upsert_gateway(&gw);
+
+        let on = |section: &str| {
+            let mut parent = parent("gw");
+            parent.section_name = Some(section.into());
+            let r = route_with_uid_parents(
+                "uid-1",
+                vec![rule(None, vec![backend("api", 80)])],
+                vec!["app.example.com".into()],
+                vec![parent],
+            );
+            let storage = Arc::new(RwLock::new(BTreeMap::new()));
+            let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+            apply_route(&r, &storage, &index, &r1(), &scope, None);
+            let eps: Vec<(String, Option<String>)> = storage
+                .read()
+                .unwrap()
+                .values()
+                .map(|ep: &Entrypoint| (ep.id.clone(), ep.config.entrypoint.clone()))
+                .collect();
+            eps
+        };
+        let admin = on("admin");
+        assert_eq!(admin.len(), 1);
+        assert!(admin[0].0.ends_with("-p8080"), "{admin:?}");
+        assert_eq!(admin[0].1.as_deref(), Some("gateway:http:8080"));
+        let web = on("web");
+        assert_eq!(web.len(), 1);
+        assert_eq!(web[0].1, None);
     }
 
     #[test]

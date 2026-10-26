@@ -91,6 +91,11 @@ pub struct EntrypointConfig {
     pub https_redirect: bool,
     #[serde(default)]
     pub https_redirect_port: Option<u16>,
+    /// Served over HTTPS alone: no frontend on the HTTP listener, not even a
+    /// redirect. A Gateway route whose plain HTTP listener is on a port of its
+    /// own is served over HTTPS this way.
+    #[serde(default)]
+    pub https_only: bool,
     #[serde(default)]
     pub redirect: Option<RedirectPolicy>,
     #[serde(default)]

@@ -54,6 +54,7 @@ pub struct ListenersView {
 
 #[derive(Debug, Serialize)]
 pub struct GatewayPortsView {
+    pub http: Vec<String>,
     pub tcp: Vec<String>,
     pub udp: Vec<String>,
 }
@@ -248,6 +249,12 @@ fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
             })
             .collect(),
         gateway_ports: GatewayPortsView {
+            http: proxy
+                .gateway_ports
+                .http
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
             tcp: proxy
                 .gateway_ports
                 .tcp
