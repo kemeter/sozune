@@ -93,6 +93,22 @@ pub(super) fn wait_for_worker_ready(
     }
 }
 
+/// A command the worker answered with a refusal: unlike a lost answer, it
+/// did nothing.
+#[derive(Debug)]
+pub(super) struct WorkerRejected {
+    id: String,
+    message: String,
+}
+
+impl std::fmt::Display for WorkerRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Worker rejected {}: {}", self.id, self.message)
+    }
+}
+
+impl std::error::Error for WorkerRejected {}
+
 pub(super) fn send_to_worker(
     channel: &mut Channel<WorkerRequest, WorkerResponse>,
     id: String,
@@ -143,11 +159,10 @@ pub(super) fn send_to_worker(
                         // A rejection means the worker answered, so it is
                         // responsive — reset the timeout streak.
                         record_command_outcome(false);
-                        return Err(anyhow::anyhow!(
-                            "Worker rejected {}: {}",
+                        return Err(anyhow::Error::new(WorkerRejected {
                             id,
-                            response.message
-                        ));
+                            message: response.message,
+                        }));
                     }
                     record_command_outcome(false);
                     return Ok(());

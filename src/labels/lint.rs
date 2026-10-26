@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::config::{AcmeConfig, ProxyTimeouts};
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{Entrypoint, Protocol};
-use crate::proxy::sozu::{header_predicate, routes_on_query};
+use crate::proxy::sozu::{header_predicate, listener_http_port, routes_on_query};
 
 /// Run per-entrypoint lints. Called immediately after parsing one candidate.
 /// `prefix` is `sozune.<protocol>.<service>.`, so labels name the full key.
@@ -46,6 +46,10 @@ pub fn lint_entrypoint(ep: &Entrypoint, prefix: &str, diagnostics: &mut Vec<Diag
 /// A route's header conditions Sōzu routes on, as lowercase name and value.
 type HeaderConditions = Vec<(String, String)>;
 
+/// Where routes may meet: host, path and listener, an HTTP one by its port
+/// (`Some`), the HTTPS one (`None`).
+type RouteKey = (String, String, Option<u16>);
+
 /// What tells a route from another on the same host and path: its priority,
 /// and the header and query conditions Sōzu routes on.
 struct RouteConditions {
@@ -69,7 +73,9 @@ struct RouteConditions {
 /// conditions collide: a request can repeat a parameter with each value.
 pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diagnostic)> {
     let mut out = Vec::new();
-    let mut routes: HashMap<(String, String), Vec<(&str, RouteConditions)>> = HashMap::new();
+    // Keyed by host, path and listener: routes on Gateway HTTP listeners of
+    // different ports never meet there, though they can on HTTPS.
+    let mut routes: HashMap<RouteKey, Vec<(&str, RouteConditions)>> = HashMap::new();
 
     for (cand_id, ep) in entrypoints {
         if !matches!(ep.protocol, Protocol::Http) {
@@ -108,54 +114,78 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
         } else {
             Vec::new()
         };
+        // The listeners it is served on.
+        let mut listeners = Vec::new();
+        if !ep.config.https_only {
+            listeners.push(Some(listener_http_port(ep, 0)));
+        }
+        if ep.config.tls {
+            listeners.push(None);
+        }
         for host in &ep.config.hostnames {
-            routes
-                .entry((host.clone(), path.clone()))
-                .or_default()
-                .push((
-                    cand_id,
-                    RouteConditions {
-                        priority: ep.config.priority,
-                        on_methods: !ep.config.methods.is_empty(),
-                        headers: headers.clone(),
-                        query: query.clone(),
-                    },
-                ));
+            for listener in &listeners {
+                routes
+                    .entry((host.clone(), path.clone(), *listener))
+                    .or_default()
+                    .push((
+                        cand_id,
+                        RouteConditions {
+                            priority: ep.config.priority,
+                            on_methods: !ep.config.methods.is_empty(),
+                            headers: headers.clone(),
+                            query: query.clone(),
+                        },
+                    ));
+            }
         }
     }
 
-    for ((host, path), declared) in &routes {
+    // Each route's partners on every listener, merged: one diagnostic per
+    // route, host and path. Ordered, so it reads the same at every run.
+    let mut collisions: std::collections::BTreeMap<(String, String, String), (bool, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for ((host, path, _), declared) in &routes {
         for (cand_id, conditions) in declared {
-            let mut others: Vec<&str> = declared
+            let others = declared
                 .iter()
                 .filter(|(other, other_conditions)| {
                     other != cand_id && conditions_overlap(conditions, other_conditions)
                 })
-                .map(|(other, _)| *other)
-                .collect();
-            if others.is_empty() {
-                continue;
-            }
-            others.sort();
-            others.dedup();
-            let others_str = others.join(", ");
-            let message = if conditions.headers.is_empty() && conditions.query.is_empty() {
-                format!(
-                    "route ({host}{path}) is also defined by: {others_str}; only the highest-priority candidate is reachable"
-                )
-            } else {
-                format!(
-                    "route ({host}{path}) is also defined by: {others_str}, with conditions a request can meet for both; the highest-priority candidate serves it"
-                )
-            };
-            out.push((
-                cand_id.to_string(),
-                Diagnostic::new(DiagnosticCode::W018RouteCollision, message)
-                .with_label("host+path")
-                .with_value(format!("{host}{path}"))
-                .with_hint("set distinct hostnames or paths, or use `priority` to make the precedence explicit"),
-            ));
+                .map(|(other, _)| other.to_string());
+            let entry = collisions
+                .entry((cand_id.to_string(), host.clone(), path.clone()))
+                .or_insert_with(|| {
+                    (
+                        conditions.headers.is_empty() && conditions.query.is_empty(),
+                        Vec::new(),
+                    )
+                });
+            entry.1.extend(others);
         }
+    }
+    for ((cand_id, host, path), (unconditional, mut others)) in collisions {
+        if others.is_empty() {
+            continue;
+        }
+        others.sort();
+        others.dedup();
+        let others_str = others.join(", ");
+        let message = if unconditional {
+            format!(
+                "route ({host}{path}) is also defined by: {others_str}; only the highest-priority candidate is reachable"
+            )
+        } else {
+            format!(
+                "route ({host}{path}) is also defined by: {others_str}, with conditions a request can meet for both; the highest-priority candidate serves it"
+            )
+        };
+        out.push((
+            cand_id,
+            Diagnostic::new(DiagnosticCode::W018RouteCollision, message)
+            .with_label("host+path")
+            .with_value(format!("{host}{path}"))
+            .with_hint("set distinct hostnames or paths, or use `priority` to make the precedence explicit"),
+        ));
     }
 
     out
@@ -345,6 +375,7 @@ mod tests {
                 add_prefix: None,
                 https_redirect,
                 https_redirect_port: None,
+                https_only: false,
                 redirect: None,
                 redirect_scheme: None,
                 redirect_template: None,
@@ -523,6 +554,53 @@ mod tests {
         assert_eq!(
             lint_collection(&[("cand-get", &get), ("cand-b", &b)]).len(),
             2
+        );
+    }
+
+    /// Routes on Gateway listeners of different ports never meet.
+    #[test]
+    fn routes_on_different_listener_ports_do_not_collide() {
+        let a = ep("example.com", Some("/api"), false, false);
+        let mut b = ep("example.com", Some("/api"), false, false);
+        b.config.entrypoint = Some("gateway:http:8080".into());
+        assert!(lint_collection(&[("cand-a", &a), ("cand-b", &b)]).is_empty());
+    }
+
+    /// Routes on different HTTP ports still meet on the HTTPS listener they
+    /// share, once reported.
+    #[test]
+    fn tls_routes_meet_on_https_whatever_their_http_port() {
+        let mut a = ep("example.com", Some("/api"), false, false);
+        a.config.tls = true;
+        let mut b = a.clone();
+        b.config.entrypoint = Some("gateway:http:8080".into());
+        assert_eq!(lint_collection(&[("cand-a", &a), ("cand-b", &b)]).len(), 2);
+        // On the same HTTP listener too: still one each.
+        assert_eq!(
+            lint_collection(&[("cand-a", &a), ("cand-c", &a.clone())]).len(),
+            2
+        );
+    }
+
+    /// Partners met on HTTP and on HTTPS are named together.
+    #[test]
+    fn partners_on_every_listener_are_named_together() {
+        let mut a = ep("example.com", Some("/api"), false, false);
+        a.config.tls = true;
+        let plain = ep("example.com", Some("/api"), false, false);
+        let mut elsewhere = a.clone();
+        elsewhere.config.entrypoint = Some("gateway:http:8080".into());
+        let out = lint_collection(&[
+            ("cand-a", &a),
+            ("cand-plain", &plain),
+            ("cand-else", &elsewhere),
+        ]);
+        let for_a: Vec<_> = out.iter().filter(|(id, _)| id == "cand-a").collect();
+        assert_eq!(for_a.len(), 1);
+        assert!(
+            for_a[0].1.message.contains("cand-else, cand-plain"),
+            "{}",
+            for_a[0].1.message
         );
     }
 

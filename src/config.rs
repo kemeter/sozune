@@ -872,10 +872,14 @@ pub struct UdpListenerConfig {
 
 /// The ports a Kubernetes Gateway listener may open on its own. A TCP, TLS or
 /// UDP listener whose port no `proxy.tcp` / `proxy.udp` entry declares is
-/// served when its port is listed here: Sōzune binds it once a route attaches
-/// to the listener and closes it when none is left.
+/// served when its port is listed here, and so is an HTTP listener on a port
+/// other than `proxy.http`'s: Sōzune binds it once a route attaches to the
+/// listener and closes it when none is left.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct GatewayPortsConfig {
+    /// Ports for HTTP listeners.
+    #[serde(default)]
+    pub http: Vec<PortRange>,
     /// Ports for TCP and TLS listeners.
     #[serde(default)]
     pub tcp: Vec<PortRange>,
@@ -885,6 +889,10 @@ pub struct GatewayPortsConfig {
 }
 
 impl GatewayPortsConfig {
+    pub fn allows_http(&self, port: u16) -> bool {
+        self.http.iter().any(|r| r.contains(port))
+    }
+
     pub fn allows_tcp(&self, port: u16) -> bool {
         self.tcp.iter().any(|r| r.contains(port))
     }
@@ -898,6 +906,16 @@ impl GatewayPortsConfig {
 /// carries the port, so the proxy knows what to bind when a route refers to it.
 pub fn gateway_tcp_listener(port: u16) -> String {
     format!("{GATEWAY_TCP_PREFIX}{port}")
+}
+
+/// The HTTP twin of [`gateway_tcp_listener`].
+pub fn gateway_http_listener(port: u16) -> String {
+    format!("{GATEWAY_HTTP_PREFIX}{port}")
+}
+
+/// The port of a listener named by [`gateway_http_listener`].
+pub fn gateway_http_port(name: &str) -> Option<u16> {
+    name.strip_prefix(GATEWAY_HTTP_PREFIX)?.parse().ok()
 }
 
 /// The UDP twin of [`gateway_tcp_listener`].
@@ -915,6 +933,7 @@ pub fn gateway_udp_port(name: &str) -> Option<u16> {
     name.strip_prefix(GATEWAY_UDP_PREFIX)?.parse().ok()
 }
 
+const GATEWAY_HTTP_PREFIX: &str = "gateway:http:";
 const GATEWAY_TCP_PREFIX: &str = "gateway:tcp:";
 const GATEWAY_UDP_PREFIX: &str = "gateway:udp:";
 

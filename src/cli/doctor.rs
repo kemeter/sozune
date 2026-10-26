@@ -827,6 +827,7 @@ fn check_privileges(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
         || cfg.proxy.udp.iter().any(|u| u.listen < 1024)
         || (cfg.proxy.gateway_ports.tcp.iter())
             .chain(&cfg.proxy.gateway_ports.udp)
+            .chain(&cfg.proxy.gateway_ports.http)
             .any(|r| r.start < 1024);
 
     if needs_low_port && unsafe { libc_geteuid() == 0 } {
