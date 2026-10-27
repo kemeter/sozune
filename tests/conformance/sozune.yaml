@@ -32,6 +32,7 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       - httproutes/status
+      - tlsroutes/status
       - gateways/status
       - gatewayclasses/status
     verbs: ["update", "patch"]
