@@ -4018,6 +4018,55 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
     use tokio::time::{sleep, timeout};
 
+    /// A real Sōzu HTTP worker on a loopback port: its command channel, and
+    /// a receiver told when its thread ends.
+    fn http_worker() -> (
+        Channel<WorkerRequest, WorkerResponse>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let port = pick_loopback_port().unwrap();
+        let listener = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, port))
+            .to_http(None)
+            .unwrap();
+        let (mut command, proxy) = Channel::generate(1000, 1_000_000).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = worker::start_http_worker(listener, proxy, 100, 16384);
+            let _ = done_tx.send(());
+        });
+        wait_for_worker_ready(&mut command, "test", Duration::from_secs(5)).unwrap();
+        (command, done_rx)
+    }
+
+    /// Send a command and leave its answer unread, as `send_to_worker` does
+    /// once it gave up waiting.
+    fn send_unanswered(command: &mut Channel<WorkerRequest, WorkerResponse>) {
+        command
+            .write_message(&WorkerRequest {
+                id: "unanswered".into(),
+                content: Request {
+                    request_type: Some(RequestType::Status(
+                        sozu_command_lib::proto::command::Status {},
+                    )),
+                },
+            })
+            .unwrap();
+        // Long enough for the answer to land in our end of the channel.
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    /// A worker whose command channel holds an answer we never read sees
+    /// the channel's closing as an error, not a close, and keeps running: told
+    /// to stop, it stops all the same.
+    #[test]
+    fn a_worker_told_to_stop_stops_with_an_answer_unread() {
+        let (mut command, done) = http_worker();
+        send_unanswered(&mut command);
+        stop_worker(&mut command, "test");
+        drop(command);
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
     fn tls_listener_with_http2(
         http2: &Http2Config,
     ) -> sozu_command_lib::proto::command::HttpsListenerConfig {
