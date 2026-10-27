@@ -36,7 +36,10 @@ use crate::model::{
 };
 use futures_util::StreamExt;
 use gateway_api::apis::experimental::tcproutes::{TCPRoute, TCPRouteParentRefs, TCPRouteRules};
-use gateway_api::apis::experimental::tlsroutes::{TLSRoute, TLSRouteParentRefs, TLSRouteRules};
+use gateway_api::apis::experimental::tlsroutes::{
+    TLSRoute, TLSRouteParentRefs, TLSRouteRules, TLSRouteStatusParents,
+    TLSRouteStatusParentsParentRef,
+};
 use gateway_api::apis::experimental::udproutes::{UDPRoute, UDPRouteParentRefs, UDPRouteRules};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{
@@ -1222,19 +1225,40 @@ impl GatewayScope {
     /// silently serving nothing.
     fn effective_tls_hostnames_by_port(&self, route: &TLSRoute) -> BTreeMap<i32, Vec<String>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let mut by_port: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        for p in route
+            .spec
+            .parent_refs
+            .iter()
+            .flatten()
+            .filter(|p| self.accepts_tls_parent_ref(route_ns, p))
+        {
+            for (port, hostnames) in self.tls_parent_hostnames_by_port(route, p) {
+                let entry = by_port.entry(port).or_default();
+                for h in hostnames {
+                    if !entry.contains(&h) {
+                        entry.push(h);
+                    }
+                }
+            }
+        }
+        by_port
+    }
+
+    /// [`Self::effective_tls_hostnames_by_port`] through the listeners one
+    /// `parentRef` selects.
+    fn tls_parent_hostnames_by_port(
+        &self,
+        route: &TLSRoute,
+        p: &TLSRouteParentRefs,
+    ) -> BTreeMap<i32, Vec<String>> {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
         let mut by_port: BTreeMap<i32, Vec<String>> = BTreeMap::new();
-        let Some(refs) = route.spec.parent_refs.as_ref() else {
-            return by_port;
-        };
-
-        for p in refs
-            .iter()
-            .filter(|p| self.accepts_tls_parent_ref(route_ns, p))
         {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
             let Some(listeners) = self.gateway_listeners(ns, &p.name, route_ns, "TLSRoute") else {
-                continue;
+                return by_port;
             };
             for listener in listeners
                 .into_iter()
@@ -2863,34 +2887,112 @@ async fn run_status_writer(
         };
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let our_status = build_route_status(&route, &scope, outcome, invalid_ref);
-        let (merged, changed) = merge_route_status(route.status.as_ref(), our_status);
+        let (_, changed) = merge_route_status(route.status.as_ref(), our_status.clone());
         if !changed {
             continue;
         }
-
-        // Build the minimal status patch — only the `parents` field of
-        // `status`, as a strategic-merge JSON patch. This still
-        // overwrites the whole array (Kubernetes doesn't deep-merge
-        // arrays), but `merged` already contains every other
-        // controller's slice unchanged, so we can't clobber them.
-        let patch = serde_json::json!({
-            "status": { "parents": merged }
-        });
         let api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
-        let pp = PatchParams::default();
-        if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
-            warn!(
-                "Gateway API: failed to patch status on HTTPRoute {}/{}: {}",
-                ns, name, e
-            );
-        } else {
-            debug!(
+        let parents = |r: &HTTPRoute| {
+            r.status
+                .as_ref()
+                .map(|s| s.parents.clone())
+                .unwrap_or_default()
+        };
+        match patch_route_parents(&api, name, our_status, parents).await {
+            Ok(true) => debug!(
                 "Gateway API: status patched on HTTPRoute {}/{} (outcome={:?})",
                 ns, name, outcome
-            );
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(
+                "Gateway API: failed to patch status on HTTPRoute {}/{}: {}",
+                ns, name, e
+            ),
         }
     }
     info!("Gateway API: HTTPRoute status writer stopped");
+}
+
+/// Write `ours` into the `status.parents[]` of the route `name`, merged into
+/// the entries it holds now: another controller's stay. The patch carries the
+/// `resourceVersion` it was merged against, so one written in between makes
+/// it fail, and it is merged again. Returns whether it wrote anything.
+async fn patch_route_parents<K, T>(
+    api: &Api<K>,
+    name: &str,
+    ours: Vec<T>,
+    parents: impl Fn(&K) -> Vec<T>,
+) -> Result<bool, kube::Error>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+    T: ParentStatus + serde::Serialize,
+{
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let current = api.get(name).await?;
+        let (merged, changed) = merge_parent_status(&parents(&current), ours.clone());
+        if !changed {
+            return Ok(false);
+        }
+        // Kubernetes does not merge arrays: the patch replaces `parents`
+        // whole, which `merged` keeps every other controller's entries in.
+        let patch = serde_json::json!({
+            "metadata": { "resourceVersion": current.meta().resource_version },
+            "status": { "parents": merged }
+        });
+        match api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(kube::Error::Api(resp)) if resp.code == 409 && attempt < ATTEMPTS => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
+}
+
+/// What the TLSRoute watcher hands the TLSRoute status writer.
+type TlsRouteStatusTx = mpsc::Sender<(TLSRoute, RouteOutcome, Option<InvalidRef>)>;
+
+/// The TLSRoute twin of [`run_status_writer`].
+async fn run_tls_status_writer(
+    client: Client,
+    mut rx: mpsc::Receiver<(TLSRoute, RouteOutcome, Option<InvalidRef>)>,
+    scope: GatewayScope,
+) {
+    info!("Gateway API: TLSRoute status writer started");
+    while let Some((route, outcome, invalid_ref)) = rx.recv().await {
+        let Some(name) = route.metadata.name.as_deref() else {
+            continue;
+        };
+        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let ours = build_tls_route_status(&route, &scope, outcome, invalid_ref);
+        let parents = |route: &TLSRoute| {
+            route
+                .status
+                .as_ref()
+                .map(|s| s.parents.clone())
+                .unwrap_or_default()
+        };
+        let (_, changed) = merge_parent_status(&parents(&route), ours.clone());
+        if !changed {
+            continue;
+        }
+        let api: Api<TLSRoute> = Api::namespaced(client.clone(), ns);
+        match patch_route_parents(&api, name, ours, parents).await {
+            Ok(true) => debug!(
+                "Gateway API: status patched on TLSRoute {}/{} (outcome={:?})",
+                ns, name, outcome
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(
+                "Gateway API: failed to patch status on TLSRoute {}/{}: {}",
+                ns, name, e
+            ),
+        }
+    }
+    info!("Gateway API: TLSRoute status writer stopped");
 }
 
 /// Build the `conditions[]` sōzune owns on a Gateway's status.
@@ -4508,24 +4610,115 @@ fn check_backend_ref(
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Result<(), InvalidRef> {
+    check_backend_ref_parts(
+        namespace,
+        BackendRefParts {
+            group: backend.group.as_deref(),
+            kind: backend.kind.as_deref(),
+            namespace: backend.namespace.as_deref(),
+            name: &backend.name,
+        },
+        resolver,
+        grants,
+    )
+}
+
+/// What [`check_backend_ref_parts`] looks at in a backendRef, whatever the
+/// route's kind.
+struct BackendRefParts<'a> {
+    group: Option<&'a str>,
+    kind: Option<&'a str>,
+    namespace: Option<&'a str>,
+    name: &'a str,
+}
+
+/// [`check_backend_ref`] for a backendRef of any route kind.
+fn check_backend_ref_parts(
+    namespace: &str,
+    backend: BackendRefParts<'_>,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Result<(), InvalidRef> {
     // Service-typed backends only. group/kind defaulting to empty/Service
     // per Gateway API spec is what we accept.
-    let kind_ok = backend.kind.as_deref().is_none_or(|k| k == "Service");
-    let group_ok = backend.group.as_deref().is_none_or(str::is_empty);
+    let kind_ok = backend.kind.is_none_or(|k| k == "Service");
+    let group_ok = backend.group.is_none_or(str::is_empty);
     if !kind_ok || !group_ok {
         return Err(InvalidRef::Kind);
     }
-    let target_ns = backend.namespace.as_deref().unwrap_or(namespace);
+    let target_ns = backend.namespace.unwrap_or(namespace);
     // Cross-namespace backendRefs require a ReferenceGrant in the target
     // namespace trusting this route's namespace: a namespace must opt in to
     // being referenced. Same-namespace refs never consult the grant set.
-    if !grants.allows(namespace, target_ns, &backend.name) {
+    if !grants.allows(namespace, target_ns, backend.name) {
         return Err(InvalidRef::NotPermitted);
     }
-    if resolver.service_exists(target_ns, &backend.name) == Some(false) {
+    if resolver.service_exists(target_ns, backend.name) == Some(false) {
         return Err(InvalidRef::NotFound);
     }
     Ok(())
+}
+
+/// Whether every rule of a TLSRoute has a backendRef taking traffic, and
+/// every backendRef that can be used and takes traffic has a ready endpoint.
+fn tls_route_backends_ready(
+    route: &TLSRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> bool {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    route.spec.rules.iter().all(|rule| {
+        let usable: Vec<_> = rule
+            .backend_refs
+            .iter()
+            .flatten()
+            .filter(|b| b.weight != Some(0))
+            .filter(|b| {
+                let parts = BackendRefParts {
+                    group: b.group.as_deref(),
+                    kind: b.kind.as_deref(),
+                    namespace: b.namespace.as_deref(),
+                    name: &b.name,
+                };
+                check_backend_ref_parts(namespace, parts, resolver, grants).is_ok()
+            })
+            .collect();
+        // A rule left with none forwards nothing.
+        !usable.is_empty()
+            && usable.iter().all(|b| {
+                let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+                b.port
+                    .and_then(|p| u16::try_from(p).ok())
+                    .is_some_and(|port| {
+                        !resolver
+                            .pod_addresses(target_ns, &b.name, port, "TCP")
+                            .is_empty()
+                    })
+            })
+    })
+}
+
+/// The first backendRef of a TLSRoute that cannot be used, if any.
+fn tls_route_invalid_ref(
+    route: &TLSRoute,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Option<InvalidRef> {
+    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    route
+        .spec
+        .rules
+        .iter()
+        .flat_map(|rule| rule.backend_refs.iter().flatten())
+        .find_map(|b| {
+            let parts = BackendRefParts {
+                group: b.group.as_deref(),
+                kind: b.kind.as_deref(),
+                namespace: b.namespace.as_deref(),
+                name: &b.name,
+            };
+            check_backend_ref_parts(namespace, parts, resolver, grants).err()
+        })
 }
 
 /// Whether `backend` can take traffic: weighted, usable, with a ready pod.
@@ -4613,9 +4806,97 @@ fn build_route_status(
     outcome: RouteOutcome,
     invalid_ref: Option<InvalidRef>,
 ) -> Vec<HTTPRouteStatusParents> {
-    let now = Time(k8s_openapi::chrono::Utc::now());
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-    let generation = route.metadata.generation;
+    parent_conditions(
+        scope,
+        route_ns,
+        route.metadata.generation,
+        route.spec.parent_refs.as_deref().unwrap_or_default(),
+        "HTTPRoute",
+        &|p| scope.accepts_parent_ref(route_ns, p),
+        GatewayScope::listener_serves_http,
+        &|_| outcome,
+        invalid_ref,
+    )
+    .into_iter()
+    .map(|(p, conditions)| HTTPRouteStatusParents {
+        controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
+        parent_ref: HTTPRouteStatusParentsParentRef {
+            group: p.group.clone(),
+            kind: p.kind.clone(),
+            name: p.name.clone(),
+            namespace: p.namespace.clone(),
+            port: p.port,
+            section_name: p.section_name.clone(),
+        },
+        conditions: Some(conditions),
+    })
+    .collect()
+}
+
+/// The TLSRoute twin of [`build_route_status`].
+fn build_tls_route_status(
+    route: &TLSRoute,
+    scope: &GatewayScope,
+    outcome: RouteOutcome,
+    invalid_ref: Option<InvalidRef>,
+) -> Vec<TLSRouteStatusParents> {
+    let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    parent_conditions(
+        scope,
+        route_ns,
+        route.metadata.generation,
+        route.spec.parent_refs.as_deref().unwrap_or_default(),
+        "TLSRoute",
+        &|p| scope.accepts_tls_parent_ref(route_ns, p),
+        GatewayScope::listener_serves_tls_passthrough,
+        // Each parent by the listeners it selects: one admitting none of
+        // the route's names refuses it, whatever another does.
+        &|p| {
+            if outcome != RouteOutcome::NotMine
+                && scope.tls_parent_hostnames_by_port(route, p).is_empty()
+            {
+                RouteOutcome::NoMatchingListenerHostname
+            } else {
+                outcome
+            }
+        },
+        invalid_ref,
+    )
+    .into_iter()
+    .map(|(p, conditions)| TLSRouteStatusParents {
+        controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
+        parent_ref: TLSRouteStatusParentsParentRef {
+            group: p.group.clone(),
+            kind: p.kind.clone(),
+            name: p.name.clone(),
+            namespace: p.namespace.clone(),
+            port: p.port,
+            section_name: p.section_name.clone(),
+        },
+        conditions: Some(conditions),
+    })
+    .collect()
+}
+
+/// The conditions sōzune reports on each parentRef of a route of
+/// `route_kind` (see [`build_route_status`]): `Accepted` and `ResolvedRefs`
+/// for one the route is `accepted` on, and for one a Gateway of ours refuses,
+/// through no listener `listener_ok` takes. A parent that is not ours gets
+/// none.
+#[allow(clippy::too_many_arguments)]
+fn parent_conditions<'a, P: ParentRef>(
+    scope: &GatewayScope,
+    route_ns: &str,
+    generation: Option<i64>,
+    parent_refs: &'a [P],
+    route_kind: &str,
+    accepted: &dyn Fn(&P) -> bool,
+    listener_ok: fn(&ListenerInfo) -> bool,
+    outcome: &dyn Fn(&P) -> RouteOutcome,
+    invalid_ref: Option<InvalidRef>,
+) -> Vec<(&'a P, Vec<Condition>)> {
+    let now = Time(k8s_openapi::chrono::Utc::now());
     let condition = |type_: &str, status: &str, reason: &str, message: String| Condition {
         type_: type_.to_string(),
         status: status.to_string(),
@@ -4625,7 +4906,61 @@ fn build_route_status(
         observed_generation: generation,
     };
 
-    let (accepted_status, accepted_reason, accepted_msg) = match outcome {
+    parent_refs
+        .iter()
+        .filter_map(|p| {
+            let (
+                (accepted_status, accepted_reason, accepted_msg),
+                (refs_status, refs_reason, refs_msg),
+            ) = outcome_verdicts(outcome(p), invalid_ref);
+            let resolved_refs = || {
+                condition(
+                    CONDITION_TYPE_RESOLVED_REFS,
+                    refs_status,
+                    refs_reason,
+                    refs_msg.clone(),
+                )
+            };
+            let conditions = if accepted(p) {
+                vec![
+                    condition(
+                        CONDITION_TYPE_ACCEPTED,
+                        accepted_status,
+                        accepted_reason,
+                        accepted_msg.clone(),
+                    ),
+                    resolved_refs(),
+                ]
+            } else {
+                // Reported rather than skipped: silence would read as a
+                // Gateway that ignores the route. A parent that is not ours
+                // gets no entry.
+                let reason = scope.parent_refusal(route_ns, p, route_kind, listener_ok)?;
+                let message = if reason == REASON_NO_MATCHING_PARENT {
+                    "No listener of this Gateway matches the parentRef's sectionName and port"
+                        .to_string()
+                } else {
+                    format!(
+                        "No listener selected by this parentRef allows {}s from namespace {}",
+                        route_kind, route_ns
+                    )
+                };
+                vec![
+                    condition(CONDITION_TYPE_ACCEPTED, "False", reason, message),
+                    resolved_refs(),
+                ]
+            };
+            Some((p, conditions))
+        })
+        .collect()
+}
+
+/// What `Accepted` and `ResolvedRefs` say, as (status, reason, message), of
+/// a route `outcome` describes on a parent.
+type Verdict = (&'static str, &'static str, String);
+
+fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (Verdict, Verdict) {
+    let accepted = match outcome {
         RouteOutcome::Accepted | RouteOutcome::NoResolvableBackends => (
             "True",
             REASON_ACCEPTED,
@@ -4649,7 +4984,7 @@ fn build_route_status(
         // No parentRef is accepted, so these are never used.
         RouteOutcome::NotMine => ("False", "", String::new()),
     };
-    let (refs_status, refs_reason, refs_msg) = match (outcome, invalid_ref) {
+    let refs = match (outcome, invalid_ref) {
         (RouteOutcome::UnsupportedFilters, _) => (
             "False",
             REASON_UNSUPPORTED_VALUE,
@@ -4670,70 +5005,7 @@ fn build_route_status(
             "All backendRefs resolved to ready endpoints".to_string(),
         ),
     };
-    let resolved_refs = || {
-        condition(
-            CONDITION_TYPE_RESOLVED_REFS,
-            refs_status,
-            refs_reason,
-            refs_msg.clone(),
-        )
-    };
-
-    route
-        .spec
-        .parent_refs
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| {
-            let conditions = if scope.accepts_parent_ref(route_ns, p) {
-                vec![
-                    condition(
-                        CONDITION_TYPE_ACCEPTED,
-                        accepted_status,
-                        accepted_reason,
-                        accepted_msg.clone(),
-                    ),
-                    resolved_refs(),
-                ]
-            } else {
-                // Reported rather than skipped: silence would read as a
-                // Gateway that ignores the route. A parent that is not ours
-                // gets no entry.
-                let reason = scope.parent_refusal(
-                    route_ns,
-                    p,
-                    "HTTPRoute",
-                    GatewayScope::listener_serves_http,
-                )?;
-                let message = if reason == REASON_NO_MATCHING_PARENT {
-                    "No listener of this Gateway matches the parentRef's sectionName and port"
-                        .to_string()
-                } else {
-                    format!(
-                        "No HTTP listener selected by this parentRef allows HTTPRoutes from namespace {}",
-                        route_ns
-                    )
-                };
-                vec![
-                    condition(CONDITION_TYPE_ACCEPTED, "False", reason, message),
-                    resolved_refs(),
-                ]
-            };
-            Some(HTTPRouteStatusParents {
-                controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
-                parent_ref: HTTPRouteStatusParentsParentRef {
-                    group: p.group.clone(),
-                    kind: p.kind.clone(),
-                    name: p.name.clone(),
-                    namespace: p.namespace.clone(),
-                    port: p.port,
-                    section_name: p.section_name.clone(),
-                },
-                conditions: Some(conditions),
-            })
-        })
-        .collect()
+    (accepted, refs)
 }
 
 /// Merge sōzune's slice of `parents[]` into the route's existing
@@ -4745,16 +5017,49 @@ fn merge_route_status(
     existing: Option<&HTTPRouteStatus>,
     ours: Vec<HTTPRouteStatusParents>,
 ) -> (Vec<HTTPRouteStatusParents>, bool) {
-    let existing_parents: &[HTTPRouteStatusParents] =
-        existing.map(|s| s.parents.as_slice()).unwrap_or_default();
-    let foreign: Vec<HTTPRouteStatusParents> = existing_parents
+    merge_parent_status(
+        existing.map(|s| s.parents.as_slice()).unwrap_or_default(),
+        ours,
+    )
+}
+
+/// An entry of a route's `status.parents[]`, whatever the route's kind.
+trait ParentStatus: Clone {
+    fn controller_name(&self) -> &str;
+    /// Whether `other` reports the same parent, with equivalent conditions.
+    fn equivalent(&self, other: &Self) -> bool;
+}
+
+macro_rules! impl_parent_status {
+    ($t:ty) => {
+        impl ParentStatus for $t {
+            fn controller_name(&self) -> &str {
+                &self.controller_name
+            }
+            fn equivalent(&self, other: &Self) -> bool {
+                self.parent_ref == other.parent_ref
+                    && conditions_equivalent(
+                        self.conditions.as_deref(),
+                        other.conditions.as_deref(),
+                    )
+            }
+        }
+    };
+}
+
+impl_parent_status!(HTTPRouteStatusParents);
+impl_parent_status!(TLSRouteStatusParents);
+
+/// [`merge_route_status`] for a route of any kind.
+fn merge_parent_status<T: ParentStatus>(existing: &[T], ours: Vec<T>) -> (Vec<T>, bool) {
+    let foreign: Vec<T> = existing
         .iter()
-        .filter(|p| p.controller_name != SOZUNE_CONTROLLER_NAME)
+        .filter(|p| p.controller_name() != SOZUNE_CONTROLLER_NAME)
         .cloned()
         .collect();
-    let our_existing: Vec<&HTTPRouteStatusParents> = existing_parents
+    let our_existing: Vec<&T> = existing
         .iter()
-        .filter(|p| p.controller_name == SOZUNE_CONTROLLER_NAME)
+        .filter(|p| p.controller_name() == SOZUNE_CONTROLLER_NAME)
         .collect();
 
     // Skip the write if our slice is byte-for-byte equivalent (modulo
@@ -4762,10 +5067,10 @@ fn merge_route_status(
     // conditions field-by-field with the timestamp ignored avoids
     // hammering the apiserver on every periodic re-resolve.
     let unchanged = our_existing.len() == ours.len()
-        && our_existing.iter().zip(ours.iter()).all(|(a, b)| {
-            a.parent_ref == b.parent_ref
-                && conditions_equivalent(a.conditions.as_deref(), b.conditions.as_deref())
-        });
+        && our_existing
+            .iter()
+            .zip(ours.iter())
+            .all(|(a, b)| a.equivalent(b));
 
     let mut merged = foreign;
     merged.extend(ours);
@@ -5063,6 +5368,7 @@ fn apply_tls_route(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
+    status_tx: Option<&TlsRouteStatusTx>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -5085,13 +5391,16 @@ fn apply_tls_route(
     // Out-of-scope routes stay tracked with zero entrypoints so they activate
     // as soon as a matching Gateway appears, and deactivate cleanly when one
     // goes away — same contract as the HTTP path.
-    let new_entrypoints = if !scope.accepts_tls_route(route) {
-        Vec::new()
+    let by_port = if scope.accepts_tls_route(route) {
+        Some(scope.effective_tls_hostnames_by_port(route))
     } else {
+        None
+    };
+    let new_entrypoints = match by_port.clone() {
+        None => Vec::new(),
         // A route can bind listeners on several ports; each gets its own
         // entrypoint set, serving only the names that listener admits.
-        scope
-            .effective_tls_hostnames_by_port(route)
+        Some(by_port) => by_port
             .into_iter()
             .flat_map(|(port, hostnames)| match listener_ports.get(port) {
                 Some(listener_name) => {
@@ -5107,8 +5416,25 @@ fn apply_tls_route(
                     Vec::new()
                 }
             })
-            .collect()
+            .collect(),
     };
+
+    // A port Sōzune does not serve is the listener's to report, on its
+    // status: the route stays accepted.
+    let outcome = match &by_port {
+        None => RouteOutcome::NotMine,
+        Some(ports) if ports.is_empty() => RouteOutcome::NoMatchingListenerHostname,
+        Some(_) if !tls_route_backends_ready(route, resolver, scope) => {
+            RouteOutcome::NoResolvableBackends
+        }
+        Some(_) => RouteOutcome::Accepted,
+    };
+    let invalid_ref = tls_route_invalid_ref(route, resolver, scope);
+    if let Some(tx) = status_tx
+        && let Err(e) = tx.try_send((route.clone(), outcome, invalid_ref))
+    {
+        debug!("Gateway API: TLSRoute status channel full or closed: {}", e);
+    }
 
     let mut storage_guard = match storage.write() {
         Ok(g) => g,
@@ -5197,6 +5523,7 @@ fn re_resolve_all_tls(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
+    status_tx: Option<&TlsRouteStatusTx>,
 ) -> bool {
     let tracked: Vec<TLSRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
@@ -5208,7 +5535,15 @@ fn re_resolve_all_tls(
 
     let mut changed = false;
     for route in &tracked {
-        if apply_tls_route(route, storage, index, resolver, scope, listener_ports) {
+        if apply_tls_route(
+            route,
+            storage,
+            index,
+            resolver,
+            scope,
+            listener_ports,
+            status_tx,
+        ) {
             changed = true;
         }
     }
@@ -5228,7 +5563,7 @@ pub async fn run_tlsroute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<TLSRoute> = Api::all(client);
+    let api: Api<TLSRoute> = Api::all(client.clone());
     // Distinguish "CRD absent" from "not allowed to list it": both stop the
     // watcher, but only the first is routine. Reporting a 403 as a missing CRD
     // would send an operator hunting for the wrong thing.
@@ -5255,6 +5590,15 @@ pub async fn run_tlsroute_watcher(
         return Ok(());
     }
 
+    // Its own status writer, as for HTTPRoutes (see `run_httproute_watcher`).
+    let (status_tx, status_rx) = mpsc::channel(256);
+    {
+        let scope = scope.clone();
+        tokio::spawn(async move {
+            run_tls_status_writer(client, status_rx, scope).await;
+        });
+    }
+
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
     let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -5273,7 +5617,7 @@ pub async fn run_tlsroute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_tls_route("apply", &route);
-                    apply_tls_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                    apply_tls_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_tls_route("delete", &route);
@@ -5308,11 +5652,11 @@ pub async fn run_tlsroute_watcher(
                 None => break,
             },
             _ = resolve_ticker.tick() => {
-                re_resolve_all_tls(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                re_resolve_all_tls(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
             }
             _ = scope.changed() => {
                 debug!("Gateway API: scope changed, re-resolving TLS routes");
-                re_resolve_all_tls(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                re_resolve_all_tls(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
             }
         };
         if changed && let Err(e) = reload_tx.send(()).await {
@@ -6587,6 +6931,89 @@ mod tests {
         assert_eq!(by_port.get(&8443), Some(&vec!["a.example.com".to_string()]));
     }
 
+    /// A TLSRoute reports, on each parent of ours, `Accepted` and
+    /// `ResolvedRefs`, a backendRef of another namespace no ReferenceGrant
+    /// opens refusing the latter.
+    #[test]
+    fn a_tls_route_reports_its_status() {
+        let scope = tls_scope(Some("*.example.com"), 8443);
+        let route = tls_route(vec!["a.example.com"], 8443);
+        let status = |route: &TLSRoute, outcome| {
+            let invalid = tls_route_invalid_ref(route, &r1(), &scope);
+            let parents = build_tls_route_status(route, &scope, outcome, invalid);
+            assert_eq!(parents.len(), 1);
+            assert_eq!(parents[0].controller_name, SOZUNE_CONTROLLER_NAME);
+            parents[0].conditions.clone().unwrap()
+        };
+        let find = |conditions: &[Condition], type_: &str| {
+            let c = conditions.iter().find(|c| c.type_ == type_).unwrap();
+            (c.status.clone(), c.reason.clone())
+        };
+
+        let accepted = status(&route, RouteOutcome::Accepted);
+        assert_eq!(
+            find(&accepted, CONDITION_TYPE_ACCEPTED),
+            ("True".to_string(), REASON_ACCEPTED.to_string())
+        );
+        assert_eq!(
+            find(&accepted, CONDITION_TYPE_RESOLVED_REFS),
+            ("True".to_string(), REASON_RESOLVED_REFS.to_string())
+        );
+
+        let mut elsewhere = route.clone();
+        elsewhere.spec.rules[0].backend_refs.as_mut().unwrap()[0].namespace = Some("other".into());
+        let refused = status(&elsewhere, RouteOutcome::Accepted);
+        assert_eq!(
+            find(&refused, CONDITION_TYPE_RESOLVED_REFS),
+            ("False".to_string(), REASON_REF_NOT_PERMITTED.to_string())
+        );
+
+        // A second parent whose listener admits none of its names refuses
+        // it, the first still accepting it.
+        let mut other = gateway("default", "gw2", "sozune");
+        let mut listener = gw_listener("tls", 8443, "TLS");
+        listener.hostname = Some("*.other.net".into());
+        listener.tls = Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
+            mode: Some(GatewayListenersTlsMode::Passthrough),
+            ..Default::default()
+        });
+        other.spec.listeners = vec![listener];
+        scope.upsert_gateway(&other);
+        let mut both = route.clone();
+        both.spec
+            .parent_refs
+            .as_mut()
+            .unwrap()
+            .push(TLSRouteParentRefs {
+                name: "gw2".into(),
+                ..Default::default()
+            });
+        let parents = build_tls_route_status(&both, &scope, RouteOutcome::Accepted, None);
+        let accepted: Vec<(String, String)> = parents
+            .iter()
+            .map(|p| find(p.conditions.as_deref().unwrap(), CONDITION_TYPE_ACCEPTED))
+            .collect();
+        assert_eq!(
+            accepted,
+            vec![
+                ("True".to_string(), REASON_ACCEPTED.to_string()),
+                (
+                    "False".to_string(),
+                    REASON_NO_MATCHING_LISTENER_HOSTNAME.to_string()
+                ),
+            ]
+        );
+
+        let unmatched = status(&route, RouteOutcome::NoMatchingListenerHostname);
+        assert_eq!(
+            find(&unmatched, CONDITION_TYPE_ACCEPTED),
+            (
+                "False".to_string(),
+                REASON_NO_MATCHING_LISTENER_HOSTNAME.to_string()
+            )
+        );
+    }
+
     #[test]
     fn tls_route_on_an_undeclared_port_is_not_served() {
         // The Gateway asks for 9443; only 8443 is declared under `proxy.tcp`,
@@ -6612,7 +7039,8 @@ mod tests {
             &index,
             &r1(),
             &scope,
-            &ports_8443()
+            &ports_8443(),
+            None
         ));
         assert_eq!(storage.read().unwrap().len(), 1);
 
@@ -6631,13 +7059,20 @@ mod tests {
         let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
         let route = tls_route(vec!["a.example.com"], 8443);
 
-        apply_tls_route(&route, &storage, &index, &r1(), &scope, &ports_8443());
+        apply_tls_route(&route, &storage, &index, &r1(), &scope, &ports_8443(), None);
         assert!(storage.read().unwrap().is_empty());
         assert_eq!(index.read().unwrap().len(), 1);
 
         // Declare 9443 and re-resolve: the route now lands.
         let ports = Arc::new([(9443, "tlsgw".to_string())].into_iter().collect());
-        assert!(re_resolve_all_tls(&storage, &index, &r1(), &scope, &ports));
+        assert!(re_resolve_all_tls(
+            &storage,
+            &index,
+            &r1(),
+            &scope,
+            &ports,
+            None
+        ));
         assert_eq!(storage.read().unwrap().len(), 1);
     }
 

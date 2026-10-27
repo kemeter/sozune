@@ -9,6 +9,10 @@
 #                      into kind
 #   CONFORMANCE_ARGS   extra flags for the suite, e.g.
 #                      "--supported-features=HTTPRouteMethodMatching"
+#   CONFORMANCE_PROFILES  profiles to run (default GATEWAY-HTTP); GATEWAY-TLS
+#                      needs GATEWAY_API_CHANNEL=experimental
+#   GATEWAY_API_CHANNEL  CRD channel to install: standard (default), or
+#                      experimental for TLSRoute
 #   KEEP_CLUSTER=1     leave the cluster up afterwards
 #   SOZUNE_LOG         Sōzune's RUST_LOG (default sozune=info)
 #
@@ -41,8 +45,22 @@ fi
 kind get kubeconfig --name "$CLUSTER_NAME" > "$KUBECONFIG_FILE"
 kubectl wait --for=condition=Ready nodes --all --timeout=120s >/dev/null
 
-log "Installing Gateway API CRDs ($GATEWAY_API_VERSION, standard)..."
-kubectl apply -f "$DIR/../e2e/k8s/gateway-api-crds-$GATEWAY_API_VERSION.yaml" >/dev/null
+log "Fetching the conformance suite ($GATEWAY_API_VERSION)..."
+suite="$CACHE_DIR/gateway-api-$GATEWAY_API_VERSION"
+if [[ ! -d "$suite" ]]; then
+    mkdir -p "$CACHE_DIR"
+    git clone --quiet --depth 1 --branch "$GATEWAY_API_VERSION" \
+        https://github.com/kubernetes-sigs/gateway-api.git "$suite"
+fi
+
+channel="${GATEWAY_API_CHANNEL:-standard}"
+log "Installing Gateway API CRDs ($GATEWAY_API_VERSION, $channel)..."
+if [[ "$channel" == "experimental" ]]; then
+    # The suite refuses CRDs of two channels: all of them, from its own tree.
+    kubectl apply --server-side -k "$suite/config/crd/experimental" >/dev/null
+else
+    kubectl apply -f "$DIR/../e2e/k8s/gateway-api-crds-$GATEWAY_API_VERSION.yaml" >/dev/null
+fi
 
 log "Deploying Sōzune ($SOZUNE_IMAGE_REF)..."
 kind load docker-image "$SOZUNE_IMAGE_REF" --name "$CLUSTER_NAME" >/dev/null
@@ -54,14 +72,6 @@ sed -e "s|__IMAGE__|$SOZUNE_IMAGE_REF|" -e "s|__NODE_IP__|$node_ip|" \
     | kubectl apply -f - >/dev/null
 kubectl wait --for=condition=Ready pod/sozune -n sozune-conformance --timeout=120s >/dev/null
 
-log "Fetching the conformance suite ($GATEWAY_API_VERSION)..."
-suite="$CACHE_DIR/gateway-api-$GATEWAY_API_VERSION"
-if [[ ! -d "$suite" ]]; then
-    mkdir -p "$CACHE_DIR"
-    git clone --quiet --depth 1 --branch "$GATEWAY_API_VERSION" \
-        https://github.com/kubernetes-sigs/gateway-api.git "$suite"
-fi
-
 log "Running the suite (Sōzune at $node_ip)..."
 status=0
 # shellcheck disable=SC2086
@@ -71,7 +81,7 @@ docker run --rm --network host \
     -e KUBECONFIG=/kubeconfig -w /src golang:1.23 \
     go test ./conformance -run TestConformance -timeout 60m -args \
         --gateway-class=sozune \
-        --conformance-profiles=GATEWAY-HTTP \
+        --conformance-profiles="${CONFORMANCE_PROFILES:-GATEWAY-HTTP}" \
         --organization=kemeter --project=sozune \
         --url=https://github.com/kemeter/sozune --version=dev \
         --report-output=/out/report.yaml \
