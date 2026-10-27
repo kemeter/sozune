@@ -250,6 +250,36 @@ pub struct MatchCondition {
     pub regex: bool,
 }
 
+impl MatchCondition {
+    /// Whether the condition can be served: one that is not a regex, or
+    /// whose regex [`anchored_regex`] compiles.
+    pub fn regex_compiles(&self) -> bool {
+        !self.regex || anchored_regex(&self.value).is_some()
+    }
+}
+
+/// `pattern` compiled to match a whole value, as header and query regex
+/// conditions do. `None` when it does not compile as written, even if it
+/// would wrapped: `a)|(?:b` becomes `^(?:a)|(?:b)$`, which takes any value
+/// starting with `a`.
+pub fn anchored_regex(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(pattern).ok()?;
+    // Anchored before compiling, not by checking the match's span: a
+    // trailing `(?x)` comment would otherwise swallow the anchors.
+    regex::Regex::new(&format!("^(?:{pattern})$")).ok()
+}
+
+impl EntrypointConfig {
+    /// The first header or query regex condition that cannot be served: one
+    /// naming no key, or whose regex does not compile.
+    pub fn invalid_match_regex(&self) -> Option<&MatchCondition> {
+        self.match_headers
+            .iter()
+            .chain(&self.match_query)
+            .find(|c| c.regex && (c.key.is_empty() || !c.regex_compiles()))
+    }
+}
+
 /// Why a route answers every request itself.
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -33,9 +33,7 @@ struct Condition {
 
 impl Condition {
     fn new(c: MatchCondition) -> Self {
-        let regex = c
-            .regex
-            .then(|| regex::Regex::new(&format!("^(?:{})$", c.value)).ok());
+        let regex = c.regex.then(|| crate::model::anchored_regex(&c.value));
         Self {
             key: c.key,
             value: c.value,

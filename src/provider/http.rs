@@ -49,6 +49,15 @@ impl HttpProvider {
                     );
                     return false;
                 }
+                // Served without it, the route would take more requests
+                // than it asks for.
+                if let Some(bad) = ep.config.invalid_match_regex() {
+                    warn!(
+                        "dropping entrypoint `{}` from the HTTP provider: the regex of `{}` does not compile",
+                        ep.id, bad.key
+                    );
+                    return false;
+                }
                 true
             })
             .map(|ep| (ep.id.clone(), ep))
@@ -87,22 +96,7 @@ impl HttpProvider {
                             }
                         };
 
-                        let old_ids: std::collections::HashSet<&String> = storage_read
-                            .iter()
-                            .filter(|(_, ep)| ep.source.as_deref() == Some(crate::provider::HTTP))
-                            .map(|(id, _)| id)
-                            .collect();
-
-                        let new_ids: std::collections::HashSet<&String> =
-                            new_entrypoints.keys().collect();
-
-                        old_ids != new_ids
-                            || new_entrypoints.iter().any(|(id, ep)| {
-                                storage_read.get(id).is_none_or(|existing| {
-                                    existing.backends != ep.backends
-                                        || existing.config.hostnames != ep.config.hostnames
-                                })
-                            })
+                        http_entrypoints_changed(&storage_read, &new_entrypoints)
                     };
 
                     if !needs_update {
@@ -145,11 +139,64 @@ impl HttpProvider {
     }
 }
 
+/// Whether the entrypoints the HTTP provider fetched (`fetched`) differ from
+/// those it put in `stored`: one more or one fewer, or any change to one, not
+/// just its backends and hostnames. The stored copies carry the source the
+/// provider gave them.
+fn http_entrypoints_changed(
+    stored: &BTreeMap<String, Entrypoint>,
+    fetched: &BTreeMap<String, Entrypoint>,
+) -> bool {
+    let ours = |ep: &Entrypoint| ep.source.as_deref() == Some(crate::provider::HTTP);
+    let old_ids: std::collections::HashSet<&String> = stored
+        .iter()
+        .filter(|(_, ep)| ours(ep))
+        .map(|(id, _)| id)
+        .collect();
+    let new_ids: std::collections::HashSet<&String> = fetched.keys().collect();
+    old_ids != new_ids
+        || fetched.iter().any(|(id, ep)| {
+            stored.get(id).is_none_or(|existing| {
+                !ours(existing)
+                    || Entrypoint {
+                        source: existing.source.clone(),
+                        ..ep.clone()
+                    } != *existing
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Backend, EntrypointConfig, LoadBalancer, Protocol};
     use axum::{Router, routing::get};
+
+    /// A change the provider makes to a route, a match condition among
+    /// others, is applied; an unchanged fetch is not.
+    #[test]
+    fn any_change_to_a_fetched_entrypoint_is_seen() {
+        let fetched: Vec<Entrypoint> = serde_json::from_str(&sample_entrypoints_json()).unwrap();
+        let fetched: BTreeMap<String, Entrypoint> =
+            fetched.into_iter().map(|ep| (ep.id.clone(), ep)).collect();
+        let stored: BTreeMap<String, Entrypoint> = fetched
+            .iter()
+            .map(|(id, ep)| {
+                let mut ep = ep.clone();
+                ep.source = Some(crate::provider::HTTP.to_string());
+                (id.clone(), ep)
+            })
+            .collect();
+        assert!(!http_entrypoints_changed(&stored, &fetched));
+
+        let mut changed = fetched.clone();
+        changed.get_mut("web").unwrap().config.match_headers = vec![crate::model::MatchCondition {
+            key: "x-version".into(),
+            value: "v[0-9]+".into(),
+            regex: true,
+        }];
+        assert!(http_entrypoints_changed(&stored, &changed));
+    }
 
     fn sample_entrypoints_json() -> String {
         serde_json::to_string(&vec![Entrypoint {

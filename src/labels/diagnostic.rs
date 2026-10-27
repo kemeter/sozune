@@ -29,6 +29,10 @@ pub enum DiagnosticCode {
     /// default for a datagram protocol, so the route is dropped rather than
     /// silently bound to the HTTP fallback port.
     E006MissingUdpPort,
+    /// A `matchHeadersRegex` or `matchQueryRegex` label holds a regular
+    /// expression that does not compile. The route is dropped rather than
+    /// served without the condition, which would take more requests.
+    E007InvalidMatchRegex,
     // Warnings — silent fallbacks today
     W001InvalidPort,
     W002InvalidPriority,
@@ -90,6 +94,7 @@ impl DiagnosticCode {
             DiagnosticCode::E004NoServices => "E004",
             DiagnosticCode::E005MissingL4Entrypoint => "E005",
             DiagnosticCode::E006MissingUdpPort => "E006",
+            DiagnosticCode::E007InvalidMatchRegex => "E007",
             DiagnosticCode::W001InvalidPort => "W001",
             DiagnosticCode::W002InvalidPriority => "W002",
             DiagnosticCode::W003InvalidTimeout => "W003",
@@ -145,6 +150,7 @@ impl DiagnosticCode {
             DiagnosticCode::E004NoServices,
             DiagnosticCode::E005MissingL4Entrypoint,
             DiagnosticCode::E006MissingUdpPort,
+            DiagnosticCode::E007InvalidMatchRegex,
             DiagnosticCode::W001InvalidPort,
             DiagnosticCode::W002InvalidPriority,
             DiagnosticCode::W003InvalidTimeout,

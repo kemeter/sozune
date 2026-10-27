@@ -1058,6 +1058,15 @@ impl KubernetesProvider {
         // Middleware from the `sozune.*` annotations, on every route.
         let candidate_id = format!("ingress:{ing_id}");
         let (settings, diags) = ingress_annotations::ingress_settings(ing, &candidate_id);
+        // An annotation the parser refuses (a match regex that does not
+        // compile) drops the routes: served without the annotations, they
+        // would lose their conditions and their middleware.
+        if diags
+            .iter()
+            .any(|d| d.severity() == crate::labels::diagnostic::Severity::Error)
+        {
+            new_entries.clear();
+        }
         crate::diagnostics::set(ctx.diagnostics, &candidate_id, diags);
         if let Some(settings) = settings {
             for (_, entrypoint) in &mut new_entries {

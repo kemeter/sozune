@@ -445,6 +445,35 @@ services:
       - "sozune.http.canary.matchHeaders=X-Canary"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # Same host and path: an X-Version header matching v[0-9]+ whole picks the
+  # second one.
+  svc-header-regex-stable:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: regexstable
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.regexstable.host=$HOST_MATCH_REGEX"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-header-regex:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: regexversion
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.regexversion.host=$HOST_MATCH_REGEX"
+      - "sozune.http.regexversion.matchHeadersRegex.X-Version=v[0-9]+"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-query-regex:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.queryregex.host=$HOST_QUERY_REGEX"
+      - "sozune.http.queryregex.matchQueryRegex.page=[0-9]+"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-ipallow:
     image: traefik/whoami
     labels:
