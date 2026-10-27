@@ -718,7 +718,18 @@ pub struct HttpsConfig {
     /// TLS protocol versions and cipher selection on the listener.
     #[serde(default)]
     pub tls: TlsOptions,
+    /// Serve TLS passthrough on this port too: a connection whose SNI names a
+    /// passthrough route (a TLSRoute on a `TLS` listener of this port, or a
+    /// TCP route on [`HTTPS_PASSTHROUGH_LISTENER`]) is forwarded undecrypted,
+    /// the others go on to the HTTPS listener. Sōzune then reads each
+    /// ClientHello before handing the connection over.
+    #[serde(default)]
+    pub passthrough: bool,
 }
+
+/// The TCP listener serving the passthrough routes of `proxy.https` when
+/// `passthrough` is on, on the HTTPS port. Its name is reserved.
+pub const HTTPS_PASSTHROUGH_LISTENER: &str = "https-passthrough";
 
 /// TLS hardening for the HTTPS listener. These are **listener-wide**: Sōzu (and
 /// the TLS stack under it) applies protocol versions and ciphers at bind time,
@@ -1231,6 +1242,7 @@ impl Default for HttpsConfig {
             error_pages: BTreeMap::new(),
             http2: Http2Config::default(),
             tls: TlsOptions::default(),
+            passthrough: false,
         }
     }
 }

@@ -266,6 +266,11 @@ pub async fn start_services(
         let tcp_listeners_for_gateway = config.proxy.tcp.clone();
         let udp_listeners_for_gateway = config.proxy.udp.clone();
         let gateway_ports_for_gateway = config.proxy.gateway_ports.clone();
+        let passthrough_for_gateway = config
+            .proxy
+            .https
+            .passthrough
+            .then_some(config.proxy.https.listen_address);
         let served_ports_for_gateway = gateway::ServedPorts::from_config(&config.proxy);
         tokio::spawn(async move {
             let client = match kubernetes_provider_for_gateway.build_client().await {
@@ -357,15 +362,19 @@ pub async fn start_services(
             });
 
             // TLSRoute serves passthrough on a real TCP listener, so it needs
-            // the port → listener table: a `proxy.tcp` entry, or the listener
-            // Sōzune opens on a port of `proxy.gateway_ports.tcp`.
+            // the port → listener table: a `proxy.tcp` entry, the listener
+            // Sōzune opens on a port of `proxy.gateway_ports.tcp`, or the
+            // passthrough one of the HTTPS port.
             let tls_client = client.clone();
             let tls_storage = Arc::clone(&storage_for_gateway);
             let tls_reload_tx = reload_tx_for_gateway.clone();
             let tls_resolver = Arc::clone(&resolver);
             let tls_scope = scope.clone();
-            let tls_listener_ports =
-                gateway::tcp_listener_ports(&tcp_listeners_for_gateway, &gateway_ports_for_gateway);
+            let tls_listener_ports = gateway::tls_listener_ports(
+                &tcp_listeners_for_gateway,
+                &gateway_ports_for_gateway,
+                passthrough_for_gateway,
+            );
             tokio::spawn(async move {
                 if let Err(e) = gateway::run_tlsroute_watcher(
                     tls_client,

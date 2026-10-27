@@ -1,22 +1,26 @@
-//! Front door for port 443 when TLS-ALPN-01 is enabled.
+//! Front door for the HTTPS port when TLS-ALPN-01 or passthrough is enabled.
 //!
-//! Normally Sōzu's HTTPS worker binds 443 directly. But answering a
-//! TLS-ALPN-01 challenge means intercepting the handshake on 443 to present a
-//! special certificate for the `acme-tls/1` protocol — something the HTTPS
-//! worker won't do. So when a `tls-alpn-01` resolver is configured, this gate
-//! binds 443 instead, prereads each connection's `ClientHello` for its ALPN
-//! offer, and splices it to one of two loopback backends:
+//! Normally Sōzu's HTTPS worker binds 443 directly. Two things need a look at
+//! the handshake before it: answering a TLS-ALPN-01 challenge, which means
+//! presenting a special certificate for the `acme-tls/1` protocol, and TLS
+//! passthrough on the HTTPS port (`proxy.https.passthrough`), which means
+//! forwarding some connections undecrypted. The HTTPS worker does neither. So
+//! when either is on, this gate binds the HTTPS port instead, prereads each
+//! connection's `ClientHello` for its ALPN offer and its SNI, and splices it to
+//! one of the loopback backends:
 //!
-//!   - offers `acme-tls/1`  → the local TLS-ALPN-01 responder
-//!   - anything else        → the HTTPS worker (moved to a loopback port)
+//!   - offers `acme-tls/1`          → the local TLS-ALPN-01 responder
+//!   - names a passthrough route    → the TCP listener serving those routes
+//!   - anything else                → the HTTPS worker (moved to a loopback port)
 //!
 //! The preread neither decrypts nor consumes: the buffered `ClientHello` bytes
 //! are replayed to the chosen backend, so the handshake completes there exactly
 //! as if the client had connected to it directly. This is the same
-//! `copy_bidirectional` splice the TCP forwarder already uses, with an ALPN
-//! decision in front.
+//! `copy_bidirectional` splice the TCP forwarder already uses, with a decision
+//! in front.
 
 use std::net::Ipv4Addr;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
@@ -30,23 +34,37 @@ const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 /// how many wire bytes (record headers included) to buffer looking for it.
 ///
 /// The cap bounds what a hostile peer can make the gate buffer per connection.
-/// A hello whose ALPN only appears past the cap is treated as non-ACME and
-/// spliced to the HTTPS worker unread — safe for normal traffic, which the
-/// worker parses itself. The only casualty would be a *challenge* hello larger
-/// than 64 KiB, which cannot happen: a TLS-ALPN-01 validator sends a minimal
-/// hello (SNI + `acme-tls/1`), a few hundred bytes. So 64 KiB never misroutes a
-/// real challenge while still being a firm ceiling.
+/// A hello not decided within the cap is spliced to the HTTPS worker unread —
+/// safe for normal traffic, which the worker parses itself. A TLS-ALPN-01
+/// validator sends a minimal hello (SNI + `acme-tls/1`), a few hundred bytes,
+/// and clients put the SNI early in theirs, so 64 KiB never misroutes a real
+/// one while still being a firm ceiling.
 const PREREAD_TIMEOUT: Duration = Duration::from_secs(5);
-const PREREAD_MAX_BYTES: usize = 64 * 1024;
+pub const PREREAD_MAX_BYTES: usize = 64 * 1024;
 
-/// Where a prereaded connection should go.
-struct GateSpec {
-    /// Public port to bind (443).
-    public_port: u16,
+/// The hostnames of the passthrough routes, as their SNI patterns: an exact
+/// name, or `*.` and a suffix for one more label. Rewritten on every reload.
+pub type PassthroughHosts = Arc<RwLock<Vec<String>>>;
+
+/// The TCP listener serving the passthrough routes, behind the gate.
+#[derive(Clone)]
+pub struct Passthrough {
+    /// Its loopback port.
+    pub loopback_port: u16,
+    /// The largest ClientHello it reads, in wire bytes.
+    pub max_hello_bytes: usize,
+    pub hosts: PassthroughHosts,
+}
+
+/// Where a prereaded connection may go.
+#[derive(Clone)]
+pub struct GateBackends {
     /// Loopback port the HTTPS worker moved to — the default backend.
-    https_loopback_port: u16,
-    /// Loopback port the TLS-ALPN-01 responder listens on.
-    responder_port: u16,
+    pub https_loopback_port: u16,
+    /// Loopback port the TLS-ALPN-01 responder listens on, when enabled.
+    pub responder_port: Option<u16>,
+    /// The passthrough listener, when `proxy.https.passthrough` is on.
+    pub passthrough: Option<Passthrough>,
 }
 
 /// Bind the public port for the gate, failing loudly if it's taken.
@@ -58,72 +76,86 @@ struct GateSpec {
 pub async fn bind(public_port: u16) -> anyhow::Result<TcpListener> {
     TcpListener::bind((Ipv4Addr::UNSPECIFIED, public_port))
         .await
-        .map_err(|e| anyhow::anyhow!("TLS-ALPN-01 gate could not bind 0.0.0.0:{public_port}: {e}"))
+        .map_err(|e| anyhow::anyhow!("TLS gate could not bind 0.0.0.0:{public_port}: {e}"))
 }
 
-/// Route each connection on an already-bound `listener` by its ClientHello ALPN
-/// offer, until the process exits.
-pub async fn run(
-    listener: TcpListener,
-    public_port: u16,
-    https_loopback_port: u16,
-    responder_port: u16,
-) {
-    let spec = GateSpec {
-        public_port,
-        https_loopback_port,
-        responder_port,
-    };
+/// Route each connection on an already-bound `listener` by its ClientHello,
+/// until the process exits.
+pub async fn run(listener: TcpListener, public_port: u16, backends: GateBackends) {
     info!(
-        "TLS-ALPN-01 gate on 0.0.0.0:{} → acme-tls/1 to 127.0.0.1:{}, else 127.0.0.1:{}",
-        spec.public_port, spec.responder_port, spec.https_loopback_port
+        "TLS gate on 0.0.0.0:{} → HTTPS worker on 127.0.0.1:{}{}{}",
+        public_port,
+        backends.https_loopback_port,
+        backends
+            .responder_port
+            .map(|p| format!(", acme-tls/1 to 127.0.0.1:{p}"))
+            .unwrap_or_default(),
+        backends
+            .passthrough
+            .as_ref()
+            .map(|p| format!(", passthrough to 127.0.0.1:{}", p.loopback_port))
+            .unwrap_or_default(),
     );
 
     loop {
         let (inbound, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("TLS-ALPN-01 gate accept error: {e}");
+                error!("TLS gate accept error: {e}");
                 continue;
             }
         };
-        let responder_port = spec.responder_port;
-        let https_port = spec.https_loopback_port;
+        let backends = backends.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(inbound, peer, responder_port, https_port).await {
-                debug!("TLS-ALPN-01 gate connection closed: {e}");
+            if let Err(e) = handle_connection(inbound, peer, &backends).await {
+                debug!("TLS gate connection closed: {e}");
             }
         });
     }
 }
 
-/// Preread the ClientHello, pick a backend by ALPN, replay the buffered bytes,
-/// and splice the rest.
+/// Preread the ClientHello, pick a backend, replay the buffered bytes, and
+/// splice the rest.
 ///
 /// `peer` is the real client address. The HTTPS worker (behind the gate on
 /// loopback) would otherwise see every connection as `127.0.0.1`, so its
 /// traffic is prefixed with a PROXY-v2 header carrying the true source and the
-/// public destination the client actually reached. The responder gets no such
-/// header — it doesn't expect one and doesn't care who is connecting.
+/// public destination the client actually reached. The responder and the
+/// passthrough listener get no such header: they do not expect one.
 async fn handle_connection(
     mut inbound: TcpStream,
     peer: std::net::SocketAddr,
-    responder_port: u16,
-    https_loopback_port: u16,
+    backends: &GateBackends,
 ) -> std::io::Result<()> {
     // The public address the client connected to, before the gate spliced it
     // onto loopback — this is what belongs in the PROXY header's destination.
     let public_dest = inbound.local_addr()?;
 
-    let (buffered, wants_acme) = preread_alpn(&mut inbound).await?;
-    let backend_port = if wants_acme {
-        responder_port
-    } else {
-        https_loopback_port
+    let (buffered, hello) = preread_client_hello(&mut inbound).await?;
+    let backend = pick_backend(&hello, backends);
+    let backend_port = match backend {
+        Backend::Responder(port) => port,
+        Backend::Passthrough(port) => {
+            // Too large for the passthrough listener to read: it would drop
+            // it, after a connection to nowhere.
+            if backends
+                .passthrough
+                .as_ref()
+                .is_some_and(|p| buffered.len() > p.max_hello_bytes)
+            {
+                debug!(
+                    "TLS gate: a {}-byte ClientHello is too large for the passthrough listener, closing",
+                    buffered.len()
+                );
+                return Ok(());
+            }
+            port
+        }
+        Backend::Https => backends.https_loopback_port,
     };
 
     let mut outbound = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port)).await?;
-    if !wants_acme {
+    if backend == Backend::Https {
         // Preserve the client IP for the HTTPS worker, which is configured to
         // expect this header (`with_expect_proxy`).
         outbound
@@ -137,6 +169,53 @@ async fn handle_connection(
     }
     copy_bidirectional(&mut inbound, &mut outbound).await?;
     Ok(())
+}
+
+/// The backend a connection is spliced to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Responder(u16),
+    Passthrough(u16),
+    Https,
+}
+
+/// Where a connection whose ClientHello says `hello` goes: an ACME challenge
+/// to the responder, a name a passthrough route serves to the passthrough
+/// listener, anything else — no hello at all included — to the HTTPS worker.
+fn pick_backend(hello: &ClientHello, backends: &GateBackends) -> Backend {
+    if hello.acme
+        && let Some(port) = backends.responder_port
+    {
+        return Backend::Responder(port);
+    }
+    if let (Some(sni), Some(passthrough)) = (hello.sni.as_deref(), &backends.passthrough) {
+        // A poisoned lock leaves the connection to the HTTPS worker.
+        let served = passthrough
+            .hosts
+            .read()
+            .is_ok_and(|hosts| hosts.iter().any(|pattern| sni_matches(pattern, sni)));
+        if served {
+            return Backend::Passthrough(passthrough.loopback_port);
+        }
+    }
+    Backend::Https
+}
+
+/// Whether the SNI pattern `pattern` takes `sni`, as Sōzu's TCP listener does:
+/// an exact name, or `*.` and a suffix for one more label, case aside.
+fn sni_matches(pattern: &str, sni: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => sni
+            .len()
+            .checked_sub(suffix.len() + 1)
+            .filter(|&split| split > 0)
+            .is_some_and(|split| {
+                sni.as_bytes()[split] == b'.'
+                    && sni[split + 1..].eq_ignore_ascii_case(suffix)
+                    && !sni[..split].contains('.')
+            }),
+        None => pattern.eq_ignore_ascii_case(sni),
+    }
 }
 
 /// Build a PROXY protocol v2 header for a `source` → `destination` TCP
@@ -180,35 +259,45 @@ fn proxy_v2_header(source: std::net::SocketAddr, dest: std::net::SocketAddr) -> 
     h
 }
 
-/// Read from `inbound` until the ClientHello's ALPN can be decided, or the
-/// preread deadline / byte cap is hit. Returns the raw bytes consumed (to be
-/// replayed to the backend) and whether `acme-tls/1` was offered. On any parse
-/// failure, timeout, or truncation the connection is treated as non-ACME: it
-/// flows to the HTTPS worker, which makes its own call.
+/// What the gate reads in a ClientHello.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClientHello {
+    /// Whether `acme-tls/1` is among the ALPN protocols offered.
+    acme: bool,
+    /// The host name of the `server_name` extension, if any.
+    sni: Option<String>,
+}
+
+/// Read from `inbound` until the ClientHello can be decided, or the preread
+/// deadline / byte cap is hit. Returns the raw bytes consumed (to be replayed
+/// to the backend) and what the hello says. On any parse failure, timeout, or
+/// truncation the connection gets an empty one: it flows to the HTTPS worker,
+/// which makes its own call.
 ///
 /// The deadline is a single absolute bound on the whole preread, not a
 /// per-read one — otherwise a peer dripping a byte just under the timeout could
 /// hold the task open indefinitely (a slowloris).
-async fn preread_alpn(inbound: &mut TcpStream) -> std::io::Result<(Vec<u8>, bool)> {
+async fn preread_client_hello(inbound: &mut TcpStream) -> std::io::Result<(Vec<u8>, ClientHello)> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + PREREAD_TIMEOUT;
 
     loop {
-        match parse_client_hello_alpn(&buf) {
-            AlpnParse::Decided(found) => return Ok((buf, found)),
-            AlpnParse::NeedMore => {}
-            AlpnParse::NotTls => return Ok((buf, false)),
+        match parse_client_hello(&buf) {
+            HelloParse::Decided(hello) => return Ok((buf, hello)),
+            HelloParse::NeedMore => {}
+            HelloParse::NotTls => return Ok((buf, ClientHello::default())),
         }
         if buf.len() >= PREREAD_MAX_BYTES {
-            return Ok((buf, false));
+            return Ok((buf, ClientHello::default()));
         }
 
         let n = match tokio::time::timeout_at(deadline, inbound.read(&mut chunk)).await {
-            Ok(Ok(0)) => return Ok((buf, false)), // peer closed
+            Ok(Ok(0)) => return Ok((buf, ClientHello::default())), // peer closed
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok((buf, false)), // deadline: let HTTPS decide
+            // Deadline: let HTTPS decide.
+            Err(_) => return Ok((buf, ClientHello::default())),
         };
         // Never buffer past the cap, even if a single read overshoots it.
         let room = PREREAD_MAX_BYTES - buf.len();
@@ -216,16 +305,16 @@ async fn preread_alpn(inbound: &mut TcpStream) -> std::io::Result<(Vec<u8>, bool
     }
 }
 
-enum AlpnParse {
-    /// ALPN resolved: `true` if `acme-tls/1` was among the offered protocols.
-    Decided(bool),
-    /// Not enough bytes yet to reach (or finish) the ALPN extension.
+enum HelloParse {
+    /// The whole ClientHello was read.
+    Decided(ClientHello),
+    /// Not enough bytes yet to reach (or finish) the ClientHello.
     NeedMore,
     /// The stream isn't a TLS ClientHello at all.
     NotTls,
 }
 
-/// Extract whether the ClientHello in `buf` offers `acme-tls/1`.
+/// Read the ALPN offer and the SNI of the ClientHello in `buf`.
 ///
 /// A ClientHello can be split across several TLS handshake records, so the
 /// handshake body is first reassembled from every leading `0x16` record, then
@@ -233,7 +322,7 @@ enum AlpnParse {
 /// the record boundary, so trailing bytes after the ClientHello can't be read
 /// as extensions. Anything malformed or truncated returns `NeedMore`/`NotTls`
 /// rather than erroring; the caller degrades to the HTTPS path.
-fn parse_client_hello_alpn(buf: &[u8]) -> AlpnParse {
+fn parse_client_hello(buf: &[u8]) -> HelloParse {
     // Reassemble the handshake stream from consecutive handshake records.
     let mut hs_stream: Vec<u8> = Vec::new();
     let mut r = 0usize;
@@ -247,7 +336,7 @@ fn parse_client_hello_alpn(buf: &[u8]) -> AlpnParse {
             // A non-handshake record interrupting the ClientHello: this isn't
             // the plain TLS-ALPN validator flow.
             if r == 0 {
-                return AlpnParse::NotTls;
+                return HelloParse::NotTls;
             }
             break;
         }
@@ -262,16 +351,16 @@ fn parse_client_hello_alpn(buf: &[u8]) -> AlpnParse {
     }
 
     if hs_stream.len() < 4 {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     }
     // Handshake header: msg_type(1) length(3). Type 1 = ClientHello.
     if hs_stream[0] != 0x01 {
-        return AlpnParse::NotTls;
+        return HelloParse::NotTls;
     }
     let declared = u32::from_be_bytes([0, hs_stream[1], hs_stream[2], hs_stream[3]]) as usize;
     let body_end = 4 + declared;
     if hs_stream.len() < body_end {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     }
     // Bound the walk by the ClientHello's declared length: trailing handshake
     // messages (or crafted bytes) after it must not be parsed as extensions.
@@ -281,45 +370,71 @@ fn parse_client_hello_alpn(buf: &[u8]) -> AlpnParse {
     p += 34;
     // session_id
     let Some(&sid_len) = hs.get(p) else {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     };
     p += 1 + sid_len as usize;
     // cipher_suites (u16 length-prefixed)
     let Some(cs_len) = read_u16(hs, p) else {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     };
     p += 2 + cs_len as usize;
     // compression_methods (u8 length-prefixed)
     let Some(&comp_len) = hs.get(p) else {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     };
     p += 1 + comp_len as usize;
     // extensions (u16 length-prefixed)
     let Some(ext_total) = read_u16(hs, p) else {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     };
     p += 2;
     let ext_end = p + ext_total as usize;
     if hs.len() < ext_end {
-        return AlpnParse::NeedMore;
+        return HelloParse::NeedMore;
     }
 
+    let mut hello = ClientHello::default();
     while p + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([hs[p], hs[p + 1]]);
         let ext_len = u16::from_be_bytes([hs[p + 2], hs[p + 3]]) as usize;
         p += 4;
         if p + ext_len > ext_end {
-            return AlpnParse::NotTls;
+            return HelloParse::NotTls;
         }
-        if ext_type == 0x0010 {
+        match ext_type {
+            // server_name.
+            0x0000 => hello.sni = server_name(&hs[p..p + ext_len]),
             // ALPN: protocol_name_list is a u16-length-prefixed list of
             // u8-length-prefixed names.
-            return AlpnParse::Decided(alpn_offers_acme(&hs[p..p + ext_len]));
+            0x0010 => hello.acme = alpn_offers_acme(&hs[p..p + ext_len]),
+            _ => {}
         }
         p += ext_len;
     }
-    // Fully parsed, no ALPN extension present.
-    AlpnParse::Decided(false)
+    HelloParse::Decided(hello)
+}
+
+/// The host name of a `server_name` extension body: a u16-length-prefixed
+/// list of entries, each a type byte (`0`, host name) and a u16-length-prefixed
+/// name. `None` when it names no host, or one that is not a name.
+fn server_name(ext: &[u8]) -> Option<String> {
+    let list_len = read_u16(ext, 0)? as usize;
+    let end = (2 + list_len).min(ext.len());
+    let mut p = 2;
+    while p + 3 <= end {
+        let name_type = ext[p];
+        let name_len = read_u16(ext, p + 1)? as usize;
+        p += 3;
+        let name = ext.get(p..p + name_len)?;
+        if name_type == 0 {
+            return std::str::from_utf8(name)
+                .ok()
+                .filter(|n| n.is_ascii())
+                .map(str::to_ascii_lowercase);
+        }
+        p += name_len;
+    }
+    None
 }
 
 /// True if the ALPN extension body offers `acme-tls/1`.
@@ -355,7 +470,24 @@ mod tests {
 
     /// Build a minimal ClientHello record carrying the given ALPN protocols.
     fn client_hello_with_alpn(protocols: &[&[u8]]) -> Vec<u8> {
-        // Extensions: one ALPN extension.
+        client_hello(protocols, None)
+    }
+
+    /// Build a minimal ClientHello record carrying the given ALPN protocols,
+    /// after a `server_name` extension naming `sni`.
+    fn client_hello(protocols: &[&[u8]], sni: Option<&str>) -> Vec<u8> {
+        let mut ext = Vec::new();
+        if let Some(sni) = sni {
+            let mut entry = vec![0u8];
+            entry.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+            entry.extend_from_slice(sni.as_bytes());
+            let mut body = (entry.len() as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(&entry);
+            ext.extend_from_slice(&0x0000u16.to_be_bytes());
+            ext.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&body);
+        }
+        // Then one ALPN extension.
         let mut names = Vec::new();
         for proto in protocols {
             names.push(proto.len() as u8);
@@ -365,7 +497,6 @@ mod tests {
         alpn_body.extend_from_slice(&(names.len() as u16).to_be_bytes());
         alpn_body.extend_from_slice(&names);
 
-        let mut ext = Vec::new();
         ext.extend_from_slice(&0x0010u16.to_be_bytes());
         ext.extend_from_slice(&(alpn_body.len() as u16).to_be_bytes());
         ext.extend_from_slice(&alpn_body);
@@ -400,27 +531,38 @@ mod tests {
         record
     }
 
-    fn decide(buf: &[u8]) -> AlpnParse {
-        parse_client_hello_alpn(buf)
+    /// Whether the hello in `buf`, when whole, offers `acme-tls/1`.
+    fn decide(buf: &[u8]) -> Decision {
+        match parse_client_hello(buf) {
+            HelloParse::Decided(hello) => Decision::Decided(hello.acme),
+            HelloParse::NeedMore => Decision::NeedMore,
+            HelloParse::NotTls => Decision::NotTls,
+        }
+    }
+
+    enum Decision {
+        Decided(bool),
+        NeedMore,
+        NotTls,
     }
 
     #[test]
     fn detects_acme_tls_alpn() {
         let hello = client_hello_with_alpn(&[b"acme-tls/1"]);
-        assert!(matches!(decide(&hello), AlpnParse::Decided(true)));
+        assert!(matches!(decide(&hello), Decision::Decided(true)));
     }
 
     #[test]
     fn normal_alpn_is_not_acme() {
         let hello = client_hello_with_alpn(&[b"h2", b"http/1.1"]);
-        assert!(matches!(decide(&hello), AlpnParse::Decided(false)));
+        assert!(matches!(decide(&hello), Decision::Decided(false)));
     }
 
     #[test]
     fn acme_among_others_is_detected() {
         // A conformant validator offers only acme-tls/1, but be liberal.
         let hello = client_hello_with_alpn(&[b"h2", b"acme-tls/1"]);
-        assert!(matches!(decide(&hello), AlpnParse::Decided(true)));
+        assert!(matches!(decide(&hello), Decision::Decided(true)));
     }
 
     #[test]
@@ -429,19 +571,19 @@ mod tests {
         // with no extensions at all still parses to a non-ACME decision.
         let hello = client_hello_with_alpn(&[]);
         // Empty protocol list → no acme match.
-        assert!(matches!(decide(&hello), AlpnParse::Decided(false)));
+        assert!(matches!(decide(&hello), Decision::Decided(false)));
     }
 
     #[test]
     fn non_tls_first_byte_is_rejected() {
-        assert!(matches!(decide(b"GET / HTTP/1.1\r\n"), AlpnParse::NotTls));
+        assert!(matches!(decide(b"GET / HTTP/1.1\r\n"), Decision::NotTls));
     }
 
     #[test]
     fn a_truncated_record_asks_for_more() {
         let hello = client_hello_with_alpn(&[b"acme-tls/1"]);
         // Cut mid-record: header says more is coming.
-        assert!(matches!(decide(&hello[..8]), AlpnParse::NeedMore));
+        assert!(matches!(decide(&hello[..8]), Decision::NeedMore));
     }
 
     /// Re-frame a single-record ClientHello into two handshake records, split
@@ -467,7 +609,7 @@ mod tests {
         // middle and confirm ALPN is still found.
         let hello = client_hello_with_alpn(&[b"acme-tls/1"]);
         let split = fragment_into_two_records(&hello, (hello.len() - 5) / 2);
-        assert!(matches!(decide(&split), AlpnParse::Decided(true)));
+        assert!(matches!(decide(&split), Decision::Decided(true)));
     }
 
     #[test]
@@ -478,7 +620,7 @@ mod tests {
         let first_rec_end = 5 + u16::from_be_bytes([split[3], split[4]]) as usize;
         assert!(matches!(
             decide(&split[..first_rec_end]),
-            AlpnParse::NeedMore
+            Decision::NeedMore
         ));
     }
 
@@ -496,7 +638,80 @@ mod tests {
         hello[3..5].copy_from_slice(&new_rec_len.to_be_bytes());
         hello.extend_from_slice(&extra);
         // Still decides on the real ALPN (h2), not confused by the trailing junk.
-        assert!(matches!(decide(&hello), AlpnParse::Decided(false)));
+        assert!(matches!(decide(&hello), Decision::Decided(false)));
+    }
+
+    fn hello_of(buf: &[u8]) -> ClientHello {
+        match parse_client_hello(buf) {
+            HelloParse::Decided(hello) => hello,
+            _ => panic!("undecided hello"),
+        }
+    }
+
+    #[test]
+    fn the_sni_is_read_along_with_the_alpn() {
+        let hello = hello_of(&client_hello(&[b"h2"], Some("App.Example.com")));
+        assert_eq!(hello.sni.as_deref(), Some("app.example.com"));
+        assert!(!hello.acme);
+        let challenge = hello_of(&client_hello(&[b"acme-tls/1"], Some("app.example.com")));
+        assert!(challenge.acme);
+        assert_eq!(hello_of(&client_hello(&[b"h2"], None)).sni, None);
+    }
+
+    #[test]
+    fn a_wildcard_takes_one_label() {
+        assert!(sni_matches("app.example.com", "APP.example.com"));
+        assert!(!sni_matches("app.example.com", "www.app.example.com"));
+        assert!(sni_matches("*.example.com", "app.example.com"));
+        assert!(!sni_matches("*.example.com", "a.b.example.com"));
+        assert!(!sni_matches("*.example.com", "example.com"));
+        assert!(!sni_matches("*.example.com", ".example.com"));
+        assert!(!sni_matches("*.example.com", "appexample.com"));
+    }
+
+    /// A challenge goes to the responder, a name a passthrough route serves
+    /// to the passthrough listener, anything else to the HTTPS worker.
+    #[test]
+    fn a_connection_goes_to_the_backend_its_hello_names() {
+        let backends = GateBackends {
+            https_loopback_port: 1,
+            responder_port: Some(2),
+            passthrough: Some(Passthrough {
+                loopback_port: 3,
+                max_hello_bytes: PREREAD_MAX_BYTES,
+                hosts: Arc::new(RwLock::new(vec!["*.pass.example.com".into()])),
+            }),
+        };
+        let pick = |acme, sni: Option<&str>| {
+            pick_backend(
+                &ClientHello {
+                    acme,
+                    sni: sni.map(str::to_string),
+                },
+                &backends,
+            )
+        };
+        assert_eq!(
+            pick(true, Some("a.pass.example.com")),
+            Backend::Responder(2)
+        );
+        assert_eq!(
+            pick(false, Some("a.pass.example.com")),
+            Backend::Passthrough(3)
+        );
+        assert_eq!(pick(false, Some("app.example.com")), Backend::Https);
+        assert_eq!(pick(false, None), Backend::Https);
+
+        let without = GateBackends {
+            responder_port: None,
+            passthrough: None,
+            ..backends.clone()
+        };
+        let hello = ClientHello {
+            acme: true,
+            sni: Some("a.pass.example.com".into()),
+        };
+        assert_eq!(pick_backend(&hello, &without), Backend::Https);
     }
 
     #[test]

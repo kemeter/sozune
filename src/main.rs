@@ -518,7 +518,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             signal_handle.close();
             match result {
                 Ok(Ok(_)) => debug!("Proxy task completed successfully"),
-                // A proxy startup failure (e.g. the TLS-ALPN-01 gate can't bind
+                // A proxy startup failure (e.g. the TLS gate can't bind
                 // 443) must fail the process, not just log: the HTTPS worker has
                 // already moved to loopback, so continuing would leave 443
                 // unserved while the process reports success.

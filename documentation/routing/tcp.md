@@ -148,6 +148,29 @@ Both share one public port; the name decides where each connection lands. Use th
 
 `sni` is TCP-only. On a `sozune.udp.*` service it emits `W028` and is ignored — datagrams carry no ClientHello.
 
+### Passthrough on the HTTPS port
+
+To route by SNI on the HTTPS port itself, next to the routes Sōzune serves over HTTPS there, turn on `proxy.https.passthrough`:
+
+```yaml
+proxy:
+  https:
+    listen_address: 443
+    passthrough: true
+```
+
+Sōzune then runs a TCP listener named `https-passthrough` behind the HTTPS port, with no port of its own, and reads each ClientHello on 443 first. A connection whose SNI names one of that listener's routes is forwarded to it, undecrypted; any other — another name, or no SNI at all — is served over HTTPS as usual. Point a route at it like at any listener:
+
+```yaml
+labels:
+  - "sozune.enable=true"
+  - "sozune.tcp.vault.entrypoint=https-passthrough"
+  - "sozune.tcp.vault.port=8200"
+  - "sozune.tcp.vault.sni=vault.example.com"
+```
+
+A name served both ways goes to passthrough. Routes on `https-passthrough` need an `sni`: a catch-all one would get nothing. Reading the ClientHello adds a hop in front of the HTTPS listener, the one TLS-ALPN-01 already uses, so the option is off by default. On Kubernetes, a Gateway `TLS` listener on the HTTPS port is served this way (see [Gateway API (TLSRoute)](/documentation/providers/kubernetes#gateway-api-tlsroute)). The name `https-passthrough` is reserved: a `proxy.tcp` entry cannot take it.
+
 ## Limitations
 
 - **No TLS termination.** Sōzu's TCP path is pure passthrough — TLS bytes flow as-is. For client-side STARTTLS protocols (PostgreSQL, MySQL) this is fine; for terminating TLS, use an HTTPS entrypoint instead. Passthrough can still *route* by name without decrypting — see [Route by SNI](#route-by-sni-tls-passthrough).

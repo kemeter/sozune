@@ -291,7 +291,7 @@ Sample response:
   "version": "0.13.0",
   "listeners": {
     "http":  { "port": 80 },
-    "https": { "port": 443 },
+    "https": { "port": 443, "passthrough": false },
     "timeouts": { "client_idle": 60, "backend_idle": 30, "backend_connect": 3, "request": 10 },
     "tcp": [
       { "name": "postgres", "port": 5432, "ip_allow_list": ["10.0.0.0/8"], "rate_limit": { "max_conns": 20, "per_seconds": 1, "exempt": [] }, "idle_timeout": 3600 }

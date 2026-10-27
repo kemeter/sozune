@@ -405,6 +405,9 @@ pub struct ServedPorts {
     pub https: u16,
     pub tcp: HashSet<u16>,
     pub udp: HashSet<u16>,
+    /// Whether a `TLS` listener on the HTTPS port is served, by its
+    /// passthrough listener (`proxy.https.passthrough`).
+    pub https_passthrough: bool,
     pub gateway: crate::config::GatewayPortsConfig,
     /// The ports of `gateway` Sōzune could not open, as the proxy reported.
     pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
@@ -417,6 +420,7 @@ impl ServedPorts {
             https: proxy.https.listen_address,
             tcp: proxy.tcp.iter().map(|l| l.listen).collect(),
             udp: proxy.udp.iter().map(|l| l.listen).collect(),
+            https_passthrough: proxy.https.passthrough,
             gateway: proxy.gateway_ports.clone(),
             unopened: Default::default(),
         }
@@ -3079,6 +3083,8 @@ fn build_listener_status(
         }
         // A TLS listener carries TLSRoutes in Passthrough mode only.
         "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (None, None),
+        // On the HTTPS port, by its passthrough listener when it has one.
+        "TLS" if served.https_passthrough && port == Some(served.https) => (Some("TLSRoute"), None),
         "TLS" | "TCP" => (
             Some(if protocol == "TLS" {
                 "TLSRoute"
@@ -6390,6 +6396,7 @@ fn log_udp_route(action: &str, route: &UDPRoute) {
 pub type TcpListenerPorts = Arc<ListenerPorts>;
 
 /// The listener serving each port a Gateway listener may declare.
+#[derive(Clone)]
 pub struct ListenerPorts {
     declared: HashMap<i32, String>,
     open: Vec<crate::config::PortRange>,
@@ -6420,6 +6427,23 @@ impl FromIterator<(i32, String)> for ListenerPorts {
             open_name: crate::config::gateway_tcp_listener,
         }
     }
+}
+
+/// [`tcp_listener_ports`] for TLSRoutes: with `proxy.https.passthrough`, the
+/// HTTPS port (`passthrough`) is served by its passthrough listener too.
+pub fn tls_listener_ports(
+    tcp: &[crate::config::TcpListenerConfig],
+    gateway_ports: &crate::config::GatewayPortsConfig,
+    passthrough: Option<u16>,
+) -> TcpListenerPorts {
+    let mut ports = ListenerPorts::clone(&tcp_listener_ports(tcp, gateway_ports));
+    if let Some(port) = passthrough {
+        ports.declared.insert(
+            i32::from(port),
+            crate::config::HTTPS_PASSTHROUGH_LISTENER.to_string(),
+        );
+    }
+    Arc::new(ports)
 }
 
 /// Build the port → listener-name table from the proxy config.
@@ -7266,6 +7290,37 @@ mod tests {
         assert_eq!(ports.get(8443).as_deref(), Some("tlsgw"));
         assert_eq!(ports.get(5432).as_deref(), Some("pg"));
         assert!(ports.get(443).is_none());
+
+        // For TLSRoutes, with passthrough on the HTTPS port.
+        let ports = tls_listener_ports(&listeners, &Default::default(), Some(443));
+        assert_eq!(
+            ports.get(443).as_deref(),
+            Some(crate::config::HTTPS_PASSTHROUGH_LISTENER)
+        );
+        assert_eq!(ports.get(8443).as_deref(), Some("tlsgw"));
+    }
+
+    /// A `TLS` listener on the HTTPS port is served once passthrough is on
+    /// there; a `TCP` one still is not.
+    #[test]
+    fn a_tls_listener_on_the_https_port_is_served_by_passthrough() {
+        let gw = gateway("default", "gw", "sozune");
+        let tls = li_tls("tls", 443, None, GatewayListenersTlsMode::Passthrough);
+        let tcp = ListenerInfo {
+            protocol: "TCP".into(),
+            ..li("tcp", 443, None)
+        };
+        let mut served = served();
+        let programmed = |served: &ServedPorts, l: &ListenerInfo| {
+            let status = build_listener_status(&gw, l, served, 0, None);
+            condition_of(&status, CONDITION_TYPE_PROGRAMMED)
+                .status
+                .clone()
+        };
+        assert_eq!(programmed(&served, &tls), "False");
+        served.https_passthrough = true;
+        assert_eq!(programmed(&served, &tls), "True");
+        assert_eq!(programmed(&served, &tcp), "False");
     }
 
     #[test]
@@ -9799,6 +9854,7 @@ mod tests {
             https: 443,
             tcp: HashSet::from([5432]),
             udp: HashSet::from([53]),
+            https_passthrough: false,
             gateway: crate::config::GatewayPortsConfig {
                 tcp: vec!["9000-9099".parse().unwrap()],
                 udp: vec!["5353".parse().unwrap()],
