@@ -39,6 +39,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- The HTTP provider only applied a change to a route it already served when its backends or hostnames changed: a new path, condition, TLS setting or middleware was ignored until Sōzune restarted. Any change is now applied on the next poll.
 - Sōzune could hang on shutdown, never exiting until killed with `SIGKILL`: a Sōzu worker that read the closing of its command channel as an error kept running, and the process waited for it. Every worker is now told to stop, and a proxy still stuck after the 10 s grace period no longer keeps the process alive.
 - A Docker route that only redirects (`redirect=permanent` or `unauthorized`) was dropped when Sōzune started, and every one of them was dropped whenever any container stopped: such a route has no backend, which read as "nothing left to serve". It now stays as long as a container declares it. A container stopping also no longer removes routes of another provider.
 - A retry (`retry.attempts`) went to the backend that had just failed, though the documentation said each attempt runs backend selection again. It now does, so a retry can land on another backend.
