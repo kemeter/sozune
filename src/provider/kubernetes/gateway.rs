@@ -31,8 +31,8 @@ use super::gateway_filters;
 use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
 use crate::model::{
-    Backend, Entrypoint, EntrypointConfig, LoadBalancer, PathConfig, PathRewrite, PathRuleType,
-    Protocol, UrlRewrite,
+    Backend, Entrypoint, EntrypointConfig, LoadBalancer, Mirror, PathConfig, PathRewrite,
+    PathRuleType, Protocol, UrlRewrite,
 };
 use futures_util::StreamExt;
 use gateway_api::apis::experimental::tcproutes::{
@@ -54,8 +54,8 @@ use gateway_api::apis::standard::gateways::{
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesBackendRefs,
-    HTTPRouteRulesMatches, HTTPRouteRulesMatchesPathType, HTTPRouteStatus, HTTPRouteStatusParents,
-    HTTPRouteStatusParentsParentRef,
+    HTTPRouteRulesFilters, HTTPRouteRulesMatches, HTTPRouteRulesMatchesPathType, HTTPRouteStatus,
+    HTTPRouteStatusParents, HTTPRouteStatusParentsParentRef,
 };
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -3825,20 +3825,20 @@ fn apply_route(
     // re_resolve_all from the Gateway watcher) and deactivate cleanly
     // when one disappears.
     //
-    // Routes that declare unsupported filters (requestMirror, extensionRef)
-    // or the conflicting requestRedirect+urlRewrite pair are also dropped:
-    // routing them as if the filter wasn't there would silently rewrite
-    // user intent. Worse than refusing the route — better to surface the
-    // problem so the user knows to fall back to Ingress annotations until
-    // filter support lands. (requestRedirect, requestHeaderModifier,
-    // responseHeaderModifier and urlRewrite are honoured.)
+    // Routes that declare unsupported filters (extensionRef) or the
+    // conflicting requestRedirect+urlRewrite pair are also dropped: routing
+    // them as if the filter wasn't there would silently rewrite user intent.
+    // Worse than refusing the route — better to surface the problem so the
+    // user knows to fall back to Ingress annotations until filter support
+    // lands. (requestRedirect, requestHeaderModifier, responseHeaderModifier,
+    // urlRewrite and requestMirror are honoured.)
     let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
         (RouteOutcome::NotMine, Vec::new())
     } else if route_has_unsupported_filters(route, resolver, scope) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect, requestHeaderModifier, responseHeaderModifier and urlRewrite are supported; requestMirror and extensionRef are not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect, requestHeaderModifier, responseHeaderModifier, urlRewrite and requestMirror are supported; extensionRef is not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -3949,7 +3949,12 @@ fn apply_route(
                 );
                 (RouteOutcome::UnsupportedFilters, Vec::new())
             } else {
-                let outcome = if !resolved {
+                // A mirror with no ready pod copies nothing: its backendRef is
+                // no more resolved than a backend's would be.
+                let mirror_unready = eps
+                    .iter()
+                    .any(|ep| ep.config.mirrors.iter().any(|m| m.backends.is_empty()));
+                let outcome = if !resolved || mirror_unready {
                     RouteOutcome::NoResolvableBackends
                 } else {
                     RouteOutcome::Accepted
@@ -4771,11 +4776,12 @@ pub fn route_to_entrypoints_with_hostnames(
 }
 
 /// True iff at least one rule in the route declares filters sōzune
-/// can't faithfully execute today (`requestMirror`, `extensionRef`, a
-/// `requestRedirect` in an unmappable form, an empty `urlRewrite`, or the
-/// conflicting `requestRedirect`+`urlRewrite` pair on one rule).
-/// `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`
-/// and `urlRewrite` are supported. The HTTPRoute watcher uses
+/// can't faithfully execute today (`extensionRef`, a `requestRedirect` in
+/// an unmappable form, an empty `urlRewrite`, an entry doing more than one
+/// thing, or the conflicting `requestRedirect`+`urlRewrite` pair on one
+/// rule). `requestRedirect`, `requestHeaderModifier`,
+/// `responseHeaderModifier`, `urlRewrite` and `requestMirror` are
+/// supported. The HTTPRoute watcher uses
 /// this as an early reject so the user sees a clear log line and a
 /// `ResolvedRefs=False` status condition rather than wrong behaviour.
 pub fn route_has_unsupported_filters(
@@ -5015,6 +5021,53 @@ fn backend_ref_usable(
             .is_empty()
 }
 
+/// Where the `requestMirror` filters of a rule copy its requests: each
+/// mirror's Service resolved to its ready pods. One that cannot be used, or
+/// has no ready pod, is kept without backends and copies nothing: the rule
+/// is served all the same, and its frontend does not move as the mirror's
+/// pods come and go.
+fn rule_mirrors(
+    namespace: &str,
+    route_name: &str,
+    rule_index: usize,
+    filters: &[HTTPRouteRulesFilters],
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> Vec<Mirror> {
+    gateway_filters::mirror_backend_refs(filters)
+        .into_iter()
+        .map(|m| {
+            let parts = BackendRefParts {
+                group: m.group.as_deref(),
+                kind: m.kind.as_deref(),
+                namespace: m.namespace.as_deref(),
+                name: &m.name,
+            };
+            if let Err(reason) = check_backend_ref_parts(namespace, parts, resolver, grants) {
+                warn!(
+                    "Gateway API: HTTPRoute {}/{} rule {} cannot mirror to {} ({:?})",
+                    namespace, route_name, rule_index, m.name, reason
+                );
+                return Mirror {
+                    backends: Vec::new(),
+                };
+            }
+            let target_ns = m.namespace.as_deref().unwrap_or(namespace);
+            let backends = m
+                .port
+                .and_then(|p| u16::try_from(p).ok())
+                .and_then(|port| {
+                    weigh_backend_refs(vec![ResolvedRef {
+                        weight: None,
+                        pods: resolver.pod_addresses(target_ns, &m.name, port, "TCP"),
+                    }])
+                })
+                .unwrap_or_default();
+            Mirror { backends }
+        })
+        .collect()
+}
+
 /// The first backendRef of `route` that cannot be used, if any.
 fn route_invalid_ref(
     route: &HTTPRoute,
@@ -5022,13 +5075,25 @@ fn route_invalid_ref(
     grants: &dyn BackendRefAuthorizer,
 ) -> Option<InvalidRef> {
     let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
-    route
-        .spec
-        .rules
-        .iter()
-        .flatten()
+    let rules = || route.spec.rules.iter().flatten();
+    let backends = rules()
         .flat_map(|rule| rule.backend_refs.iter().flatten())
-        .find_map(|b| check_backend_ref(namespace, b, resolver, grants).err())
+        .find_map(|b| check_backend_ref(namespace, b, resolver, grants).err());
+    // The Services the rules mirror to are backendRefs too.
+    backends.or_else(|| {
+        rules()
+            .flat_map(|rule| rule.filters.iter().flatten())
+            .filter_map(|f| f.request_mirror.as_ref())
+            .find_map(|m| {
+                let parts = BackendRefParts {
+                    group: m.backend_ref.group.as_deref(),
+                    kind: m.backend_ref.kind.as_deref(),
+                    namespace: m.backend_ref.namespace.as_deref(),
+                    name: &m.backend_ref.name,
+                };
+                check_backend_ref_parts(namespace, parts, resolver, grants).err()
+            })
+    })
 }
 
 /// What the watcher decided about a route, computed once and used both
@@ -5200,7 +5265,7 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters sōzune cannot represent (requestMirror and extensionRef are unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect, requestHeaderModifier, responseHeaderModifier and urlRewrite are supported)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (extensionRef is unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect, requestHeaderModifier, responseHeaderModifier, urlRewrite and requestMirror are supported)".to_string(),
         ),
         RouteOutcome::UnsupportedMatches => (
             "False",
@@ -5343,9 +5408,10 @@ fn rule_to_entrypoints(
     // ones we can map faithfully: `requestRedirect` → Sōzu's native
     // frontend redirect, `requestHeaderModifier` / `responseHeaderModifier`
     // → Sōzu's native frontend header edits, and `urlRewrite` → Sōzu's
-    // native frontend path/host rewrite (transparent, no redirect). A rule
-    // carrying any filter we can't represent (requestMirror, extensionRef),
-    // or the conflicting requestRedirect+urlRewrite pair, is refused
+    // native frontend path/host rewrite (transparent, no redirect), and
+    // `requestMirror` → a copy the middleware sends. A rule carrying any
+    // filter we can't represent (extensionRef), or the conflicting
+    // requestRedirect+urlRewrite pair, is refused
     // outright: routing it as if the filter weren't there would silently
     // rewrite user intent. The watcher also gates on
     // `route_has_unsupported_filters` to set the route status, but we
@@ -5408,6 +5474,14 @@ fn rule_to_entrypoints(
     };
 
     let (request_timeout, backend_timeout) = rule_timeouts_ms(rule);
+    let mirrors = if answers {
+        // A redirect forwards nothing to copy.
+        Vec::new()
+    } else {
+        rule_mirrors(
+            namespace, route_name, rule_index, &filters, resolver, grants,
+        )
+    };
 
     // Gateway API: matches inside a rule are OR'd. Emit one entrypoint
     // per match. A rule with no matches at all is "match anything" —
@@ -5519,6 +5593,7 @@ fn rule_to_entrypoints(
                     match_client_ip: Vec::new(),
                     answer: invalid_backends.then_some(crate::model::FixedAnswer::InvalidBackends),
                     ip_allow_list: Vec::new(),
+                    mirrors: mirrors.clone(),
                 },
                 source: Some(id),
                 candidates: Vec::new(),
@@ -6895,6 +6970,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         match_query: Vec::new(),
         match_client_ip: Vec::new(),
         answer: None,
+        mirrors: Vec::new(),
         ip_allow_list: Vec::new(),
     }
 }
@@ -9354,22 +9430,52 @@ mod tests {
         assert_eq!(eps[0].config.headers.len(), 1);
     }
 
+    /// A `requestMirror` is served: the rule's entrypoints copy their
+    /// requests to the mirror's pods, through the middleware.
     #[test]
-    fn route_with_request_mirror_is_still_unsupported() {
+    fn route_with_request_mirror_copies_its_requests() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesFiltersRequestMirror, HTTPRouteRulesFiltersRequestMirrorBackendRef,
+        };
         let filter = HTTPRouteRulesFilters {
-            request_mirror: Some(Default::default()),
+            request_mirror: Some(HTTPRouteRulesFiltersRequestMirror {
+                backend_ref: HTTPRouteRulesFiltersRequestMirrorBackendRef {
+                    name: "mirror".into(),
+                    port: Some(8080),
+                    ..Default::default()
+                },
+            }),
             ..Default::default()
         };
         let r = route_with(
             vec![rule_with_filter(vec![backend("api", 80)], vec![filter])],
             vec!["app.example.com".into()],
         );
-        assert!(route_has_unsupported_filters(
+        assert!(!route_has_unsupported_filters(
             &r,
             &r1(),
             &AllowAllBackendRefs
         ));
-        assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        assert_eq!(eps.len(), 1);
+        let mirrors = &eps[0].config.mirrors;
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].backends.len(), 1);
+        assert_eq!(mirrors[0].backends[0].port, 8080);
+        assert!(crate::middleware::needs_middleware(&eps[0].config));
+        // A mirror with no ready pod stays, copying nothing: the route keeps
+        // going through the middleware.
+        let rule_filters = r.spec.rules.as_ref().unwrap()[0].filters.clone().unwrap();
+        let mirrors = rule_mirrors(
+            "default",
+            "web",
+            0,
+            &rule_filters,
+            &r0(),
+            &AllowAllBackendRefs,
+        );
+        assert_eq!(mirrors.len(), 1);
+        assert!(mirrors[0].backends.is_empty());
     }
 
     #[test]

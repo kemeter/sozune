@@ -280,11 +280,12 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# Unsupported filters (requestMirror, extensionRef) still cause the whole
-# route to be dropped, AND the rejection is reflected in status with
+# An unsupported filter (extensionRef) still causes the whole route to be
+# dropped, AND the rejection is reflected in status with
 # reason=UnsupportedValue. Routing as if the filter wasn't there would
-# silently misrepresent intent. (requestRedirect, header modifiers and
-# urlRewrite are supported and tested separately below.)
+# silently misrepresent intent. (requestRedirect, header modifiers,
+# urlRewrite and requestMirror are supported; a route with a requestMirror
+# is checked to be served next to it.)
 # ----------------------------------------------------------------------
 log "[02] Gateway: route declaring an unsupported filter is dropped with status"
 
@@ -305,10 +306,31 @@ spec:
             type: PathPrefix
             value: /
       filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: example.com
+            kind: Plugin
+            name: unknown
+      backendRefs:
+        - name: svcb
+          port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mirror-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-mirror.k8s-test.localhost
+  rules:
+    - filters:
         - type: RequestMirror
           requestMirror:
             backendRef:
-              name: svcb
+              name: svca
               port: 80
       backendRefs:
         - name: svcb
@@ -320,9 +342,18 @@ filtered_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
     "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
 filtered_status=${filtered_status:-000}
 if [[ "$filtered_status" == "404" ]]; then
-    pass "route with requestMirror filter is not served (got 404)"
+    pass "route with an extensionRef filter is not served (got 404)"
 else
     fail "filtered route was served (got $filtered_status, expected 404)"
+fi
+
+mirror_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    -H "Host: gw-mirror.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+if [[ "$mirror_status" == "200" ]]; then
+    pass "route with a requestMirror filter is served by its own backend"
+else
+    fail "route with a requestMirror filter was not served (got '$mirror_status')"
 fi
 
 # The status must show our Accepted=False / reason=UnsupportedValue.
@@ -695,7 +726,7 @@ fi
 
 # Cleanup of the dynamically-applied resources to leave the cluster
 # tidy if the suite is re-run.
-kubectl delete httproute filtered-route foreign-route header-route rewrite-route -n sozune-test >/dev/null 2>&1 || true
+kubectl delete httproute filtered-route mirror-route foreign-route header-route rewrite-route -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gateway foreign-gw -n sozune-test >/dev/null 2>&1 || true
 kubectl delete gatewayclass foreign >/dev/null 2>&1 || true
 kubectl delete namespace gw-frontend >/dev/null 2>&1 || true

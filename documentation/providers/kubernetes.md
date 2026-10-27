@@ -426,7 +426,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `backendRef.filters` — `requestHeaderModifier` and `responseHeaderModifier`, when every backendRef of the rule that can take traffic carries the same ones: they then apply to the whole rule, Sōzu editing headers per route rather than per backend. Different filters on the backendRefs of a rule, or another kind, drop the route (`Accepted=False reason=UnsupportedValue`).
 - `backendRef.weight` — the Service's share of the rule's traffic, as the spec defines it: `weight / Σ weights`, however many pods each Service runs (a Service of 3 pods weighted 90 against one of 1 pod weighted 10 is a 90/10 split). An unset weight is `1`; a weight of `0` sends the Service no traffic, and a rule whose backendRefs all weigh `0` forwards nothing (`503`). Each pod carries an integer weight of at most 2³¹−1, so a Service cannot outweigh another by more than 2³¹−1 times the other's pod count: a ratio past that is capped.
 - `spec.rules[].timeouts` — `request` caps the whole request, from its arrival to the end of the response: the middleware, the client's body, every attempt, the response body, and a WebSocket handshake but not the tunnel after it. `backendRequest` caps each attempt on a backend, its response body included, as [`backendTimeout`](../middleware/backend-timeout.md) does. Past either, the client gets `504`, or a response cut short once it has started. `request: 0s` sets no request timeout, `backendRequest: 0s` no backend timeout. Such a rule goes through the middleware.
-- `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
+- `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite`, `requestMirror` (see [HTTPRoute filters](#httproute-filters) below). `extensionRef` is not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — Sōzune writes standard conditions back onto the resources it owns, visible via `kubectl describe` / `kubectl get`:
   - `HTTPRoute`, `TLSRoute`, `TCPRoute` and `UDPRoute` — for every `parentRef` Sōzune owns, `status.parents[]` carries `Accepted` and `ResolvedRefs` (`controllerName: kemeter.io/sozune`). Other controllers' entries are preserved untouched.
@@ -540,7 +540,7 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 
 ### What's not supported (yet)
 
-- HTTPRoute `filters` `requestMirror` and `extensionRef`. Declaring one of these (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. Use Service or Ingress annotations until support lands. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` **are** supported — see [HTTPRoute filters](#httproute-filters).)
+- HTTPRoute filter `extensionRef`. Declaring it (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` and `requestMirror` **are** supported — see [HTTPRoute filters](#httproute-filters).)
 - `GRPCRoute`.
 - A `backendRef` that is invalid (an unsupported kind, a cross-namespace ref with no `ReferenceGrant`) is left out of the rule, and its share of the traffic goes to the other backends. The spec asks for that share to be answered with `500`.
 
@@ -552,10 +552,25 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 | `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
-| `requestMirror` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
+| `requestMirror` | Yes | A copy of each request to another Service, its answer ignored (see below) |
 | `extensionRef` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
 
 A rule may combine a header modifier with **either** a `requestRedirect` **or** a `urlRewrite` (e.g. a `requestRedirect` together with a `requestHeaderModifier`); all are honoured together. `requestRedirect` and `urlRewrite` **conflict** — one redirects the client, the other transparently rewrites the forwarded request, and both target the same frontend rewrite — so a rule carrying both is rejected. A rule carrying any unsupported filter drops the whole route.
+
+#### requestMirror
+
+```yaml
+filters:
+  - type: RequestMirror
+    requestMirror:
+      backendRef:
+        name: app-next
+        port: 8080
+```
+
+Each request the rule forwards is copied to one ready pod of `app-next`, picked by weight as for a backend. The client gets the answer of the rule's own backends: the mirror's is discarded, and a mirror that is slow, down or has no ready pod changes nothing for the client. The copy carries the request as the backend gets it, headers edited by the rule's `requestHeaderModifier` and body included. Several `requestMirror` filters copy to each of their Services. A rule that redirects forwards nothing, so it copies nothing. A WebSocket upgrade is not copied: the copy would open a tunnel on the mirror with nobody at the other end.
+
+Such a route goes through the Sōzune middleware, which reads the whole request body before forwarding it (as it does for retries). A copy gives up after the rule's `backendRequest` timeout, 30 s without one, and at most 1024 copies are under way at once, all mirrors together: past that, a request is not copied, so a slow mirror cannot pile them up. A `backendRef` the route cannot use (another namespace without a `ReferenceGrant`, a Service that does not exist) makes `ResolvedRefs=False`, and is not copied to; a mirror Service with no ready pod makes it `False` with `BackendNotFound` until one is ready. `percent` and `fraction`, from the experimental channel, are not read: every request is copied.
 
 #### requestRedirect
 
@@ -840,7 +855,7 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
 - **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
-- **Gateway API: `GRPCRoute` and the `requestMirror` / `extensionRef` HTTPRoute filters are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, and `urlRewrite` filters. See the Gateway API section above for details.
+- **Gateway API: `GRPCRoute` and the `extensionRef` HTTPRoute filter are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` and `requestMirror` filters. See the Gateway API section above for details.
 - **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what [`HTTPS` listeners](#https-listeners) are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables

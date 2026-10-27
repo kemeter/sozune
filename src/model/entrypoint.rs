@@ -235,6 +235,17 @@ pub struct EntrypointConfig {
     /// the reason given.
     #[serde(default)]
     pub answer: Option<FixedAnswer>,
+    /// Each request the route serves is copied to these too, their answers
+    /// ignored.
+    #[serde(default)]
+    pub mirrors: Vec<Mirror>,
+}
+
+/// Where a route's requests are copied to: one of `backends`, picked by
+/// weight, gets each of them.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct Mirror {
+    pub backends: Vec<Backend>,
 }
 
 /// One key/value match condition used by header and query matching. An empty

@@ -510,6 +510,7 @@ mod tests {
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
                 answer: None,
+                mirrors: Vec::new(),
                 ip_allow_list: Vec::new(),
             },
             source: Some("api".to_string()),

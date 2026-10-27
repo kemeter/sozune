@@ -15,6 +15,10 @@ use super::MiddlewareAppState;
 use super::chain::{self, RequestCtx};
 use super::diag;
 
+/// How long a copy to a mirror may take, on a route without a backend
+/// timeout.
+const MIRROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Monotonic milliseconds since the process started, for circuit-breaker
 /// cooldown timing. Monotonic (not wall-clock) so clock changes don't confuse
 /// the breaker.
@@ -315,6 +319,39 @@ pub async fn handle_proxy(
                     return resp;
                 }
             };
+
+            // A copy to each mirror, its answer ignored: the client's response
+            // waits for none of them, and a mirror failing changes nothing.
+            for mirror in &route.mirrors {
+                // Too many copies under way already: this one is dropped.
+                let Ok(permit) = super::mirror_permits().try_acquire_owned() else {
+                    debug!("Mirror busy, request not copied");
+                    continue;
+                };
+                let Some((mirror_host, mirror_port)) = mirror.pick() else {
+                    continue;
+                };
+                let Ok(mirror_uri) =
+                    format!("http://{mirror_host}:{mirror_port}{forwarded_path}{query}")
+                        .parse::<Uri>()
+                else {
+                    continue;
+                };
+                let mut copy = parts.clone();
+                copy.uri = mirror_uri;
+                let copy = Request::from_parts(copy, Body::from(body_bytes.clone()));
+                let client = state.http_client.clone();
+                let limit = timeout.unwrap_or(MIRROR_TIMEOUT);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let uri = copy.uri().to_string();
+                    match tokio::time::timeout(limit, client.request(copy)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => debug!("Mirror {} failed: {}", uri, e),
+                        Err(_) => debug!("Mirror {} timed out", uri),
+                    }
+                });
+            }
 
             // Send to the backend, retrying connection-level failures and timeouts
             // (the backend produced no response). A response that arrives — even a

@@ -17,10 +17,10 @@ use crate::model::entrypoint::{
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRouteRules, HTTPRouteRulesBackendRefs, HTTPRouteRulesFilters,
-    HTTPRouteRulesFiltersRequestHeaderModifier, HTTPRouteRulesFiltersRequestRedirect,
-    HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesFiltersResponseHeaderModifier,
-    HTTPRouteRulesFiltersUrlRewrite, HTTPRouteRulesFiltersUrlRewritePath,
-    HTTPRouteRulesFiltersUrlRewritePathType,
+    HTTPRouteRulesFiltersRequestHeaderModifier, HTTPRouteRulesFiltersRequestMirrorBackendRef,
+    HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectScheme,
+    HTTPRouteRulesFiltersResponseHeaderModifier, HTTPRouteRulesFiltersUrlRewrite,
+    HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
 };
 
 /// The redirect settings a `requestRedirect` filter maps onto. These line
@@ -109,8 +109,16 @@ pub fn effective_rule_filters(
 
 fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
     // An entry carrying a still-unsupported variant fails outright.
-    if filter.request_mirror.is_some() || filter.extension_ref.is_some() {
+    if filter.extension_ref.is_some() {
         return false;
+    }
+    // A `requestMirror` entry carries nothing else: one doing more at once
+    // is not a filter the spec describes.
+    if filter.request_mirror.is_some() {
+        return filter.request_redirect.is_none()
+            && filter.request_header_modifier.is_none()
+            && filter.response_header_modifier.is_none()
+            && filter.url_rewrite.is_none();
     }
     // A `urlRewrite` must carry something we recognise (a path mode and/or a
     // hostname). An empty rewrite block is a no-op we refuse, like an empty
@@ -140,6 +148,17 @@ fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
             filter.request_header_modifier.is_some() || filter.response_header_modifier.is_some()
         }
     }
+}
+
+/// The backendRefs a rule's `requestMirror` filters copy its requests to.
+pub fn mirror_backend_refs(
+    filters: &[HTTPRouteRulesFilters],
+) -> Vec<&HTTPRouteRulesFiltersRequestMirrorBackendRef> {
+    filters
+        .iter()
+        .filter_map(|f| f.request_mirror.as_ref())
+        .map(|m| &m.backend_ref)
+        .collect()
 }
 
 /// Map a header modifier's `set` / `add` / `remove` lists onto
@@ -578,17 +597,20 @@ mod tests {
     }
 
     #[test]
-    fn request_mirror_is_unsupported() {
-        let f = HTTPRouteRulesFilters {
-            request_redirect: None,
-            request_header_modifier: None,
-            response_header_modifier: None,
+    fn a_request_mirror_is_supported_alone_in_its_entry() {
+        let mirror = HTTPRouteRulesFilters {
             request_mirror: Some(Default::default()),
-            url_rewrite: None,
-            extension_ref: None,
-            r#type: Default::default(),
+            ..Default::default()
         };
-        assert!(!rule_filters_supported(&[f]));
+        let headers = HTTPRouteRulesFilters {
+            request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+                remove: Some(vec!["X-A".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(rule_filters_supported(&[mirror.clone(), headers]));
+        assert_eq!(mirror_backend_refs(&[mirror]).len(), 1);
     }
 
     use gateway_api::apis::standard::httproutes::{

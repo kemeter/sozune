@@ -176,6 +176,46 @@ pub struct MiddlewareRoute {
     /// The `Host` the backend gets instead of the client's, the client's
     /// going in `X-Forwarded-Host`.
     pub rewrite_host: Option<String>,
+    /// Where each request is copied to, its answer ignored.
+    pub mirrors: Vec<MirrorTarget>,
+}
+
+/// One of a route's mirrors: its backends, and how to pick one.
+pub struct MirrorTarget {
+    pub backends: Vec<(String, u16)>,
+    pub balancer: WeightedRoundRobin,
+}
+
+/// How many copies to mirrors may be under way at once, all routes together:
+/// a slow mirror would otherwise hold a connection and a body for every
+/// request. Past it, a copy is dropped: the request it copies goes on all the
+/// same. One limit for the process, so a reload rebuilding the routes does not
+/// give them a fresh one while earlier copies still run.
+pub const MIRROR_MAX_IN_FLIGHT: usize = 1024;
+
+/// The permits of [`MIRROR_MAX_IN_FLIGHT`].
+pub fn mirror_permits() -> Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    Arc::clone(PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MIRROR_MAX_IN_FLIGHT))))
+}
+
+impl MirrorTarget {
+    fn new(mirror: &crate::model::Mirror) -> Self {
+        let weights: Vec<u32> = mirror.backends.iter().map(|b| b.weight).collect();
+        Self {
+            backends: mirror
+                .backends
+                .iter()
+                .map(|b| (b.address.clone(), b.port))
+                .collect(),
+            balancer: WeightedRoundRobin::new(&weights),
+        }
+    }
+
+    /// The backend the next copy goes to.
+    pub fn pick(&self) -> Option<&(String, u16)> {
+        self.balancer.next().and_then(|i| self.backends.get(i))
+    }
 }
 
 impl std::fmt::Debug for MiddlewareRoute {
@@ -577,6 +617,8 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.retry.as_ref().is_some_and(|r| r.attempts > 1)
         // The circuit breaker is enforced in the middleware proxy handler.
         || config.circuit_breaker.is_some()
+        // So is the copy of each request to a mirror.
+        || !config.mirrors.is_empty()
 }
 
 /// Build middleware route from entrypoint config.
@@ -716,6 +758,7 @@ pub fn build_middleware_route(
         circuit_breaker,
         middlewares,
         rewrite_host: url_rewrite_host(config).map(str::to_string),
+        mirrors: config.mirrors.iter().map(MirrorTarget::new).collect(),
     })
 }
 
@@ -772,6 +815,7 @@ mod route_key_tests {
             circuit_breaker: None,
             middlewares: Vec::new(),
             rewrite_host: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -954,6 +998,7 @@ mod route_key_tests {
             circuit_breaker: None,
             middlewares: Vec::new(),
             rewrite_host: None,
+            mirrors: Vec::new(),
         })
     }
 
