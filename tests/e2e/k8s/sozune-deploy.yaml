@@ -101,6 +101,7 @@ data:
       gateway_ports:
         tcp: ["18447"]
         udp: ["18448"]
+        https: ["18449"]
 
     middleware:
       port: 13180

@@ -469,10 +469,11 @@ async fn resolve_route(
         acme_enabled: state.acme_enabled,
         trusted_proxies: &trusted_proxies,
         plugins: &state.plugins,
-        http_ports: Some((
-            state.config.proxy.http.listen_address,
-            &state.config.proxy.gateway_ports,
-        )),
+        ports: Some(crate::proxy::resolve::ListenerPorts {
+            http: state.config.proxy.http.listen_address,
+            https: state.config.proxy.https.listen_address,
+            gateway: &state.config.proxy.gateway_ports,
+        }),
     };
     match crate::proxy::resolve::resolve(&inputs, &request).await {
         Ok(resolution) => Json(resolution).into_response(),

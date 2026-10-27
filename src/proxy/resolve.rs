@@ -30,7 +30,7 @@ use crate::proxy::health::UnhealthyMap;
 use crate::proxy::sozu::{
     ACME_CHALLENGE_CLUSTER, FrontListener, build_acme_frontend, build_acme_twins,
     build_http_frontends, fill_middleware_table, header_predicate, listener_http_port,
-    routing_order,
+    listener_https_port, routing_order,
 };
 use crate::util::fuzzy::closest_match;
 
@@ -154,9 +154,16 @@ pub struct ResolveInputs<'a> {
     /// The WASM plugins the proxy loaded: a route's chain holds them at their
     /// place, and leaves out the ones it names but the proxy does not have.
     pub plugins: &'a PluginRegistry,
-    /// The main HTTP port and the ports Gateway HTTP listeners are served on
-    /// (`proxy.gateway_ports.http`), when known.
-    pub http_ports: Option<(u16, &'a crate::config::GatewayPortsConfig)>,
+    /// The main HTTP and HTTPS ports and those Gateway listeners are served
+    /// on (`proxy.gateway_ports`), when known.
+    pub ports: Option<ListenerPorts<'a>>,
+}
+
+/// The ports the HTTP and HTTPS listeners are on.
+pub struct ListenerPorts<'a> {
+    pub http: u16,
+    pub https: u16,
+    pub gateway: &'a crate::config::GatewayPortsConfig,
 }
 
 /// The request reduced to what routing looks at.
@@ -396,14 +403,13 @@ fn route_with_sozu(inputs: &ResolveInputs<'_>, target: &Target) -> SozuDecision 
     let mut router = Router::new();
     let mut refused = BTreeMap::new();
     let any_address = SocketAddress::new_v4(0, 0, 0, 0, 0);
-    let http_port = target_http_port(inputs, target);
+    let target_port = target_listener_port(inputs, target);
 
     for (cluster_id, entrypoint) in routing_order(inputs.live) {
         if entrypoint.protocol != Protocol::Http {
             continue;
         }
-        if target.listener == FrontListener::Http && listener_http_port(entrypoint, 0) != http_port
-        {
+        if listener_port(entrypoint, target.listener) != target_port {
             continue;
         }
         // Challenge frontends go on each route's own listener too.
@@ -463,22 +469,35 @@ fn route_with_sozu(inputs: &ResolveInputs<'_>, target: &Target) -> SozuDecision 
     }
 }
 
-/// The HTTP listener a request reaches, by its port: that of a Gateway
-/// listener of its own when the URL names it, the main one (`0`) otherwise.
-fn target_http_port(inputs: &ResolveInputs<'_>, target: &Target) -> u16 {
+/// The port of the listener `listener` an entrypoint's frontends go on: that
+/// of its Gateway listener, `0` for the main one.
+fn listener_port(entrypoint: &Entrypoint, listener: FrontListener) -> u16 {
+    match listener {
+        FrontListener::Http => listener_http_port(entrypoint, 0),
+        FrontListener::Https => listener_https_port(entrypoint, 0),
+    }
+}
+
+/// The listener a request reaches, by its port: that of a Gateway listener of
+/// its own when the URL names it, the main one (`0`) otherwise.
+fn target_listener_port(inputs: &ResolveInputs<'_>, target: &Target) -> u16 {
     // From the routes stored as well as those live: one Sōzu left out still
     // keeps its listener's port from the main listener.
     let own_ports: BTreeSet<u16> = inputs
         .live
         .values()
         .chain(inputs.storage.values())
-        .map(|ep| listener_http_port(ep, 0))
+        .map(|ep| listener_port(ep, target.listener))
         .filter(|port| *port != 0)
         .collect();
     let configured = |p: &u16| {
         inputs
-            .http_ports
-            .is_some_and(|(main, gateway)| *p != main && gateway.allows_http(*p))
+            .ports
+            .as_ref()
+            .is_some_and(|ports| match target.listener {
+                FrontListener::Http => *p != ports.http && ports.gateway.allows_http(*p),
+                FrontListener::Https => *p != ports.https && ports.gateway.allows_https(*p),
+            })
     };
     target
         .port
@@ -505,8 +524,7 @@ fn explain_candidates(
         if entrypoint.protocol != Protocol::Http
             || decision.cluster_id.as_deref() == Some(cluster_id.as_str())
             || !hostnames_match(&entrypoint.config.hostnames, &target.host)
-            || (target.listener == FrontListener::Http
-                && listener_http_port(entrypoint, 0) != target_http_port(inputs, target))
+            || listener_port(entrypoint, target.listener) != target_listener_port(inputs, target)
         {
             continue;
         }
@@ -1030,7 +1048,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest = serde_json::from_value(request).unwrap();
         resolve(&inputs, &request).await.unwrap()
@@ -1062,6 +1080,35 @@ mod tests {
         assert_eq!(served_by(&on_8080), Some("admin"));
         assert!(on_8080.candidates.is_empty());
         let on_main = resolve_in(routes(), get("http://app.example.com/")).await;
+        assert_eq!(served_by(&on_main), Some("main"));
+        assert!(on_main.candidates.is_empty());
+    }
+
+    /// The HTTPS twin of [`a_request_reaches_the_listener_of_its_port`].
+    #[tokio::test]
+    async fn an_https_request_reaches_the_listener_of_its_port() {
+        let routes = || {
+            vec![
+                route(
+                    "main",
+                    &["app.example.com"],
+                    serde_json::json!({ "tls": true }),
+                ),
+                route(
+                    "admin",
+                    &["app.example.com"],
+                    serde_json::json!({
+                        "entrypoint": "gateway:https:8443",
+                        "tls": true,
+                        "https_only": true,
+                    }),
+                ),
+            ]
+        };
+        let on_8443 = resolve_in(routes(), get("https://app.example.com:8443/")).await;
+        assert_eq!(served_by(&on_8443), Some("admin"));
+        assert!(on_8443.candidates.is_empty());
+        let on_main = resolve_in(routes(), get("https://app.example.com/")).await;
         assert_eq!(served_by(&on_main), Some("main"));
         assert!(on_main.candidates.is_empty());
     }
@@ -1480,7 +1527,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/api/users")).unwrap();
@@ -1512,7 +1559,7 @@ mod tests {
             acme_enabled: true,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest = serde_json::from_value(serde_json::json!({
             "url": "http://app.example.com/.well-known/acme-challenge/token",
@@ -1546,7 +1593,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/")).unwrap();
@@ -1575,7 +1622,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest = serde_json::from_value(serde_json::json!({
             "url": "http://app.example.com/",
@@ -1637,7 +1684,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/")).unwrap();
@@ -1689,7 +1736,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/")).unwrap();
@@ -1721,7 +1768,7 @@ mod tests {
             acme_enabled: false,
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
-            http_ports: None,
+            ports: None,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("app.example.com/no-scheme")).unwrap();

@@ -3,8 +3,9 @@
 #
 # A Gateway declares an HTTPS listener whose certificateRefs name a TLS
 # Secret. Its HTTPRoute is served over HTTPS with that certificate, on
-# Sōzune's HTTPS port, and its plain HTTP requests are redirected there. A
-# missing Secret is reported on the listener.
+# Sōzune's HTTPS port, and its plain HTTP requests are redirected there. An
+# HTTPS listener on a port of `proxy.gateway_ports.https` is served on that
+# port. A missing Secret is reported on the listener.
 #
 # Sourced by run-k8s.sh after 06-gateway-ports.sh.
 
@@ -46,6 +47,7 @@ metadata:
 spec:
   parentRefs:
     - name: httpsgw
+      sectionName: https
   hostnames:
     - $GW_HTTPS_HOST
   rules:
@@ -102,6 +104,89 @@ if [[ "$location" == https://* ]]; then
     pass "Plain HTTP is redirected to HTTPS"
 else
     fail "Plain HTTP was not redirected to HTTPS (Location: '$location')"
+fi
+
+log "[07] Gateway HTTPS: a listener on a port of gateway_ports.https"
+
+GW_OWN_HOST="gw-https-own.k8s-test.localhost"
+kubectl patch gateway httpsgw -n sozune-test --type=json -p "[
+  {\"op\": \"add\", \"path\": \"/spec/listeners/-\", \"value\": {
+    \"name\": \"own\", \"protocol\": \"HTTPS\", \"port\": $GATEWAY_HTTPS_PORT,
+    \"tls\": {\"certificateRefs\": [{\"name\": \"gw-https-tls\"}]}}}
+]" >/dev/null
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: https-own-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: httpsgw
+      sectionName: own
+  hostnames:
+    - $GW_OWN_HOST
+  rules:
+    - backendRefs:
+        - name: svca
+          port: 80
+EOF
+
+code=""
+for _ in $(seq 1 30); do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
+        --resolve "$GW_OWN_HOST:$GATEWAY_HTTPS_PORT:127.0.0.1" "https://$GW_OWN_HOST:$GATEWAY_HTTPS_PORT/" 2>/dev/null)
+    [[ "$code" == "200" ]] && break
+    sleep 2
+done
+if [[ "$code" == "200" ]]; then
+    pass "The route answers over HTTPS on the listener's port"
+else
+    fail "The route did not answer on the listener's port (got: '$code')"
+fi
+
+subject=$(printf '' | openssl s_client -connect "127.0.0.1:$GATEWAY_HTTPS_PORT" \
+    -servername "$GW_HTTPS_HOST" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
+if [[ "$subject" == *"$GW_HTTPS_HOST"* ]]; then
+    pass "The listener's port presents the Secret's certificate"
+else
+    fail "The listener's port did not present the Secret's certificate (got: '$subject')"
+fi
+
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
+    --resolve "$GW_OWN_HOST:$HTTPS_PORT:127.0.0.1" "https://$GW_OWN_HOST:$HTTPS_PORT/" 2>/dev/null)
+if [[ "$code" != "200" ]]; then
+    pass "The route is not served on the main HTTPS port"
+else
+    fail "The route is served on the main HTTPS port too"
+fi
+
+# Whether a TLS handshake on the listener's port presents a certificate: a
+# TCP connection alone tells nothing, kind's port mapping accepts it anyway.
+own_port_handshakes() {
+    printf '' | timeout 5 openssl s_client -connect "127.0.0.1:$GATEWAY_HTTPS_PORT" \
+        -servername "$GW_HTTPS_HOST" 2>/dev/null | openssl x509 -noout -subject >/dev/null 2>&1
+}
+
+if own_port_handshakes; then
+    pass "The HTTPS port completes a handshake while a route is attached"
+else
+    fail "The HTTPS port completes no handshake while a route is attached"
+fi
+
+kubectl delete httproute https-own-route -n sozune-test >/dev/null 2>&1
+closed=""
+for _ in $(seq 1 30); do
+    if ! own_port_handshakes; then
+        closed="yes"
+        break
+    fi
+    sleep 2
+done
+if [[ "$closed" == "yes" ]]; then
+    pass "The HTTPS port closes with its last route"
+else
+    fail "The HTTPS port stayed open after its route was deleted"
 fi
 
 log "[07] Gateway HTTPS: a missing Secret is reported on the listener"
