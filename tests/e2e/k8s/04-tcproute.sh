@@ -42,3 +42,18 @@ else
     fail "TCPRoute did not reach the backend (got: '$reply')"
     kubectl get tcproute -n sozune-test -o wide 2>/dev/null
 fi
+
+log "[04] TCPRoute: its status reports Accepted and ResolvedRefs"
+
+accepted=""
+for _ in $(seq 1 30); do
+    accepted=$(kubectl get tcproute tcp-raw -n sozune-test \
+        -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}/{.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' 2>/dev/null)
+    [[ "$accepted" == "True/True" ]] && break
+    sleep 2
+done
+if [[ "$accepted" == "True/True" ]]; then
+    pass "TCPRoute status: Accepted and ResolvedRefs"
+else
+    fail "TCPRoute status is not Accepted/ResolvedRefs (got: '$accepted')"
+fi
