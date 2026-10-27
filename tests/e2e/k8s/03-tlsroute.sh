@@ -79,3 +79,73 @@ if [[ "$unknown" == *"k8s-tls-passthrough-ok"* ]]; then
 else
     pass "unmatched SNI reaches no backend"
 fi
+
+log "[03] TLSRoute: a TLS listener on the HTTPS port (proxy.https.passthrough)"
+
+PT_HTTPS_HOST="passthrough-https.k8s-test.localhost"
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tls-https-gw
+  namespace: sozune-test
+spec:
+  gatewayClassName: sozune
+  listeners:
+    - name: passthrough
+      protocol: TLS
+      port: $HTTPS_PORT
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        kinds:
+          - kind: TLSRoute
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: tls-https-passthrough
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: tls-https-gw
+  hostnames:
+    - $PT_HTTPS_HOST
+  rules:
+    - backendRefs:
+        - name: svc-tls
+          port: 8443
+EOF
+
+banner=""
+for _ in $(seq 1 30); do
+    banner=$(timeout 5 openssl s_client -connect "127.0.0.1:$HTTPS_PORT" \
+        -servername "$PT_HTTPS_HOST" -quiet -verify_quiet </dev/null 2>/dev/null || true)
+    [[ "$banner" == *"k8s-tls-passthrough-ok"* ]] && break
+    sleep 2
+done
+if [[ "$banner" == *"k8s-tls-passthrough-ok"* ]]; then
+    pass "A TLSRoute on the HTTPS port reaches its backend undecrypted"
+else
+    fail "A TLSRoute on the HTTPS port did not reach its backend (got: '$banner')"
+fi
+
+accepted=$(kubectl get tlsroute tls-https-passthrough -n sozune-test \
+    -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}' 2>/dev/null)
+if [[ "$accepted" == "True" ]]; then
+    pass "The TLSRoute reports Accepted"
+else
+    fail "The TLSRoute does not report Accepted (got: '$accepted')"
+fi
+
+# Any other name on the HTTPS port is still served over HTTPS.
+other=$(timeout 5 openssl s_client -connect "127.0.0.1:$HTTPS_PORT" \
+    -servername "nope.k8s-test.localhost" -quiet -verify_quiet </dev/null 2>/dev/null || true)
+if [[ "$other" == *"k8s-tls-passthrough-ok"* ]]; then
+    fail "Another name on the HTTPS port was passed through (got: '$other')"
+else
+    pass "Another name on the HTTPS port is not passed through"
+fi
+
+kubectl delete tlsroute tls-https-passthrough -n sozune-test >/dev/null 2>&1
+kubectl delete gateway tls-https-gw -n sozune-test >/dev/null 2>&1

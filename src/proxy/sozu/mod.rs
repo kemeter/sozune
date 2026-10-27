@@ -14,7 +14,7 @@ use crate::model::{Backend, Entrypoint, HeaderConfig, HeaderDirection, LoadBalan
 use crate::proxy::backend::ProxyInputs;
 use crate::proxy::health::{UnhealthyMap, probe_key};
 use crate::proxy::metrics_snapshot;
-use crate::proxy::tls_alpn_gate;
+use crate::proxy::tls_gate;
 use acme::{
     add_certificate, register_acme_challenge_cluster, remove_certificate, replace_certificate,
 };
@@ -186,7 +186,7 @@ struct Channels {
     http_port: u16,
     https_port: u16,
     /// Octets of the IP the HTTPS worker listens on. `0.0.0.0` normally, but
-    /// `127.0.0.1` when the ALPN gate fronts 443 and the worker moved to
+    /// `127.0.0.1` when the TLS gate fronts 443 and the worker moved to
     /// loopback. HTTPS frontends and certificates must attach to this exact
     /// address, or Sōzu rejects them ("found no listener with address …").
     https_ip: [u8; 4],
@@ -210,7 +210,7 @@ struct Channels {
 impl Channels {
     /// The address the HTTPS worker's listener is bound to. HTTPS frontends and
     /// certificates must attach here — using `0.0.0.0` when the worker is on
-    /// loopback (behind the ALPN gate) makes Sōzu reject them.
+    /// loopback (behind the TLS gate) makes Sōzu reject them.
     fn https_addr(&self) -> SocketAddress {
         let [a, b, c, d] = self.https_ip;
         SocketAddress::new_v4(a, b, c, d, self.https_port)
@@ -377,6 +377,12 @@ fn spawn_tcp_workers(
         if crate::config::gateway_tcp_port(&tcp_cfg.name).is_some() {
             anyhow::bail!(
                 "TCP listener name `{}` in proxy.tcp is reserved for the listeners Gateways open",
+                tcp_cfg.name
+            );
+        }
+        if tcp_cfg.name == crate::config::HTTPS_PASSTHROUGH_LISTENER {
+            anyhow::bail!(
+                "TCP listener name `{}` in proxy.tcp is reserved for the passthrough routes of proxy.https",
                 tcp_cfg.name
             );
         }
@@ -633,13 +639,16 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     // What a Gateway HTTP listener on a port of its own is built from.
     let http_listener_template = http_listener.clone();
 
-    // With the ALPN gate active, the HTTPS worker steps off the public 443 onto
-    // loopback and the gate owns 443, prereading each connection's ALPN. Bound
-    // to 127.0.0.1 so nothing but the gate can reach it. Without the gate, the
+    // With the TLS gate active (TLS-ALPN-01, or passthrough on the HTTPS
+    // port), the HTTPS worker steps off the public 443 onto loopback and the
+    // gate owns 443, prereading each connection's ClientHello. Bound to
+    // 127.0.0.1 so nothing but the gate can reach it. Without the gate, the
     // worker binds the public 443 directly — the unchanged default.
-    let (https_bind_ip, https_bind_port) = match tls_alpn_responder_port {
-        Some(_) => (Ipv4Addr::LOCALHOST, pick_loopback_port()?),
-        None => (Ipv4Addr::UNSPECIFIED, config.https.listen_address),
+    let gated = tls_alpn_responder_port.is_some() || config.https.passthrough;
+    let (https_bind_ip, https_bind_port) = if gated {
+        (Ipv4Addr::LOCALHOST, pick_loopback_port()?)
+    } else {
+        (Ipv4Addr::UNSPECIFIED, config.https.listen_address)
     };
     let https_bind = https_bind_ip.octets();
     let mut https_builder = ListenerBuilder::new_https(SocketAddress::new_v4(
@@ -658,7 +667,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     // real client IP. So the gate prepends a PROXY-v2 header carrying the true
     // peer, and the worker is told to expect it — otherwise client-IP matching,
     // allow-lists and access logs would all read 127.0.0.1.
-    if tls_alpn_responder_port.is_some() {
+    if gated {
         https_builder.with_expect_proxy(true);
     }
     let https_listener = https_builder
@@ -705,7 +714,34 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     wait_for_worker_ready(&mut command_channel_https, "HTTPS", timeout)?;
 
     // Spawn one Sōzu TCP worker per declared listener.
-    let (tcp_channels, tcp_worker_handles, tcp_forwarders) = spawn_tcp_workers(config)?;
+    let (mut tcp_channels, mut tcp_worker_handles, tcp_forwarders) = spawn_tcp_workers(config)?;
+    // The passthrough routes of the HTTPS port: a TCP listener the gate
+    // splices to, with no public port of its own.
+    let passthrough = if config.https.passthrough {
+        // A ClientHello the gate read whole, the worker reads too: up to its
+        // buffer, which bounds its preread whatever the setting.
+        let max_hello_bytes = tls_gate::PREREAD_MAX_BYTES.min(config.buffer_size);
+        let listener = crate::config::TcpListenerConfig {
+            name: crate::config::HTTPS_PASSTHROUGH_LISTENER.to_string(),
+            listen: config.https.listen_address,
+            ip_allow_list: Vec::new(),
+            rate_limit: None,
+            sni_preread_timeout: None,
+            sni_preread_max_bytes: u32::try_from(max_hello_bytes).ok(),
+            idle_timeout: None,
+        };
+        let (channel, handle, forwarder) =
+            spawn_tcp_worker(&listener, WorkerSettings::from_config(config))?;
+        tcp_channels.insert(listener.name, channel);
+        tcp_worker_handles.push(handle);
+        Some(tls_gate::Passthrough {
+            loopback_port: forwarder.loopback_port,
+            max_hello_bytes,
+            hosts: Arc::new(RwLock::new(Vec::new())),
+        })
+    } else {
+        None
+    };
     let (udp_channels, udp_worker_handles) = spawn_udp_workers(config)?;
 
     // Spawn one pre-accept forwarder per TCP listener: it owns the public port,
@@ -723,27 +759,33 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         "Sōzu HTTP worker running on 0.0.0.0:{}",
         config.http.listen_address
     );
-    match tls_alpn_responder_port {
-        Some(_) => info!(
-            "Sōzu HTTPS worker running on 127.0.0.1:{https_bind_port} (behind the TLS-ALPN-01 gate on :{})",
+    if gated {
+        info!(
+            "Sōzu HTTPS worker running on 127.0.0.1:{https_bind_port} (behind the TLS gate on :{})",
             config.https.listen_address
-        ),
-        None => info!(
+        );
+    } else {
+        info!(
             "Sōzu HTTPS worker running on 0.0.0.0:{}",
             config.https.listen_address
-        ),
+        );
     }
 
-    // Front 443 with the ALPN-aware gate when a tls-alpn-01 resolver exists:
-    // `acme-tls/1` handshakes go to the responder, everything else to the HTTPS
-    // worker now on `https_bind_port`. Bind synchronously so a taken 443 fails
-    // startup here — the worker has already moved to loopback, so a silent gate
-    // failure would leave 443 unserved.
-    if let Some(responder_port) = tls_alpn_responder_port {
+    // Front 443 with the TLS gate: `acme-tls/1` handshakes go to the
+    // responder, those naming a passthrough route to its listener, everything
+    // else to the HTTPS worker now on `https_bind_port`. Bind synchronously so
+    // a taken 443 fails startup here — the worker has already moved to
+    // loopback, so a silent gate failure would leave 443 unserved.
+    if gated {
         let public_port = config.https.listen_address;
-        let listener = handle.block_on(tls_alpn_gate::bind(public_port))?;
+        let listener = handle.block_on(tls_gate::bind(public_port))?;
+        let backends = tls_gate::GateBackends {
+            https_loopback_port: https_bind_port,
+            responder_port: tls_alpn_responder_port,
+            passthrough: passthrough.clone(),
+        };
         handle.spawn(async move {
-            tls_alpn_gate::run(listener, public_port, https_bind_port, responder_port).await;
+            tls_gate::run(listener, public_port, backends).await;
         });
     }
 
@@ -950,6 +992,15 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                         e
                     ),
                 }
+                if let Some(passthrough) = &passthrough {
+                    match passthrough.hosts.write() {
+                        Ok(mut hosts) => *hosts = passthrough_hosts(&previous_snapshot),
+                        Err(e) => error!(
+                            "internal state corrupted (passthrough hosts), restart required: {}",
+                            e
+                        ),
+                    }
+                }
             }
         });
     });
@@ -1019,6 +1070,23 @@ impl HeldCertificate {
     ) -> anyhow::Result<()> {
         remove_certificate(channel, address, &self.cert_pem)
     }
+}
+
+/// The SNI patterns of the live routes on the passthrough listener of the
+/// HTTPS port, which the TLS gate sends there.
+fn passthrough_hosts(live: &RoutingSnapshot) -> Vec<String> {
+    let mut hosts: Vec<String> = live
+        .values()
+        .filter(|ep| {
+            ep.protocol == Protocol::Tcp
+                && ep.config.entrypoint.as_deref()
+                    == Some(crate::config::HTTPS_PASSTHROUGH_LISTENER)
+        })
+        .filter_map(|ep| ep.config.sni.as_deref().map(str::to_ascii_lowercase))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Hand a certificate to the HTTPS worker, or take one back. Returns whether
@@ -4283,6 +4351,35 @@ mod tests {
         assert!(release_certificate(&mut holders, "cd"));
     }
 
+    /// The TLS gate sends the passthrough listener the SNIs of its routes,
+    /// and no other listener's.
+    #[test]
+    fn passthrough_hosts_are_the_snis_of_its_routes() {
+        let route = |id: &str, listener: &str, sni: Option<&str>| {
+            (id.to_string(), tcp_ep(id, listener, sni))
+        };
+        let live: RoutingSnapshot = [
+            route(
+                "a",
+                crate::config::HTTPS_PASSTHROUGH_LISTENER,
+                Some("A.example.com"),
+            ),
+            route(
+                "b",
+                crate::config::HTTPS_PASSTHROUGH_LISTENER,
+                Some("*.b.example.com"),
+            ),
+            route("c", "tlsgw", Some("c.example.com")),
+            route("d", crate::config::HTTPS_PASSTHROUGH_LISTENER, None),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            passthrough_hosts(&live),
+            vec!["*.b.example.com".to_string(), "a.example.com".to_string()]
+        );
+    }
+
     /// A declared listener cannot take the name of one a Gateway opens, or a
     /// Gateway route would be installed on it, whatever its port.
     #[test]
@@ -4297,6 +4394,10 @@ mod tests {
             sni_preread_max_bytes: None,
             idle_timeout: None,
         }];
+        let err = spawn_tcp_workers(&config).err().unwrap();
+        assert!(err.to_string().contains("reserved"), "{err}");
+
+        config.tcp[0].name = crate::config::HTTPS_PASSTHROUGH_LISTENER.to_string();
         let err = spawn_tcp_workers(&config).err().unwrap();
         assert!(err.to_string().contains("reserved"), "{err}");
 

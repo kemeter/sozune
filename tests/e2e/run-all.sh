@@ -101,6 +101,9 @@ proxy:
       "404": "<html><body><h1>sozune custom 404</h1></body></html>"
   https:
     listen_address: $HTTPS_PORT
+    # TLS passthrough on the HTTPS port too (34-https-passthrough.sh): every
+    # HTTPS test goes through the TLS gate.
+    passthrough: true
     tls:
       min_version: "1.3"
       certificates:
@@ -711,6 +714,23 @@ services:
       - "sozune.tcp.snibeta.entrypoint=tcpsni"
       - "sozune.tcp.snibeta.port=9000"
       - "sozune.tcp.snibeta.sni=beta.sni.test"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-sni-https:
+    image: alpine
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache socat openssl >/dev/null 2>&1 &&
+         openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem
+           -days 1 -nodes -subj /CN=https.sni.test >/dev/null 2>&1 &&
+         exec socat OPENSSL-LISTEN:9000,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr
+           SYSTEM:'echo sni-backend-https'"
+    labels:
+      - "sozune.enable=true"
+      - "sozune.tcp.snihttps.entrypoint=https-passthrough"
+      - "sozune.tcp.snihttps.port=9000"
+      - "sozune.tcp.snihttps.sni=https.sni.test"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 EOF
 

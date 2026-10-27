@@ -702,6 +702,8 @@ proxy:
 
 A declared entry wins when both apply. A port opened from `gateway_ports` has none of the entry settings: declare a `proxy.tcp` entry to filter or rate-limit it.
 
+With `proxy.https.passthrough`, a `TLS` listener on `proxy.https.listen_address` is served too, by the passthrough listener of the HTTPS port, next to the `HTTPS` listeners there: a ClientHello naming one of its routes is forwarded undecrypted, any other is served over HTTPS (see [Passthrough on the HTTPS port](/documentation/routing/tcp#passthrough-on-the-https-port)).
+
 A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which port it wanted, and the Gateway's listener status says `PortUnavailable` (see [Status conditions](#status-conditions)). Declare the listener or list the port and the route goes live on the next reload, with no need to re-apply it. If a listed port cannot be bound, because another process holds it, the listener status says `PortUnavailable` with the reason, and Sōzune tries again on the next reload.
 
 ### What is supported

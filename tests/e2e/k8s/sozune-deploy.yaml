@@ -85,6 +85,9 @@ data:
         listen_address: 18180
       https:
         listen_address: 18443
+        # TLS passthrough on the HTTPS port too, for a Gateway TLS listener
+        # there: every HTTPS test goes through the TLS gate.
+        passthrough: true
       # TLSRoute attaches here: a Gateway declaring a TLS listener on this port
       # resolves to this named listener.
       tcp:

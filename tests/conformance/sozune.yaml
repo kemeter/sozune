@@ -70,6 +70,8 @@ data:
         listen_address: 80
       https:
         listen_address: 443
+        # GATEWAY-TLS puts a TLS listener on the HTTPS port.
+        passthrough: true
 ---
 apiVersion: v1
 kind: Pod
