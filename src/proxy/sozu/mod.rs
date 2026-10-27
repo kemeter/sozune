@@ -593,6 +593,17 @@ fn stop_worker(channel: &mut Channel<WorkerRequest, WorkerResponse>, name: &str)
     }
 }
 
+/// Stop every worker, on shutdown. Dropping their command channels is not
+/// enough: a worker reading the close as an error on its channel, rather than
+/// as a close, keeps running, and its thread is never joined.
+fn stop_workers(channels: &mut Channels) {
+    stop_worker(&mut channels.http, "http");
+    stop_worker(&mut channels.https, "https");
+    for (name, listener) in channels.tcp.iter_mut().chain(channels.udp.iter_mut()) {
+        stop_worker(&mut listener.channel, name);
+    }
+}
+
 pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Result<()> {
     let ProxyInputs {
         storage,
@@ -1002,6 +1013,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     }
                 }
             }
+            stop_workers(&mut channels);
         });
     });
 

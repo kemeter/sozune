@@ -285,28 +285,49 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let (unopened_gateway_ports_tx, unopened_gateway_ports) =
         tokio::sync::watch::channel(proxy::backend::UnopenedGatewayPorts::default());
     let metrics_store_proxy = Arc::clone(&metrics_store);
-    let proxy_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        proxy::backend::init_proxy(
-            proxy::backend::ProxyInputs {
-                storage: storage_proxy,
-                shutdown_rx,
-                reload_rx,
-                cert_rx,
-                metrics_poll_rx,
-                metrics_store: metrics_store_proxy,
-                acme_challenge_port,
-                tls_alpn_responder_port,
-                middleware_state: middleware_state_proxy,
-                middleware_port,
-                live_routes: live_routes_proxy,
-                unhealthy_backends: unhealthy_backends_proxy,
-                unopened_gateway_ports: unopened_gateway_ports_tx,
-                plugins,
-                handle,
-            },
-            &proxy_config,
-        )
-    });
+    // On a thread of its own rather than the runtime's blocking pool: the
+    // runtime waits for that pool when it shuts down, so a proxy that does not
+    // stop would keep the process from ever exiting.
+    let (proxy_done_tx, proxy_done_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("proxy".into())
+        .spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+                    proxy::backend::init_proxy(
+                        proxy::backend::ProxyInputs {
+                            storage: storage_proxy,
+                            shutdown_rx,
+                            reload_rx,
+                            cert_rx,
+                            metrics_poll_rx,
+                            metrics_store: metrics_store_proxy,
+                            acme_challenge_port,
+                            tls_alpn_responder_port,
+                            middleware_state: middleware_state_proxy,
+                            middleware_port,
+                            live_routes: live_routes_proxy,
+                            unhealthy_backends: unhealthy_backends_proxy,
+                            unopened_gateway_ports: unopened_gateway_ports_tx,
+                            plugins,
+                            handle,
+                        },
+                        &proxy_config,
+                    )
+                }));
+            let _ = proxy_done_tx.send(result);
+        })?;
+    let proxy_task = async move {
+        match proxy_done_rx.await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(panic)) => Err(panic
+                .downcast_ref::<&str>()
+                .map(|m| m.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string())),
+            Err(_) => Err("the proxy thread ended without a result".to_string()),
+        }
+    };
 
     // Poll Sōzu workers for metrics every 5 seconds. Drop on full channel —
     // a backed-up poller means the proxy mainloop is busy and we should not
