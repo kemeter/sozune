@@ -8648,18 +8648,22 @@ mod tests {
     /// comment would swallow the anchors.
     #[test]
     fn a_regex_is_checked_anchored() {
-        let r = route_with(
-            vec![rule(
-                Some(vec![header_match(
-                    "X-Canary",
-                    "(?x)v # comment",
-                    HTTPRouteRulesMatchesHeadersType::RegularExpression,
-                )]),
-                vec![backend("api", 80)],
-            )],
-            vec!["app.example.com".into()],
-        );
-        assert!(route_has_unsupported_matches(&r));
+        // A comment swallowing the anchors, and a regex valid only once
+        // wrapped, which would take any value starting with `a`.
+        for pattern in ["(?x)v # comment", "a)|(?:b"] {
+            let r = route_with(
+                vec![rule(
+                    Some(vec![header_match(
+                        "X-Canary",
+                        pattern,
+                        HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                    )]),
+                    vec![backend("api", 80)],
+                )],
+                vec!["app.example.com".into()],
+            );
+            assert!(route_has_unsupported_matches(&r), "{pattern}");
+        }
     }
 
     #[test]

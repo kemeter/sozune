@@ -194,6 +194,33 @@ mod tests {
         assert!(settings.config.rate_limit.is_some());
     }
 
+    /// A regex condition annotation applies; one that does not compile is a
+    /// blocking error, which the routes of the Ingress are dropped on.
+    #[test]
+    fn regex_annotations_are_conditions_or_errors() {
+        let (settings, diagnostics) = ingress_settings(
+            &annotated(&[("sozune.matchHeadersRegex.X-Version", "v[0-9]+")]),
+            "ingress:default/web",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let condition = &settings.unwrap().config.match_headers[0];
+        assert!(condition.regex && condition.key == "X-Version");
+
+        let (settings, diagnostics) = ingress_settings(
+            &annotated(&[("sozune.matchHeadersRegex.X-Version", "v(")]),
+            "ingress:default/web",
+        );
+        assert!(settings.is_none());
+        let error = diagnostics
+            .iter()
+            .find(|d| d.code == DiagnosticCode::E007InvalidMatchRegex)
+            .unwrap();
+        assert_eq!(
+            error.label.as_deref(),
+            Some("sozune.matchHeadersRegex.X-Version")
+        );
+    }
+
     #[test]
     fn routing_annotations_are_reported_and_ignored() {
         let (settings, diagnostics) = ingress_settings(

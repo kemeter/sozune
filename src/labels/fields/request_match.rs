@@ -15,6 +15,53 @@ pub fn parse_match_query(labels: &HashMap<String, String>, prefix: &str) -> Vec<
     parse_conditions(labels, &format!("{prefix}matchQuery"))
 }
 
+/// Parse `<prefix>matchHeadersRegex.<Header>=<regex>` labels into regex
+/// conditions, one per label: a regex may hold the commas `matchHeaders`
+/// splits on. Sorted by header name, so the order does not depend on the
+/// labels'.
+pub fn parse_match_headers_regex(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+) -> Vec<MatchCondition> {
+    parse_regex_conditions(labels, &format!("{prefix}matchHeadersRegex."))
+}
+
+/// Parse `<prefix>matchQueryRegex.<param>=<regex>` labels. Same shape as
+/// [`parse_match_headers_regex`].
+pub fn parse_match_query_regex(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+) -> Vec<MatchCondition> {
+    parse_regex_conditions(labels, &format!("{prefix}matchQueryRegex."))
+}
+
+fn parse_regex_conditions(
+    labels: &HashMap<String, String>,
+    key_prefix: &str,
+) -> Vec<MatchCondition> {
+    let mut out: Vec<MatchCondition> = labels
+        .iter()
+        .filter_map(|(k, v)| {
+            // A label naming no key stays, with an empty one, for the parser
+            // to refuse: skipped, it would leave the route without its
+            // condition. Whitespace in a regex is part of it.
+            // The bare field, missing its `.<name>`, names no key either.
+            let key = match k.strip_prefix(key_prefix) {
+                Some(name) => name.trim(),
+                None if k == key_prefix.trim_end_matches('.') => "",
+                None => return None,
+            };
+            Some(MatchCondition {
+                key: key.to_string(),
+                value: v.clone(),
+                regex: true,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
 /// Parse `<prefix>matchClientIP=cidr,cidr2,...` into a list of raw IP/CIDR
 /// strings. Validation (and dropping of invalid entries) happens later, in
 /// the matching layer, which shares the allow-list's CIDR parser. Empty
@@ -114,6 +161,35 @@ mod tests {
         let got = parse_match_headers(&l, "sozune.");
         assert_eq!(got[0].key, "X-Time");
         assert_eq!(got[0].value, "12:30");
+    }
+
+    #[test]
+    fn a_regex_label_names_its_key() {
+        let l = labels(&[
+            ("sozune.matchHeadersRegex.X-Version", " ^v{1,3}$"),
+            ("sozune.matchHeadersRegex.", "kept"),
+            ("sozune.matchQueryRegex.page", "[0-9]+"),
+        ]);
+        let headers = parse_match_headers_regex(&l, "sozune.");
+        assert_eq!(
+            headers,
+            vec![
+                MatchCondition {
+                    key: String::new(),
+                    value: "kept".into(),
+                    regex: true,
+                },
+                MatchCondition {
+                    key: "X-Version".into(),
+                    value: " ^v{1,3}$".into(),
+                    regex: true,
+                },
+            ]
+        );
+        let query = parse_match_query_regex(&l, "sozune.");
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0].key, "page");
+        assert!(query[0].regex);
     }
 
     #[test]

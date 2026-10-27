@@ -867,11 +867,33 @@ fn reject_unroutable_hostname(
     ))
 }
 
+/// Reject a header or query condition whose regex does not compile: served
+/// without it, the route would take more requests than it asks for.
+fn reject_invalid_match_regex(
+    config: &crate::model::EntrypointConfig,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let bad = config.invalid_match_regex()?;
+    warn!(
+        "refusing entrypoint: the regex of `{}` does not compile",
+        bad.key
+    );
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "match condition regex does not compile",
+            "key": bad.key,
+            "regex": bad.value,
+        })),
+    ))
+}
+
 async fn create_entrypoint(
     State(state): State<AppState>,
     Json(payload): Json<CreateEntrypointRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(refusal) = reject_unroutable_hostname(&payload.config) {
+    if let Some(refusal) = reject_unroutable_hostname(&payload.config)
+        .or_else(|| reject_invalid_match_regex(&payload.config))
+    {
         return refusal;
     }
 
@@ -920,7 +942,9 @@ async fn update_entrypoint(
     Path(id): Path<String>,
     Json(payload): Json<CreateEntrypointRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(refusal) = reject_unroutable_hostname(&payload.config) {
+    if let Some(refusal) = reject_unroutable_hostname(&payload.config)
+        .or_else(|| reject_invalid_match_regex(&payload.config))
+    {
         return refusal;
     }
 
@@ -1449,6 +1473,37 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "`{bad}` must not become a route"
             );
+        }
+    }
+
+    /// A header or query condition whose regex does not compile is refused,
+    /// not served without it.
+    #[tokio::test]
+    async fn creating_an_entrypoint_refuses_an_invalid_match_regex() {
+        let state = test_state();
+        let app = test_app(state.clone());
+
+        for (field, regex, status) in [
+            ("match_headers", "v(1", StatusCode::BAD_REQUEST),
+            ("match_query", "[0-9", StatusCode::BAD_REQUEST),
+            ("match_headers", "v[0-9]+", StatusCode::CREATED),
+        ] {
+            let mut payload = sample_entrypoint_json();
+            payload["config"][field] = serde_json::json!([
+                { "key": "x-version", "value": regex, "regex": true }
+            ]);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/entrypoints")
+                        .header("authorization", admin_auth())
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{field} `{regex}`");
         }
     }
 

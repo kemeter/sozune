@@ -219,8 +219,37 @@ fn build_entrypoint(
     let plugins = plugins::parse_plugins(labels, &prefix);
     let plugin_config = plugin_config::parse_plugin_config(labels, &prefix, diagnostics);
     let parsed_error_pages = error_pages::parse_error_pages(labels, &prefix, diagnostics);
-    let match_headers = request_match::parse_match_headers(labels, &prefix);
-    let match_query = request_match::parse_match_query(labels, &prefix);
+    let mut match_headers = request_match::parse_match_headers(labels, &prefix);
+    match_headers.extend(request_match::parse_match_headers_regex(labels, &prefix));
+    let mut match_query = request_match::parse_match_query(labels, &prefix);
+    match_query.extend(request_match::parse_match_query_regex(labels, &prefix));
+    // A condition left out would serve the route to more requests than it
+    // asks for: the whole route goes.
+    if let Some(bad) = match_headers
+        .iter()
+        .chain(&match_query)
+        .find(|c| c.regex && (c.key.is_empty() || !c.regex_compiles()))
+    {
+        let field = if match_headers.contains(bad) {
+            "matchHeadersRegex"
+        } else {
+            "matchQueryRegex"
+        };
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticCode::E007InvalidMatchRegex,
+                if bad.key.is_empty() {
+                    "the regex condition names no header or parameter, dropping the route"
+                } else {
+                    "the regular expression does not compile, dropping the route"
+                },
+            )
+            .with_label(format!("{prefix}{field}.{}", bad.key))
+            .with_value(&bad.value)
+.with_hint("name the header or parameter after the dot, and fix the regex's syntax: the value must match it whole"),
+        );
+        return None;
+    }
     let match_client_ip = request_match::parse_match_client_ip(labels, &prefix);
     let ip_allow_list = ip_allow_list::parse_ip_allow_list(labels, &prefix);
 
@@ -528,6 +557,57 @@ mod tests {
         NetworkInfo {
             name: name.into(),
             ip: Some(ip.into()),
+        }
+    }
+
+    #[test]
+    fn regex_labels_add_regex_conditions() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web.host", "app.example.com"),
+                ("sozune.http.web.matchHeaders", "X-Env:prod"),
+                ("sozune.http.web.matchHeadersRegex.X-Version", "v{1,3}"),
+                ("sozune.http.web.matchQueryRegex.page", "[0-9]+"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let web = r.entrypoints.get("http_web").unwrap();
+        let headers: Vec<(&str, &str, bool)> = web
+            .config
+            .match_headers
+            .iter()
+            .map(|m| (m.key.as_str(), m.value.as_str(), m.regex))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![("X-Env", "prod", false), ("X-Version", "v{1,3}", true)]
+        );
+        assert_eq!(web.config.match_query.len(), 1);
+        assert!(web.config.match_query[0].regex);
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_drops_the_route() {
+        for (key, regex) in [
+            ("sozune.http.web.matchQueryRegex.page", "[0-9"),
+            ("sozune.http.web.matchQueryRegex.page", "a)|(?:b"),
+            ("sozune.http.web.matchHeadersRegex.", "v[0-9]+"),
+            ("sozune.http.web.matchQueryRegex", "[0-9]+"),
+        ] {
+            let c = candidate(
+                &[
+                    ("sozune.enable", "true"),
+                    ("sozune.http.web.host", "app.example.com"),
+                    (key, regex),
+                ],
+                vec![net("bridge", "10.0.0.1")],
+            );
+            let r = parse(&c);
+            assert!(r.entrypoints.is_empty(), "{key}");
+            assert!(has_code(&r, DiagnosticCode::E007InvalidMatchRegex), "{key}");
         }
     }
 

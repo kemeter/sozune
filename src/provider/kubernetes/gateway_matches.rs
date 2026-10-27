@@ -99,9 +99,8 @@ fn method_verb(method: &HTTPRouteRulesMatchesMethod) -> &'static str {
 /// reject the route with a clear status rather than serve it with the
 /// condition dropped.
 pub fn match_has_unsupported_conditions(m: &HTTPRouteRulesMatches) -> bool {
-    // Checked anchored, as it is served: a trailing `(?x)` comment would
-    // otherwise swallow the anchors.
-    let invalid = |pattern: &str| regex::Regex::new(&format!("^(?:{pattern})$")).is_err();
+    // Checked as it is served.
+    let invalid = |pattern: &str| crate::model::anchored_regex(pattern).is_none();
     let header_regex = m.headers.as_deref().unwrap_or_default().iter().any(|h| {
         matches!(
             h.r#type,

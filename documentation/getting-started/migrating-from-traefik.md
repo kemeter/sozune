@@ -61,6 +61,8 @@ A Traefik rule becomes one label per matcher. All the matchers of a route must m
 | ``Method(`GET`)`` | `methods=GET` (comma-separated for several) |
 | ``Header(`X-Api-Version`, `2`)`` | `matchHeaders=X-Api-Version:2` (see the note below) |
 | ``Query(`beta`, `1`)`` | `matchQuery=beta:1` (see the note below) |
+| ``HeaderRegexp(`X-Version`, `^v[0-9]+$`)`` | `matchHeadersRegex.X-Version=v[0-9]+`. The regex matches the whole value, where Traefik's matches anywhere in it: write `.*v[0-9]+.*` to keep that. See [Regular expressions](/documentation/routing/header-query-matching#regular-expressions). |
+| ``QueryRegexp(`page`, `^[0-9]+$`)`` | `matchQueryRegex.page=[0-9]+`, likewise. |
 | ``ClientIP(`10.0.0.0/8`)`` | `matchClientIP=10.0.0.0/8` (see the note below) |
 | `routers.<r>.priority` | `priority`. Traefik ranks routes by rule length when no priority is set. Sōzune does not: at equal priority, the first route by id wins, even over a longer path. Set `priority` on the more specific route when two routes overlap. |
 

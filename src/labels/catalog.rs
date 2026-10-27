@@ -52,6 +52,8 @@ const SERVICE_FIELDS: &[&str] = &[
     "plugins",
     "matchHeaders",
     "matchQuery",
+    "matchHeadersRegex",
+    "matchQueryRegex",
     "matchClientIP",
     "ipAllowList",
 ];
@@ -64,6 +66,8 @@ const SERVICE_FIELD_PREFIXES: &[&str] = &[
     "errorPages.",
     "plugins.",
     "healthCheck.headers.",
+    "matchHeadersRegex.",
+    "matchQueryRegex.",
 ];
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["http", "tcp", "udp"];

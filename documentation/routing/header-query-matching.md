@@ -17,6 +17,18 @@ labels:
 
 An entry without a `:` (e.g. `matchHeaders=X-Debug`) matches on **key presence** alone, any value. Only the first `:` splits key from value, so values may themselves contain colons.
 
+### Regular expressions
+
+```yaml
+labels:
+  - "sozune.http.<svc>.matchHeadersRegex.<Header>=<regex>"
+  - "sozune.http.<svc>.matchQueryRegex.<param>=<regex>"
+```
+
+One label per condition, the header or parameter in the key: a regular expression may hold commas, which `matchHeaders` splits on. The value must match it **whole**, as if it were written between `^` and `$`: `matchHeadersRegex.X-Version=v[0-9]+` takes `v2` and `v12`, not `v2-beta`. The syntax is that of the Rust `regex` crate: no look-around or back-references. These conditions add to those of `matchHeaders` and `matchQuery`, every one of them must hold.
+
+A regular expression that does not compile, or a label naming no header or parameter, drops the route with `E007` (run `sozune explain E007`): served without the condition, it would take requests it does not ask for.
+
 ## Example
 
 ```yaml
@@ -59,9 +71,9 @@ labels:
 
 ## Limitations
 
-- Header conditions on `Host` or `Cookie`, and query conditions on a route with more than three of them, a condition holding `%`, a `pathRegex`, `stripPrefix` or `addPrefix`, are checked by a Sōzune middleware once the route is picked: a request that fails them gets `404 Not Found` from that route, without trying another one. Two such routes on the same host and path cannot both be live: give them distinct paths.
+- Header conditions on `Host` or `Cookie`, and query conditions on a route with more than three of them, a condition holding `%` or a regular expression, a `pathRegex`, `stripPrefix` or `addPrefix`, are checked by a Sōzune middleware once the route is picked: a request that fails them gets `404 Not Found` from that route, without trying another one. Two such routes on the same host and path cannot both be live: give them distinct paths.
 - `Host` is better matched with `host`, which routes on it.
 
 ## Other surfaces
 
-Besides Docker/Swarm/Podman/Nomad labels, `match_headers` and `match_query` are available via the HTTP provider, the YAML config file, and the REST API (as lists of `{key, value}` objects on the entrypoint).
+Besides Docker/Swarm/Podman/Nomad labels, `match_headers` and `match_query` are available via the HTTP provider, the YAML config file, and the REST API (as lists of `{key, value}` objects on the entrypoint; `"regex": true` makes `value` a regular expression, and one that does not compile is refused: the API answers `400`, the HTTP provider drops the entrypoint). On a Kubernetes Ingress, the `sozune.matchHeadersRegex.<Header>` and `sozune.matchQueryRegex.<param>` annotations do the same; one that does not compile leaves the Ingress unserved.

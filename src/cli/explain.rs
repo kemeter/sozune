@@ -119,6 +119,14 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.udp.dns.port=53"),
     },
     Entry {
+        code: "E007",
+        title: "Invalid match regex",
+        cause: "A `matchHeadersRegex.<Header>` or `matchQueryRegex.<param>` label holds a regular expression that does not compile, or names no header or parameter after the dot.",
+        effect: "The route is dropped: served without the condition, it would take requests it does not ask for.",
+        fix: "Fix the regular expression. It must match the whole header or parameter value; `^` and `$` are implied.",
+        example: Some("sozune.http.web.matchHeadersRegex.X-Version=v[0-9]+"),
+    },
+    Entry {
         code: "W001",
         title: "Invalid port value",
         cause: "The port label contains a value that is not an integer between 0 and 65535.",

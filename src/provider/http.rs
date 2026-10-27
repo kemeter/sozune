@@ -49,6 +49,15 @@ impl HttpProvider {
                     );
                     return false;
                 }
+                // Served without it, the route would take more requests
+                // than it asks for.
+                if let Some(bad) = ep.config.invalid_match_regex() {
+                    warn!(
+                        "dropping entrypoint `{}` from the HTTP provider: the regex of `{}` does not compile",
+                        ep.id, bad.key
+                    );
+                    return false;
+                }
                 true
             })
             .map(|ep| (ep.id.clone(), ep))
