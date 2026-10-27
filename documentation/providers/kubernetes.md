@@ -224,11 +224,18 @@ rules:
     verbs: ["get", "list", "watch"]
   # Optional: only needed for Gateway API status reporting (kubectl
   # describe will show sōzune's conditions: Accepted/ResolvedRefs on
-  # HTTPRoutes and TLSRoutes, Accepted/Programmed on Gateways and their
-  # listeners, Accepted on GatewayClasses).
+  # HTTPRoutes, TLSRoutes, TCPRoutes and UDPRoutes, Accepted/Programmed on
+  # Gateways and their listeners, Accepted on GatewayClasses).
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["httproutes/status", "tlsroutes/status", "gateways/status", "gatewayclasses/status"]
+      [
+        "httproutes/status",
+        "tlsroutes/status",
+        "tcproutes/status",
+        "udproutes/status",
+        "gateways/status",
+        "gatewayclasses/status",
+      ]
     verbs: ["update", "patch"]
   # Optional: only needed for an Ingress `spec.tls[].secretName` and for
   # Gateway HTTPS listeners, which read their certificates from
@@ -422,7 +429,7 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite` (see [HTTPRoute filters](#httproute-filters) below). `requestMirror`, `extensionRef` are not supported yet.
 - Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — Sōzune writes standard conditions back onto the resources it owns, visible via `kubectl describe` / `kubectl get`:
-  - `HTTPRoute` and `TLSRoute` — for every `parentRef` Sōzune owns, `status.parents[]` carries `Accepted` and `ResolvedRefs` (`controllerName: kemeter.io/sozune`). Other controllers' entries are preserved untouched.
+  - `HTTPRoute`, `TLSRoute`, `TCPRoute` and `UDPRoute` — for every `parentRef` Sōzune owns, `status.parents[]` carries `Accepted` and `ResolvedRefs` (`controllerName: kemeter.io/sozune`). Other controllers' entries are preserved untouched.
   - `Gateway` — `status.conditions[]` carries `Accepted` and `Programmed`, both reflecting whether Sōzune owns the Gateway's `GatewayClass`.
   - `GatewayClass` — `status.conditions[]` carries `Accepted` on classes whose `controllerName` is `kemeter.io/sozune`.
 
@@ -448,6 +455,8 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
 
 **TLSRoute** (`status.parents[].conditions[]`): the same conditions, minus those about filters and matches, which a TLSRoute does not have. `NotAllowedByListeners` speaks of `TLS` listeners in `Passthrough` mode. A route on a listener port Sōzune does not serve stays `Accepted`: the listener's status says `PortUnavailable`.
+
+**TCPRoute**, **UDPRoute** (`status.parents[].conditions[]`): likewise, without hostnames: `NotAllowedByListeners` speaks of `TCP`, or `UDP`, listeners.
 
 **Gateway** (`status.conditions[]`):
 
@@ -771,6 +780,7 @@ proxy:
 | Routing | None — the whole port goes to the backend. One rule → one entrypoint. No hostnames, matches, or filters (a TCPRoute has none). |
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
 | `parentRefs` | `sectionName` and `port` select a listener, among those whose [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes) admit the route. A route may bind listeners on several ports; each gets its own entrypoint. |
+| Status | `Accepted` and `ResolvedRefs`, as for an HTTPRoute (see [Status conditions](#status-conditions)); writing it needs the `tcproutes/status` RBAC, `udproutes/status` for a UDPRoute. |
 
 ## Gateway API (UDPRoute)
 

@@ -41,12 +41,20 @@ rules:
       ]
     verbs: ["get", "list", "watch"]
   # Status sub-resources — sōzune patches conditions on the resources it
-  # owns: `status.parents[]` on HTTPRoutes and TLSRoutes (Accepted/ResolvedRefs) and
+  # owns: `status.parents[]` on HTTPRoutes, TLSRoutes, TCPRoutes and UDPRoutes
+  # (Accepted/ResolvedRefs) and
   # `status.conditions[]` on Gateways (Accepted/Programmed) and
   # GatewayClasses (Accepted).
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["httproutes/status", "tlsroutes/status", "gateways/status", "gatewayclasses/status"]
+      [
+        "httproutes/status",
+        "tlsroutes/status",
+        "tcproutes/status",
+        "udproutes/status",
+        "gateways/status",
+        "gatewayclasses/status",
+      ]
     verbs: ["update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

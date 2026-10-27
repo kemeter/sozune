@@ -35,12 +35,18 @@ use crate::model::{
     Protocol, UrlRewrite,
 };
 use futures_util::StreamExt;
-use gateway_api::apis::experimental::tcproutes::{TCPRoute, TCPRouteParentRefs, TCPRouteRules};
+use gateway_api::apis::experimental::tcproutes::{
+    TCPRoute, TCPRouteParentRefs, TCPRouteRules, TCPRouteStatusParents,
+    TCPRouteStatusParentsParentRef,
+};
 use gateway_api::apis::experimental::tlsroutes::{
     TLSRoute, TLSRouteParentRefs, TLSRouteRules, TLSRouteStatusParents,
     TLSRouteStatusParentsParentRef,
 };
-use gateway_api::apis::experimental::udproutes::{UDPRoute, UDPRouteParentRefs, UDPRouteRules};
+use gateway_api::apis::experimental::udproutes::{
+    UDPRoute, UDPRouteParentRefs, UDPRouteRules, UDPRouteStatusParents,
+    UDPRouteStatusParentsParentRef,
+};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
@@ -2956,47 +2962,329 @@ where
     Ok(false)
 }
 
-/// What the TLSRoute watcher hands the TLSRoute status writer.
-type TlsRouteStatusTx = mpsc::Sender<(TLSRoute, RouteOutcome, Option<InvalidRef>)>;
+/// A TLSRoute, TCPRoute or UDPRoute: a route of whole connections, whose
+/// status reports its parents and its backendRefs as an HTTPRoute's does.
+trait L4Route:
+    kube::Resource<DynamicType = (), Scope = k8s_openapi::NamespaceResourceScope>
+    + Clone
+    + std::fmt::Debug
+    + serde::de::DeserializeOwned
+    + Send
+    + Sync
+    + 'static
+{
+    const KIND: &'static str;
+    /// The protocol of its backends' endpoints.
+    const PROTOCOL: &'static str;
+    type Parent: ParentStatus + serde::Serialize + Send + Sync;
+    /// Each rule's backendRefs.
+    fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>>;
+    /// Its `status.parents[]`.
+    fn status_parents(&self) -> Vec<Self::Parent>;
+    /// The entries of `status.parents[]` sōzune owns, for `outcome`.
+    fn build_status(
+        &self,
+        scope: &GatewayScope,
+        outcome: RouteOutcome,
+        invalid_ref: Option<InvalidRef>,
+    ) -> Vec<Self::Parent>;
+}
 
-/// The TLSRoute twin of [`run_status_writer`].
-async fn run_tls_status_writer(
+/// A backendRef of an [`L4Route`] rule, as its status reads it.
+struct L4BackendRef<'a> {
+    parts: BackendRefParts<'a>,
+    port: Option<i32>,
+    weight: Option<i32>,
+}
+
+/// [`L4Route::backend_refs`]: the rules of TLS, TCP and UDP routes share
+/// their shape, not their type.
+macro_rules! l4_backend_refs {
+    ($route:expr) => {
+        $route
+            .spec
+            .rules
+            .iter()
+            .map(|rule| {
+                rule.backend_refs
+                    .iter()
+                    .flatten()
+                    .map(|b| L4BackendRef {
+                        parts: BackendRefParts {
+                            group: b.group.as_deref(),
+                            kind: b.kind.as_deref(),
+                            namespace: b.namespace.as_deref(),
+                            name: &b.name,
+                        },
+                        port: b.port,
+                        weight: b.weight,
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+}
+
+/// An entry of [`L4Route::build_status`], from a parentRef `$p` and its
+/// conditions: the status types of TLS, TCP and UDP routes share their shape.
+macro_rules! l4_parent_status {
+    ($parent:ident, $parent_ref:ident, $p:expr, $conditions:expr) => {
+        $parent {
+            controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
+            parent_ref: $parent_ref {
+                group: $p.group.clone(),
+                kind: $p.kind.clone(),
+                name: $p.name.clone(),
+                namespace: $p.namespace.clone(),
+                port: $p.port,
+                section_name: $p.section_name.clone(),
+            },
+            conditions: Some($conditions),
+        }
+    };
+}
+
+impl L4Route for TLSRoute {
+    const KIND: &'static str = "TLSRoute";
+    const PROTOCOL: &'static str = "TCP";
+    type Parent = TLSRouteStatusParents;
+
+    fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>> {
+        l4_backend_refs!(self)
+    }
+
+    fn status_parents(&self) -> Vec<Self::Parent> {
+        self.status
+            .as_ref()
+            .map(|s| s.parents.clone())
+            .unwrap_or_default()
+    }
+
+    fn build_status(
+        &self,
+        scope: &GatewayScope,
+        outcome: RouteOutcome,
+        invalid_ref: Option<InvalidRef>,
+    ) -> Vec<Self::Parent> {
+        let route_ns = self.metadata.namespace.as_deref().unwrap_or("default");
+        parent_conditions(
+            scope,
+            route_ns,
+            self.metadata.generation,
+            self.spec.parent_refs.as_deref().unwrap_or_default(),
+            Self::KIND,
+            &|p| scope.accepts_tls_parent_ref(route_ns, p),
+            GatewayScope::listener_serves_tls_passthrough,
+            // Each parent by the listeners it selects: one admitting none of
+            // the route's names refuses it, whatever another does.
+            &|p| {
+                if outcome != RouteOutcome::NotMine
+                    && scope.tls_parent_hostnames_by_port(self, p).is_empty()
+                {
+                    RouteOutcome::NoMatchingListenerHostname
+                } else {
+                    outcome
+                }
+            },
+            invalid_ref,
+        )
+        .into_iter()
+        .map(|(p, conditions)| {
+            l4_parent_status!(
+                TLSRouteStatusParents,
+                TLSRouteStatusParentsParentRef,
+                p,
+                conditions
+            )
+        })
+        .collect()
+    }
+}
+
+impl L4Route for TCPRoute {
+    const KIND: &'static str = "TCPRoute";
+    const PROTOCOL: &'static str = "TCP";
+    type Parent = TCPRouteStatusParents;
+
+    fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>> {
+        l4_backend_refs!(self)
+    }
+
+    fn status_parents(&self) -> Vec<Self::Parent> {
+        self.status
+            .as_ref()
+            .map(|s| s.parents.clone())
+            .unwrap_or_default()
+    }
+
+    fn build_status(
+        &self,
+        scope: &GatewayScope,
+        outcome: RouteOutcome,
+        invalid_ref: Option<InvalidRef>,
+    ) -> Vec<Self::Parent> {
+        let route_ns = self.metadata.namespace.as_deref().unwrap_or("default");
+        parent_conditions(
+            scope,
+            route_ns,
+            self.metadata.generation,
+            self.spec.parent_refs.as_deref().unwrap_or_default(),
+            Self::KIND,
+            &|p| scope.accepts_tcp_parent_ref(route_ns, p),
+            GatewayScope::listener_serves_tcp,
+            &|_| outcome,
+            invalid_ref,
+        )
+        .into_iter()
+        .map(|(p, conditions)| {
+            l4_parent_status!(
+                TCPRouteStatusParents,
+                TCPRouteStatusParentsParentRef,
+                p,
+                conditions
+            )
+        })
+        .collect()
+    }
+}
+
+impl L4Route for UDPRoute {
+    const KIND: &'static str = "UDPRoute";
+    const PROTOCOL: &'static str = "UDP";
+    type Parent = UDPRouteStatusParents;
+
+    fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>> {
+        l4_backend_refs!(self)
+    }
+
+    fn status_parents(&self) -> Vec<Self::Parent> {
+        self.status
+            .as_ref()
+            .map(|s| s.parents.clone())
+            .unwrap_or_default()
+    }
+
+    fn build_status(
+        &self,
+        scope: &GatewayScope,
+        outcome: RouteOutcome,
+        invalid_ref: Option<InvalidRef>,
+    ) -> Vec<Self::Parent> {
+        let route_ns = self.metadata.namespace.as_deref().unwrap_or("default");
+        parent_conditions(
+            scope,
+            route_ns,
+            self.metadata.generation,
+            self.spec.parent_refs.as_deref().unwrap_or_default(),
+            Self::KIND,
+            &|p| scope.accepts_udp_parent_ref(route_ns, p),
+            GatewayScope::listener_serves_udp,
+            &|_| outcome,
+            invalid_ref,
+        )
+        .into_iter()
+        .map(|(p, conditions)| {
+            l4_parent_status!(
+                UDPRouteStatusParents,
+                UDPRouteStatusParentsParentRef,
+                p,
+                conditions
+            )
+        })
+        .collect()
+    }
+}
+
+/// What an [`L4Route`] watcher hands its status writer.
+type L4StatusTx<R> = mpsc::Sender<(R, RouteOutcome, Option<InvalidRef>)>;
+
+/// Start the status writer of an [`L4Route`] kind, as
+/// [`run_httproute_watcher`] does for HTTPRoutes.
+fn spawn_l4_status_writer<R: L4Route>(client: Client, scope: GatewayScope) -> L4StatusTx<R> {
+    let (tx, rx) = mpsc::channel(256);
+    tokio::spawn(run_l4_status_writer::<R>(client, rx, scope));
+    tx
+}
+
+/// The [`L4Route`] twin of [`run_status_writer`].
+async fn run_l4_status_writer<R: L4Route>(
     client: Client,
-    mut rx: mpsc::Receiver<(TLSRoute, RouteOutcome, Option<InvalidRef>)>,
+    mut rx: mpsc::Receiver<(R, RouteOutcome, Option<InvalidRef>)>,
     scope: GatewayScope,
 ) {
-    info!("Gateway API: TLSRoute status writer started");
+    info!("Gateway API: {} status writer started", R::KIND);
     while let Some((route, outcome, invalid_ref)) = rx.recv().await {
-        let Some(name) = route.metadata.name.as_deref() else {
+        let Some(name) = route.meta().name.clone() else {
             continue;
         };
-        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let ours = build_tls_route_status(&route, &scope, outcome, invalid_ref);
-        let parents = |route: &TLSRoute| {
-            route
-                .status
-                .as_ref()
-                .map(|s| s.parents.clone())
-                .unwrap_or_default()
-        };
-        let (_, changed) = merge_parent_status(&parents(&route), ours.clone());
+        let ns = route
+            .meta()
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let ours = route.build_status(&scope, outcome, invalid_ref);
+        let (_, changed) = merge_parent_status(&route.status_parents(), ours.clone());
         if !changed {
             continue;
         }
-        let api: Api<TLSRoute> = Api::namespaced(client.clone(), ns);
-        match patch_route_parents(&api, name, ours, parents).await {
+        let api: Api<R> = Api::namespaced(client.clone(), &ns);
+        match patch_route_parents(&api, &name, ours, R::status_parents).await {
             Ok(true) => debug!(
-                "Gateway API: status patched on TLSRoute {}/{} (outcome={:?})",
-                ns, name, outcome
+                "Gateway API: status patched on {} {}/{} (outcome={:?})",
+                R::KIND,
+                ns,
+                name,
+                outcome
             ),
             Ok(false) => {}
             Err(e) => warn!(
-                "Gateway API: failed to patch status on TLSRoute {}/{}: {}",
-                ns, name, e
+                "Gateway API: failed to patch status on {} {}/{}: {}",
+                R::KIND,
+                ns,
+                name,
+                e
             ),
         }
     }
-    info!("Gateway API: TLSRoute status writer stopped");
+    info!("Gateway API: {} status writer stopped", R::KIND);
+}
+
+/// Hand an [`L4Route`]'s `outcome` to its status writer, with the first of
+/// its backendRefs that cannot be used. Best effort, as for HTTPRoutes.
+fn report_l4_status<R: L4Route>(
+    route: &R,
+    outcome: RouteOutcome,
+    resolver: &dyn ServiceResolver,
+    scope: &GatewayScope,
+    status_tx: Option<&L4StatusTx<R>>,
+) {
+    let invalid_ref = l4_route_invalid_ref(route, resolver, scope);
+    if let Some(tx) = status_tx
+        && let Err(e) = tx.try_send((route.clone(), outcome, invalid_ref))
+    {
+        debug!(
+            "Gateway API: {} status channel full or closed: {}",
+            R::KIND,
+            e
+        );
+    }
+}
+
+/// The outcome of an [`L4Route`] whose acceptance takes no hostnames:
+/// whether a parent of ours takes it (`accepted`), then its backends.
+fn l4_outcome<R: L4Route>(
+    route: &R,
+    accepted: bool,
+    resolver: &dyn ServiceResolver,
+    grants: &dyn BackendRefAuthorizer,
+) -> RouteOutcome {
+    if !accepted {
+        RouteOutcome::NotMine
+    } else if l4_route_backends_ready(route, resolver, grants) {
+        RouteOutcome::Accepted
+    } else {
+        RouteOutcome::NoResolvableBackends
+    }
 }
 
 /// Build the `conditions[]` sōzune owns on a Gateway's status.
@@ -4631,6 +4919,7 @@ fn check_backend_ref(
 
 /// What [`check_backend_ref_parts`] looks at in a backendRef, whatever the
 /// route's kind.
+#[derive(Clone, Copy)]
 struct BackendRefParts<'a> {
     group: Option<&'a str>,
     kind: Option<&'a str>,
@@ -4665,66 +4954,47 @@ fn check_backend_ref_parts(
     Ok(())
 }
 
-/// Whether every rule of a TLSRoute has a backendRef taking traffic, and
+/// Whether every rule of an [`L4Route`] has a backendRef taking traffic, and
 /// every backendRef that can be used and takes traffic has a ready endpoint.
-fn tls_route_backends_ready(
-    route: &TLSRoute,
+fn l4_route_backends_ready<R: L4Route>(
+    route: &R,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> bool {
-    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
-    route.spec.rules.iter().all(|rule| {
-        let usable: Vec<_> = rule
-            .backend_refs
-            .iter()
-            .flatten()
+    let namespace = route.meta().namespace.as_deref().unwrap_or("default");
+    route.backend_refs().into_iter().all(|refs| {
+        let usable: Vec<L4BackendRef<'_>> = refs
+            .into_iter()
             .filter(|b| b.weight != Some(0))
-            .filter(|b| {
-                let parts = BackendRefParts {
-                    group: b.group.as_deref(),
-                    kind: b.kind.as_deref(),
-                    namespace: b.namespace.as_deref(),
-                    name: &b.name,
-                };
-                check_backend_ref_parts(namespace, parts, resolver, grants).is_ok()
-            })
+            .filter(|b| check_backend_ref_parts(namespace, b.parts, resolver, grants).is_ok())
             .collect();
         // A rule left with none forwards nothing.
         !usable.is_empty()
             && usable.iter().all(|b| {
-                let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+                let target_ns = b.parts.namespace.unwrap_or(namespace);
                 b.port
                     .and_then(|p| u16::try_from(p).ok())
                     .is_some_and(|port| {
                         !resolver
-                            .pod_addresses(target_ns, &b.name, port, "TCP")
+                            .pod_addresses(target_ns, b.parts.name, port, R::PROTOCOL)
                             .is_empty()
                     })
             })
     })
 }
 
-/// The first backendRef of a TLSRoute that cannot be used, if any.
-fn tls_route_invalid_ref(
-    route: &TLSRoute,
+/// The first backendRef of an [`L4Route`] that cannot be used, if any.
+fn l4_route_invalid_ref<R: L4Route>(
+    route: &R,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Option<InvalidRef> {
-    let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
+    let namespace = route.meta().namespace.as_deref().unwrap_or("default");
     route
-        .spec
-        .rules
-        .iter()
-        .flat_map(|rule| rule.backend_refs.iter().flatten())
-        .find_map(|b| {
-            let parts = BackendRefParts {
-                group: b.group.as_deref(),
-                kind: b.kind.as_deref(),
-                namespace: b.namespace.as_deref(),
-                name: &b.name,
-            };
-            check_backend_ref_parts(namespace, parts, resolver, grants).err()
-        })
+        .backend_refs()
+        .into_iter()
+        .flatten()
+        .find_map(|b| check_backend_ref_parts(namespace, b.parts, resolver, grants).err())
 }
 
 /// Whether `backend` can take traffic: weighted, usable, with a ready pod.
@@ -4828,51 +5098,6 @@ fn build_route_status(
     .map(|(p, conditions)| HTTPRouteStatusParents {
         controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
         parent_ref: HTTPRouteStatusParentsParentRef {
-            group: p.group.clone(),
-            kind: p.kind.clone(),
-            name: p.name.clone(),
-            namespace: p.namespace.clone(),
-            port: p.port,
-            section_name: p.section_name.clone(),
-        },
-        conditions: Some(conditions),
-    })
-    .collect()
-}
-
-/// The TLSRoute twin of [`build_route_status`].
-fn build_tls_route_status(
-    route: &TLSRoute,
-    scope: &GatewayScope,
-    outcome: RouteOutcome,
-    invalid_ref: Option<InvalidRef>,
-) -> Vec<TLSRouteStatusParents> {
-    let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-    parent_conditions(
-        scope,
-        route_ns,
-        route.metadata.generation,
-        route.spec.parent_refs.as_deref().unwrap_or_default(),
-        "TLSRoute",
-        &|p| scope.accepts_tls_parent_ref(route_ns, p),
-        GatewayScope::listener_serves_tls_passthrough,
-        // Each parent by the listeners it selects: one admitting none of
-        // the route's names refuses it, whatever another does.
-        &|p| {
-            if outcome != RouteOutcome::NotMine
-                && scope.tls_parent_hostnames_by_port(route, p).is_empty()
-            {
-                RouteOutcome::NoMatchingListenerHostname
-            } else {
-                outcome
-            }
-        },
-        invalid_ref,
-    )
-    .into_iter()
-    .map(|(p, conditions)| TLSRouteStatusParents {
-        controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
-        parent_ref: TLSRouteStatusParentsParentRef {
             group: p.group.clone(),
             kind: p.kind.clone(),
             name: p.name.clone(),
@@ -5055,6 +5280,8 @@ macro_rules! impl_parent_status {
 
 impl_parent_status!(HTTPRouteStatusParents);
 impl_parent_status!(TLSRouteStatusParents);
+impl_parent_status!(TCPRouteStatusParents);
+impl_parent_status!(UDPRouteStatusParents);
 
 /// [`merge_route_status`] for a route of any kind.
 fn merge_parent_status<T: ParentStatus>(existing: &[T], ours: Vec<T>) -> (Vec<T>, bool) {
@@ -5374,7 +5601,7 @@ fn apply_tls_route(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
-    status_tx: Option<&TlsRouteStatusTx>,
+    status_tx: Option<&L4StatusTx<TLSRoute>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -5430,17 +5657,12 @@ fn apply_tls_route(
     let outcome = match &by_port {
         None => RouteOutcome::NotMine,
         Some(ports) if ports.is_empty() => RouteOutcome::NoMatchingListenerHostname,
-        Some(_) if !tls_route_backends_ready(route, resolver, scope) => {
+        Some(_) if !l4_route_backends_ready(route, resolver, scope) => {
             RouteOutcome::NoResolvableBackends
         }
         Some(_) => RouteOutcome::Accepted,
     };
-    let invalid_ref = tls_route_invalid_ref(route, resolver, scope);
-    if let Some(tx) = status_tx
-        && let Err(e) = tx.try_send((route.clone(), outcome, invalid_ref))
-    {
-        debug!("Gateway API: TLSRoute status channel full or closed: {}", e);
-    }
+    report_l4_status(route, outcome, resolver, scope, status_tx);
 
     let mut storage_guard = match storage.write() {
         Ok(g) => g,
@@ -5529,7 +5751,7 @@ fn re_resolve_all_tls(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
-    status_tx: Option<&TlsRouteStatusTx>,
+    status_tx: Option<&L4StatusTx<TLSRoute>>,
 ) -> bool {
     let tracked: Vec<TLSRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
@@ -5596,14 +5818,7 @@ pub async fn run_tlsroute_watcher(
         return Ok(());
     }
 
-    // Its own status writer, as for HTTPRoutes (see `run_httproute_watcher`).
-    let (status_tx, status_rx) = mpsc::channel(256);
-    {
-        let scope = scope.clone();
-        tokio::spawn(async move {
-            run_tls_status_writer(client, status_rx, scope).await;
-        });
-    }
+    let status_tx = spawn_l4_status_writer::<TLSRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -5796,6 +6011,7 @@ fn apply_tcp_route(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
+    status_tx: Option<&L4StatusTx<TCPRoute>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -5815,7 +6031,12 @@ fn apply_tcp_route(
         GatewayScope::listener_serves_tcp,
     );
 
-    let new_entrypoints = if !scope.accepts_tcp_route(route) {
+    let accepted = scope.accepts_tcp_route(route);
+    // A port Sōzune does not serve is the listener's to report: the route
+    // stays accepted.
+    let outcome = l4_outcome(route, accepted, resolver, scope);
+    report_l4_status(route, outcome, resolver, scope, status_tx);
+    let new_entrypoints = if !accepted {
         Vec::new()
     } else {
         scope
@@ -5922,6 +6143,7 @@ fn re_resolve_all_tcp(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
+    status_tx: Option<&L4StatusTx<TCPRoute>>,
 ) -> bool {
     let tracked: Vec<TCPRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
@@ -5933,7 +6155,15 @@ fn re_resolve_all_tcp(
 
     let mut changed = false;
     for route in &tracked {
-        if apply_tcp_route(route, storage, index, resolver, scope, listener_ports) {
+        if apply_tcp_route(
+            route,
+            storage,
+            index,
+            resolver,
+            scope,
+            listener_ports,
+            status_tx,
+        ) {
             changed = true;
         }
     }
@@ -5950,13 +6180,14 @@ pub async fn run_tcproute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<TCPRoute> = Api::all(client);
+    let api: Api<TCPRoute> = Api::all(client.clone());
     if api.list(&Default::default()).await.is_err() {
         info!(
             "Gateway API: TCPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
         );
         return Ok(());
     }
+    let status_tx = spawn_l4_status_writer::<TCPRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: TcpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -5976,7 +6207,7 @@ pub async fn run_tcproute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_tcp_route("apply", &route);
-                    apply_tcp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                    apply_tcp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_tcp_route("delete", &route);
@@ -6011,11 +6242,11 @@ pub async fn run_tcproute_watcher(
                 None => break,
             },
             _ = resolve_ticker.tick() => {
-                re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
             }
             _ = scope.changed() => {
                 debug!("Gateway API: scope changed, re-resolving TCP routes");
-                re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
             }
         };
         if changed && let Err(e) = reload_tx.send(()).await {
@@ -6147,6 +6378,7 @@ fn apply_udp_route(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &UdpListenerPorts,
+    status_tx: Option<&L4StatusTx<UDPRoute>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -6166,7 +6398,11 @@ fn apply_udp_route(
         GatewayScope::listener_serves_udp,
     );
 
-    let new_entrypoints = if !scope.accepts_udp_route(route) {
+    let accepted = scope.accepts_udp_route(route);
+    // As for TCPRoutes.
+    let outcome = l4_outcome(route, accepted, resolver, scope);
+    report_l4_status(route, outcome, resolver, scope, status_tx);
+    let new_entrypoints = if !accepted {
         Vec::new()
     } else {
         scope
@@ -6273,6 +6509,7 @@ fn re_resolve_all_udp(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &UdpListenerPorts,
+    status_tx: Option<&L4StatusTx<UDPRoute>>,
 ) -> bool {
     let tracked: Vec<UDPRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
@@ -6284,7 +6521,15 @@ fn re_resolve_all_udp(
 
     let mut changed = false;
     for route in &tracked {
-        if apply_udp_route(route, storage, index, resolver, scope, listener_ports) {
+        if apply_udp_route(
+            route,
+            storage,
+            index,
+            resolver,
+            scope,
+            listener_ports,
+            status_tx,
+        ) {
             changed = true;
         }
     }
@@ -6301,13 +6546,14 @@ pub async fn run_udproute_watcher(
     scope: GatewayScope,
     listener_ports: UdpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<UDPRoute> = Api::all(client);
+    let api: Api<UDPRoute> = Api::all(client.clone());
     if api.list(&Default::default()).await.is_err() {
         info!(
             "Gateway API: UDPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
         );
         return Ok(());
     }
+    let status_tx = spawn_l4_status_writer::<UDPRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: UdpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -6327,7 +6573,7 @@ pub async fn run_udproute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_udp_route("apply", &route);
-                    apply_udp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                    apply_udp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_udp_route("delete", &route);
@@ -6362,11 +6608,11 @@ pub async fn run_udproute_watcher(
                 None => break,
             },
             _ = resolve_ticker.tick() => {
-                re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
             }
             _ = scope.changed() => {
                 debug!("Gateway API: scope changed, re-resolving UDP routes");
-                re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports)
+                re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
             }
         };
         if changed && let Err(e) = reload_tx.send(()).await {
@@ -6963,8 +7209,8 @@ mod tests {
         let scope = tls_scope(Some("*.example.com"), 8443);
         let route = tls_route(vec!["a.example.com"], 8443);
         let status = |route: &TLSRoute, outcome| {
-            let invalid = tls_route_invalid_ref(route, &r1(), &scope);
-            let parents = build_tls_route_status(route, &scope, outcome, invalid);
+            let invalid = l4_route_invalid_ref(route, &r1(), &scope);
+            let parents = route.build_status(&scope, outcome, invalid);
             assert_eq!(parents.len(), 1);
             assert_eq!(parents[0].controller_name, SOZUNE_CONTROLLER_NAME);
             parents[0].conditions.clone().unwrap()
@@ -7012,7 +7258,7 @@ mod tests {
                 name: "gw2".into(),
                 ..Default::default()
             });
-        let parents = build_tls_route_status(&both, &scope, RouteOutcome::Accepted, None);
+        let parents = both.build_status(&scope, RouteOutcome::Accepted, None);
         let accepted: Vec<(String, String)> = parents
             .iter()
             .map(|p| find(p.conditions.as_deref().unwrap(), CONDITION_TYPE_ACCEPTED))
@@ -7404,6 +7650,60 @@ mod tests {
         }
     }
 
+    /// TCP and UDP routes report their status as TLS ones do: `Accepted` on
+    /// a parent of ours, `ResolvedRefs` from their backends.
+    #[test]
+    fn tcp_and_udp_routes_report_their_status() {
+        let condition = |parents: Vec<Condition>, type_: &str| {
+            let c = parents.into_iter().find(|c| c.type_ == type_).unwrap();
+            (c.status, c.reason)
+        };
+
+        let scope = tcp_scope(9000);
+        let route = tcp_route(9000);
+        assert_eq!(
+            l4_outcome(&route, true, &r1(), &scope),
+            RouteOutcome::Accepted
+        );
+        assert_eq!(
+            l4_outcome(&route, true, &r0(), &scope),
+            RouteOutcome::NoResolvableBackends
+        );
+        let parents = route.build_status(&scope, RouteOutcome::Accepted, None);
+        assert_eq!(parents.len(), 1);
+        let conditions = parents[0].conditions.clone().unwrap();
+        assert_eq!(
+            condition(conditions.clone(), CONDITION_TYPE_ACCEPTED),
+            ("True".to_string(), REASON_ACCEPTED.to_string())
+        );
+        assert_eq!(
+            condition(conditions, CONDITION_TYPE_RESOLVED_REFS),
+            ("True".to_string(), REASON_RESOLVED_REFS.to_string())
+        );
+        let unready = route.build_status(&scope, RouteOutcome::NoResolvableBackends, None);
+        assert_eq!(
+            condition(
+                unready[0].conditions.clone().unwrap(),
+                CONDITION_TYPE_RESOLVED_REFS
+            ),
+            ("False".to_string(), REASON_BACKEND_NOT_FOUND.to_string())
+        );
+
+        let scope = udp_scope(53);
+        let mut route = udp_route(53);
+        route.spec.rules[0].backend_refs.as_mut().unwrap()[0].namespace = Some("other".into());
+        let invalid = l4_route_invalid_ref(&route, &r1(), &scope);
+        assert_eq!(invalid, Some(InvalidRef::NotPermitted));
+        let parents = route.build_status(&scope, RouteOutcome::Accepted, invalid);
+        assert_eq!(
+            condition(
+                parents[0].conditions.clone().unwrap(),
+                CONDITION_TYPE_RESOLVED_REFS
+            ),
+            ("False".to_string(), REASON_REF_NOT_PERMITTED.to_string())
+        );
+    }
+
     fn tcp_ports() -> TcpListenerPorts {
         Arc::new([(9000, "tcpgw".to_string())].into_iter().collect())
     }
@@ -7461,7 +7761,8 @@ mod tests {
             &index,
             &r1(),
             &scope,
-            &tcp_ports()
+            &tcp_ports(),
+            None
         ));
         assert_eq!(storage.read().unwrap().len(), 1);
 
@@ -7478,13 +7779,20 @@ mod tests {
         let index: TcpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
         let route = tcp_route(9000);
 
-        apply_tcp_route(&route, &storage, &index, &r1(), &scope, &tcp_ports());
+        apply_tcp_route(&route, &storage, &index, &r1(), &scope, &tcp_ports(), None);
         assert!(storage.read().unwrap().is_empty());
         assert_eq!(index.read().unwrap().len(), 1);
 
         // Declare 9443 and re-resolve: the route lands.
         let ports = Arc::new([(9443, "tcpgw".to_string())].into_iter().collect());
-        assert!(re_resolve_all_tcp(&storage, &index, &r1(), &scope, &ports));
+        assert!(re_resolve_all_tcp(
+            &storage,
+            &index,
+            &r1(),
+            &scope,
+            &ports,
+            None
+        ));
         assert_eq!(storage.read().unwrap().len(), 1);
     }
 
@@ -7600,7 +7908,8 @@ mod tests {
             &index,
             &r1(),
             &scope,
-            &udp_ports()
+            &udp_ports(),
+            None
         ));
         assert_eq!(storage.read().unwrap().len(), 1);
 

@@ -38,6 +38,8 @@ rules:
     resources:
       - httproutes/status
       - tlsroutes/status
+      - tcproutes/status
+      - udproutes/status
       - gateways/status
       - gatewayclasses/status
     verbs: ["update", "patch"]

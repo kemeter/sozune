@@ -41,3 +41,18 @@ else
     fail "UDPRoute did not reach the backend (got: '$reply')"
     kubectl get udproute -n sozune-test -o wide 2>/dev/null
 fi
+
+log "[05] UDPRoute: its status reports Accepted and ResolvedRefs"
+
+accepted=""
+for _ in $(seq 1 30); do
+    accepted=$(kubectl get udproute udp-raw -n sozune-test \
+        -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}/{.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}' 2>/dev/null)
+    [[ "$accepted" == "True/True" ]] && break
+    sleep 2
+done
+if [[ "$accepted" == "True/True" ]]; then
+    pass "UDPRoute status: Accepted and ResolvedRefs"
+else
+    fail "UDPRoute status is not Accepted/ResolvedRefs (got: '$accepted')"
+fi
