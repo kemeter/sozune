@@ -54,6 +54,11 @@ pub struct Passthrough {
     /// The largest ClientHello it reads, in wire bytes.
     pub max_hello_bytes: usize,
     pub hosts: PassthroughHosts,
+    /// The names of the certificates the HTTPS worker holds, as SNI
+    /// patterns. A name neither they nor a passthrough route serve has its
+    /// connection closed, as a TLSRoute listener must, rather than answered
+    /// with Sōzu's default certificate.
+    pub certificates: PassthroughHosts,
 }
 
 /// Where a prereaded connection may go.
@@ -152,6 +157,10 @@ async fn handle_connection(
             port
         }
         Backend::Https => backends.https_loopback_port,
+        Backend::Refused => {
+            debug!("TLS gate: no route or certificate serves the SNI, closing");
+            return Ok(());
+        }
     };
 
     let mut outbound = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port)).await?;
@@ -177,11 +186,14 @@ enum Backend {
     Responder(u16),
     Passthrough(u16),
     Https,
+    /// Served by nothing: the connection is closed.
+    Refused,
 }
 
 /// Where a connection whose ClientHello says `hello` goes: an ACME challenge
 /// to the responder, a name a passthrough route serves to the passthrough
-/// listener, anything else — no hello at all included — to the HTTPS worker.
+/// listener, a name no certificate covers either nowhere, anything else — no
+/// hello at all included — to the HTTPS worker.
 fn pick_backend(hello: &ClientHello, backends: &GateBackends) -> Backend {
     if hello.acme
         && let Some(port) = backends.responder_port
@@ -196,6 +208,13 @@ fn pick_backend(hello: &ClientHello, backends: &GateBackends) -> Backend {
             .is_ok_and(|hosts| hosts.iter().any(|pattern| sni_matches(pattern, sni)));
         if served {
             return Backend::Passthrough(passthrough.loopback_port);
+        }
+        // A poisoned lock leaves the connection to the HTTPS worker too.
+        let certified = passthrough.certificates.read().map_or(true, |names| {
+            names.iter().any(|pattern| sni_matches(pattern, sni))
+        });
+        if !certified {
+            return Backend::Refused;
         }
     }
     Backend::Https
@@ -670,7 +689,8 @@ mod tests {
     }
 
     /// A challenge goes to the responder, a name a passthrough route serves
-    /// to the passthrough listener, anything else to the HTTPS worker.
+    /// to the passthrough listener, one no certificate covers nowhere,
+    /// anything else to the HTTPS worker.
     #[test]
     fn a_connection_goes_to_the_backend_its_hello_names() {
         let backends = GateBackends {
@@ -680,6 +700,7 @@ mod tests {
                 loopback_port: 3,
                 max_hello_bytes: PREREAD_MAX_BYTES,
                 hosts: Arc::new(RwLock::new(vec!["*.pass.example.com".into()])),
+                certificates: Arc::new(RwLock::new(vec!["app.example.com".into()])),
             }),
         };
         let pick = |acme, sni: Option<&str>| {
@@ -700,6 +721,7 @@ mod tests {
             Backend::Passthrough(3)
         );
         assert_eq!(pick(false, Some("app.example.com")), Backend::Https);
+        assert_eq!(pick(false, Some("other.example.com")), Backend::Refused);
         assert_eq!(pick(false, None), Backend::Https);
 
         let without = GateBackends {

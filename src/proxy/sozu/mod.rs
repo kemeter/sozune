@@ -749,6 +749,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
             loopback_port: forwarder.loopback_port,
             max_hello_bytes,
             hosts: Arc::new(RwLock::new(Vec::new())),
+            certificates: Arc::new(RwLock::new(Vec::new())),
         })
     } else {
         None
@@ -880,7 +881,9 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     },
                     cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                         Some(cmd) => {
-                            if !apply_certificate(&mut channels, cmd) {
+                            let applied = apply_certificate(&mut channels, cmd);
+                            share_certificate_names(&channels, passthrough.as_ref());
+                            if !applied {
                                 continue 'outer;
                             }
                         }
@@ -969,6 +972,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                             cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                                 Some(cmd) => {
                                     apply_certificate(&mut channels, cmd);
+                                    share_certificate_names(&channels, passthrough.as_ref());
                                     deadline = tokio::time::Instant::now() + reload_debounce;
                                 }
                                 None => {
@@ -1081,6 +1085,27 @@ impl HeldCertificate {
         address: SocketAddress,
     ) -> anyhow::Result<()> {
         remove_certificate(channel, address, &self.cert_pem)
+    }
+}
+
+/// Tells the TLS gate the names of the certificates the HTTPS worker holds.
+fn share_certificate_names(channels: &Channels, passthrough: Option<&tls_gate::Passthrough>) {
+    let Some(passthrough) = passthrough else {
+        return;
+    };
+    let mut names: Vec<String> = channels
+        .certificates
+        .values()
+        .flat_map(|held| held.names.iter().map(|name| name.to_ascii_lowercase()))
+        .collect();
+    names.sort();
+    names.dedup();
+    match passthrough.certificates.write() {
+        Ok(mut shared) => *shared = names,
+        Err(e) => error!(
+            "internal state corrupted (certificate names), restart required: {}",
+            e
+        ),
     }
 }
 
