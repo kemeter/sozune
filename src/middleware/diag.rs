@@ -71,6 +71,16 @@ pub fn invalid_backends(host: &str) -> Response<Body> {
     )
 }
 
+/// 503 Service Unavailable — the request fell to the share of a backend
+/// with no ready instance.
+pub fn unavailable_backend(host: &str) -> Response<Body> {
+    diag_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable-backend",
+        format!("sozune: a backend of the route for host '{host}' has no ready instance.\n"),
+    )
+}
+
 /// 404 Not Found — the host belongs to another listener of the Gateway,
 /// none of whose routes served the request.
 pub fn other_listener(host: &str) -> Response<Body> {

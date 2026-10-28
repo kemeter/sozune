@@ -202,6 +202,29 @@ pub async fn handle_proxy(
                 return response.into_response();
             }
 
+            // The share of requests that falls to a backend which cannot take
+            // them is answered with its error.
+            let failing = match route.failing_shares.as_ref().and_then(|s| s.next()) {
+                Some(1) => Some(diag::invalid_backends(&host)),
+                Some(2) => Some(diag::unavailable_backend(&host)),
+                _ => None,
+            };
+            if let Some(resp) = failing {
+                let duration = start.elapsed();
+                let status = resp.status().as_u16();
+                state.request_metrics.record(duration, status);
+                access_log(
+                    &source_ip,
+                    &method,
+                    &host,
+                    &path,
+                    status,
+                    duration,
+                    "middleware",
+                );
+                return resp.into_response();
+            }
+
             // Circuit breaker: if the route's breaker is open, short-circuit with
             // 503 before touching the backend. `should_allow` also handles the
             // open→half-open transition after the cooldown.

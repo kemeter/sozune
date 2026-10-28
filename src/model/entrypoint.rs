@@ -243,6 +243,23 @@ pub struct EntrypointConfig {
     /// of the route of this name, from the same provider.
     #[serde(default)]
     pub mirror_of: Option<String>,
+    /// Shares of the route's requests answered with an error instead of
+    /// being forwarded, as Gateway API asks for the backendRefs that cannot
+    /// take them.
+    #[serde(default)]
+    pub failing_shares: Option<FailingShares>,
+}
+
+/// How a route's requests split between its backends and errors, by the
+/// weights of the references each part stands for.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailingShares {
+    /// The weight of the references whose pods are the route's backends.
+    pub forwarded: u32,
+    /// The weight of the references Sōzune cannot use: answered `500`.
+    pub invalid: u32,
+    /// The weight of the references with no ready pod: answered `503`.
+    pub unavailable: u32,
 }
 
 /// Where a route's requests are copied to: one of `backends`, picked by

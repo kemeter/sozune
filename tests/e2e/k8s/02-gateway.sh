@@ -746,3 +746,56 @@ if [[ "$address" == "192.0.2.10" ]]; then
 else
     fail "Gateway status.addresses was not written (got '$address')"
 fi
+
+# ----------------------------------------------------------------------
+# A backendRef Sōzune cannot use keeps its share of the requests, answered
+# 500, as Gateway API asks: they do not all go to the backendRefs left.
+# ----------------------------------------------------------------------
+log "[02] Gateway: an invalid backendRef's share is answered 500"
+
+kubectl apply -n sozune-test -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: half-invalid-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-half-invalid.k8s-test.localhost
+  rules:
+    - backendRefs:
+        - name: svcb
+          port: 80
+          weight: 1
+        - name: no-such-service
+          port: 80
+          weight: 1
+YAML
+half_ok=0
+half_500=0
+for _ in $(seq 1 30); do
+    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "Host: gw-half-invalid.k8s-test.localhost" \
+        "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+    if [[ "$status" != "404" && "$status" != "000" ]]; then
+        break
+    fi
+    sleep 1
+done
+for _ in $(seq 1 20); do
+    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "Host: gw-half-invalid.k8s-test.localhost" \
+        "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null)
+    case "$status" in
+        200) half_ok=$((half_ok + 1)) ;;
+        500) half_500=$((half_500 + 1)) ;;
+    esac
+done
+if [[ "$half_ok" -eq 10 && "$half_500" -eq 10 ]]; then
+    pass "equal weights split 10 / 10 between svcb and 500"
+else
+    fail "expected 10 answers from svcb and 10 500s, got $half_ok and $half_500"
+fi
+kubectl delete -n sozune-test httproute half-invalid-route >/dev/null 2>&1 || true

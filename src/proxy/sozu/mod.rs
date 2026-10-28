@@ -3441,6 +3441,7 @@ fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
     let frontend = |config: &crate::model::EntrypointConfig| crate::model::EntrypointConfig {
         mirrors: Vec::new(),
         mirror_of: None,
+        failing_shares: None,
         ..config.clone()
     };
     old.protocol == new.protocol && frontend(&old.config) == frontend(&new.config)
@@ -5212,6 +5213,7 @@ mod tests {
                 answer: None,
                 mirrors: Vec::new(),
                 mirror_of: None,
+                failing_shares: None,
             },
             candidates: Vec::new(),
         }

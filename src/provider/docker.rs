@@ -1064,6 +1064,7 @@ pub(super) mod merge_tests {
                 answer: None,
                 mirrors: Vec::new(),
                 mirror_of: None,
+                failing_shares: None,
                 ip_allow_list: Vec::new(),
             },
             source: None,
