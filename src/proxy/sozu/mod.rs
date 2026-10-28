@@ -1454,10 +1454,41 @@ pub(crate) fn routes_as_applied(
     client_certificate_https_port: Option<u16>,
     unhealthy: &UnhealthyMap,
 ) -> (BTreeMap<String, Entrypoint>, Evicted) {
-    without_unhealthy_backends(
+    let (routes, evicted) = without_unhealthy_backends(
         &require_https_for_client_certificates(storage, client_certificate_https_port),
         unhealthy,
-    )
+    );
+    (with_mirror_routes(routes), evicted)
+}
+
+/// `routes` with each route that mirrors another (`mirror_of`) folded into
+/// the route it names, of the same provider: its backends become a mirror of
+/// that route, and it is served no more on its own. One naming no route
+/// mirrors nothing.
+pub(crate) fn with_mirror_routes(
+    routes: BTreeMap<String, Entrypoint>,
+) -> BTreeMap<String, Entrypoint> {
+    if routes.values().all(|ep| ep.config.mirror_of.is_none()) {
+        return routes;
+    }
+    let (mirrors, mut routes): (BTreeMap<_, _>, BTreeMap<_, _>) = routes
+        .into_iter()
+        .partition(|(_, ep)| ep.config.mirror_of.is_some());
+    for route in routes
+        .values_mut()
+        .filter(|ep| ep.protocol == Protocol::Http)
+    {
+        for mirror in mirrors.values() {
+            if mirror.source == route.source
+                && mirror.config.mirror_of.as_deref() == Some(route.name.as_str())
+            {
+                route.config.mirrors.push(crate::model::Mirror {
+                    backends: mirror.backends.clone(),
+                });
+            }
+        }
+    }
+    routes
 }
 
 /// Rebuild the middleware route table from current storage
@@ -3353,6 +3384,7 @@ fn remove_acme_frontends(
 fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
     let frontend = |config: &crate::model::EntrypointConfig| crate::model::EntrypointConfig {
         mirrors: Vec::new(),
+        mirror_of: None,
         ..config.clone()
     };
     old.protocol == new.protocol && frontend(&old.config) == frontend(&new.config)
@@ -5123,6 +5155,7 @@ mod tests {
                 match_client_ip: Vec::new(),
                 answer: None,
                 mirrors: Vec::new(),
+                mirror_of: None,
             },
             candidates: Vec::new(),
         }
@@ -5626,6 +5659,35 @@ mod tests {
             !is_backends_only_change(&old, &new),
             "middleware-routed entrypoints must not use the in-place backend diff"
         );
+    }
+
+    /// A route mirroring another is folded into it, from the same provider
+    /// only, and served no more on its own.
+    #[test]
+    fn a_mirror_route_is_folded_into_the_route_it_names() {
+        let mut web = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        web.id = "http_web".into();
+        web.name = "web".into();
+        web.source = Some("docker".into());
+        let mut next = base_ep(vec![Backend::new("10.0.0.2", 8080)]);
+        next.id = "http_web-next".into();
+        next.name = "web-next".into();
+        next.source = Some("docker".into());
+        next.config.hostnames = Vec::new();
+        next.config.mirror_of = Some("web".into());
+        let mut elsewhere = next.clone();
+        elsewhere.id = "http_web-other".into();
+        elsewhere.source = Some("swarm".into());
+
+        let routes: BTreeMap<String, Entrypoint> = [web, next, elsewhere]
+            .into_iter()
+            .map(|ep| (ep.id.clone(), ep))
+            .collect();
+        let routes = with_mirror_routes(routes);
+        assert_eq!(routes.keys().collect::<Vec<_>>(), ["http_web"]);
+        let mirrors = &routes["http_web"].config.mirrors;
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].backends, vec![Backend::new("10.0.0.2", 8080)]);
     }
 
     /// A route through the middleware whose backends or mirrors change needs

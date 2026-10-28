@@ -724,7 +724,9 @@ fn entrypoints_are_replicas(a: &Entrypoint, b: &Entrypoint) -> bool {
     let mut b_hosts = b.config.hostnames.clone();
     a_hosts.sort();
     b_hosts.sort();
-    a_hosts == b_hosts && a.config.path == b.config.path
+    // Mirrors of different routes share no backends, though both serve no
+    // host.
+    a_hosts == b_hosts && a.config.path == b.config.path && a.config.mirror_of == b.config.mirror_of
 }
 
 /// Insert `incoming` under `key` in `dest`, or merge backends into the existing
@@ -978,6 +980,7 @@ pub(super) mod merge_tests {
                 match_client_ip: Vec::new(),
                 answer: None,
                 mirrors: Vec::new(),
+                mirror_of: None,
                 ip_allow_list: Vec::new(),
             },
             source: None,

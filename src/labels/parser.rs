@@ -176,6 +176,33 @@ fn build_entrypoint(
 
     let prefix = format!("sozune.{protocol}.{service_name}.");
 
+    // A mirror of another route serves no host of its own.
+    let mirror_of = labels
+        .get(&format!("{prefix}mirrorOf"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(target) = mirror_of {
+        // Only its backend counts: it serves no route of its own, whatever
+        // routing labels it carries.
+        let port = core::parse_port(labels, &prefix, protocol, diagnostics);
+        let backend = match core::parse_weight(labels, &prefix, diagnostics) {
+            Some(weight) => Backend::new(backend_ip, port).with_weight(weight),
+            None => Backend::new(backend_ip, port),
+        };
+        return Some(Entrypoint {
+            id: format!("{protocol}_{service_name}"),
+            backends: vec![backend],
+            name: service_name.to_string(),
+            protocol: Protocol::Http,
+            config: EntrypointConfig {
+                mirror_of: Some(target),
+                ..Default::default()
+            },
+            source: None,
+            candidates: Vec::new(),
+        });
+    }
     let hostnames = host::parse_hostnames(labels, &prefix, diagnostics)?;
     let port = core::parse_port(labels, &prefix, protocol, diagnostics);
 
@@ -370,6 +397,7 @@ fn build_entrypoint(
             ip_allow_list,
             answer: None,
             mirrors: Vec::new(),
+            mirror_of: None,
         },
         source: None,
         candidates: Vec::new(),
@@ -528,6 +556,7 @@ fn build_l4_entrypoint(
             match_client_ip: Vec::new(),
             answer: None,
             mirrors: Vec::new(),
+            mirror_of: None,
             ip_allow_list: Vec::new(),
         },
         source: None,
@@ -651,6 +680,31 @@ mod tests {
         let r = parse(&c);
         assert!(r.entrypoints.is_empty());
         assert!(has_code(&r, DiagnosticCode::E004NoServices));
+    }
+
+    /// A mirror of another route needs no host: it serves nothing itself.
+    #[test]
+    fn a_mirror_route_needs_no_host() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.web-next.mirrorOf", "web"),
+                ("sozune.http.web-next.port", "8080"),
+                // Routing labels are left out.
+                ("sozune.http.web-next.path", "/next"),
+                ("sozune.http.web-next.redirect", "permanent"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let mirror = r.entrypoints.get("http_web-next").unwrap();
+        assert_eq!(mirror.config.mirror_of.as_deref(), Some("web"));
+        assert!(mirror.config.hostnames.is_empty());
+        assert_eq!(mirror.backends[0].port, 8080);
+        assert_eq!(mirror.config.path, None);
+        assert_eq!(mirror.config.redirect, None);
+        assert!(!has_code(&r, DiagnosticCode::E002MissingHost));
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 
     #[test]

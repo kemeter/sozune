@@ -54,6 +54,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "matchQuery",
     "matchHeadersRegex",
     "matchQueryRegex",
+    "mirrorOf",
     "matchClientIP",
     "ipAllowList",
 ];

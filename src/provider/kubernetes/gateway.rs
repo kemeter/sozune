@@ -5594,6 +5594,7 @@ fn rule_to_entrypoints(
                     answer: invalid_backends.then_some(crate::model::FixedAnswer::InvalidBackends),
                     ip_allow_list: Vec::new(),
                     mirrors: mirrors.clone(),
+                    mirror_of: None,
                 },
                 source: Some(id),
                 candidates: Vec::new(),
@@ -6971,6 +6972,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         match_client_ip: Vec::new(),
         answer: None,
         mirrors: Vec::new(),
+        mirror_of: None,
         ip_allow_list: Vec::new(),
     }
 }

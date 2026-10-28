@@ -466,6 +466,29 @@ services:
       - "sozune.http.regexversion.matchHeadersRegex.X-Version=v[0-9]+"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # svc-mirror-shadow gets a copy of each request of svc-mirrored, and logs
+  # its request line.
+  svc-mirrored:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.mirrored.host=$HOST_MIRROR"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-mirror-shadow:
+    image: alpine
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache socat >/dev/null 2>&1 &&
+         exec socat TCP-LISTEN:8080,fork,reuseaddr
+           SYSTEM:'head -1 >&2; printf \"HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n\"'"
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.mirroredshadow.mirrorOf=mirrored"
+      - "sozune.http.mirroredshadow.port=8080"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-query-regex:
     image: traefik/whoami
     labels:

@@ -79,7 +79,7 @@ pub enum Protocol {
     Udp,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
 pub struct EntrypointConfig {
     pub hostnames: Vec<String>,
     pub path: Option<PathConfig>,
@@ -239,6 +239,10 @@ pub struct EntrypointConfig {
     /// ignored.
     #[serde(default)]
     pub mirrors: Vec<Mirror>,
+    /// A route serving nothing itself: its backends get a copy of each request
+    /// of the route of this name, from the same provider.
+    #[serde(default)]
+    pub mirror_of: Option<String>,
 }
 
 /// Where a route's requests are copied to: one of `backends`, picked by
