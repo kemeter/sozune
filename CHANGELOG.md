@@ -41,6 +41,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- A route going through the middleware ignored its `loadBalancer`: `least_connections`, `power_of_two` and `random` all balanced in weighted round robin there. The middleware now honours them, counting for the first two the requests waiting for each backend's response. See [Weighted load balancing](documentation/routing/load-balancing.md#weighted-load-balancing).
 - A route going through the middleware kept sending a dead backend its share of requests, each paying a failed attempt, until a health check, when the route had one, took it out. A backend giving no response to 3 requests in a row is now left out for 10 seconds, as Sōzu does for the routes it serves itself, unless every backend of the route is. See [Without a health check](documentation/advanced/health-checks.md#without-a-health-check).
 - A route going through the middleware could not reach a backend with an IPv6 address: the middleware wrote it unbracketed into the URL it forwarded to, which failed to parse, and the client got `502`. It is now bracketed.
 - A route going through the middleware (rate limit, auth, compression, timeouts…) had its Sōzu frontend removed and added again whenever its backends changed, a rollout or a scale for instance: its requests got `404` in between. Sōzu's only backend for such a route is the middleware, so its frontend now stays, and only the middleware's table changes.

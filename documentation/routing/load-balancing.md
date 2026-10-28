@@ -109,7 +109,7 @@ The weight belongs to a backend, not to a service: three replicas of `app-stable
 
 A weight of `0` makes the backend a **backup**: it takes no traffic while another backend can serve, and takes over when none can. A negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
 
-A route that goes through the Sōzune middleware (rate limit, compression, auth, retry…) is balanced by the middleware with the weighted round robin above, whatever `loadBalancer` says. There, a backup takes over a request no backend gave a response to: once the [retries](/documentation/middleware/retry) are spent, each backend the request has not tried yet gets one try, heaviest first, then each backup. A WebSocket upgrade, which is not retried, goes through the same order when its backend refuses it.
+A route that goes through the Sōzune middleware (rate limit, compression, auth, retry…) is balanced by the middleware, by the same `loadBalancer` and weights. There, `least_connections` and `power_of_two` count the requests waiting for a backend's response headers; a WebSocket tunnel or a response body still streaming is not counted. Also there, a backup takes over a request no backend gave a response to: once the [retries](/documentation/middleware/retry) are spent, each backend the request has not tried yet gets one try, heaviest first, then each backup. A WebSocket upgrade, which is not retried, goes through the same order when its backend refuses it.
 
 ## When a backend leaves
 
