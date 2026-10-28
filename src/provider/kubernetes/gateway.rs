@@ -118,6 +118,20 @@ const SCOPE_SUBSCRIBERS: usize = 4;
 /// again.
 const STATUS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long one status write may take. The client's own read timeout is
+/// sized for watches, minutes long, and a write stuck that long would hold
+/// back every write queued behind it.
+const STATUS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `write`, given up past [`STATUS_WRITE_TIMEOUT`] as a failed write.
+pub(crate) async fn bounded_status_write<T>(
+    write: impl std::future::Future<Output = Result<T, kube::Error>>,
+) -> Result<T, kube::Error> {
+    tokio::time::timeout(STATUS_WRITE_TIMEOUT, write)
+        .await
+        .unwrap_or_else(|elapsed| Err(kube::Error::Service(Box::new(elapsed))))
+}
+
 /// In-memory snapshot of the Gateway API resources sōzune has decided to
 /// honour. The HTTPRoute watcher consults this on every apply to decide
 /// whether a route is in scope; the GatewayClass and Gateway watchers
@@ -1956,6 +1970,41 @@ impl GatewayScope {
         });
     }
 
+    /// Queue the status write of the GatewayClass `name` again after
+    /// [`STATUS_RETRY_DELAY`], from the class as it is then, unless Sōzune no
+    /// longer owns it.
+    fn retry_gatewayclass_status(&self, client: Client, name: String) {
+        let scope = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STATUS_RETRY_DELAY).await;
+            let status_tx = match scope.state.read() {
+                Ok(g) if g.gateway_classes.contains(&name) => g.status_tx.clone(),
+                _ => return,
+            };
+            let Some(status_tx) = status_tx else {
+                return;
+            };
+            let api: Api<GatewayClass> = Api::all(client.clone());
+            match bounded_status_write(api.get(&name)).await {
+                // Handed to another controller meanwhile: not ours to write.
+                Ok(class) if class.spec.controller_name != SOZUNE_CONTROLLER_NAME => {}
+                Ok(class) => {
+                    let _ = status_tx
+                        .send(StatusWrite::GatewayClass(Box::new(class)))
+                        .await;
+                }
+                Err(kube::Error::Api(r)) if r.code == 404 => {}
+                Err(e) => {
+                    warn!(
+                        "Gateway API: failed to read GatewayClass {}, trying again shortly: {}",
+                        name, e
+                    );
+                    scope.retry_gatewayclass_status(client, name);
+                }
+            }
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn published_addresses_for_tests(&self) -> Option<Vec<(String, String)>> {
         self.state.read().ok()?.addresses.clone()
@@ -2908,7 +2957,7 @@ async fn run_status_writer(
                 .map(|s| s.parents.clone())
                 .unwrap_or_default()
         };
-        match patch_route_parents(&api, name, our_status, parents).await {
+        match bounded_status_write(patch_route_parents(&api, name, our_status, parents)).await {
             Ok(true) => debug!(
                 "Gateway API: status patched on HTTPRoute {}/{} (outcome={:?})",
                 ns, name, outcome
@@ -3228,7 +3277,8 @@ async fn run_l4_status_writer<R: L4Route>(
             continue;
         }
         let api: Api<R> = Api::namespaced(client.clone(), &ns);
-        match patch_route_parents(&api, &name, ours, R::status_parents).await {
+        match bounded_status_write(patch_route_parents(&api, &name, ours, R::status_parents)).await
+        {
             Ok(true) => debug!(
                 "Gateway API: status patched on {} {}/{} (outcome={:?})",
                 R::KIND,
@@ -3681,7 +3731,9 @@ pub async fn run_gateway_status_writer(
     while let Some(msg) = rx.recv().await {
         match msg {
             StatusWrite::Gateway(gw) => patch_gateway_status(&client, &scope, &gw).await,
-            StatusWrite::GatewayClass(class) => patch_gatewayclass_status(&client, &class).await,
+            StatusWrite::GatewayClass(class) => {
+                patch_gatewayclass_status(&client, &scope, &class).await
+            }
         }
     }
     info!("Gateway API: Gateway/GatewayClass status writer stopped");
@@ -3738,7 +3790,7 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
     }
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let pp = PatchParams::default();
-    match api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
+    match bounded_status_write(api.patch_status(name, &pp, &Patch::Merge(&patch))).await {
         // Deleted meanwhile: nothing left to write.
         Err(kube::Error::Api(r)) if r.code == 404 => {
             debug!(
@@ -3763,7 +3815,7 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
 /// reaches the writer only when sōzune owns it (controllerName matches); a
 /// class pointing at another controller is never queued, as Gateway API
 /// requires.
-async fn patch_gatewayclass_status(client: &Client, class: &GatewayClass) {
+async fn patch_gatewayclass_status(client: &Client, scope: &GatewayScope, class: &GatewayClass) {
     let Some(name) = class.metadata.name.as_deref() else {
         return;
     };
@@ -3778,13 +3830,17 @@ async fn patch_gatewayclass_status(client: &Client, class: &GatewayClass) {
     });
     let api: Api<GatewayClass> = Api::all(client.clone());
     let pp = PatchParams::default();
-    if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
-        warn!(
-            "Gateway API: failed to patch status on GatewayClass {}: {}",
-            name, e
-        );
-    } else {
-        debug!("Gateway API: status patched on GatewayClass {}", name);
+    match bounded_status_write(api.patch_status(name, &pp, &Patch::Merge(&patch))).await {
+        // Deleted meanwhile: nothing left to write.
+        Err(kube::Error::Api(r)) if r.code == 404 => {}
+        Err(e) => {
+            warn!(
+                "Gateway API: failed to patch status on GatewayClass {}, trying again shortly: {}",
+                name, e
+            );
+            scope.retry_gatewayclass_status(client.clone(), name.to_string());
+        }
+        Ok(_) => debug!("Gateway API: status patched on GatewayClass {}", name),
     }
 }
 

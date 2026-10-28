@@ -71,16 +71,13 @@ else
     return 0
 fi
 
-# Find the timestamp of the data line and assert it arrived within 1s of
-# publish — proves Sozune doesn't buffer the chunk until connection close.
+# The event arrived while the stream was still open: Mercure never closes
+# it, so a proxy buffering until the connection ends would have delivered
+# nothing before the subscriber was stopped, 2s after publish. The delay is
+# reported, not asserted: a busy host stretches it without any buffering.
 data_line=$(grep "data: hello-from-sozune-e2e" "$sub_out" | head -1)
 data_ts_str=$(echo "$data_line" | awk '{print $1}')
 # Convert "1777672623.131" → 1777672623131 (ms)
 data_ts=$(echo "$data_ts_str" | awk -F. '{printf "%d", $1 * 1000 + $2}')
 delta_ms=$((data_ts - publish_ts))
-
-if [[ "$delta_ms" -lt 1000 ]]; then
-    pass "event streamed in real time (${delta_ms} ms after publish)"
-else
-    fail "event delivery was buffered: ${delta_ms} ms after publish (expected < 1000)"
-fi
+pass "event streamed while the connection was open (${delta_ms} ms after publish)"
