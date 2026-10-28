@@ -294,7 +294,7 @@ pub async fn handle_proxy(
                     &forwarded_path,
                     &query,
                     timeout,
-                    &state.passive_health,
+                    &state,
                     &route,
                 )
                 .await;
@@ -660,7 +660,7 @@ async fn handle_websocket(
     path: &str,
     query: &str,
     timeout: Option<std::time::Duration>,
-    health: &std::sync::Arc<super::passive_health::PassiveHealth>,
+    state: &MiddlewareAppState,
     route: &std::sync::Arc<super::MiddlewareRoute>,
 ) -> axum::response::Response {
     debug!("WebSocket upgrade request to {:?}{}", backends, path);
@@ -685,7 +685,7 @@ async fn handle_websocket(
     for ((backend_host, backend_port), index) in backends {
         let backend_addr = format!("{}:{}", uri_host(backend_host), backend_port);
         let attempt = super::passive_health::Attempt::new(
-            health.clone(),
+            state.passive_health.clone(),
             (backend_host.clone(), *backend_port),
         );
         // Counted as waiting until the backend answers, not for the tunnel.
@@ -712,7 +712,7 @@ async fn handle_websocket(
         match outcome {
             Ok((stream, n)) => {
                 attempt.succeeded();
-                answered = Some((stream, n));
+                answered = Some((stream, n, (backend_host.clone(), *backend_port)));
                 break;
             }
             Err((failure, is_timeout)) => {
@@ -723,7 +723,7 @@ async fn handle_websocket(
             }
         }
     }
-    let Some((mut backend_stream, n)) = answered else {
+    let Some((mut backend_stream, n, tunnel_backend)) = answered else {
         // A 504 when the last backend tried timed out, as for a request.
         return if last_timed_out {
             diag::backend_timeout(&format!("websocket: {last_failure}"), timeout).into_response()
@@ -759,6 +759,11 @@ async fn handle_websocket(
 
     // Use hyper's upgrade mechanism to get the client's underlying connection
     let on_upgrade = hyper::upgrade::on(req);
+    // Closed when its backend leaves the route; refused when it already has.
+    let Some(mut tunnel) = super::tunnels::tunnels().register(&route.cluster_id, tunnel_backend)
+    else {
+        return diag::backend_unreachable("websocket: the backend left the route").into_response();
+    };
 
     tokio::spawn(async move {
         match on_upgrade.await {
@@ -780,6 +785,9 @@ async fn handle_websocket(
                         if let Err(e) = result {
                             debug!("WebSocket backend->client closed: {}", e);
                         }
+                    }
+                    _ = tunnel.closed() => {
+                        debug!("WebSocket closed: its backend left the route");
                     }
                 }
                 debug!("WebSocket connection closed");

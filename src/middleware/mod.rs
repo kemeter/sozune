@@ -10,6 +10,7 @@ pub mod passive_health;
 mod proxy;
 pub mod rate_limit;
 pub(crate) mod request_match;
+pub mod tunnels;
 mod wasm;
 
 use std::sync::{Arc, Mutex, RwLock};
