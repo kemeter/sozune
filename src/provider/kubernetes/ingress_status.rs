@@ -117,9 +117,12 @@ async fn write_status(
 ) -> bool {
     let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
     let patch = serde_json::json!({ "status": { "loadBalancer": { "ingress": addresses } } });
-    match api
-        .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
+    match super::gateway::bounded_status_write(api.patch_status(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    ))
+    .await
     {
         Ok(_) => {
             debug!(
