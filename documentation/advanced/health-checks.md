@@ -66,6 +66,10 @@ The probe sends `GET http://<backend-host>:<port><path>`, `<port>` being `health
 
 Without `healthCheck.path`, the backend keeps the plain TCP probe — fully backward compatible. `healthCheck.status` and `healthCheck.headers.*` need a path: without one they emit `W021` and are ignored.
 
+## Without a health check
+
+A backend that stops answering is also left out without one, from the requests it fails. Sōzu does it for the routes it serves itself. For a route that goes through the Sōzune middleware (rate limit, auth, compression, timeouts, retries, a mirror…), a backend that gives no response to 3 requests in a row (refused connection, timeout) gets no more requests for 10 seconds, unless every backend of the route is in that state. The next request it is picked for then tries it again: an answer, whatever its status, brings it back; a failure leaves it out for 10 more seconds. A health check takes a backend out before any request fails on it; this only reacts to the failures.
+
 ## What it does not do
 
 - **No status ranges.** `healthCheck.status` accepts one exact code; without it, any `2xx`/`3xx` is healthy.
