@@ -72,6 +72,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'header-query-matching',
     'client-ip-matching',
     'load-balancing',
+    'mirroring',
     'tcp',
   ],
   providers: ['docker', 'podman', 'swarm', 'kubernetes', 'nomad', 'consul', 'ring', 'http'],

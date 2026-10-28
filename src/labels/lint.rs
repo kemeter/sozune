@@ -416,6 +416,7 @@ mod tests {
                 match_client_ip: Vec::new(),
                 answer: None,
                 mirrors: Vec::new(),
+                mirror_of: None,
                 ip_allow_list: Vec::new(),
             },
             source: None,
