@@ -183,18 +183,24 @@ log "[02] Middleware: rate limiting"
 
 wait_for_status "http://127.0.0.1:$HTTP_PORT/" "$HOST_RATELIMIT" "200" || true
 
-for i in $(seq 1 3); do
-    curl -s -o /dev/null --max-time 2 -H "Host: $HOST_RATELIMIT" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || true
+# Twice the burst at once: sent one after another, a slow host lets the
+# bucket refill between them.
+rl_out=$(mktemp)
+rl_pids=()
+for _ in $(seq 1 6); do
+    curl -s -o /dev/null -w "%{http_code}\n" --max-time 2 \
+        -H "Host: $HOST_RATELIMIT" "http://127.0.0.1:$HTTP_PORT/" >>"$rl_out" 2>/dev/null &
+    rl_pids+=($!)
 done
-
-rl_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
-    -H "Host: $HOST_RATELIMIT" \
-    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || echo "000")
-if [[ "$rl_status" == "429" ]]; then
-    pass "rate limiting returns 429 after burst exceeded"
+# Not a bare `wait`: Sōzune runs in the background of the same shell.
+wait "${rl_pids[@]}" 2>/dev/null || true
+rl_limited=$(grep -c '^429$' "$rl_out" || true)
+if [[ "$rl_limited" -ge 1 ]]; then
+    pass "rate limiting returns 429 after burst exceeded ($rl_limited/6)"
 else
-    fail "rate limiting returned $rl_status instead of 429"
+    fail "rate limiting returned no 429 for twice the burst: $(sort "$rl_out" | uniq -c | tr '\n' ' ')"
 fi
+rm -f "$rl_out"
 
 log "[02] Middleware: gzip compression"
 

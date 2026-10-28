@@ -21,10 +21,12 @@ if ! wait_for_tcp_open "127.0.0.1" "$TCP_SNI_PORT"; then
 fi
 pass "SNI listener on $TCP_SNI_PORT is open"
 
-# The backends build a cert and install packages on first boot, which takes
-# longer than the socat-only services. Give the TLS path time to come up.
+# The backends install packages and build a cert on first boot, which takes
+# longer than the socat-only services, and longer still on a busy host. Give
+# the TLS path a minute to come up.
 sni_ready=0
-for _ in $(seq 1 "$MAX_RETRIES"); do
+sni_deadline=$((SECONDS + 60))
+while [[ $SECONDS -lt $sni_deadline ]]; do
     if [[ "$(tls_sni_probe "127.0.0.1" "$TCP_SNI_PORT" "alpha.sni.test")" == *"sni-backend-alpha"* ]]; then
         sni_ready=1
         break
