@@ -90,6 +90,7 @@ It asks the running instance, so the API must be enabled; it is reached at `api.
 | `-X, --method` | Request method (default `GET`) |
 | `-H, --header 'Name: value'` | Request header, repeatable |
 | `--client-ip <ip>` | Client address; IP allow-lists and client-IP matching are not evaluated without it |
+| `--client-cert` | The client presents a valid certificate; without it, an `https` URL fails its handshake when [client certificates](../tls/overview.md#client-certificates-mutual-tls) are `required` |
 | `--json` | Print the API's JSON answer |
 
 It exits, with or without `--json`, `0` when a route serves the request (proxied, redirected, ACME challenge), `1` when it is not served (no route matches, or sozune answers it with an error such as a `403` or `404`), and `2` when the question could not be answered (API unreachable, credentials refused, invalid URL or header). The same answer is available from the API as `POST /routes/resolve`, see [the endpoint reference](../configuration/api.md#post-routesresolve).

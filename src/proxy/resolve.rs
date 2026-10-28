@@ -48,6 +48,10 @@ pub struct ResolveRequest {
     /// not evaluated without it.
     #[serde(default)]
     pub client_ip: Option<IpAddr>,
+    /// The client presents a valid certificate in its TLS handshake. A
+    /// listener that requires one refuses the handshake without it.
+    #[serde(default)]
+    pub client_certificate: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,7 +62,7 @@ pub enum Outcome {
     /// Answered with a redirect.
     Redirected,
     /// A route matched, but the request is answered with an error before
-    /// reaching a backend.
+    /// reaching a backend; or the TLS handshake fails before any route.
     Rejected,
     /// Served by the ACME HTTP-01 challenge responder.
     AcmeChallenge,
@@ -157,6 +161,12 @@ pub struct ResolveInputs<'a> {
     /// The main HTTP and HTTPS ports and those Gateway listeners are served
     /// on (`proxy.gateway_ports`), when known.
     pub ports: Option<ListenerPorts<'a>>,
+    /// The HTTPS listeners refuse a handshake without a valid client
+    /// certificate (`proxy.https.tls.client_auth` mode `required`).
+    pub client_certificate_required: bool,
+    /// The main HTTPS port forwards the TLS of the passthrough routes
+    /// undecrypted (`proxy.https.passthrough`).
+    pub https_passthrough: bool,
 }
 
 /// The ports the HTTP and HTTPS listeners are on.
@@ -243,8 +253,57 @@ pub async fn resolve(
 ) -> Result<Resolution, String> {
     let target = Target::parse(request)?;
     // Built once up front so an invalid method or header is a 400 whatever
-    // route the request would take.
+    // becomes of the request, its TLS handshake included: the question is
+    // malformed.
     synthetic_request(&target, request)?;
+    if let Some(route) = passthrough_route(inputs, &target) {
+        let evicted = inputs
+            .evicted
+            .get(&route.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let (outcome, summary) = if route.backends.is_empty() {
+            (
+                Outcome::Rejected,
+                format!(
+                    "passthrough route `{}` has no backend: the connection is closed",
+                    route.name
+                ),
+            )
+        } else {
+            (
+                Outcome::Proxied,
+                format!(
+                    "forwarded undecrypted by passthrough route `{}`: no HTTP route sees it",
+                    route.name
+                ),
+            )
+        };
+        return Ok(Resolution {
+            outcome,
+            status: None,
+            summary,
+            route: Some(route_summary(route)),
+            candidates: Vec::new(),
+            pipeline: Vec::new(),
+            backends: backend_states(route, inputs.unhealthy, evicted),
+        });
+    }
+    if target.listener == FrontListener::Https
+        && inputs.client_certificate_required
+        && !request.client_certificate
+    {
+        return Ok(Resolution {
+            outcome: Outcome::Rejected,
+            status: None,
+            summary: "the TLS handshake fails: the HTTPS listener requires a client certificate"
+                .to_string(),
+            route: None,
+            candidates: Vec::new(),
+            pipeline: Vec::new(),
+            backends: Vec::new(),
+        });
+    }
     let decision = route_with_sozu(inputs, &target);
     let candidates = explain_candidates(inputs, &target, &decision);
 
@@ -476,6 +535,33 @@ fn listener_port(entrypoint: &Entrypoint, listener: FrontListener) -> u16 {
         FrontListener::Http => listener_http_port(entrypoint, 0),
         FrontListener::Https => listener_https_port(entrypoint, 0),
     }
+}
+
+/// The passthrough route the TLS gate forwards an `https` request to,
+/// undecrypted: with `proxy.https.passthrough`, on the main HTTPS port, a live
+/// route of its passthrough listener whose SNI takes the host. An exact name
+/// is preferred to a wildcard.
+fn passthrough_route<'a>(inputs: &ResolveInputs<'a>, target: &Target) -> Option<&'a Entrypoint> {
+    // The gate is on the main HTTPS port alone, when it is known.
+    let on_gate_port = match &inputs.ports {
+        Some(ports) => target.port == Some(ports.https),
+        None => target_listener_port(inputs, target) == 0,
+    };
+    if !inputs.https_passthrough || target.listener != FrontListener::Https || !on_gate_port {
+        return None;
+    }
+    let taking = |wildcard: bool| {
+        inputs.live.values().find(|ep| {
+            ep.protocol == Protocol::Tcp
+                && ep.config.entrypoint.as_deref()
+                    == Some(crate::config::HTTPS_PASSTHROUGH_LISTENER)
+                && ep.config.sni.as_deref().is_some_and(|pattern| {
+                    pattern.starts_with("*.") == wildcard
+                        && crate::proxy::tls_gate::sni_matches(pattern, &target.host)
+                })
+        })
+    };
+    taking(false).or_else(|| taking(true))
 }
 
 /// The listener a request reaches, by its port: that of a Gateway listener of
@@ -1037,6 +1123,23 @@ mod tests {
     }
 
     async fn resolve_in(routes: Vec<Entrypoint>, request: serde_json::Value) -> Resolution {
+        resolve_with_client_auth(routes, request, false).await
+    }
+
+    async fn resolve_with_client_auth(
+        routes: Vec<Entrypoint>,
+        request: serde_json::Value,
+        client_certificate_required: bool,
+    ) -> Resolution {
+        resolve_with_tls(routes, request, client_certificate_required, false).await
+    }
+
+    async fn resolve_with_tls(
+        routes: Vec<Entrypoint>,
+        request: serde_json::Value,
+        client_certificate_required: bool,
+        https_passthrough: bool,
+    ) -> Resolution {
         let storage = storage(routes);
         let unhealthy = UnhealthyMap::new();
         let trusted = TrustedProxies::default();
@@ -1049,9 +1152,92 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required,
+            https_passthrough,
         };
         let request: ResolveRequest = serde_json::from_value(request).unwrap();
         resolve(&inputs, &request).await.unwrap()
+    }
+
+    /// With client certificates required, an HTTPS request without one
+    /// fails its handshake: no route sees it.
+    #[tokio::test]
+    async fn a_required_client_certificate_fails_the_handshake_without_one() {
+        let routes = || {
+            vec![route(
+                "web",
+                &["app.example.com"],
+                serde_json::json!({ "tls": true }),
+            )]
+        };
+
+        let refused =
+            resolve_with_client_auth(routes(), get("https://app.example.com/"), true).await;
+        assert_eq!(refused.outcome, Outcome::Rejected);
+        assert_eq!(refused.status, None);
+        assert!(
+            refused.summary.contains("client certificate"),
+            "{}",
+            refused.summary
+        );
+        assert!(refused.route.is_none());
+
+        let with_one = resolve_with_client_auth(
+            routes(),
+            serde_json::json!({ "url": "https://app.example.com/", "client_certificate": true }),
+            true,
+        )
+        .await;
+        assert_eq!(with_one.outcome, Outcome::Proxied);
+
+        // Not asked for one: served as before.
+        let not_required =
+            resolve_with_client_auth(routes(), get("https://app.example.com/"), false).await;
+        assert_eq!(not_required.outcome, Outcome::Proxied);
+    }
+
+    /// With passthrough on the HTTPS port, a host a passthrough route takes
+    /// goes to it undecrypted: neither the HTTP routes nor the client
+    /// certificate check see it.
+    #[tokio::test]
+    async fn a_passthrough_host_is_forwarded_undecrypted() {
+        let passthrough = |id: &str, sni: &str| {
+            let mut tcp = route(id, &[], serde_json::json!({}));
+            tcp.protocol = Protocol::Tcp;
+            tcp.config.entrypoint = Some(crate::config::HTTPS_PASSTHROUGH_LISTENER.to_string());
+            tcp.config.sni = Some(sni.to_string());
+            tcp
+        };
+        let routes = || {
+            vec![
+                route(
+                    "web",
+                    &["app.example.com"],
+                    serde_json::json!({ "tls": true }),
+                ),
+                passthrough("any", "*.example.com"),
+                passthrough("app", "app.example.com"),
+            ]
+        };
+
+        let forwarded =
+            resolve_with_tls(routes(), get("https://app.example.com/"), true, true).await;
+        assert_eq!(forwarded.outcome, Outcome::Proxied);
+        assert_eq!(forwarded.route.unwrap().id, "app");
+        let wildcard = resolve_with_tls(routes(), get("https://db.example.com/"), true, true).await;
+        assert_eq!(wildcard.route.unwrap().id, "any");
+
+        let mut empty = passthrough("app", "app.example.com");
+        empty.backends.clear();
+        let closed =
+            resolve_with_tls(vec![empty], get("https://app.example.com/"), true, true).await;
+        assert_eq!(closed.outcome, Outcome::Rejected);
+        assert_eq!(closed.status, None);
+
+        // Without passthrough on the port, the HTTPS listener has it.
+        let terminated =
+            resolve_with_tls(routes(), get("https://app.example.com/"), false, false).await;
+        assert_eq!(terminated.route.unwrap().id, "web");
     }
 
     fn get(url: &str) -> serde_json::Value {
@@ -1528,6 +1714,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/api/users")).unwrap();
@@ -1560,6 +1748,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest = serde_json::from_value(serde_json::json!({
             "url": "http://app.example.com/.well-known/acme-challenge/token",
@@ -1594,6 +1784,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/")).unwrap();
@@ -1623,6 +1815,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest = serde_json::from_value(serde_json::json!({
             "url": "http://app.example.com/",
@@ -1685,6 +1879,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/")).unwrap();
@@ -1737,6 +1933,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("http://app.example.com/")).unwrap();
@@ -1769,6 +1967,8 @@ mod tests {
             trusted_proxies: &trusted,
             plugins: &PluginRegistry::new(),
             ports: None,
+            client_certificate_required: false,
+            https_passthrough: false,
         };
         let request: ResolveRequest =
             serde_json::from_value(get("app.example.com/no-scheme")).unwrap();
