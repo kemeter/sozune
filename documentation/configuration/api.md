@@ -392,7 +392,7 @@ curl -u admin:your-password -X POST http://localhost:3035/routes/resolve \
   -d '{"url": "https://app.example.com/api/users", "method": "GET", "headers": {"X-Tenant": "acme"}, "client_ip": "203.0.113.7"}'
 ```
 
-Only `url` is required. `method` defaults to `GET`. Without `client_ip`, rules on the client address (IP allow-list, client-IP matching) are reported as not evaluated.
+Only `url` is required. `method` defaults to `GET`. Without `client_ip`, rules on the client address (IP allow-list, client-IP matching) are reported as not evaluated. `client_certificate: true` says the client presents a valid certificate: with [client certificates](../tls/overview.md#client-certificates-mutual-tls) `required`, an `https` request without one is `rejected`, its TLS handshake failing before any route sees it. With [passthrough on the HTTPS port](../routing/tcp.md#passthrough-on-the-https-port), an `https` request whose host a passthrough route takes is reported `proxied` by that route: it is forwarded undecrypted, so no HTTP route, middleware or client certificate check sees it.
 
 ```json
 {
@@ -418,8 +418,8 @@ Only `url` is required. `method` defaults to `GET`. Without `client_ip`, rules o
 }
 ```
 
-- `outcome`: `proxied` (sent to a backend), `redirected`, `rejected` (a route matched but sōzune answers with an error, see `status`), `acme_challenge`, or `no_route`.
-- `status`: the status sōzune answers with itself; `null` when a backend answers, or when the route closes the connection without answering (`redirect: close`).
+- `outcome`: `proxied` (sent to a backend), `redirected`, `rejected` (a route matched but sōzune answers with an error, see `status`; or the TLS handshake fails, for want of a required client certificate), `acme_challenge`, or `no_route`.
+- `status`: the status sōzune answers with itself; `null` when a backend answers, when the route closes the connection without answering (`redirect: close`), or when the TLS handshake fails.
 - `candidates`: the other routes whose hostname matches, each with a `verdict` — `shadowed` (would match, but a route tried before it matches first), `rejected` (its path, method or TLS setting does not match), or `refused` (Sōzu refused it, so it is not live).
 - `pipeline`: the route's middlewares in the order they run. `pass` and `blocked` are decided on the request; `applies` depends on live state (rate-limit buckets, in-flight requests, the forward-auth server) and is not decided; `not_evaluated` needs `client_ip`, comes after a blocking step, or is `basic-auth`: credentials are never checked by this endpoint, so a route protected by basic auth is reported as proxied *if the credentials are valid*, and as a `401` when the request carries none.
 - `backends`: the route's backends and their health-check state: `address`, `healthy`, `reason` (why it is unhealthy) and `in_rotation` (`false` for a backend the last reload left out). Those in rotation come first.

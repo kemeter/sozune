@@ -21,8 +21,15 @@
   /** One `Name: value` per line. */
   let headers = $state('');
   let clientIp = $state(getParam('client_ip', ''));
+  let clientCert = $state(getParam('client_cert', '') === '1');
 
-  type Submitted = { url: string; method: string; headers: string; clientIp: string };
+  type Submitted = {
+    url: string;
+    method: string;
+    headers: string;
+    clientIp: string;
+    clientCert: boolean;
+  };
   let result = $state<Resolution | null>(null);
   /** The request `result` answers: the URL is synced from it, and the result
    *  is marked stale once the form no longer matches it. */
@@ -63,6 +70,7 @@
     if (request.url) params.set('url', request.url);
     if (request.method !== 'GET') params.set('method', request.method);
     if (request.clientIp) params.set('client_ip', request.clientIp);
+    if (request.clientCert) params.set('client_cert', '1');
     // The headers are not in the URL: reloaded or shared, this test would run
     // without them and could answer differently. Leave it to be completed.
     if (request.headers.trim()) params.set('run', '0');
@@ -78,7 +86,13 @@
     if (!url.trim()) return;
     // Snapshot taken before the await: edits made while it is in flight belong
     // to the next request, not to this answer.
-    const request: Submitted = { url: url.trim(), method, headers, clientIp: clientIp.trim() };
+    const request: Submitted = {
+      url: url.trim(),
+      method,
+      headers,
+      clientIp: clientIp.trim(),
+      clientCert
+    };
     loading = true;
     error = null;
     try {
@@ -86,7 +100,8 @@
         url: request.url,
         method: request.method,
         headers: parseHeaders(request.headers),
-        client_ip: request.clientIp || undefined
+        client_ip: request.clientIp || undefined,
+        client_certificate: request.clientCert || undefined
       });
       submitted = request;
       syncUrl(request);
@@ -129,7 +144,8 @@
       (submitted.url !== url.trim() ||
         submitted.method !== method ||
         submitted.headers !== headers ||
-        submitted.clientIp !== clientIp.trim())
+        submitted.clientIp !== clientIp.trim() ||
+        submitted.clientCert !== clientCert)
   );
 
   const stepGlyph: Record<string, string> = {
@@ -181,6 +197,10 @@
     <label class="field client">
       <span class="field-label">Client IP <span class="hint">for IP-based rules</span></span>
       <input class="mono" type="text" placeholder="203.0.113.7" bind:value={clientIp} />
+    </label>
+    <label class="check">
+      <input type="checkbox" bind:checked={clientCert} />
+      <span>Client certificate <span class="hint">when HTTPS requires one</span></span>
     </label>
   </div>
 </form>
@@ -331,6 +351,16 @@
   }
   .field.client {
     flex: 1;
+  }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    align-self: flex-end;
+    padding-bottom: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--fg-2);
+    cursor: pointer;
   }
   .field-label {
     font-size: 0.7rem;

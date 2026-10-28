@@ -29,6 +29,11 @@ pub struct RouteArgs {
     #[arg(long, value_name = "IP")]
     pub client_ip: Option<IpAddr>,
 
+    /// The client presents a valid certificate, for an HTTPS listener that
+    /// requires one (`proxy.https.tls.client_auth`).
+    #[arg(long)]
+    pub client_cert: bool,
+
     /// API user [env: SOZUNE_API_USER]. The password is read from
     /// SOZUNE_API_PASSWORD, or given as `user:password`.
     #[arg(short, long)]
@@ -77,6 +82,7 @@ async fn ask(args: &RouteArgs, config_path: &str) -> Result<(Resolution, String)
         "method": args.method,
         "headers": headers,
         "client_ip": args.client_ip,
+        "client_certificate": args.client_cert,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -349,6 +355,7 @@ mod tests {
             method: "GET".to_string(),
             headers: Vec::new(),
             client_ip: None,
+            client_cert: false,
             user: Some("alice:secret".to_string()),
             api: None,
             json: false,

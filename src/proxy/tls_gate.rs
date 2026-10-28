@@ -203,7 +203,7 @@ fn pick_backend(hello: &ClientHello, backends: &GateBackends) -> Backend {
 
 /// Whether the SNI pattern `pattern` takes `sni`, as Sōzu's TCP listener does:
 /// an exact name, or `*.` and a suffix for one more label, case aside.
-fn sni_matches(pattern: &str, sni: &str) -> bool {
+pub(crate) fn sni_matches(pattern: &str, sni: &str) -> bool {
     match pattern.strip_prefix("*.") {
         Some(suffix) => sni
             .len()

@@ -357,6 +357,9 @@ export interface ResolveRequest {
   method?: string;
   headers?: Record<string, string>;
   client_ip?: string;
+  /** The client presents a valid certificate, for an HTTPS listener that
+   *  requires one. */
+  client_certificate?: boolean;
 }
 
 export type ResolveOutcome = 'proxied' | 'redirected' | 'rejected' | 'acme_challenge' | 'no_route';

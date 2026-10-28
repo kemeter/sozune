@@ -46,6 +46,9 @@
     if (methods && methods.length > 0 && !methods.includes('GET')) {
       params.set('method', methods[0]);
     }
+    // The route is what is tested, not the listener: a client that would pass
+    // a required client-certificate check. Ignored where none is required.
+    if (scheme === 'https') params.set('client_cert', '1');
     // Left to be completed rather than resolved as is when the route needs what
     // the link cannot carry: a header, credentials, or a client address.
     const cfg = entrypoint.config;

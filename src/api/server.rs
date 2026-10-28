@@ -474,6 +474,8 @@ async fn resolve_route(
             https: state.config.proxy.https.listen_address,
             gateway: &state.config.proxy.gateway_ports,
         }),
+        client_certificate_required: client_certificate_port.is_some(),
+        https_passthrough: state.config.proxy.https.passthrough,
     };
     match crate::proxy::resolve::resolve(&inputs, &request).await {
         Ok(resolution) => Json(resolution).into_response(),
