@@ -3381,6 +3381,46 @@ fn build_gateway_conditions(gateway: &Gateway, accepted: bool) -> Vec<Condition>
     ]
 }
 
+/// Marks a Gateway some of whose `listeners` are not accepted: its
+/// `Accepted` condition says `ListenersNotValid`, still `True` while another
+/// listener is accepted. With none left, it is neither accepted nor
+/// programmed.
+fn mark_invalid_listeners(
+    conditions: &mut [Condition],
+    listeners: &[gateway_api::apis::standard::gateways::GatewayStatusListeners],
+) {
+    let invalid = listeners
+        .iter()
+        .filter(|l| {
+            l.conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_TYPE_ACCEPTED && c.status == "False")
+        })
+        .count();
+    if invalid == 0 {
+        return;
+    }
+    let none_valid = invalid == listeners.len();
+    for condition in conditions.iter_mut() {
+        if condition.type_ == CONDITION_TYPE_ACCEPTED {
+            condition.reason = REASON_LISTENERS_NOT_VALID.to_string();
+            condition.message = format!(
+                "{invalid} of the Gateway's {} listeners are not valid",
+                listeners.len()
+            );
+        } else if condition.type_ == CONDITION_TYPE_PROGRAMMED && none_valid {
+            condition.reason = REASON_INVALID.to_string();
+            condition.message = "No listener of the Gateway is valid".to_string();
+        } else {
+            continue;
+        }
+        if none_valid {
+            condition.status = "False".to_string();
+        }
+    }
+}
+
+const REASON_LISTENERS_NOT_VALID: &str = "ListenersNotValid";
 const REASON_PORT_UNAVAILABLE: &str = "PortUnavailable";
 const REASON_UNSUPPORTED_PROTOCOL: &str = "UnsupportedProtocol";
 const REASON_INVALID: &str = "Invalid";
@@ -3759,7 +3799,9 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
         return;
     };
     let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
-    let ours = build_gateway_conditions(gateway, true);
+    let listener_statuses = scope.listener_statuses(gateway);
+    let mut ours = build_gateway_conditions(gateway, true);
+    mark_invalid_listeners(&mut ours, &listener_statuses);
     let existing = gateway
         .status
         .as_ref()
@@ -3767,7 +3809,7 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
     let (merged, conditions_changed) = merge_conditions(existing, ours);
     let (listeners, listeners_changed) = merge_listener_statuses(
         gateway.status.as_ref().and_then(|s| s.listeners.as_deref()),
-        scope.listener_statuses(gateway),
+        listener_statuses,
     );
     // Written only when Sōzune publishes an address: otherwise what is
     // there is left alone.
@@ -10245,6 +10287,41 @@ mod tests {
             find_condition(&conds, CONDITION_TYPE_PROGRAMMED).status,
             "True"
         );
+    }
+
+    #[test]
+    fn invalid_listeners_mark_the_gateway() {
+        use gateway_api::apis::standard::gateways::GatewayStatusListeners;
+        let gw = gateway("default", "gw", "sozune");
+        let listener = |accepted: bool| GatewayStatusListeners {
+            conditions: vec![Condition {
+                type_: CONDITION_TYPE_ACCEPTED.to_string(),
+                status: if accepted { "True" } else { "False" }.to_string(),
+                reason: String::new(),
+                message: String::new(),
+                last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+                observed_generation: None,
+            }],
+            ..Default::default()
+        };
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_invalid_listeners(&mut conds, &[listener(true), listener(false)]);
+        assert_eq!(conds[0].status, "True");
+        assert_eq!(conds[0].reason, REASON_LISTENERS_NOT_VALID);
+        assert_eq!(conds[1].status, "True");
+        assert_eq!(conds[1].reason, REASON_PROGRAMMED);
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_invalid_listeners(&mut conds, &[listener(false)]);
+        assert_eq!(conds[0].status, "False");
+        assert_eq!(conds[0].reason, REASON_LISTENERS_NOT_VALID);
+        assert_eq!(conds[1].status, "False");
+        assert_eq!(conds[1].reason, REASON_INVALID);
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_invalid_listeners(&mut conds, &[listener(true)]);
+        assert_eq!(conds[0].reason, REASON_ACCEPTED);
     }
 
     #[test]

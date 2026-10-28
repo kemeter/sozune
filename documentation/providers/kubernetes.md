@@ -464,6 +464,8 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Gateway's `gatewayClassName` points at a class sōzune owns |
 | `Programmed` | `True` (`Programmed`) | Same instant as acceptance — sōzune does not stage programming |
+| `Accepted` | `True` (`ListenersNotValid`) | Some of its listeners are not accepted (see the listener conditions below), others are |
+| `Accepted`, `Programmed` | `False` (`ListenersNotValid`, `Invalid`) | None of its listeners is accepted |
 
 With `publish_service` or `publish_addresses` set, `status.addresses` carries Sōzune's address (see [Ingress status](#ingress-status)).
 
