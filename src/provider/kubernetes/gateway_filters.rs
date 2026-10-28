@@ -61,9 +61,11 @@ pub fn rule_filters_supported(filters: &[HTTPRouteRulesFilters]) -> bool {
 }
 
 /// A rule's filters with those of its backendRefs, `None` when the latter
-/// cannot be represented. Sōzu edits headers per route, not per backend: the
-/// backendRefs that can take traffic (`usable`) must all carry the same
-/// filters, header modifiers only, which then apply to the whole rule.
+/// cannot be represented: header modifiers only. The backendRefs that can
+/// take traffic (`usable`) carrying the same filters, theirs apply to the
+/// whole rule, where Sōzu edits the headers; when they differ, each
+/// backend's are left to the middleware, which edits what it sends that
+/// backend (see [`backend_ref_header_edits`]).
 pub fn effective_rule_filters(
     rule: &HTTPRouteRules,
     usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
@@ -73,23 +75,61 @@ pub fn effective_rule_filters(
     if filters.iter().any(|f| f.request_redirect.is_some()) {
         return Some(filters);
     }
-    let backend_refs: Vec<&HTTPRouteRulesBackendRefs> = rule
-        .backend_refs
+    let backend_refs = usable_backend_refs(rule, usable);
+    let per_ref = backend_refs
+        .iter()
+        .map(|b| backend_ref_filters(b))
+        .collect::<Option<Vec<_>>>()?;
+    if backend_refs_share_filters(rule, usable) {
+        if let Some(shared) = per_ref.into_iter().next() {
+            filters.extend(shared);
+        }
+    } else if !per_ref.iter().all(|f| rule_filters_supported(f)) {
+        // Checked here, as they are not among the rule's.
+        return None;
+    }
+    Some(filters)
+}
+
+/// Whether the backendRefs that can take traffic carry the same filters,
+/// which then apply to the whole rule.
+pub fn backend_refs_share_filters(
+    rule: &HTTPRouteRules,
+    usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
+) -> bool {
+    let backend_refs = usable_backend_refs(rule, usable);
+    let Some(first) = backend_refs.first() else {
+        return true;
+    };
+    let shared = first.filters.as_deref().unwrap_or_default();
+    backend_refs
+        .iter()
+        .all(|b| b.filters.as_deref().unwrap_or_default() == shared)
+}
+
+/// The header edits of a backendRef's own filters, for the middleware to
+/// make on what it sends that backend. Empty when one is not a header
+/// modifier: such a rule is refused (see [`effective_rule_filters`]).
+pub fn backend_ref_header_edits(backend: &HTTPRouteRulesBackendRefs) -> Vec<HeaderConfig> {
+    header_edits_from_filters(&backend_ref_filters(backend).unwrap_or_default())
+}
+
+fn usable_backend_refs<'a>(
+    rule: &'a HTTPRouteRules,
+    usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
+) -> Vec<&'a HTTPRouteRulesBackendRefs> {
+    rule.backend_refs
         .iter()
         .flatten()
         .filter(|b| usable(b))
-        .collect();
-    let Some(first) = backend_refs.first() else {
-        return Some(filters);
-    };
-    let shared = first.filters.clone().unwrap_or_default();
-    let same = backend_refs
-        .iter()
-        .all(|b| b.filters.as_deref().unwrap_or_default() == shared.as_slice());
-    if !same {
-        return None;
-    }
-    for filter in &shared {
+        .collect()
+}
+
+/// A backendRef's filters as rule filters, `None` when one is not a header
+/// modifier.
+fn backend_ref_filters(backend: &HTTPRouteRulesBackendRefs) -> Option<Vec<HTTPRouteRulesFilters>> {
+    let mut filters = Vec::new();
+    for filter in backend.filters.iter().flatten() {
         // Same schema as a rule filter: converted through its JSON form.
         let converted: HTTPRouteRulesFilters =
             serde_json::from_value(serde_json::to_value(filter).ok()?).ok()?;
@@ -728,13 +768,19 @@ mod tests {
         assert_eq!(edits[0].name, "X-Header-Set");
         assert_eq!(edits[0].value, "v");
 
+        // Different filters stay with their backends.
+        let split = rule(vec![backend(vec![set("a")]), backend(vec![set("b")])]);
         assert!(
-            effective_rule_filters(
-                &rule(vec![backend(vec![set("a")]), backend(vec![set("b")])]),
-                &|_| true
-            )
-            .is_none()
+            effective_rule_filters(&split, &|_| true)
+                .unwrap()
+                .is_empty()
         );
+        assert!(!backend_refs_share_filters(&split, &|_| true));
+        let edits = backend_ref_header_edits(&split.backend_refs.as_ref().unwrap()[1]);
+        assert_eq!(edits[0].value, "b");
+        // Checked as the rule's would be: an empty value is refused.
+        let empty = rule(vec![backend(vec![set("a")]), backend(vec![set("")])]);
+        assert!(effective_rule_filters(&empty, &|_| true).is_none());
         let mirror = HTTPRouteRulesBackendRefsFilters {
             request_mirror: Some(HTTPRouteRulesBackendRefsFiltersRequestMirror::default()),
             ..Default::default()

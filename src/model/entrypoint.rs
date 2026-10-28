@@ -45,6 +45,10 @@ pub struct Backend {
     pub port: u16,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Header edits for the requests sent to this backend and the responses
+    /// it gives, on top of the route's: Gateway API's backendRef filters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HeaderConfig>,
 }
 
 fn default_weight() -> u32 {
@@ -57,6 +61,7 @@ impl Backend {
             address: address.into(),
             port,
             weight: default_weight(),
+            headers: Vec::new(),
         }
     }
 
@@ -424,7 +429,7 @@ pub struct EntrypointAcmeConfig {
     pub resolver: String,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HeaderConfig {
     pub name: String,
     pub value: String,
@@ -436,7 +441,7 @@ pub struct HeaderConfig {
     pub append: bool,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HeaderDirection {
     #[default]

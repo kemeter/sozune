@@ -31,8 +31,8 @@ use super::gateway_filters;
 use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
 use crate::model::{
-    Backend, Entrypoint, EntrypointConfig, LoadBalancer, Mirror, PathConfig, PathRewrite,
-    PathRuleType, Protocol, UrlRewrite,
+    Backend, Entrypoint, EntrypointConfig, HeaderConfig, LoadBalancer, Mirror, PathConfig,
+    PathRewrite, PathRuleType, Protocol, UrlRewrite,
 };
 use futures_util::StreamExt;
 use gateway_api::apis::experimental::tcproutes::{
@@ -4236,6 +4236,8 @@ struct ResolvedRef {
     weight: Option<i32>,
     /// Each ready pod's address and the port it listens on.
     pods: Vec<(String, u16)>,
+    /// The header edits of the backendRef's own filters.
+    headers: Vec<HeaderConfig>,
 }
 
 /// How a rule's requests split between its pods and errors, from the weights
@@ -4347,10 +4349,12 @@ fn weigh_backend_refs(refs: Vec<ResolvedRef>) -> Option<Vec<Backend>> {
             .into_iter()
             .zip(per_pod)
             .flat_map(|((_, r), weight)| {
+                let headers = r.headers;
                 r.pods.into_iter().map(move |(address, port)| Backend {
                     address,
                     port,
                     weight: weight as u32,
+                    headers: headers.clone(),
                 })
             })
             .collect(),
@@ -5143,6 +5147,7 @@ fn rule_mirrors(
                     weigh_backend_refs(vec![ResolvedRef {
                         weight: None,
                         pods: resolver.pod_addresses(target_ns, &m.name, port, "TCP"),
+                        headers: Vec::new(),
                     }])
                 })
                 .unwrap_or_default();
@@ -5522,6 +5527,9 @@ fn rule_to_entrypoints(
         .as_ref()
         .is_some_and(|r| r.policy.answers_without_backend());
     let backend_refs = rule.backend_refs.as_deref().unwrap_or_default();
+    // backendRefs with filters of their own: the middleware makes them. A
+    // redirect forwards nothing for them to edit.
+    let own_filters = !answers && !gateway_filters::backend_refs_share_filters(rule, &usable);
     let mut resolved: Vec<ResolvedRef> = Vec::new();
     let mut invalid = 0;
     // The weights of the backendRefs by what becomes of their share:
@@ -5548,6 +5556,11 @@ fn rule_to_entrypoints(
         resolved.push(ResolvedRef {
             weight: b.weight,
             pods,
+            headers: if own_filters {
+                gateway_filters::backend_ref_header_edits(b)
+            } else {
+                Vec::new()
+            },
         });
     }
     let failing_shares = if answers {
@@ -6172,6 +6185,7 @@ fn tcp_rule_backends(
             Some(ResolvedRef {
                 weight: b.weight,
                 pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
+                headers: Vec::new(),
             })
         })
         .collect();
@@ -6541,6 +6555,7 @@ fn udp_rule_backends(
             Some(ResolvedRef {
                 weight: b.weight,
                 pods: resolver.pod_addresses(target_ns, &b.name, port, "UDP"),
+                headers: Vec::new(),
             })
         })
         .collect();
@@ -7019,6 +7034,7 @@ fn tls_rule_backends(
             Some(ResolvedRef {
                 weight: b.weight,
                 pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
+                headers: Vec::new(),
             })
         })
         .collect();
@@ -8447,6 +8463,63 @@ mod tests {
         assert_eq!(eps[0].config.headers[0].value, "api");
     }
 
+    /// backendRefs with different filters keep each their own: the
+    /// middleware edits what it sends each backend.
+    #[test]
+    fn backend_refs_keep_filters_of_their_own() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesBackendRefsFilters,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+        };
+        let set = |value: &str| {
+            Some(vec![HTTPRouteRulesBackendRefsFilters {
+                request_header_modifier: Some(
+                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+                        set: Some(vec![
+                            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                                name: "X-Backend".into(),
+                                value: value.into(),
+                            },
+                        ]),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }])
+        };
+        let mut api = backend("api", 80);
+        api.filters = set("api");
+        let mut web = backend("web", 80);
+        web.filters = set("web");
+        let mut shared = rule(None, vec![api, web]);
+        shared.filters = Some(vec![HTTPRouteRulesFilters {
+            response_header_modifier: Some(
+                gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersResponseHeaderModifier {
+                    remove: Some(vec!["Server".into()]),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }]);
+        let route = route_with(vec![shared], vec!["app.example.com".into()]);
+        assert!(!route_has_unsupported_filters(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
+        let eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
+        // The rule's own edits stay the route's.
+        assert_eq!(eps[0].config.headers[0].name, "Server");
+        let values: Vec<&str> = eps[0]
+            .backends
+            .iter()
+            .map(|b| b.headers[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["api", "web"]);
+        assert!(crate::middleware::needs_middleware(&eps[0]));
+    }
+
     #[test]
     fn a_rule_without_backends_answers_500() {
         let r = route_with(
@@ -9009,7 +9082,7 @@ mod tests {
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert!(eps[0].config.match_query[0].regex);
         // Left to the middleware: Sōzu routes on literal query values only.
-        assert!(crate::middleware::needs_middleware(&eps[0].config));
+        assert!(crate::middleware::needs_middleware(&eps[0]));
     }
 
     #[test]
@@ -9299,6 +9372,7 @@ mod tests {
             pods: (0..pods)
                 .map(|i| (format!("10.{}.{}.{}", pods % 256, i / 256, i % 256), 80))
                 .collect(),
+            headers: Vec::new(),
         }
     }
 
@@ -9620,7 +9694,7 @@ mod tests {
         assert_eq!(mirrors.len(), 1);
         assert_eq!(mirrors[0].backends.len(), 1);
         assert_eq!(mirrors[0].backends[0].port, 8080);
-        assert!(crate::middleware::needs_middleware(&eps[0].config));
+        assert!(crate::middleware::needs_middleware(&eps[0]));
         // A mirror with no ready pod stays, copying nothing: the route keeps
         // going through the middleware.
         let rule_filters = r.spec.rules.as_ref().unwrap()[0].filters.clone().unwrap();
