@@ -1766,7 +1766,9 @@ fn configure_sozu_routing(
         // reject the command as a duplicate. Its frontends only move when a
         // route installed earlier in this loop must pass in front of them.
         if let Some(old) = previous.get(cluster_id)
-            && (old == entrypoint || is_backends_only_change(old, entrypoint))
+            && (old == entrypoint
+                || is_backends_only_change(old, entrypoint)
+                || is_middleware_only_change(old, entrypoint))
         {
             if reorder_live_routes && entrypoint.protocol == Protocol::Http {
                 let outcome = reinstall_http_frontends(channels, cluster_id, old, entrypoint);
@@ -3346,9 +3348,14 @@ fn remove_acme_frontends(
 /// Default-deny by construction: we compare the whole `config` (and `protocol`)
 /// rather than an allow-list of fields, so any new `EntrypointConfig` field is
 /// treated as a frontend change automatically — a forgotten field can never be
-/// silently classified as "backends-only" and dropped on reload.
+/// silently classified as "backends-only" and dropped on reload. The one field
+/// left out is `mirrors`: like the backends, only the middleware reads them.
 fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
-    old.protocol == new.protocol && old.config == new.config
+    let frontend = |config: &crate::model::EntrypointConfig| crate::model::EntrypointConfig {
+        mirrors: Vec::new(),
+        ..config.clone()
+    };
+    old.protocol == new.protocol && frontend(&old.config) == frontend(&new.config)
 }
 
 /// True when a changed cluster can be reloaded by diffing only its backends
@@ -3369,7 +3376,21 @@ fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
 /// in-flight flows). Middleware only exists on HTTP, so the check is a no-op for
 /// L4 but kept uniform.
 fn is_backends_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
-    frontend_unchanged(old, new) && !middleware::needs_middleware(&new.config)
+    frontend_unchanged(old, new)
+        && !middleware::needs_middleware(&old.config)
+        && !middleware::needs_middleware(&new.config)
+}
+
+/// True when a changed cluster needs nothing from Sōzu: its frontend is
+/// unchanged and it goes through the middleware, before as after, so Sōzu's
+/// only backend for it is the middleware. Its backends and mirrors are the
+/// middleware's, whose table every reload rebuilds.
+fn is_middleware_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
+    // Only an HTTP route goes through the middleware, whatever its config.
+    old.protocol == Protocol::Http
+        && frontend_unchanged(old, new)
+        && middleware::needs_middleware(&old.config)
+        && middleware::needs_middleware(&new.config)
 }
 
 /// Diff the backend sets of a cluster whose frontend is unchanged, **adding new
@@ -3619,6 +3640,13 @@ fn apply_routing_diff(
             // rescale. configure_sozu_routing() skips re-adding such clusters
             // (see is_backends_only_change check there), so this is the whole
             // update.
+            if is_middleware_only_change(old, new) {
+                debug!(
+                    "Cluster {} changed for the middleware only: Sōzu keeps it as is",
+                    cluster_id
+                );
+                continue;
+            }
             if is_backends_only_change(old, new) {
                 info!("Updating backends in place for cluster: {}", cluster_id);
                 diff_backends_in_place(channels, cluster_id, old, new);
@@ -5094,6 +5122,7 @@ mod tests {
                 match_query: Vec::new(),
                 match_client_ip: Vec::new(),
                 answer: None,
+                mirrors: Vec::new(),
             },
             candidates: Vec::new(),
         }
@@ -5597,6 +5626,28 @@ mod tests {
             !is_backends_only_change(&old, &new),
             "middleware-routed entrypoints must not use the in-place backend diff"
         );
+    }
+
+    /// A route through the middleware whose backends or mirrors change needs
+    /// nothing from Sōzu; one that starts or stops going through the
+    /// middleware does.
+    #[test]
+    fn a_middleware_route_changing_only_for_the_middleware_keeps_its_frontend() {
+        let mirror = |address: &str| crate::model::Mirror {
+            backends: vec![Backend::new(address, 8080)],
+        };
+        let mut old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        old.config.mirrors = vec![mirror("10.0.1.1")];
+        let mut new = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+        new.config.mirrors = vec![mirror("10.0.1.2")];
+        assert!(is_middleware_only_change(&old, &new));
+        assert!(!is_backends_only_change(&old, &new));
+
+        // The first mirror moves the route onto the middleware.
+        let plain = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        assert!(frontend_unchanged(&plain, &new));
+        assert!(!is_middleware_only_change(&plain, &new));
+        assert!(!is_backends_only_change(&plain, &new));
     }
 
     #[test]

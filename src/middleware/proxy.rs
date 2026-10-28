@@ -15,6 +15,20 @@ use super::MiddlewareAppState;
 use super::chain::{self, RequestCtx};
 use super::diag;
 
+/// `host` as the host of a URI or a socket address: an IPv6 literal in
+/// brackets, anything else as it is.
+fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
+/// How long a copy to a mirror may take, on a route without a backend
+/// timeout.
+const MIRROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Monotonic milliseconds since the process started, for circuit-breaker
 /// cooldown timing. Monotonic (not wall-clock) so clock changes don't confuse
 /// the breaker.
@@ -246,7 +260,10 @@ pub async fn handle_proxy(
 
             let target_uri = format!(
                 "http://{}:{}{}{}",
-                backend_host, backend_port, forwarded_path, query
+                uri_host(&backend_host),
+                backend_port,
+                forwarded_path,
+                query
             );
 
             debug!(
@@ -316,6 +333,40 @@ pub async fn handle_proxy(
                 }
             };
 
+            // A copy to each mirror, its answer ignored: the client's response
+            // waits for none of them, and a mirror failing changes nothing.
+            for mirror in &route.mirrors {
+                // Too many copies under way already: this one is dropped.
+                let Ok(permit) = super::mirror_permits().try_acquire_owned() else {
+                    debug!("Mirror busy, request not copied");
+                    continue;
+                };
+                let Some((mirror_host, mirror_port)) = mirror.pick() else {
+                    continue;
+                };
+                let Ok(mirror_uri) = format!(
+                    "http://{}:{mirror_port}{forwarded_path}{query}",
+                    uri_host(mirror_host)
+                )
+                .parse::<Uri>() else {
+                    continue;
+                };
+                let mut copy = parts.clone();
+                copy.uri = mirror_uri;
+                let copy = Request::from_parts(copy, Body::from(body_bytes.clone()));
+                let client = state.http_client.clone();
+                let limit = timeout.unwrap_or(MIRROR_TIMEOUT);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let uri = copy.uri().to_string();
+                    match tokio::time::timeout(limit, client.request(copy)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => debug!("Mirror {} failed: {}", uri, e),
+                        Err(_) => debug!("Mirror {} timed out", uri),
+                    }
+                });
+            }
+
             // Send to the backend, retrying connection-level failures and timeouts
             // (the backend produced no response). A response that arrives — even a
             // 5xx — is returned as-is and never retried, so a side effect is not
@@ -325,7 +376,7 @@ pub async fn handle_proxy(
             // the backends this request has not tried, and a backup (weight 0)
             // only takes over once every other backend failed.
             let uri_of = |(host, port): &(String, u16)| {
-                format!("http://{host}:{port}{forwarded_path}{query}")
+                format!("http://{}:{port}{forwarded_path}{query}", uri_host(host))
                     .parse::<Uri>()
                     .ok()
             };
@@ -605,7 +656,7 @@ async fn handle_websocket(
     let mut last_failure = String::from("no backend");
     let mut last_timed_out = false;
     for (backend_host, backend_port) in backends {
-        let backend_addr = format!("{}:{}", backend_host, backend_port);
+        let backend_addr = format!("{}:{}", uri_host(backend_host), backend_port);
         // Bounded by the route's backend timeout, so a backend that accepts
         // the connection and never answers does not hold the upgrade back
         // from the next one.
@@ -867,6 +918,18 @@ mod timeout_tests {
 #[cfg(test)]
 mod forwarding_tests {
     use super::*;
+
+    #[test]
+    fn an_ipv6_backend_is_bracketed() {
+        assert_eq!(uri_host("fd00::1"), "[fd00::1]");
+        assert_eq!(uri_host("[fd00::1]"), "[fd00::1]");
+        assert_eq!(uri_host("10.0.0.1"), "10.0.0.1");
+        assert!(
+            format!("http://{}:8080/", uri_host("fd00::1"))
+                .parse::<Uri>()
+                .is_ok()
+        );
+    }
 
     fn breaker() -> std::sync::Arc<super::super::circuit_breaker::CircuitBreaker> {
         std::sync::Arc::new(super::super::circuit_breaker::CircuitBreaker::new(
