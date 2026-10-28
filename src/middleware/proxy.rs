@@ -14,6 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use super::MiddlewareAppState;
 use super::chain::{self, RequestCtx};
 use super::diag;
+use crate::model::HeaderDirection;
 
 /// `host` as the host of a URI or a socket address: an IPv6 literal in
 /// brackets, anything else as it is.
@@ -112,6 +113,10 @@ pub async fn handle_proxy(
         .remove(super::ROUTE_HEADER)
         .and_then(|v| String::from_utf8(v.as_bytes().to_vec()).ok());
 
+    // The route the request matched, whose response edits apply to whatever
+    // answers it.
+    let matched = std::sync::Arc::new(std::sync::OnceLock::new());
+    let matched_route = matched.clone();
     let fut = async move {
         let (route, known_hosts) = {
             let table = match state.route_table.read() {
@@ -145,6 +150,7 @@ pub async fn handle_proxy(
                 return diag::no_route_for_host(&host, &known_hosts).into_response();
             }
         };
+        let _ = matched_route.set(route.clone());
 
         // Build the per-request context shared across middlewares.
         let mut ctx = RequestCtx {
@@ -424,8 +430,15 @@ pub async fn handle_proxy(
                 tries += 1;
                 target_uri = current.to_string();
                 parts.uri = current;
+                // The picked backend's own header edits.
+                let mut attempt_parts = parts.clone();
+                super::edit_headers(
+                    &mut attempt_parts.headers,
+                    route.edits_for(picked),
+                    HeaderDirection::Request,
+                );
                 let forwarded_req =
-                    Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+                    Request::from_parts(attempt_parts, Body::from(body_bytes.clone()));
                 let attempt_start = tokio::time::Instant::now();
                 // Counted for the balancers that pick by load, until the
                 // backend answers or the attempt ends.
@@ -539,7 +552,12 @@ pub async fn handle_proxy(
             // When a deadline bounds the response body, once the body has gone
             // through, as it can still fail or be cut short; on the status
             // otherwise, so an endless stream does not hold the breaker.
-            let response = response.into_response();
+            let mut response = response.into_response();
+            // Set after the response phase, which a middleware may rebuild
+            // the response in.
+            if let Some(index) = picked {
+                response.extensions_mut().insert(super::ServedBy(index));
+            }
             let bounded =
                 request_deadline.is_some() || route.backend_timeout.is_some_and(|ms| ms > 0);
             match route.circuit_breaker.clone() {
@@ -587,7 +605,11 @@ pub async fn handle_proxy(
         }
     };
 
-    fut.instrument(span).await
+    let mut response = fut.instrument(span).await;
+    if let Some(route) = matched.get() {
+        route.edit_response(&mut response);
+    }
+    response
 }
 
 /// Emit one access-log line for a completed request.
@@ -688,15 +710,25 @@ async fn handle_websocket(
 ) -> axum::response::Response {
     debug!("WebSocket upgrade request to {:?}{}", backends, path);
 
-    // Build the raw HTTP upgrade request to send to the backend
-    let mut upgrade_request = format!("GET {}{} HTTP/1.1\r\n", path, query);
-
-    for (key, value) in req.headers() {
-        if let Ok(v) = value.to_str() {
-            upgrade_request.push_str(&format!("{}: {}\r\n", key, v));
+    // Build the raw HTTP upgrade request to send to a backend, with its
+    // header edits.
+    let request_headers = req.headers().clone();
+    let upgrade_request_for = |index: Option<usize>| {
+        let mut headers = request_headers.clone();
+        super::edit_headers(
+            &mut headers,
+            route.edits_for(index),
+            HeaderDirection::Request,
+        );
+        let mut upgrade_request = format!("GET {}{} HTTP/1.1\r\n", path, query);
+        for (key, value) in &headers {
+            if let Ok(v) = value.to_str() {
+                upgrade_request.push_str(&format!("{}: {}\r\n", key, v));
+            }
         }
-    }
-    upgrade_request.push_str("\r\n");
+        upgrade_request.push_str("\r\n");
+        upgrade_request
+    };
 
     // Send the upgrade to each backend in turn until one answers it: a
     // backend that refuses the connection, or closes it without a response,
@@ -716,6 +748,7 @@ async fn handle_websocket(
         // Bounded by the route's backend timeout, so a backend that accepts
         // the connection and never answers does not hold the upgrade back
         // from the next one.
+        let upgrade_request = upgrade_request_for(*index);
         let handshake = websocket_handshake(&backend_addr, &upgrade_request, &mut response_buf);
         let outcome = match timeout {
             Some(limit) => tokio::time::timeout(limit, handshake)
@@ -735,7 +768,7 @@ async fn handle_websocket(
         match outcome {
             Ok((stream, n)) => {
                 attempt.succeeded();
-                answered = Some((stream, n, (backend_host.clone(), *backend_port)));
+                answered = Some((stream, n, (backend_host.clone(), *backend_port), *index));
                 break;
             }
             Err((failure, is_timeout)) => {
@@ -746,7 +779,7 @@ async fn handle_websocket(
             }
         }
     }
-    let Some((mut backend_stream, n, tunnel_backend)) = answered else {
+    let Some((mut backend_stream, n, tunnel_backend, answered_index)) = answered else {
         // A 504 when the last backend tried timed out, as for a request.
         return if last_timed_out {
             diag::backend_timeout(&format!("websocket: {last_failure}"), timeout).into_response()
@@ -768,16 +801,26 @@ async fn handle_websocket(
         .into_response();
     }
 
-    // Parse the response headers to forward to the client
+    // Parse the response headers to forward to the client.
     let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
 
-    for line in response_str.lines().skip(1) {
-        if line.is_empty() {
-            break;
+    if let Some(headers) = response_builder.headers_mut() {
+        for line in response_str.lines().skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(": ")
+                && let (Ok(key), Ok(value)) = (
+                    axum::http::HeaderName::from_bytes(key.as_bytes()),
+                    axum::http::HeaderValue::from_str(value),
+                )
+            {
+                headers.append(key, value);
+            }
         }
-        if let Some((key, value)) = line.split_once(": ") {
-            response_builder = response_builder.header(key, value);
-        }
+    }
+    if let (Some(extensions), Some(index)) = (response_builder.extensions_mut(), answered_index) {
+        extensions.insert(super::ServedBy(index));
     }
 
     // Use hyper's upgrade mechanism to get the client's underlying connection

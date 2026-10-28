@@ -749,6 +749,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
             loopback_port: forwarder.loopback_port,
             max_hello_bytes,
             hosts: Arc::new(RwLock::new(Vec::new())),
+            certificates: Arc::new(RwLock::new(Vec::new())),
         })
     } else {
         None
@@ -880,7 +881,9 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     },
                     cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                         Some(cmd) => {
-                            if !apply_certificate(&mut channels, cmd) {
+                            let applied = apply_certificate(&mut channels, cmd);
+                            share_certificate_names(&channels, passthrough.as_ref());
+                            if !applied {
                                 continue 'outer;
                             }
                         }
@@ -969,6 +972,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                             cert_cmd = cert_rx.recv(), if cert_rx_open => match cert_cmd {
                                 Some(cmd) => {
                                     apply_certificate(&mut channels, cmd);
+                                    share_certificate_names(&channels, passthrough.as_ref());
                                     deadline = tokio::time::Instant::now() + reload_debounce;
                                 }
                                 None => {
@@ -1081,6 +1085,27 @@ impl HeldCertificate {
         address: SocketAddress,
     ) -> anyhow::Result<()> {
         remove_certificate(channel, address, &self.cert_pem)
+    }
+}
+
+/// Tells the TLS gate the names of the certificates the HTTPS worker holds.
+fn share_certificate_names(channels: &Channels, passthrough: Option<&tls_gate::Passthrough>) {
+    let Some(passthrough) = passthrough else {
+        return;
+    };
+    let mut names: Vec<String> = channels
+        .certificates
+        .values()
+        .flat_map(|held| held.names.iter().map(|name| name.to_ascii_lowercase()))
+        .collect();
+    names.sort();
+    names.dedup();
+    match passthrough.certificates.write() {
+        Ok(mut shared) => *shared = names,
+        Err(e) => error!(
+            "internal state corrupted (certificate names), restart required: {}",
+            e
+        ),
     }
 }
 
@@ -1535,7 +1560,7 @@ pub(crate) fn fill_middleware_table(
         if !matches!(entrypoint.protocol, Protocol::Http) {
             continue;
         }
-        if middleware::needs_middleware(&entrypoint.config) {
+        if middleware::needs_middleware(entrypoint) {
             let route = middleware::build_middleware_route(
                 cluster_id,
                 &entrypoint.config,
@@ -2091,11 +2116,21 @@ pub(crate) fn build_http_frontends(
 
         // `Sozune-Route` is reserved on requests: an edit of it could reach
         // the middleware ahead of the route it names. Its response side stays.
+        // The middleware makes the response edits when a backend has its own.
+        let edits_responses = middleware::edits_responses(entrypoint);
         let header_edits: Vec<HeaderConfig> = entrypoint
             .config
             .headers
             .iter()
             .filter_map(|edit| {
+                let edit = &match edit.direction {
+                    HeaderDirection::Response if edits_responses => return None,
+                    HeaderDirection::Both if edits_responses => HeaderConfig {
+                        direction: HeaderDirection::Request,
+                        ..edit.clone()
+                    },
+                    _ => edit.clone(),
+                };
                 if !edit.name.eq_ignore_ascii_case(middleware::ROUTE_HEADER) {
                     return Some(edit.clone());
                 }
@@ -2109,7 +2144,7 @@ pub(crate) fn build_http_frontends(
             })
             .collect();
         let mut frontend_headers = build_frontend_headers(&header_edits);
-        if middleware::needs_middleware(&entrypoint.config) {
+        if middleware::needs_middleware(entrypoint) {
             // Names the route for the middleware, which cannot tell it from
             // another one on the same host and path by itself.
             frontend_headers.extend(build_frontend_headers(&[HeaderConfig {
@@ -2320,7 +2355,7 @@ fn configure_http_entrypoint(
 
     // Add backends
     // If this entrypoint needs middleware, route through the middleware server instead
-    let use_middleware = middleware::needs_middleware(&entrypoint.config);
+    let use_middleware = middleware::needs_middleware(entrypoint);
 
     if use_middleware {
         debug!(
@@ -3278,7 +3313,7 @@ fn remove_backends(
     entrypoint: &Entrypoint,
     middleware_port: u16,
 ) {
-    let removals: Vec<RemoveBackend> = if middleware::needs_middleware(&entrypoint.config) {
+    let removals: Vec<RemoveBackend> = if middleware::needs_middleware(entrypoint) {
         vec![RemoveBackend {
             cluster_id: cluster_id.to_string(),
             backend_id: middleware_backend_id(cluster_id),
@@ -3466,8 +3501,8 @@ fn frontend_unchanged(old: &Entrypoint, new: &Entrypoint) -> bool {
 /// L4 but kept uniform.
 fn is_backends_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
     frontend_unchanged(old, new)
-        && !middleware::needs_middleware(&old.config)
-        && !middleware::needs_middleware(&new.config)
+        && !middleware::needs_middleware(old)
+        && !middleware::needs_middleware(new)
 }
 
 /// True when a changed cluster needs nothing from Sōzu: its frontend is
@@ -3478,8 +3513,8 @@ fn is_middleware_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
     // Only an HTTP route goes through the middleware, whatever its config.
     old.protocol == Protocol::Http
         && frontend_unchanged(old, new)
-        && middleware::needs_middleware(&old.config)
-        && middleware::needs_middleware(&new.config)
+        && middleware::needs_middleware(old)
+        && middleware::needs_middleware(new)
 }
 
 /// Diff the backend sets of a cluster whose frontend is unchanged, **adding new
@@ -3766,7 +3801,7 @@ fn apply_routing_diff(
                     // is re-added, and closing its sessions would cut every
                     // WebSocket on each change to the route. Through the
                     // middleware, Sōzu's backend is the middleware itself.
-                    if !middleware::needs_middleware(&old.config) || old.protocol != new.protocol {
+                    if !middleware::needs_middleware(old) || old.protocol != new.protocol {
                         departed.push(DepartedBackends::new(cluster_id, old, new));
                     }
 
@@ -4332,7 +4367,7 @@ mod tests {
             value: "beta=1".into(),
             regex: false,
         }];
-        assert!(middleware::needs_middleware(&ep.config));
+        assert!(middleware::needs_middleware(&ep));
         let route = middleware::build_middleware_route(
             "c",
             &ep.config,
@@ -4406,7 +4441,7 @@ mod tests {
         assert!(!matches(&ep.config, "/apix?debug"));
         assert!(!matches(&ep.config, "/api?debugger=1"));
         assert!(routes_on_query(&ep.config));
-        assert!(!middleware::needs_middleware(&ep.config));
+        assert!(!middleware::needs_middleware(&ep));
 
         // A `%` in a condition: the middleware keeps the query conditions.
         ep.config.match_query = vec![condition("q", "100%")];
@@ -4420,7 +4455,7 @@ mod tests {
             hostname: None,
         });
         assert!(builders::query_path_rule(&ep.config).is_none());
-        assert!(middleware::needs_middleware(&ep.config));
+        assert!(middleware::needs_middleware(&ep));
     }
 
     /// An HTTPS-only route has no frontend on the HTTP listener.

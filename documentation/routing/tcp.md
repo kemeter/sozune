@@ -159,7 +159,7 @@ proxy:
     passthrough: true
 ```
 
-Sōzune then runs a TCP listener named `https-passthrough` behind the HTTPS port, with no port of its own, and reads each ClientHello on 443 first. A connection whose SNI names one of that listener's routes is forwarded to it, undecrypted; any other — another name, or no SNI at all — is served over HTTPS as usual. Point a route at it like at any listener:
+Sōzune then runs a TCP listener named `https-passthrough` behind the HTTPS port, with no port of its own, and reads each ClientHello on 443 first. A connection whose SNI names one of that listener's routes is forwarded to it, undecrypted; one whose SNI a certificate Sōzune holds covers, or with no SNI at all, is served over HTTPS as usual. Any other is closed, rather than answered with Sōzu's default certificate. Point a route at it like at any listener:
 
 ```yaml
 labels:

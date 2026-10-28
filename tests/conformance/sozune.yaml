@@ -68,8 +68,10 @@ data:
     proxy:
       gateway_ports:
         http: ["8080-8099"]
-        # The UDPRoute test's listener.
-        udp: ["5300"]
+        # The TCPRoute and TLSRoute tests' listeners.
+        tcp: ["8883", "9300-9321"]
+        # The UDPRoute tests' listeners.
+        udp: ["5300-5312"]
       http:
         listen_address: 80
       https:

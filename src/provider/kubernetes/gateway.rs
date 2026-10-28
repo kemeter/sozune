@@ -31,8 +31,8 @@ use super::gateway_filters;
 use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
 use crate::model::{
-    Backend, Entrypoint, EntrypointConfig, LoadBalancer, Mirror, PathConfig, PathRewrite,
-    PathRuleType, Protocol, UrlRewrite,
+    Backend, Entrypoint, EntrypointConfig, HeaderConfig, LoadBalancer, Mirror, PathConfig,
+    PathRewrite, PathRuleType, Protocol, UrlRewrite,
 };
 use futures_util::StreamExt;
 use gateway_api::apis::experimental::tcproutes::{
@@ -3381,6 +3381,46 @@ fn build_gateway_conditions(gateway: &Gateway, accepted: bool) -> Vec<Condition>
     ]
 }
 
+/// Marks a Gateway some of whose `listeners` are not accepted: its
+/// `Accepted` condition says `ListenersNotValid`, still `True` while another
+/// listener is accepted. With none left, it is neither accepted nor
+/// programmed.
+fn mark_invalid_listeners(
+    conditions: &mut [Condition],
+    listeners: &[gateway_api::apis::standard::gateways::GatewayStatusListeners],
+) {
+    let invalid = listeners
+        .iter()
+        .filter(|l| {
+            l.conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_TYPE_ACCEPTED && c.status == "False")
+        })
+        .count();
+    if invalid == 0 {
+        return;
+    }
+    let none_valid = invalid == listeners.len();
+    for condition in conditions.iter_mut() {
+        if condition.type_ == CONDITION_TYPE_ACCEPTED {
+            condition.reason = REASON_LISTENERS_NOT_VALID.to_string();
+            condition.message = format!(
+                "{invalid} of the Gateway's {} listeners are not valid",
+                listeners.len()
+            );
+        } else if condition.type_ == CONDITION_TYPE_PROGRAMMED && none_valid {
+            condition.reason = REASON_INVALID.to_string();
+            condition.message = "No listener of the Gateway is valid".to_string();
+        } else {
+            continue;
+        }
+        if none_valid {
+            condition.status = "False".to_string();
+        }
+    }
+}
+
+const REASON_LISTENERS_NOT_VALID: &str = "ListenersNotValid";
 const REASON_PORT_UNAVAILABLE: &str = "PortUnavailable";
 const REASON_UNSUPPORTED_PROTOCOL: &str = "UnsupportedProtocol";
 const REASON_INVALID: &str = "Invalid";
@@ -3759,7 +3799,9 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
         return;
     };
     let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
-    let ours = build_gateway_conditions(gateway, true);
+    let listener_statuses = scope.listener_statuses(gateway);
+    let mut ours = build_gateway_conditions(gateway, true);
+    mark_invalid_listeners(&mut ours, &listener_statuses);
     let existing = gateway
         .status
         .as_ref()
@@ -3767,7 +3809,7 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
     let (merged, conditions_changed) = merge_conditions(existing, ours);
     let (listeners, listeners_changed) = merge_listener_statuses(
         gateway.status.as_ref().and_then(|s| s.listeners.as_deref()),
-        scope.listener_statuses(gateway),
+        listener_statuses,
     );
     // Written only when Sōzune publishes an address: otherwise what is
     // there is left alone.
@@ -4236,6 +4278,8 @@ struct ResolvedRef {
     weight: Option<i32>,
     /// Each ready pod's address and the port it listens on.
     pods: Vec<(String, u16)>,
+    /// The header edits of the backendRef's own filters.
+    headers: Vec<HeaderConfig>,
 }
 
 /// How a rule's requests split between its pods and errors, from the weights
@@ -4347,10 +4391,12 @@ fn weigh_backend_refs(refs: Vec<ResolvedRef>) -> Option<Vec<Backend>> {
             .into_iter()
             .zip(per_pod)
             .flat_map(|((_, r), weight)| {
+                let headers = r.headers;
                 r.pods.into_iter().map(move |(address, port)| Backend {
                     address,
                     port,
                     weight: weight as u32,
+                    headers: headers.clone(),
                 })
             })
             .collect(),
@@ -5143,6 +5189,7 @@ fn rule_mirrors(
                     weigh_backend_refs(vec![ResolvedRef {
                         weight: None,
                         pods: resolver.pod_addresses(target_ns, &m.name, port, "TCP"),
+                        headers: Vec::new(),
                     }])
                 })
                 .unwrap_or_default();
@@ -5522,6 +5569,9 @@ fn rule_to_entrypoints(
         .as_ref()
         .is_some_and(|r| r.policy.answers_without_backend());
     let backend_refs = rule.backend_refs.as_deref().unwrap_or_default();
+    // backendRefs with filters of their own: the middleware makes them. A
+    // redirect forwards nothing for them to edit.
+    let own_filters = !answers && !gateway_filters::backend_refs_share_filters(rule, &usable);
     let mut resolved: Vec<ResolvedRef> = Vec::new();
     let mut invalid = 0;
     // The weights of the backendRefs by what becomes of their share:
@@ -5548,6 +5598,11 @@ fn rule_to_entrypoints(
         resolved.push(ResolvedRef {
             weight: b.weight,
             pods,
+            headers: if own_filters {
+                gateway_filters::backend_ref_header_edits(b)
+            } else {
+                Vec::new()
+            },
         });
     }
     let failing_shares = if answers {
@@ -6172,10 +6227,32 @@ fn tcp_rule_backends(
             Some(ResolvedRef {
                 weight: b.weight,
                 pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
+                headers: Vec::new(),
             })
         })
         .collect();
     weigh_backend_refs(resolved)
+}
+
+/// The ports routes older than the one of `meta`, among `others`, bind: the
+/// routes on one TCP or UDP port cannot share it, so the oldest is served, the
+/// first by namespace and name of those as old.
+fn ports_of_older_routes<'a>(
+    meta: &kube::api::ObjectMeta,
+    others: impl Iterator<Item = (&'a kube::api::ObjectMeta, BTreeSet<i32>)>,
+) -> BTreeSet<i32> {
+    let age = |m: &kube::api::ObjectMeta| {
+        (
+            m.creation_timestamp.as_ref().map(|t| t.0),
+            m.namespace.clone(),
+            m.name.clone(),
+        )
+    };
+    let own = age(meta);
+    others
+        .filter(|(other, _)| other.uid != meta.uid && age(other) < own)
+        .flat_map(|(_, ports)| ports)
+        .collect()
 }
 
 /// Resolve a TCPRoute to its entrypoints and swap them into storage. Mirrors
@@ -6212,12 +6289,23 @@ fn apply_tcp_route(
     // stays accepted.
     let outcome = l4_outcome(route, accepted, resolver, scope);
     report_l4_status(route, outcome, resolver, scope, status_tx);
+    let held = match index.read() {
+        Ok(tracked) => ports_of_older_routes(
+            &route.metadata,
+            tracked
+                .values()
+                .filter(|t| scope.accepts_tcp_route(&t.route))
+                .map(|t| (&t.route.metadata, scope.effective_tcp_ports(&t.route))),
+        ),
+        Err(_) => BTreeSet::new(),
+    };
     let new_entrypoints = if !accepted {
         Vec::new()
     } else {
         scope
             .effective_tcp_ports(route)
             .into_iter()
+            .filter(|port| !held.contains(port))
             .flat_map(|port| match listener_ports.get(port) {
                 Some(listener_name) => {
                     tcp_route_to_entrypoints(route, resolver, scope, &listener_name, port)
@@ -6383,14 +6471,19 @@ pub async fn run_tcproute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_tcp_route("apply", &route);
+                    // The routes on its ports are decided again: an older one
+                    // takes them over at once.
                     apply_tcp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
+                        | re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_tcp_route("delete", &route);
                     if let Some(uid) = route.metadata.uid.as_deref() {
                         scope.forget_attachments("TCPRoute", uid);
                     }
+                    // The next route on its ports takes them over at once.
                     delete_tcp_route(&route, &storage, &index)
+                        | re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: TCPRoute init");
@@ -6407,7 +6500,10 @@ pub async fn run_tcproute_watcher(
                             |t: &TrackedTcpRoute| t.entrypoint_ids.as_slice(),
                             &storage,
                             &scope,
-                        ),
+                        )
+                        // The routes the dropped ones kept off their ports
+                        // take them over.
+                        | re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx)),
                         None => false,
                     }
                 }
@@ -6541,6 +6637,7 @@ fn udp_rule_backends(
             Some(ResolvedRef {
                 weight: b.weight,
                 pods: resolver.pod_addresses(target_ns, &b.name, port, "UDP"),
+                headers: Vec::new(),
             })
         })
         .collect();
@@ -6578,12 +6675,23 @@ fn apply_udp_route(
     // As for TCPRoutes.
     let outcome = l4_outcome(route, accepted, resolver, scope);
     report_l4_status(route, outcome, resolver, scope, status_tx);
+    let held = match index.read() {
+        Ok(tracked) => ports_of_older_routes(
+            &route.metadata,
+            tracked
+                .values()
+                .filter(|t| scope.accepts_udp_route(&t.route))
+                .map(|t| (&t.route.metadata, scope.effective_udp_ports(&t.route))),
+        ),
+        Err(_) => BTreeSet::new(),
+    };
     let new_entrypoints = if !accepted {
         Vec::new()
     } else {
         scope
             .effective_udp_ports(route)
             .into_iter()
+            .filter(|port| !held.contains(port))
             .flat_map(|port| match listener_ports.get(port) {
                 Some(listener_name) => {
                     udp_route_to_entrypoints(route, resolver, scope, &listener_name, port)
@@ -6749,14 +6857,19 @@ pub async fn run_udproute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_udp_route("apply", &route);
+                    // The routes on its ports are decided again: an older one
+                    // takes them over at once.
                     apply_udp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
+                        | re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_udp_route("delete", &route);
                     if let Some(uid) = route.metadata.uid.as_deref() {
                         scope.forget_attachments("UDPRoute", uid);
                     }
+                    // The next route on its ports takes them over at once.
                     delete_udp_route(&route, &storage, &index)
+                        | re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: UDPRoute init");
@@ -6773,7 +6886,10 @@ pub async fn run_udproute_watcher(
                             |t: &TrackedUdpRoute| t.entrypoint_ids.as_slice(),
                             &storage,
                             &scope,
-                        ),
+                        )
+                        // The routes the dropped ones kept off their ports
+                        // take them over.
+                        | re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx)),
                         None => false,
                     }
                 }
@@ -7019,6 +7135,7 @@ fn tls_rule_backends(
             Some(ResolvedRef {
                 weight: b.weight,
                 pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
+                headers: Vec::new(),
             })
         })
         .collect();
@@ -7887,6 +8004,40 @@ mod tests {
         Arc::new([(9000, "tcpgw".to_string())].into_iter().collect())
     }
 
+    /// Of the routes on one TCP or UDP port, the oldest is served.
+    #[test]
+    fn the_oldest_route_takes_a_port() {
+        use kube::api::ObjectMeta;
+        let meta = |name: &str, second: i64| ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some("ns".into()),
+            uid: Some(name.into()),
+            creation_timestamp: Some(Time(
+                k8s_openapi::chrono::DateTime::from_timestamp(second, 0).unwrap(),
+            )),
+            ..Default::default()
+        };
+        let older = meta("older", 1);
+        let newer = meta("newer", 2);
+        let twin = meta("twin", 2);
+        let ports = |p: &[i32]| p.iter().copied().collect::<BTreeSet<i32>>();
+        let routes = [
+            (&older, ports(&[9000])),
+            (&newer, ports(&[9000, 9001])),
+            (&twin, ports(&[9001])),
+        ];
+        assert!(ports_of_older_routes(&older, routes.clone().into_iter()).is_empty());
+        assert_eq!(
+            ports_of_older_routes(&newer, routes.clone().into_iter()),
+            ports(&[9000])
+        );
+        // As old: the first by name.
+        assert_eq!(
+            ports_of_older_routes(&twin, routes.into_iter()),
+            ports(&[9000, 9001])
+        );
+    }
+
     #[test]
     fn tcp_route_produces_one_catch_all_entrypoint_per_rule() {
         let scope = tcp_scope(9000);
@@ -8445,6 +8596,63 @@ mod tests {
         ));
         let eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps[0].config.headers[0].value, "api");
+    }
+
+    /// backendRefs with different filters keep each their own: the
+    /// middleware edits what it sends each backend.
+    #[test]
+    fn backend_refs_keep_filters_of_their_own() {
+        use gateway_api::apis::standard::httproutes::{
+            HTTPRouteRulesBackendRefsFilters,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+        };
+        let set = |value: &str| {
+            Some(vec![HTTPRouteRulesBackendRefsFilters {
+                request_header_modifier: Some(
+                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+                        set: Some(vec![
+                            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                                name: "X-Backend".into(),
+                                value: value.into(),
+                            },
+                        ]),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }])
+        };
+        let mut api = backend("api", 80);
+        api.filters = set("api");
+        let mut web = backend("web", 80);
+        web.filters = set("web");
+        let mut shared = rule(None, vec![api, web]);
+        shared.filters = Some(vec![HTTPRouteRulesFilters {
+            response_header_modifier: Some(
+                gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersResponseHeaderModifier {
+                    remove: Some(vec!["Server".into()]),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }]);
+        let route = route_with(vec![shared], vec!["app.example.com".into()]);
+        assert!(!route_has_unsupported_filters(
+            &route,
+            &r1(),
+            &AllowAllBackendRefs
+        ));
+        let eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
+        // The rule's own edits stay the route's.
+        assert_eq!(eps[0].config.headers[0].name, "Server");
+        let values: Vec<&str> = eps[0]
+            .backends
+            .iter()
+            .map(|b| b.headers[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["api", "web"]);
+        assert!(crate::middleware::needs_middleware(&eps[0]));
     }
 
     #[test]
@@ -9009,7 +9217,7 @@ mod tests {
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert!(eps[0].config.match_query[0].regex);
         // Left to the middleware: Sōzu routes on literal query values only.
-        assert!(crate::middleware::needs_middleware(&eps[0].config));
+        assert!(crate::middleware::needs_middleware(&eps[0]));
     }
 
     #[test]
@@ -9299,6 +9507,7 @@ mod tests {
             pods: (0..pods)
                 .map(|i| (format!("10.{}.{}.{}", pods % 256, i / 256, i % 256), 80))
                 .collect(),
+            headers: Vec::new(),
         }
     }
 
@@ -9620,7 +9829,7 @@ mod tests {
         assert_eq!(mirrors.len(), 1);
         assert_eq!(mirrors[0].backends.len(), 1);
         assert_eq!(mirrors[0].backends[0].port, 8080);
-        assert!(crate::middleware::needs_middleware(&eps[0].config));
+        assert!(crate::middleware::needs_middleware(&eps[0]));
         // A mirror with no ready pod stays, copying nothing: the route keeps
         // going through the middleware.
         let rule_filters = r.spec.rules.as_ref().unwrap()[0].filters.clone().unwrap();
@@ -10171,6 +10380,41 @@ mod tests {
             find_condition(&conds, CONDITION_TYPE_PROGRAMMED).status,
             "True"
         );
+    }
+
+    #[test]
+    fn invalid_listeners_mark_the_gateway() {
+        use gateway_api::apis::standard::gateways::GatewayStatusListeners;
+        let gw = gateway("default", "gw", "sozune");
+        let listener = |accepted: bool| GatewayStatusListeners {
+            conditions: vec![Condition {
+                type_: CONDITION_TYPE_ACCEPTED.to_string(),
+                status: if accepted { "True" } else { "False" }.to_string(),
+                reason: String::new(),
+                message: String::new(),
+                last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+                observed_generation: None,
+            }],
+            ..Default::default()
+        };
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_invalid_listeners(&mut conds, &[listener(true), listener(false)]);
+        assert_eq!(conds[0].status, "True");
+        assert_eq!(conds[0].reason, REASON_LISTENERS_NOT_VALID);
+        assert_eq!(conds[1].status, "True");
+        assert_eq!(conds[1].reason, REASON_PROGRAMMED);
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_invalid_listeners(&mut conds, &[listener(false)]);
+        assert_eq!(conds[0].status, "False");
+        assert_eq!(conds[0].reason, REASON_LISTENERS_NOT_VALID);
+        assert_eq!(conds[1].status, "False");
+        assert_eq!(conds[1].reason, REASON_INVALID);
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_invalid_listeners(&mut conds, &[listener(true)]);
+        assert_eq!(conds[0].reason, REASON_ACCEPTED);
     }
 
     #[test]

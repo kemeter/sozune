@@ -20,7 +20,10 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::{error, info, warn};
 
-use crate::model::{Backend, EntrypointConfig, LoadBalancer, MatchCondition};
+use crate::model::{
+    Backend, Entrypoint, EntrypointConfig, HeaderConfig, HeaderDirection, LoadBalancer,
+    MatchCondition,
+};
 use crate::proxy::sozu::{header_predicate, routes_on_query};
 use chain::Middleware;
 use compress::CompressMiddleware;
@@ -190,6 +193,12 @@ pub struct MiddlewareRoute {
     pub rewrite_host: Option<String>,
     /// Where each request is copied to, its answer ignored.
     pub mirrors: Vec<MirrorTarget>,
+    /// The header edits of each backend, by its index in `backends`.
+    pub backend_headers: Vec<Vec<HeaderConfig>>,
+    /// The route's response header edits, which the middleware makes rather
+    /// than Sōzu when a backend has edits of its own: see
+    /// [`edits_responses`].
+    pub response_headers: Vec<HeaderConfig>,
     /// Picks, by their weights, whether a request is forwarded (`0`) or
     /// answered `500` (`1`) or `503` (`2`): see [`crate::model::FailingShares`].
     pub failing_shares: Option<WeightedRoundRobin>,
@@ -377,6 +386,26 @@ impl MiddlewareRouteTable {
 }
 
 impl MiddlewareRoute {
+    /// The header edits of the backend at `index`, if one was picked.
+    pub fn edits_for(&self, index: Option<usize>) -> &[HeaderConfig] {
+        index
+            .and_then(|index| self.backend_headers.get(index))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Makes the response edits of the route, then those of the backend that
+    /// gave `response`, if one did (see [`ServedBy`]).
+    pub fn edit_response(&self, response: &mut axum::response::Response) {
+        let served_by = response.extensions().get::<ServedBy>().map(|s| s.0);
+        let headers = response.headers_mut();
+        edit_headers(headers, &self.response_headers, HeaderDirection::Response);
+        edit_headers(
+            headers,
+            self.edits_for(served_by),
+            HeaderDirection::Response,
+        );
+    }
+
     /// The backends one request tries, in order, until one answers. See
     /// [`BackendAttempts`]. `attempts` is the route's retry budget; a
     /// WebSocket upgrade, which is never retried, passes 1. `health` tells
@@ -818,8 +847,49 @@ pub(crate) fn timed_out(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// The index of the backend that gave a response, for its header edits.
+#[derive(Clone, Copy)]
+pub struct ServedBy(pub usize);
+
+/// Whether the middleware, rather than Sōzu, makes the response header edits
+/// of `entrypoint`'s route: those of a backend with edits of its own come
+/// after the route's, and Sōzu's would come last.
+pub fn edits_responses(entrypoint: &Entrypoint) -> bool {
+    // A route Sōzu answers itself keeps them at Sōzu.
+    !entrypoint.answers_without_backend()
+        && entrypoint.backends.iter().any(|b| !b.headers.is_empty())
+}
+
+/// Makes the `edits` going `direction` on `headers`, as Sōzu makes a route's:
+/// a set replaces the header, an append adds a value next to it, and an empty
+/// value removes it.
+pub(crate) fn edit_headers(
+    headers: &mut axum::http::HeaderMap,
+    edits: &[HeaderConfig],
+    direction: HeaderDirection,
+) {
+    use axum::http::{HeaderName, HeaderValue};
+    for edit in edits {
+        if edit.direction != direction && edit.direction != HeaderDirection::Both {
+            continue;
+        }
+        let Ok(name) = HeaderName::from_bytes(edit.name.as_bytes()) else {
+            continue;
+        };
+        if !edit.append || edit.value.is_empty() {
+            headers.remove(&name);
+        }
+        if let Ok(value) = HeaderValue::from_str(&edit.value)
+            && !edit.value.is_empty()
+        {
+            headers.append(name, value);
+        }
+    }
+}
+
 /// Check if an entrypoint needs middleware processing
-pub fn needs_middleware(config: &EntrypointConfig) -> bool {
+pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
+    let config = &entrypoint.config;
     config.answer.is_some()
         || url_rewrite_host(config).is_some()
         || config.backend_timeout.is_some()
@@ -842,6 +912,8 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || !config.mirrors.is_empty()
         // And the share of requests answered with an error.
         || config.failing_shares.is_some()
+        // And the header edits of a backend of its own.
+        || edits_responses(entrypoint)
 }
 
 /// Build middleware route from entrypoint config.
@@ -980,6 +1052,19 @@ pub fn build_middleware_route(
             .map(|b| backend_load(&(b.address.clone(), b.port)))
             .collect(),
         backups: backup_indexes(&weights),
+        backend_headers: backends.iter().map(|b| b.headers.clone()).collect(),
+        response_headers: if config.redirect.is_none_or(|r| !r.answers_without_backend())
+            && backends.iter().any(|b| !b.headers.is_empty())
+        {
+            config
+                .headers
+                .iter()
+                .filter(|h| h.direction != HeaderDirection::Request)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        },
         backend_timeout: config.backend_timeout,
         request_timeout: config.request_timeout,
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
@@ -1035,6 +1120,61 @@ mod route_key_tests {
     use super::*;
 
     /// A route over backends `b0`, `b1`… with these weights.
+    #[test]
+    fn edit_headers_sets_appends_and_removes() {
+        let edit = |name: &str, value: &str, append: bool| HeaderConfig {
+            name: name.into(),
+            value: value.into(),
+            direction: HeaderDirection::Request,
+            append,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-set", "old".parse().unwrap());
+        headers.insert("x-add", "old".parse().unwrap());
+        headers.insert("x-gone", "old".parse().unwrap());
+        let edits = [
+            edit("X-Set", "new", false),
+            edit("X-Add", "new", true),
+            edit("X-Gone", "", false),
+            HeaderConfig {
+                direction: HeaderDirection::Response,
+                ..edit("X-Response", "no", false)
+            },
+        ];
+        edit_headers(&mut headers, &edits, HeaderDirection::Request);
+        assert_eq!(headers.get_all("x-set").iter().collect::<Vec<_>>(), ["new"]);
+        assert_eq!(
+            headers.get_all("x-add").iter().collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+        assert!(!headers.contains_key("x-gone"));
+        assert!(!headers.contains_key("x-response"));
+    }
+
+    /// The route's response edits come first, then those of the backend that
+    /// answered.
+    #[test]
+    fn edit_response_makes_the_route_edits_then_the_backend_ones() {
+        let set = |value: &str| HeaderConfig {
+            name: "X-Edit".into(),
+            value: value.into(),
+            direction: HeaderDirection::Response,
+            append: false,
+        };
+        let mut route = weighted_route(&[1, 1]);
+        route.response_headers = vec![set("route")];
+        route.backend_headers = vec![vec![set("backend")], Vec::new()];
+
+        let mut served = axum::response::Response::new(axum::body::Body::empty());
+        served.extensions_mut().insert(ServedBy(0));
+        route.edit_response(&mut served);
+        assert_eq!(served.headers()["x-edit"], "backend");
+
+        let mut local = axum::response::Response::new(axum::body::Body::empty());
+        route.edit_response(&mut local);
+        assert_eq!(local.headers()["x-edit"], "route");
+    }
+
     fn weighted_route(weights: &[u32]) -> MiddlewareRoute {
         MiddlewareRoute {
             cluster_id: "web".to_string(),
@@ -1051,6 +1191,8 @@ mod route_key_tests {
             rewrite_host: None,
             mirrors: Vec::new(),
             failing_shares: None,
+            backend_headers: Vec::new(),
+            response_headers: Vec::new(),
         }
     }
 
@@ -1394,6 +1536,8 @@ mod route_key_tests {
             rewrite_host: None,
             mirrors: Vec::new(),
             failing_shares: None,
+            backend_headers: Vec::new(),
+            response_headers: Vec::new(),
         })
     }
 

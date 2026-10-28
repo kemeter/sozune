@@ -354,7 +354,7 @@ pub async fn resolve(
         ));
     }
 
-    let served_by = if middleware::needs_middleware(&entrypoint.config) {
+    let served_by = if middleware::needs_middleware(entrypoint) {
         match run_middleware(
             inputs,
             &cluster_id,
