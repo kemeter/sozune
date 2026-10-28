@@ -6,6 +6,7 @@ mod fixed_answer;
 mod forward_auth;
 pub mod in_flight_req;
 pub mod ip_allow_list;
+pub mod passive_health;
 mod proxy;
 pub mod rate_limit;
 pub(crate) mod request_match;
@@ -48,6 +49,8 @@ pub struct MiddlewareAppState {
     /// Live request-latency histogram. The proxy handler records each
     /// completed request here; the API `/metrics` endpoint reads the same Arc.
     pub request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
+    /// The backends left out after failing requests in a row.
+    pub passive_health: Arc<passive_health::PassiveHealth>,
 }
 
 pub type MiddlewareState = Arc<RwLock<MiddlewareRouteTable>>;
@@ -343,10 +346,16 @@ impl MiddlewareRouteTable {
 impl MiddlewareRoute {
     /// The backends one request tries, in order, until one answers. See
     /// [`BackendAttempts`]. `attempts` is the route's retry budget; a
-    /// WebSocket upgrade, which is never retried, passes 1.
-    pub fn attempts(&self, attempts: u32) -> BackendAttempts<'_> {
+    /// WebSocket upgrade, which is never retried, passes 1. `health` tells
+    /// the backends left out after failing.
+    pub fn attempts<'a>(
+        &'a self,
+        attempts: u32,
+        health: &'a passive_health::PassiveHealth,
+    ) -> BackendAttempts<'a> {
         BackendAttempts {
             route: self,
+            health,
             attempts: attempts.max(1) as usize,
             tried: Vec::new(),
             fallback: None,
@@ -368,9 +377,11 @@ impl MiddlewareRoute {
 ///
 /// A backup is tried only once every other backend has been. Backends are
 /// picked one at a time, as attempts fail, so a request that does not retry
-/// moves the balancer once.
+/// moves the balancer once. A backend left out after failing (see
+/// [`passive_health`]) comes after the others, unless every one is.
 pub struct BackendAttempts<'a> {
     route: &'a MiddlewareRoute,
+    health: &'a passive_health::PassiveHealth,
     attempts: usize,
     tried: Vec<usize>,
     fallback: Option<std::collections::VecDeque<usize>>,
@@ -378,14 +389,45 @@ pub struct BackendAttempts<'a> {
 
 impl BackendAttempts<'_> {
     /// The backends that are not backups and that this request has not
-    /// tried, heaviest first, then in declaration order.
+    /// tried: those not left out first, heaviest first, then in declaration
+    /// order.
     fn untried_primaries(&self) -> Vec<usize> {
         let route = self.route;
         let mut untried: Vec<usize> = (0..route.backends.len())
             .filter(|index| !route.is_backup(*index) && !self.tried.contains(index))
             .collect();
-        untried.sort_by_key(|&index| std::cmp::Reverse(route.balancer.weights[index]));
+        untried.sort_by_key(|&index| {
+            (
+                self.is_down(index),
+                std::cmp::Reverse(route.balancer.weights[index]),
+            )
+        });
         untried
+    }
+
+    fn is_down(&self, index: usize) -> bool {
+        self.route
+            .backends
+            .get(index)
+            .is_some_and(|backend| self.health.is_down(backend))
+    }
+
+    /// The balancer's pick among the backends not left out, by their
+    /// weights; a backup not left out when every other backend is; the
+    /// balancer's pick among all of them when every backend is.
+    fn balanced(&self) -> Option<usize> {
+        let route = self.route;
+        route
+            .balancer
+            .next_where(|index| !self.is_down(index))
+            .or_else(|| {
+                route
+                    .backups
+                    .iter()
+                    .copied()
+                    .find(|&index| !self.is_down(index))
+            })
+            .or_else(|| route.balancer.next())
     }
 }
 
@@ -395,21 +437,42 @@ impl<'a> Iterator for BackendAttempts<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let route = self.route;
         let index = if self.tried.is_empty() {
-            route.balancer.next()
+            self.balanced()
         } else if self.tried.len() < self.attempts {
-            self.untried_primaries()
-                .first()
-                .copied()
-                .or_else(|| route.balancer.next())
+            // An untried backend not left out; when each untried one is, a
+            // backup not left out before them. Once every backend was tried,
+            // the balancer picks again.
+            let primaries = self.untried_primaries();
+            let up = |index: &usize| !self.is_down(*index);
+            match primaries.iter().copied().find(up) {
+                Some(index) => Some(index),
+                None if !primaries.is_empty() => route
+                    .backups
+                    .iter()
+                    .copied()
+                    .filter(|index| !self.tried.contains(index))
+                    .find(up)
+                    .or_else(|| primaries.first().copied()),
+                None => self.balanced(),
+            }
         } else {
             if self.fallback.is_none() {
                 let fallback = if route.backups.is_empty() {
                     Default::default()
                 } else {
-                    self.untried_primaries()
+                    // Those left out last, backups included.
+                    let (up, down): (Vec<usize>, Vec<usize>) = self
+                        .untried_primaries()
                         .into_iter()
-                        .chain(route.backups.iter().copied())
-                        .collect()
+                        .chain(
+                            route
+                                .backups
+                                .iter()
+                                .copied()
+                                .filter(|index| !self.tried.contains(index)),
+                        )
+                        .partition(|&index| !self.is_down(index));
+                    up.into_iter().chain(down).collect()
                 };
                 self.fallback = Some(fallback);
             }
@@ -429,7 +492,6 @@ impl<'a> Iterator for BackendAttempts<'a> {
 #[derive(Debug)]
 pub struct WeightedRoundRobin {
     weights: Vec<i64>,
-    total: i64,
     current: Mutex<Vec<i64>>,
 }
 
@@ -444,31 +506,37 @@ impl WeightedRoundRobin {
         if weights.iter().all(|&w| w == 0) {
             weights.iter_mut().for_each(|w| *w = 1);
         }
-        let total = weights.iter().sum();
         Self {
             current: Mutex::new(vec![0; weights.len()]),
             weights,
-            total,
         }
     }
 
     pub fn next(&self) -> Option<usize> {
+        self.next_where(|_| true)
+    }
+
+    /// [`Self::next`] among the backends `eligible` takes. One it leaves out
+    /// does not take part in the turn, so the others keep their ratios.
+    pub fn next_where(&self, eligible: impl Fn(usize) -> bool) -> Option<usize> {
         let mut current = self
             .current
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut picked: Option<usize> = None;
+        let mut total = 0;
         for (index, &weight) in self.weights.iter().enumerate() {
-            if weight == 0 {
+            if weight == 0 || !eligible(index) {
                 continue;
             }
             current[index] += weight;
+            total += weight;
             if picked.is_none_or(|p| current[index] > current[p]) {
                 picked = Some(index);
             }
         }
         if let Some(index) = picked {
-            current[index] -= self.total;
+            current[index] -= total;
         }
         picked
     }
@@ -779,6 +847,7 @@ pub async fn serve(
         route_table,
         http_client: Client::builder(TokioExecutor::new()).build_http(),
         request_metrics,
+        passive_health: Arc::default(),
     };
 
     let app = Router::new()
@@ -821,11 +890,74 @@ mod route_key_tests {
 
     /// The backends a request tries when every one of them fails.
     fn tried(route: &MiddlewareRoute, attempts: u32) -> Vec<String> {
+        tried_with(route, attempts, &passive_health::PassiveHealth::default())
+    }
+
+    fn tried_with(
+        route: &MiddlewareRoute,
+        attempts: u32,
+        health: &passive_health::PassiveHealth,
+    ) -> Vec<String> {
         route
-            .attempts(attempts)
+            .attempts(attempts, health)
             .take(10)
             .map(|(host, _)| host.clone())
             .collect()
+    }
+
+    /// A backend left out after failing is not picked while another one can
+    /// be; when every one is, they are tried all the same.
+    #[test]
+    fn a_backend_left_out_comes_after_the_others() {
+        let health = passive_health::PassiveHealth::default();
+        let down = |host: &str| {
+            for _ in 0..passive_health::MAX_FAILURES {
+                health.failed(&(host.to_string(), 80));
+            }
+        };
+        down("b0");
+        let route = weighted_route(&[100, 100]);
+        for _ in 0..4 {
+            assert_eq!(tried_with(&route, 1, &health), ["b1"]);
+        }
+        assert_eq!(tried_with(&route, 2, &health), ["b1", "b0"]);
+        down("b1");
+        assert_eq!(tried_with(&route, 1, &health).len(), 1);
+
+        // The others keep their ratios.
+        let health = passive_health::PassiveHealth::default();
+        for _ in 0..passive_health::MAX_FAILURES {
+            health.failed(&("b2".to_string(), 80));
+        }
+        let route = weighted_route(&[100, 100, 100]);
+        let mut picks = std::collections::HashMap::new();
+        for _ in 0..100 {
+            *picks
+                .entry(tried_with(&route, 1, &health)[0].clone())
+                .or_insert(0) += 1;
+        }
+        assert_eq!(picks.get("b0"), Some(&50));
+        assert_eq!(picks.get("b1"), Some(&50));
+
+        // However much heavier the backend left out.
+        let health = passive_health::PassiveHealth::default();
+        for _ in 0..passive_health::MAX_FAILURES {
+            health.failed(&("b0".to_string(), 80));
+        }
+        let route = weighted_route(&[100_000, 1]);
+        assert_eq!(tried_with(&route, 1, &health), ["b1"]);
+
+        // A backup when every other backend is left out.
+        let route = weighted_route(&[100, 0]);
+        assert_eq!(tried_with(&route, 1, &health), ["b1", "b0"]);
+
+        // On a retry too, before the backend left out.
+        let health = passive_health::PassiveHealth::default();
+        for _ in 0..passive_health::MAX_FAILURES {
+            health.failed(&("b1".to_string(), 80));
+        }
+        let route = weighted_route(&[100, 50, 0]);
+        assert_eq!(tried_with(&route, 2, &health)[..2], ["b0", "b2"]);
     }
 
     #[test]

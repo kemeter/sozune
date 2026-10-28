@@ -235,7 +235,7 @@ pub async fn handle_proxy(
             } else {
                 route.retry_attempts.max(1)
             };
-            let mut plan = route.attempts(attempts);
+            let mut plan = route.attempts(attempts, &state.passive_health);
             let (backend_host, backend_port) = match plan.next() {
                 Some(b) => b.clone(),
                 None => {
@@ -287,7 +287,15 @@ pub async fn handle_proxy(
                         .collect();
                 // The request's deadline bounds the handshakes, not the tunnel.
                 let timeout = backend_timeout(route.backend_timeout);
-                return handle_websocket(req, &candidates, &forwarded_path, &query, timeout).await;
+                return handle_websocket(
+                    req,
+                    &candidates,
+                    &forwarded_path,
+                    &query,
+                    timeout,
+                    &state.passive_health,
+                )
+                .await;
             }
 
             // Build the forwarded request.
@@ -385,14 +393,19 @@ pub async fn handle_proxy(
             let mut backend_response = None;
             let mut target_uri = target_uri;
             let mut tries = 0u32;
-            let mut uri = Some(primary_uri);
-            while let Some(current) = uri.take() {
+            let mut uri = Some(((backend_host.clone(), backend_port), primary_uri));
+            while let Some((backend, current)) = uri.take() {
                 tries += 1;
                 target_uri = current.to_string();
                 parts.uri = current;
                 let forwarded_req =
                     Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
                 let attempt_start = tokio::time::Instant::now();
+                // Counted a failure if the request's deadline cancels it.
+                let attempt = super::passive_health::Attempt::new(
+                    state.passive_health.clone(),
+                    backend.clone(),
+                );
                 forwarded.store(true, std::sync::atomic::Ordering::Relaxed);
                 let response_future = state.http_client.request(forwarded_req);
 
@@ -412,6 +425,8 @@ pub async fn handle_proxy(
 
                 match result {
                     Ok(resp) => {
+                        // An answer, whatever its status: the backend is up.
+                        attempt.succeeded();
                         let (parts, body) = resp.into_parts();
                         let body = body.map_err(|e| axum::Error::new(std::io::Error::other(e)));
                         // A backend timeout the route sets caps the whole response,
@@ -427,6 +442,7 @@ pub async fn handle_proxy(
                         backend_response = Some(Response::from_parts(parts, body));
                     }
                     Err((msg, is_timeout)) => {
+                        attempt.failed();
                         last_err = msg;
                         last_was_timeout = is_timeout;
                         // Past the request's deadline, no other attempt.
@@ -435,7 +451,8 @@ pub async fn handle_proxy(
                         uri = if expired {
                             None
                         } else {
-                            plan.by_ref().find_map(uri_of)
+                            plan.by_ref()
+                                .find_map(|b| uri_of(b).map(|u| (b.clone(), u)))
                         };
                         if uri.is_some() {
                             debug!(
@@ -635,6 +652,7 @@ async fn handle_websocket(
     path: &str,
     query: &str,
     timeout: Option<std::time::Duration>,
+    health: &std::sync::Arc<super::passive_health::PassiveHealth>,
 ) -> axum::response::Response {
     debug!("WebSocket upgrade request to {:?}{}", backends, path);
 
@@ -657,6 +675,10 @@ async fn handle_websocket(
     let mut last_timed_out = false;
     for (backend_host, backend_port) in backends {
         let backend_addr = format!("{}:{}", uri_host(backend_host), backend_port);
+        let attempt = super::passive_health::Attempt::new(
+            health.clone(),
+            (backend_host.clone(), *backend_port),
+        );
         // Bounded by the route's backend timeout, so a backend that accepts
         // the connection and never answers does not hold the upgrade back
         // from the next one.
@@ -677,10 +699,12 @@ async fn handle_websocket(
         };
         match outcome {
             Ok((stream, n)) => {
+                attempt.succeeded();
                 answered = Some((stream, n));
                 break;
             }
             Err((failure, is_timeout)) => {
+                attempt.failed();
                 error!("WebSocket upgrade failed: {}", failure);
                 last_failure = failure;
                 last_timed_out = is_timeout;
