@@ -190,6 +190,9 @@ pub struct MiddlewareRoute {
     pub rewrite_host: Option<String>,
     /// Where each request is copied to, its answer ignored.
     pub mirrors: Vec<MirrorTarget>,
+    /// Picks, by their weights, whether a request is forwarded (`0`) or
+    /// answered `500` (`1`) or `503` (`2`): see [`crate::model::FailingShares`].
+    pub failing_shares: Option<WeightedRoundRobin>,
 }
 
 /// One of a route's mirrors: its backends, and how to pick one.
@@ -837,6 +840,8 @@ pub fn needs_middleware(config: &EntrypointConfig) -> bool {
         || config.circuit_breaker.is_some()
         // So is the copy of each request to a mirror.
         || !config.mirrors.is_empty()
+        // And the share of requests answered with an error.
+        || config.failing_shares.is_some()
 }
 
 /// Build middleware route from entrypoint config.
@@ -982,6 +987,9 @@ pub fn build_middleware_route(
         middlewares,
         rewrite_host: url_rewrite_host(config).map(str::to_string),
         mirrors: config.mirrors.iter().map(MirrorTarget::new).collect(),
+        failing_shares: config
+            .failing_shares
+            .map(|s| WeightedRoundRobin::new(&[s.forwarded, s.invalid, s.unavailable])),
     })
 }
 
@@ -1042,6 +1050,7 @@ mod route_key_tests {
             middlewares: Vec::new(),
             rewrite_host: None,
             mirrors: Vec::new(),
+            failing_shares: None,
         }
     }
 
@@ -1384,6 +1393,7 @@ mod route_key_tests {
             middlewares: Vec::new(),
             rewrite_host: None,
             mirrors: Vec::new(),
+            failing_shares: None,
         })
     }
 

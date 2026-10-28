@@ -4238,6 +4238,33 @@ struct ResolvedRef {
     pods: Vec<(String, u16)>,
 }
 
+/// How a rule's requests split between its pods and errors, from the weights
+/// of its backendRefs: forwarded, invalid (`500`) and without a ready pod
+/// (`503`). `None` when no share is answered with an error.
+fn failing_shares(shares: [u128; 3]) -> Option<crate::model::FailingShares> {
+    if shares[1..].iter().all(|&w| w == 0) {
+        return None;
+    }
+    let divisor = shares.iter().copied().fold(0, gcd);
+    let mut shares = shares.map(|w| w / divisor);
+    let largest = shares.iter().copied().max().unwrap_or(1);
+    if largest > MAX_POD_WEIGHT {
+        // Scaled down, a share keeping at least 1.
+        shares = shares.map(|w| {
+            if w == 0 {
+                0
+            } else {
+                (w * MAX_POD_WEIGHT / largest).max(1)
+            }
+        });
+    }
+    Some(crate::model::FailingShares {
+        forwarded: shares[0] as u32,
+        invalid: shares[1] as u32,
+        unavailable: shares[2] as u32,
+    })
+}
+
 /// The largest weight Sōzu takes for a backend.
 const MAX_POD_WEIGHT: u128 = i32::MAX as u128;
 
@@ -5497,6 +5524,11 @@ fn rule_to_entrypoints(
     let backend_refs = rule.backend_refs.as_deref().unwrap_or_default();
     let mut resolved: Vec<ResolvedRef> = Vec::new();
     let mut invalid = 0;
+    // The weights of the backendRefs by what becomes of their share:
+    // forwarded, answered 500, answered 503.
+    let mut shares = [0u128; 3];
+    let ref_weight =
+        |b: &HTTPRouteRulesBackendRefs| u128::try_from(b.weight.unwrap_or(1)).unwrap_or(0);
     for b in backend_refs {
         if let Err(reason) = check_backend_ref(namespace, b, resolver, grants) {
             warn!(
@@ -5504,17 +5536,25 @@ fn rule_to_entrypoints(
                 namespace, route_name, rule_index, b.name, reason
             );
             invalid += 1;
+            shares[1] += ref_weight(b);
             continue;
         }
         let Some(port) = b.port.and_then(|p| u16::try_from(p).ok()) else {
             continue;
         };
         let target_ns = b.namespace.as_deref().unwrap_or(namespace);
+        let pods = resolver.pod_addresses(target_ns, &b.name, port, "TCP");
+        shares[if pods.is_empty() { 2 } else { 0 }] += ref_weight(b);
         resolved.push(ResolvedRef {
             weight: b.weight,
-            pods: resolver.pod_addresses(target_ns, &b.name, port, "TCP"),
+            pods,
         });
     }
+    let failing_shares = if answers {
+        None
+    } else {
+        failing_shares(shares)
+    };
     // Gateway API: a rule with no backendRef, or none it can use, answers
     // 500.
     let invalid_backends = !answers && invalid == backend_refs.len();
@@ -5523,10 +5563,13 @@ fn rule_to_entrypoints(
     } else if answers {
         weigh_backend_refs(resolved).unwrap_or_default()
     } else {
-        let Some(backends) = weigh_backend_refs(resolved) else {
-            return Vec::new();
-        };
-        backends
+        match weigh_backend_refs(resolved) {
+            Some(backends) => backends,
+            // No ready pod to forward to, but invalid backendRefs whose
+            // share to answer. Without one, the rule waits for a pod.
+            None if failing_shares.is_some_and(|s| s.invalid > 0) => Vec::new(),
+            None => return Vec::new(),
+        }
     };
 
     let (request_timeout, backend_timeout) = rule_timeouts_ms(rule);
@@ -5651,6 +5694,7 @@ fn rule_to_entrypoints(
                     ip_allow_list: Vec::new(),
                     mirrors: mirrors.clone(),
                     mirror_of: None,
+                    failing_shares,
                 },
                 source: Some(id),
                 candidates: Vec::new(),
@@ -7029,6 +7073,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         answer: None,
         mirrors: Vec::new(),
         mirror_of: None,
+        failing_shares: None,
         ip_allow_list: Vec::new(),
     }
 }
@@ -8530,6 +8575,61 @@ mod tests {
         let r = route_with(vec![rule(None, vec![b])], vec!["app.example.com".into()]);
         let eps = route_to_entrypoints(&r, &CrossNsResolver, &AllowAllBackendRefs);
         assert_eq!(eps[0].backends[0].address, "10.1.0.1");
+    }
+
+    /// The share of a backendRef Sōzune cannot use is answered `500`, that
+    /// of one with no ready pod `503`, each by its weight.
+    #[test]
+    fn unusable_backend_refs_keep_their_share_as_errors() {
+        struct OnlyApi;
+        impl ServiceResolver for OnlyApi {
+            fn pod_ips(&self, _namespace: &str, service: &str) -> Vec<String> {
+                if service == "api" {
+                    vec!["10.0.0.1".into(), "10.0.0.2".into()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        let mut api = backend("api", 80);
+        api.weight = Some(6);
+        let mut down = backend("down", 80);
+        down.weight = Some(2);
+        let mut unsupported = backend("bucket", 80);
+        unsupported.kind = Some("Bucket".into());
+        unsupported.weight = Some(4);
+        let shares = |refs| {
+            let r = route_with(vec![rule(None, refs)], vec!["app.example.com".into()]);
+            route_to_entrypoints(&r, &OnlyApi, &AllowAllBackendRefs)[0]
+                .config
+                .failing_shares
+        };
+
+        assert_eq!(
+            shares(vec![api.clone(), down.clone(), unsupported]),
+            Some(crate::model::FailingShares {
+                forwarded: 3,
+                invalid: 2,
+                unavailable: 1,
+            })
+        );
+        // Every share forwarded: nothing to answer.
+        assert_eq!(shares(vec![api.clone()]), None);
+        // A weight of 0 has no share.
+        down.weight = Some(0);
+        assert_eq!(shares(vec![api.clone(), down.clone()]), None);
+        // Nothing forwarded: the errors take every request.
+        api.weight = Some(0);
+        let mut bucket = backend("bucket", 80);
+        bucket.kind = Some("Bucket".into());
+        assert_eq!(
+            shares(vec![api, bucket]),
+            Some(crate::model::FailingShares {
+                forwarded: 0,
+                invalid: 1,
+                unavailable: 0,
+            })
+        );
     }
 
     // A ReferenceGrant in `to_ns` trusting `HTTPRoute` from `from_ns`.

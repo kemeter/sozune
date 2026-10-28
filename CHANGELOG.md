@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 
 ### Routing
 
+- HTTPRoute backendRefs that cannot take traffic — a kind Sōzune does not serve, another namespace without a `ReferenceGrant`, a Service that does not exist — keep their share of the rule's requests, by weight, answered `500`, and those whose Service has no ready pod theirs answered `503`, as Gateway API requires. Their share used to go to the other backendRefs. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
 - HTTPRoute timeouts — a rule's `timeouts.request` now caps the whole request, the client's body and every attempt included, and `timeouts.backendRequest` each attempt on a backend, as `backendTimeout` does: past either, the client gets `504`. `0s` disables either. They used to be ignored. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
 - HTTPRoute backendRef filters — header modifiers set on a rule's backendRefs (`backendRefs[].filters`) now apply, when every backendRef of the rule carries the same ones. They used to be ignored. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
 - HTTPRoute prefix redirects — a `requestRedirect` whose `path` is `replacePrefixMatch` now redirects, swapping the matched prefix and keeping the rest of the path. Such a route used to be dropped. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).

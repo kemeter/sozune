@@ -411,6 +411,20 @@ pub async fn resolve(
         .map(Vec::as_slice)
         .unwrap_or_default();
     resolution.backends = backend_states(served, inputs.unhealthy, evicted);
+    if let Some(shares) = served.config.failing_shares {
+        let total =
+            u64::from(shares.forwarded) + u64::from(shares.invalid) + u64::from(shares.unavailable);
+        let percent = |weight: u32| u64::from(weight) * 100 / total.max(1);
+        resolution.pipeline.push(step(
+            "backend-refs",
+            StepVerdict::Applies,
+            Some(&format!(
+                "{}% of requests get 500 (backendRefs that cannot be used), {}% get 503 (no ready pod)",
+                percent(shares.invalid),
+                percent(shares.unavailable)
+            )),
+        ));
+    }
     if served.config.answer == Some(crate::model::FixedAnswer::InvalidBackends) {
         resolution.outcome = Outcome::Rejected;
         resolution.status = Some(500);
@@ -423,6 +437,22 @@ pub async fn resolve(
         resolution.status = Some(404);
         resolution.summary = format!(
             "the host belongs to another listener of the Gateway of route `{}`, none of whose routes serves the request",
+            served.name
+        );
+    } else if let Some(shares) = served
+        .config
+        .failing_shares
+        .filter(|shares| shares.forwarded == 0)
+    {
+        // Nothing is forwarded: the errors take every request.
+        resolution.outcome = Outcome::Rejected;
+        resolution.status = match (shares.invalid, shares.unavailable) {
+            (_, 0) => Some(500),
+            (0, _) => Some(503),
+            _ => None,
+        };
+        resolution.summary = format!(
+            "route `{}` has no backendRef that can take the request: it gets 500 or 503",
             served.name
         );
     } else if served.backends.is_empty() {
