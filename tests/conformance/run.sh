@@ -13,6 +13,10 @@
 #                      needs GATEWAY_API_CHANNEL=experimental
 #   GATEWAY_API_CHANNEL  CRD channel to install: standard (default), or
 #                      experimental for TLSRoute
+#   GATEWAY_API_VERSION  Gateway API release whose suite and CRDs to use
+#                      (default v1.2.0)
+#   CONFORMANCE_TIMEOUT  `go test` timeout (default 60m)
+#   CONFORMANCE_GO_FLAGS  extra `go test` flags, e.g. "-v"
 #   KEEP_CLUSTER=1     leave the cluster up afterwards
 #   SOZUNE_LOG         Sōzune's RUST_LOG (default sozune=info)
 #
@@ -22,7 +26,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CLUSTER_NAME="sozune-conformance"
-GATEWAY_API_VERSION="v1.2.0"
+GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.2.0}"
 SOZUNE_IMAGE_REF="${SOZUNE_IMAGE_REF:-kemeter/sozune:latest}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/sozune-conformance"
 KUBECONFIG_FILE="$(mktemp)"
@@ -58,8 +62,10 @@ log "Installing Gateway API CRDs ($GATEWAY_API_VERSION, $channel)..."
 if [[ "$channel" == "experimental" ]]; then
     # The suite refuses CRDs of two channels: all of them, from its own tree.
     kubectl apply --server-side -k "$suite/config/crd/experimental" >/dev/null
-else
+elif [[ -f "$DIR/../e2e/k8s/gateway-api-crds-$GATEWAY_API_VERSION.yaml" ]]; then
     kubectl apply -f "$DIR/../e2e/k8s/gateway-api-crds-$GATEWAY_API_VERSION.yaml" >/dev/null
+else
+    kubectl apply --server-side -k "$suite/config/crd" >/dev/null
 fi
 
 log "Deploying Sōzune ($SOZUNE_IMAGE_REF)..."
@@ -75,15 +81,18 @@ kubectl wait --for=condition=Ready pod/sozune -n sozune-conformance --timeout=12
 log "Running the suite (Sōzune at $node_ip)..."
 status=0
 # shellcheck disable=SC2086
+# The Go the suite's release asks for.
+go_version=$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' "$suite/go.mod")
 docker run --rm --network host \
     -v "$suite:/src" -v "$KUBECONFIG_FILE:/kubeconfig:ro" -v "$DIR:/out" \
     -v sozune-conformance-gomod:/go/pkg/mod \
-    -e KUBECONFIG=/kubeconfig -w /src golang:1.23 \
-    go test ./conformance -run TestConformance -timeout 60m -args \
+    -e KUBECONFIG=/kubeconfig -w /src "golang:${go_version:-1.23}" \
+    go test ./conformance -run TestConformance -timeout "${CONFORMANCE_TIMEOUT:-60m}" ${CONFORMANCE_GO_FLAGS:-} -args \
         --gateway-class=sozune \
         --conformance-profiles="${CONFORMANCE_PROFILES:-GATEWAY-HTTP}" \
         --organization=kemeter --project=sozune \
         --url=https://github.com/kemeter/sozune --version=dev \
+        --contact=https://github.com/kemeter/sozune/issues \
         --report-output=/out/report.yaml \
         ${CONFORMANCE_ARGS:-} || status=$?
 
