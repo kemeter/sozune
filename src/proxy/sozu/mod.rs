@@ -1283,6 +1283,9 @@ fn handle_reload(
         open_gateway_listeners(channels, &wanted_gateway_listeners);
 
         // Update middleware route table
+        // The tunnels to the new backends are admitted before the middleware
+        // routes to them.
+        middleware::tunnels::tunnels().publish(http_backends(&storage_read));
         update_middleware_routes(&storage_read, middleware_state, plugins, trusted_proxies);
 
         let outcome = configure_sozu_routing(
@@ -1296,6 +1299,7 @@ fn handle_reload(
         // once reaches them instead of a route being reinstalled. A route the
         // reload did not install keeps its sessions: they are all it has left.
         close_departed_sessions(channels, &reinstalled_only(departed, &outcome));
+        close_departed_tunnels(previous_snapshot, &storage_read, &outcome);
         match outcome {
             Ok(skipped) => {
                 // Entrypoints we chose not to send must not be recorded as
@@ -3110,6 +3114,58 @@ fn reinstalled_only(
             Err(ReloadFailure { applied, .. }) => applied.contains(&lost.cluster_id),
         })
         .collect()
+}
+
+/// The backends of each HTTP route, by address, for the middleware's tunnels.
+fn http_backends(storage: &BTreeMap<String, Entrypoint>) -> HashMap<String, Vec<(String, u16)>> {
+    storage
+        .iter()
+        .filter(|(_, route)| route.protocol == Protocol::Http)
+        .map(|(cluster_id, route)| {
+            let backends = route
+                .backends
+                .iter()
+                .map(|b| (b.address.clone(), b.port))
+                .collect();
+            (cluster_id.clone(), backends)
+        })
+        .collect()
+}
+
+/// Hands the middleware's WebSocket tunnels the backends of each HTTP route,
+/// closing those to a backend their route no longer has, the route gone
+/// included. A route the reload left uninstalled keeps its tunnels, all its
+/// clients have left, until a later reload installs it.
+fn close_departed_tunnels(
+    previous: &RoutingSnapshot,
+    storage: &BTreeMap<String, Entrypoint>,
+    outcome: &Result<BTreeSet<String>, ReloadFailure>,
+) {
+    middleware::tunnels::tunnels().reroute(http_backends(storage), |cluster_id| {
+        storage
+            .get(cluster_id)
+            .is_some_and(|route| left_uninstalled(cluster_id, route, previous, outcome))
+    });
+}
+
+/// Whether the reload left `route`'s frontends uninstalled: skipped, or,
+/// when it failed, taken down and not installed again. A route it changed
+/// only in the middleware, or only in its backends, kept them.
+fn left_uninstalled(
+    cluster_id: &str,
+    route: &Entrypoint,
+    previous: &RoutingSnapshot,
+    outcome: &Result<BTreeSet<String>, ReloadFailure>,
+) -> bool {
+    let reinstalled = previous.get(cluster_id).is_none_or(|old| {
+        !(old == route
+            || is_backends_only_change(old, route)
+            || is_middleware_only_change(old, route))
+    });
+    match outcome {
+        Ok(skipped) => skipped.contains(cluster_id),
+        Err(ReloadFailure { applied, .. }) => reinstalled && !applied.contains(cluster_id),
+    }
 }
 
 /// Closes the sessions of the backends changed routes lost, after the reload
@@ -5586,6 +5642,52 @@ mod tests {
             .collect();
         assert_eq!(departed, ["10.0.0.2:80", "10.0.0.3:80"]);
         assert!(departed_backends(&old, &old).is_empty());
+    }
+
+    /// A failed reload keeps the middleware's tunnels only on a route whose
+    /// frontends it took down and did not install again.
+    #[test]
+    fn tunnels_wait_only_for_a_route_left_uninstalled() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let previous: RoutingSnapshot = [("web".to_string(), old.clone())].into();
+        let failed = || -> Result<BTreeSet<String>, ReloadFailure> {
+            Err(ReloadFailure {
+                error: anyhow::anyhow!("worker gone"),
+                applied: BTreeSet::new(),
+            })
+        };
+
+        // Only its backends changed: its frontends stayed up.
+        let moved = base_ep(vec![Backend::new("10.0.0.2", 80)]);
+        assert!(!left_uninstalled("web", &moved, &previous, &failed()));
+        // Skipped, its frontends are not there whatever the change.
+        assert!(left_uninstalled(
+            "web",
+            &moved,
+            &previous,
+            &Ok(["web".to_string()].into())
+        ));
+
+        let mut renamed = moved.clone();
+        renamed.config.hostnames = vec!["other.example.com".to_string()];
+        assert!(left_uninstalled("web", &renamed, &previous, &failed()));
+        let applied = Err(ReloadFailure {
+            error: anyhow::anyhow!("worker gone"),
+            applied: ["web".to_string()].into(),
+        });
+        assert!(!left_uninstalled("web", &renamed, &previous, &applied));
+        assert!(!left_uninstalled(
+            "web",
+            &renamed,
+            &previous,
+            &Ok(BTreeSet::new())
+        ));
+        assert!(left_uninstalled(
+            "web",
+            &renamed,
+            &previous,
+            &Ok(["web".to_string()].into())
+        ));
     }
 
     #[test]

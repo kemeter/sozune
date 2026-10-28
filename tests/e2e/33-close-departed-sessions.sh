@@ -23,10 +23,11 @@ docker run -d --name sozune-depart-b --network "$NETWORK" jmalloc/echo-server >/
 DEPART_A=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}" sozune-depart-a)
 DEPART_B=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}" sozune-depart-b)
 
-# $1: backend address; $2: the route's header edits, as JSON.
+# $1: backend address; $2: the route's header edits, as JSON; $3: its
+# backend timeout, which sends it through the middleware.
 depart_entrypoint() {
-    printf '{"name":"depart","backends":[{"address":"%s","port":8080,"weight":100}],"protocol":"Http","config":{"hostnames":["%s"],"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":%s}}' \
-        "$1" "$HOST_DEPART" "${2:-[]}"
+    printf '{"name":"depart","backends":[{"address":"%s","port":8080,"weight":100}],"protocol":"Http","config":{"hostnames":["%s"],"path":null,"tls":false,"strip_prefix":false,"https_redirect":false,"priority":0,"auth":null,"headers":%s,"backend_timeout":%s}}' \
+        "$1" "$HOST_DEPART" "${2:-[]}" "${3:-null}"
 }
 
 # Opens a WebSocket on the route and starts watching it: `cat` ends when
@@ -111,6 +112,47 @@ if websocket_closed; then
     fi
 else
     fail "the WebSocket stayed open after a changed route dropped its backend"
+fi
+close_websocket
+
+log "[33] Departed backend: middleware tunnels are closed too"
+
+# A backend timeout sends the route through the middleware, whose WebSocket
+# tunnel to A must close when the route moves to B.
+curl -s -o /dev/null --max-time 5 -X PUT \
+    -H "Authorization: Basic $API_BASIC_AUTH" -H "Content-Type: application/json" \
+    -d "$(depart_entrypoint "$DEPART_A" '[]' 30000)" \
+    "$DEPART_API_URL/entrypoints/$depart_id" 2>/dev/null || true
+sleep 2
+
+open_websocket
+if grep -qi "101 Switching Protocols" "$ws_out"; then
+    pass "a WebSocket is open through the middleware"
+else
+    fail "the WebSocket upgrade through the middleware failed: $(head -1 "$ws_out")"
+fi
+curl -s -o /dev/null --max-time 5 -X PUT \
+    -H "Authorization: Basic $API_BASIC_AUTH" -H "Content-Type: application/json" \
+    -d "$(depart_entrypoint "$DEPART_B" '[]' 30000)" \
+    "$DEPART_API_URL/entrypoints/$depart_id" 2>/dev/null || true
+
+if websocket_closed; then
+    pass "the middleware's tunnel closes once its backend leaves the route"
+else
+    fail "the middleware's tunnel stayed open on a backend that left the route"
+fi
+close_websocket
+
+# A change that keeps the backend leaves the tunnel open.
+open_websocket
+curl -s -o /dev/null --max-time 5 -X PUT \
+    -H "Authorization: Basic $API_BASIC_AUTH" -H "Content-Type: application/json" \
+    -d "$(depart_entrypoint "$DEPART_B" '[]' 31000)" \
+    "$DEPART_API_URL/entrypoints/$depart_id" 2>/dev/null || true
+if websocket_closed; then
+    fail "the middleware's tunnel closed although its backend stayed"
+else
+    pass "the middleware's tunnel stays open while its backend stays"
 fi
 close_websocket
 

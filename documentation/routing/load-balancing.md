@@ -119,7 +119,7 @@ When a backend leaves a route — its container stops, the service scales down, 
 - an HTTP/2 connection is told to stop (`GOAWAY`), finishes its open streams and closes;
 - a WebSocket or TCP connection closes at once, and the client reconnects.
 
-A route change that keeps a backend (another header, another weight) leaves its connections open, and so does a change Sōzune could not apply: the route keeps what it had. When a route is changed, its connections are closed once its new version is in place, so a client that reconnects at once is served. On a route that goes through the Sōzune middleware, connections are closed this way only when the whole route goes away: a WebSocket tunnel the middleware opened to a backend that left stays open until one side closes it.
+A route change that keeps a backend (another header, another weight) leaves its connections open, and so does a change Sōzune could not apply: the route keeps what it had. When a route is changed, its connections are closed once its new version is in place, so a client that reconnects at once is served. On a route that goes through the Sōzune middleware, a WebSocket tunnel the middleware opened to a backend that left is closed too, once the new version of the route is in place. A backend the route keeps keeps its tunnels, even when the route stops going through the middleware.
 
 ## Sticky sessions
 

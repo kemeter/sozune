@@ -14,7 +14,7 @@ Every **10 seconds** by default, Sōzune probes each backend. Without a health-c
 | Timeout | Backend marked unhealthy |
 | HTTP status not accepted | Backend marked unhealthy (`bad_status`) |
 
-When a backend turns unhealthy, Sōzune takes it out of its route: Sōzu and the Sōzune middleware stop sending it requests, and the connections Sōzu holds to it are closed. A WebSocket tunnel the middleware opened stays until one side closes it (see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves)). It keeps being probed, and comes back as soon as a probe succeeds.
+When a backend turns unhealthy, Sōzune takes it out of its route: Sōzu and the Sōzune middleware stop sending it requests, and the connections Sōzu holds to it are closed, and so are the WebSocket tunnels the middleware opened to it (see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves)). It keeps being probed, and comes back as soon as a probe succeeds.
 
 - **Every backend unhealthy:** none is taken out. A route with nothing left would refuse every request, and a probe can be wrong — a misconfigured `healthCheck.path` fails on every backend at once. The dashboard and `sozune route resolve` say so.
 - **Backups:** a backend of [weight `0`](/documentation/routing/load-balancing#weighted-load-balancing) is a backup. When the others are unhealthy and it is not, it serves.
