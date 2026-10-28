@@ -19,7 +19,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::{error, info, warn};
 
-use crate::model::{Backend, EntrypointConfig, MatchCondition};
+use crate::model::{Backend, EntrypointConfig, LoadBalancer, MatchCondition};
 use crate::proxy::sozu::{header_predicate, routes_on_query};
 use chain::Middleware;
 use compress::CompressMiddleware;
@@ -163,6 +163,14 @@ pub struct MiddlewareRoute {
     pub backends: Vec<(String, u16)>,
     /// Picks among `backends` in proportion to their weights.
     pub balancer: WeightedRoundRobin,
+    /// How a request's backend is picked: by `balancer` in turn, at random,
+    /// or by load. Hashing on a flow key has no meaning for HTTP: those pick
+    /// in turn.
+    pub algorithm: LoadBalancer,
+    /// Requests waiting for an answer from each backend of `backends`, from
+    /// [`backend_load`]: shared by every route to that address, and kept
+    /// across a rebuild of the table while a request still waits.
+    pub in_flight: Vec<Arc<std::sync::atomic::AtomicUsize>>,
     /// Indexes into `backends` of the backups: weight 0 next to backends that
     /// have a weight. Tried when the picked backend gives no response.
     pub backups: Vec<usize>,
@@ -195,6 +203,27 @@ pub struct MirrorTarget {
 /// same. One limit for the process, so a reload rebuilding the routes does not
 /// give them a fresh one while earlier copies still run.
 pub const MIRROR_MAX_IN_FLIGHT: usize = 1024;
+
+/// The count of requests waiting for `backend`'s answer, one per address
+/// whatever the route: the routes rebuilt on a reload get the count their
+/// predecessors still update.
+pub fn backend_load(backend: &(String, u16)) -> Arc<std::sync::atomic::AtomicUsize> {
+    type Loads =
+        std::collections::HashMap<(String, u16), std::sync::Weak<std::sync::atomic::AtomicUsize>>;
+    static LOADS: std::sync::OnceLock<Mutex<Loads>> = std::sync::OnceLock::new();
+    let mut loads = LOADS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(load) = loads.get(backend).and_then(std::sync::Weak::upgrade) {
+        return load;
+    }
+    // Forget the addresses no route holds any more.
+    loads.retain(|_, load| load.strong_count() > 0);
+    let load = Arc::default();
+    loads.insert(backend.clone(), Arc::downgrade(&load));
+    load
+}
 
 /// The permits of [`MIRROR_MAX_IN_FLIGHT`].
 pub fn mirror_permits() -> Arc<tokio::sync::Semaphore> {
@@ -365,6 +394,122 @@ impl MiddlewareRoute {
     fn is_backup(&self, index: usize) -> bool {
         self.backups.contains(&index)
     }
+
+    /// The backend a request goes to, among those `eligible` takes, by the
+    /// route's algorithm. Weights count whatever the algorithm.
+    pub fn pick(&self, eligible: impl Fn(usize) -> bool) -> Option<usize> {
+        let weights = &self.balancer.weights;
+        let eligible = |index: usize| weights.get(index).is_some_and(|&w| w > 0) && eligible(index);
+        if matches!(
+            self.algorithm,
+            LoadBalancer::RoundRobin | LoadBalancer::Hrw | LoadBalancer::Maglev
+        ) {
+            return self.balancer.next_where(eligible);
+        }
+        let candidates: Vec<usize> = (0..self.backends.len()).filter(|&i| eligible(i)).collect();
+        match self.algorithm {
+            LoadBalancer::Random => self.weighted_random(&candidates),
+            LoadBalancer::LeastConnections => {
+                // Ties drawn by weight: on a quiet route every backend often
+                // has nothing waiting, and the weights must still share it.
+                let best = candidates.iter().copied().reduce(|best, index| {
+                    if self.less_loaded(index, best) {
+                        index
+                    } else {
+                        best
+                    }
+                })?;
+                let least: Vec<usize> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|&index| !self.less_loaded(best, index))
+                    .collect();
+                self.weighted_random(&least)
+            }
+            LoadBalancer::PowerOfTwo => {
+                let a = self.weighted_random(&candidates)?;
+                let others: Vec<usize> = candidates.iter().copied().filter(|&i| i != a).collect();
+                let Some(b) = self.weighted_random(&others) else {
+                    return Some(a);
+                };
+                Some(if self.less_loaded(b, a) { b } else { a })
+            }
+            LoadBalancer::RoundRobin | LoadBalancer::Hrw | LoadBalancer::Maglev => None,
+        }
+    }
+
+    /// One of `candidates` at random, in proportion to its weight.
+    fn weighted_random(&self, candidates: &[usize]) -> Option<usize> {
+        let weights = &self.balancer.weights;
+        let total: u64 = candidates.iter().map(|&i| weights[i] as u64).sum();
+        if total == 0 {
+            return None;
+        }
+        let mut draw = random_u64() % total;
+        candidates.iter().copied().find(|&index| {
+            let weight = weights[index] as u64;
+            if draw < weight {
+                true
+            } else {
+                draw -= weight;
+                false
+            }
+        })
+    }
+
+    /// Whether `a` has fewer requests waiting for its answer than `b`, for
+    /// its weight.
+    fn less_loaded(&self, a: usize, b: usize) -> bool {
+        let load = |index: usize| {
+            self.in_flight
+                .get(index)
+                .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed)) as u128
+        };
+        let weight = |index: usize| self.balancer.weights[index].max(1) as u128;
+        load(a) * weight(b) < load(b) * weight(a)
+    }
+
+    /// Count a request waiting for the answer of the backend at `index`,
+    /// until the returned guard is dropped.
+    pub fn waiting_on(&self, index: usize) -> Option<Waiting> {
+        let load = self.in_flight.get(index)?;
+        load.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(Waiting(Arc::clone(load)))
+    }
+}
+
+/// A request waiting for a backend's answer, counted for the balancers that
+/// pick by load.
+pub struct Waiting(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A cheap pseudo-random number, for the balancers that pick at random: an
+/// xorshift over a state seeded from the clock.
+fn random_u64() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let next = |mut x: u64| {
+        if x == 0 {
+            x = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64)
+                | 1;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    // Advanced atomically, so concurrent requests never share a draw.
+    let previous = STATE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(next(x)))
+        .unwrap_or_default();
+    next(previous)
 }
 
 /// The backends one request tries, in order, until one answers:
@@ -388,6 +533,11 @@ pub struct BackendAttempts<'a> {
 }
 
 impl BackendAttempts<'_> {
+    /// The index in the route's `backends` of the backend last returned.
+    pub fn last_index(&self) -> Option<usize> {
+        self.tried.last().copied()
+    }
+
     /// The backends that are not backups and that this request has not
     /// tried: those not left out first, heaviest first, then in declaration
     /// order.
@@ -418,8 +568,7 @@ impl BackendAttempts<'_> {
     fn balanced(&self) -> Option<usize> {
         let route = self.route;
         route
-            .balancer
-            .next_where(|index| !self.is_down(index))
+            .pick(|index| !self.is_down(index))
             .or_else(|| {
                 route
                     .backups
@@ -427,7 +576,7 @@ impl BackendAttempts<'_> {
                     .copied()
                     .find(|&index| !self.is_down(index))
             })
-            .or_else(|| route.balancer.next())
+            .or_else(|| route.pick(|_| true))
     }
 }
 
@@ -819,6 +968,11 @@ pub fn build_middleware_route(
             .map(|b| (b.address.clone(), b.port))
             .collect(),
         balancer: WeightedRoundRobin::new(&weights),
+        algorithm: config.load_balancer,
+        in_flight: backends
+            .iter()
+            .map(|b| backend_load(&(b.address.clone(), b.port)))
+            .collect(),
         backups: backup_indexes(&weights),
         backend_timeout: config.backend_timeout,
         request_timeout: config.request_timeout,
@@ -877,6 +1031,8 @@ mod route_key_tests {
             cluster_id: "web".to_string(),
             backends: (0..weights.len()).map(|i| (format!("b{i}"), 80)).collect(),
             balancer: WeightedRoundRobin::new(weights),
+            algorithm: LoadBalancer::RoundRobin,
+            in_flight: weights.iter().map(|_| Default::default()).collect(),
             backups: backup_indexes(weights),
             backend_timeout: None,
             request_timeout: None,
@@ -886,6 +1042,100 @@ mod route_key_tests {
             rewrite_host: None,
             mirrors: Vec::new(),
         }
+    }
+
+    fn with_algorithm(weights: &[u32], algorithm: LoadBalancer) -> MiddlewareRoute {
+        MiddlewareRoute {
+            algorithm,
+            ..weighted_route(weights)
+        }
+    }
+
+    fn load(route: &MiddlewareRoute, loads: &[usize]) {
+        for (n, &load) in route.in_flight.iter().zip(loads) {
+            n.store(load, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// `random` picks in proportion to the weights, among eligible backends.
+    #[test]
+    fn random_picks_by_weight() {
+        let route = with_algorithm(&[3, 1, 5], LoadBalancer::Random);
+        let mut counts = [0; 3];
+        for _ in 0..4000 {
+            counts[route.pick(|index| index != 2).unwrap()] += 1;
+        }
+        assert_eq!(counts[2], 0);
+        assert!((2700..3300).contains(&counts[0]), "{counts:?}");
+    }
+
+    /// `least_connections` picks the backend with the fewest requests
+    /// waiting for its answer, for its weight.
+    #[test]
+    fn least_connections_picks_the_least_loaded() {
+        let route = with_algorithm(&[1, 1], LoadBalancer::LeastConnections);
+        load(&route, &[2, 0]);
+        assert_eq!(route.pick(|_| true), Some(1));
+        // Twice the weight takes twice the load.
+        let route = with_algorithm(&[2, 1], LoadBalancer::LeastConnections);
+        load(&route, &[1, 1]);
+        assert_eq!(route.pick(|_| true), Some(0));
+        load(&route, &[3, 1]);
+        assert_eq!(route.pick(|_| true), Some(1));
+        assert_eq!(route.pick(|index| index == 0), Some(0));
+    }
+
+    /// `power_of_two` keeps the less loaded of two picks.
+    #[test]
+    fn power_of_two_avoids_the_loaded_backend() {
+        let route = with_algorithm(&[1, 1], LoadBalancer::PowerOfTwo);
+        load(&route, &[10, 0]);
+        let loaded = (0..1000)
+            .filter(|_| route.pick(|_| true) == Some(0))
+            .count();
+        // The two picks are distinct backends: the idle one always wins.
+        assert_eq!(loaded, 0);
+    }
+
+    /// Equal loads leave the weights to share the traffic: on a quiet route
+    /// nothing is ever waiting.
+    #[test]
+    fn least_connections_ties_go_by_weight() {
+        let route = with_algorithm(&[9, 1], LoadBalancer::LeastConnections);
+        let first = (0..2000)
+            .filter(|_| route.pick(|_| true) == Some(0))
+            .count();
+        assert!((1700..1900).contains(&first), "{first}");
+    }
+
+    /// A request waiting for a backend counts until its guard goes.
+    #[test]
+    fn waiting_counts_until_dropped() {
+        let route = with_algorithm(&[1, 1], LoadBalancer::LeastConnections);
+        let waiting = route.waiting_on(0);
+        assert_eq!(route.pick(|_| true), Some(1));
+        drop(waiting);
+        assert_eq!(
+            route.in_flight[0].load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// A route rebuilt on a reload sees the requests still waiting on the
+    /// one it replaces.
+    #[test]
+    fn load_survives_a_rebuild() {
+        let backend = ("load-survives-a-rebuild".to_string(), 80);
+        let old = backend_load(&backend);
+        old.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let new = backend_load(&backend);
+        assert_eq!(new.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop((old, new));
+        // Nothing holds it any more: a later route starts from zero.
+        assert_eq!(
+            backend_load(&backend).load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     /// The backends a request tries when every one of them fails.
@@ -1123,6 +1373,8 @@ mod route_key_tests {
             cluster_id: name.to_string(),
             backends: vec![(name.to_string(), 80)],
             balancer: WeightedRoundRobin::new(&[100]),
+            algorithm: LoadBalancer::RoundRobin,
+            in_flight: vec![Default::default()],
             backups: Vec::new(),
             backend_timeout: None,
             request_timeout: None,

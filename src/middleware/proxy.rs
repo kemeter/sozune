@@ -281,10 +281,11 @@ pub async fn handle_proxy(
                 // WebSocket tunnels live for the whole connection (minutes to hours),
                 // so their duration is not a request latency — deliberately excluded
                 // from the request-duration histogram to avoid skewing the distribution.
-                let candidates: Vec<(String, u16)> =
-                    std::iter::once((backend_host.clone(), backend_port))
-                        .chain(plan.cloned())
-                        .collect();
+                let first = plan.last_index();
+                let mut candidates = vec![((backend_host.clone(), backend_port), first)];
+                while let Some(backend) = plan.next() {
+                    candidates.push((backend.clone(), plan.last_index()));
+                }
                 // The request's deadline bounds the handshakes, not the tunnel.
                 let timeout = backend_timeout(route.backend_timeout);
                 return handle_websocket(
@@ -294,6 +295,7 @@ pub async fn handle_proxy(
                     &query,
                     timeout,
                     &state.passive_health,
+                    &route,
                 )
                 .await;
             }
@@ -393,6 +395,7 @@ pub async fn handle_proxy(
             let mut backend_response = None;
             let mut target_uri = target_uri;
             let mut tries = 0u32;
+            let mut picked = plan.last_index();
             let mut uri = Some(((backend_host.clone(), backend_port), primary_uri));
             while let Some((backend, current)) = uri.take() {
                 tries += 1;
@@ -401,6 +404,9 @@ pub async fn handle_proxy(
                 let forwarded_req =
                     Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
                 let attempt_start = tokio::time::Instant::now();
+                // Counted for the balancers that pick by load, until the
+                // backend answers or the attempt ends.
+                let waiting = picked.and_then(|index| route.waiting_on(index));
                 // Counted a failure if the request's deadline cancels it.
                 let attempt = super::passive_health::Attempt::new(
                     state.passive_health.clone(),
@@ -423,6 +429,7 @@ pub async fn handle_proxy(
                     response_future.await.map_err(|e| (e.to_string(), false))
                 };
 
+                drop(waiting);
                 match result {
                     Ok(resp) => {
                         // An answer, whatever its status: the backend is up.
@@ -454,6 +461,7 @@ pub async fn handle_proxy(
                             plan.by_ref()
                                 .find_map(|b| uri_of(b).map(|u| (b.clone(), u)))
                         };
+                        picked = plan.last_index();
                         if uri.is_some() {
                             debug!(
                                 "Backend {} attempt {} failed ({}); retrying",
@@ -648,11 +656,12 @@ async fn websocket_handshake(
 /// connection: the picked backend, then the backups.
 async fn handle_websocket(
     req: Request<Body>,
-    backends: &[(String, u16)],
+    backends: &[((String, u16), Option<usize>)],
     path: &str,
     query: &str,
     timeout: Option<std::time::Duration>,
     health: &std::sync::Arc<super::passive_health::PassiveHealth>,
+    route: &std::sync::Arc<super::MiddlewareRoute>,
 ) -> axum::response::Response {
     debug!("WebSocket upgrade request to {:?}{}", backends, path);
 
@@ -673,12 +682,14 @@ async fn handle_websocket(
     let mut answered = None;
     let mut last_failure = String::from("no backend");
     let mut last_timed_out = false;
-    for (backend_host, backend_port) in backends {
+    for ((backend_host, backend_port), index) in backends {
         let backend_addr = format!("{}:{}", uri_host(backend_host), backend_port);
         let attempt = super::passive_health::Attempt::new(
             health.clone(),
             (backend_host.clone(), *backend_port),
         );
+        // Counted as waiting until the backend answers, not for the tunnel.
+        let waiting = index.and_then(|index| route.waiting_on(index));
         // Bounded by the route's backend timeout, so a backend that accepts
         // the connection and never answers does not hold the upgrade back
         // from the next one.
@@ -697,6 +708,7 @@ async fn handle_websocket(
                 }),
             None => handshake.await,
         };
+        drop(waiting);
         match outcome {
             Ok((stream, n)) => {
                 attempt.succeeded();
