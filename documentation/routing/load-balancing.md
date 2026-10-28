@@ -48,6 +48,8 @@ Both containers register as backends of the `app` service (the part of `sozune.h
 
 The Compose service name (`app-instance-1`, `app-instance-2`) is irrelevant — only the Sōzune service name in the label matters.
 
+Containers merged into one service share its route, with the settings of the first one Sōzune found: during a rolling update, the old containers' settings stay until the last of them stops, then the route takes those of the new ones. One exception: a container that forwards to a backend wins over one that answers itself (`redirect=permanent`, `unauthorized` or `close`). A rollout that turns a service into a redirect keeps serving it until its last container stops, then redirects; one that turns a redirect into a service forwards as soon as its first container starts. Sōzune logs a warning while containers of one service disagree.
+
 ## Multiple backends from the API
 
 ```json

@@ -27,6 +27,10 @@ pub struct DockerProvider {
     /// containers apart: host-network ones all resolve to `127.0.0.1`, and
     /// Docker recycles addresses.
     container_ips: std::sync::Mutex<HashMap<String, Vec<Backend>>>,
+    /// What each container serving routes declares, by route key: a route is
+    /// rebuilt from its remaining containers when one leaves, so it takes
+    /// what they declare, not what the one that left did.
+    declared: std::sync::Mutex<HashMap<String, HashMap<String, Entrypoint>>>,
 }
 
 #[async_trait]
@@ -106,6 +110,7 @@ impl DockerProvider {
             config,
             name,
             container_ips: std::sync::Mutex::new(HashMap::new()),
+            declared: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -249,6 +254,7 @@ impl DockerProvider {
                                             endpoints_of(entrypoints.values()),
                                         );
                                     }
+                                    self.remember(container_id, &entrypoints);
                                     let mut storage_write = match storage.write() {
                                         Ok(guard) => guard,
                                         Err(e) => {
@@ -307,24 +313,8 @@ impl DockerProvider {
                                         continue;
                                     }
                                 };
-                                let mut keys_to_remove = Vec::new();
-                                for (key, entrypoint) in storage_write.iter_mut() {
-                                    if drop_backends_of(
-                                        entrypoint,
-                                        container_id,
-                                        &container_ip,
-                                        self.name,
-                                    ) {
-                                        keys_to_remove.push(key.clone());
-                                    }
-                                }
-                                for key in &keys_to_remove {
-                                    info!(
-                                        "Removing entrypoint with no backends after unhealthy: {}",
-                                        key
-                                    );
-                                    storage_write.remove(key);
-                                }
+                                self.forget(container_id);
+                                self.take_off(&mut storage_write, container_id, &container_ip);
                                 storage_changed = true;
                             }
                             "stop" | "die" | "destroy" => {
@@ -361,23 +351,8 @@ impl DockerProvider {
                                     }
                                 };
 
-                                let mut keys_to_remove = Vec::new();
-                                for (key, entrypoint) in storage_write.iter_mut() {
-                                    if drop_backends_of(
-                                        entrypoint,
-                                        container_id,
-                                        &container_ip,
-                                        self.name,
-                                    ) {
-                                        keys_to_remove.push(key.clone());
-                                    }
-                                }
-
-                                for key in &keys_to_remove {
-                                    info!("Removing entrypoint with no backends: {}", key);
-                                    storage_write.remove(key);
-                                }
-
+                                self.forget(container_id);
+                                self.take_off(&mut storage_write, container_id, &container_ip);
                                 storage_changed = true;
                             }
                             "update" => {
@@ -410,20 +385,8 @@ impl DockerProvider {
                                     };
 
                                     // Remove old entries for this container
-                                    let mut keys_to_remove = Vec::new();
-                                    for (key, entrypoint) in storage_write.iter_mut() {
-                                        if drop_backends_of(
-                                            entrypoint,
-                                            container_id,
-                                            &previous,
-                                            self.name,
-                                        ) {
-                                            keys_to_remove.push(key.clone());
-                                        }
-                                    }
-                                    for key in keys_to_remove {
-                                        storage_write.remove(&key);
-                                    }
+                                    self.forget(container_id);
+                                    self.take_off(&mut storage_write, container_id, &previous);
 
                                     // Add new entries, and remember them: a
                                     // later stop has to drop what the container
@@ -435,6 +398,7 @@ impl DockerProvider {
                                             endpoints_of(entrypoints.values()),
                                         );
                                     }
+                                    self.remember(container_id, &entrypoints);
                                     for (key, entrypoint) in entrypoints {
                                         merge_or_insert_entrypoint_btree(
                                             &mut storage_write,
@@ -559,10 +523,15 @@ impl DockerProvider {
                 continue;
             }
 
-            for (key, entrypoint) in result.entrypoints {
-                if entrypoint.backends.is_empty() && !entrypoint.answers_without_backend() {
-                    continue;
-                }
+            let serving: HashMap<String, Entrypoint> = result
+                .entrypoints
+                .into_iter()
+                .filter(|(_, entrypoint)| {
+                    !entrypoint.backends.is_empty() || entrypoint.answers_without_backend()
+                })
+                .collect();
+            self.remember(&container_id, &serving);
+            for (key, entrypoint) in serving {
                 merge_or_insert_entrypoint(&mut entrypoints, key, entrypoint, &container_id);
             }
         }
@@ -644,6 +613,34 @@ impl DockerProvider {
             enabled_default: self.config.expose_by_default,
             health,
         }
+    }
+
+    /// Record what `container_id` declares, replacing what it did before.
+    fn remember(&self, container_id: &str, entrypoints: &HashMap<String, Entrypoint>) {
+        if let Ok(mut declared) = self.declared.lock() {
+            if entrypoints.is_empty() {
+                declared.remove(container_id);
+            } else {
+                declared.insert(container_id.to_string(), entrypoints.clone());
+            }
+        }
+    }
+
+    fn forget(&self, container_id: &str) {
+        if let Ok(mut declared) = self.declared.lock() {
+            declared.remove(container_id);
+        }
+    }
+
+    /// Take `container_id` off the routes it serves: see [`take_off`].
+    fn take_off(
+        &self,
+        storage: &mut BTreeMap<String, Entrypoint>,
+        container_id: &str,
+        departing: &[Backend],
+    ) {
+        let declared = self.declared.lock().map(|d| d.clone()).unwrap_or_default();
+        take_off(storage, container_id, departing, self.name, &declared);
     }
 
     /// Fetch network information AND health status for a container via inspect.
@@ -729,6 +726,101 @@ fn entrypoints_are_replicas(a: &Entrypoint, b: &Entrypoint) -> bool {
     a_hosts == b_hosts && a.config.path == b.config.path && a.config.mirror_of == b.config.mirror_of
 }
 
+/// Merge `incoming`, a replica of `existing`'s route, into it: its candidates
+/// and backends. The route keeps the configuration of the first replica,
+/// except that one that forwards wins over one that answers without a
+/// backend (a redirect): during a rollout from one to the other, the route
+/// forwards while any container serves it, and redirects once the last one
+/// is gone. A route of another provider (`same_provider` false) keeps its
+/// own: this provider's cleanup could not restore it.
+fn merge_replica(existing: &mut Entrypoint, incoming: Entrypoint, same_provider: bool) {
+    if same_provider && existing.answers_without_backend() != incoming.answers_without_backend() {
+        warn!(
+            "containers of route `{}` disagree: some redirect, some forward to a backend; it forwards while any of them serves it",
+            existing.id
+        );
+        if existing.answers_without_backend() {
+            existing.config = incoming.config.clone();
+        }
+    }
+    existing.add_candidates(&incoming.candidates);
+    for backend in incoming.backends {
+        if !existing.backends.contains(&backend) {
+            existing.backends.push(backend);
+        }
+    }
+}
+
+/// The route `current`, stored under `key`, as the containers `candidates`
+/// declare it, merged in their order, from what each one declared
+/// (`declared`). `None` when one of them declared nothing for it: the route
+/// cannot be rebuilt.
+fn rebuild_route(
+    key: &str,
+    current: &Entrypoint,
+    candidates: &[String],
+    declared: &HashMap<String, HashMap<String, Entrypoint>>,
+) -> Option<Entrypoint> {
+    let mut route: Option<Entrypoint> = None;
+    for candidate in candidates {
+        let parts = declared.get(candidate)?;
+        // A route that collided with another is stored under `<key>_<id>`,
+        // and declared under `<key>`.
+        let part = parts
+            .get(key)
+            .or_else(|| {
+                parts.iter().find_map(|(declared_key, part)| {
+                    let suffixed = key
+                        .strip_prefix(declared_key.as_str())
+                        .is_some_and(|rest| rest.starts_with('_'));
+                    (suffixed && entrypoints_are_replicas(part, current)).then_some(part)
+                })
+            })?
+            .clone();
+        match &mut route {
+            None => route = Some(part),
+            Some(route) => merge_replica(route, part, true),
+        }
+    }
+    route
+}
+
+/// Take `container_id` off the routes of `provider` it serves, `departing`
+/// its endpoints. A route other containers still serve is rebuilt from what
+/// they declare (`declared`); one nobody serves any more, or left with no
+/// backend to forward to, goes.
+fn take_off(
+    storage: &mut BTreeMap<String, Entrypoint>,
+    container_id: &str,
+    departing: &[Backend],
+    provider: &str,
+    declared: &HashMap<String, HashMap<String, Entrypoint>>,
+) {
+    let mut keys_to_remove = Vec::new();
+    for (key, entrypoint) in storage.iter_mut() {
+        let served = entrypoint.candidates.iter().any(|id| id == container_id);
+        let mut gone = drop_backends_of(entrypoint, container_id, departing, provider);
+        if served
+            && entrypoint.source.as_deref() == Some(provider)
+            && let Some(rebuilt) = rebuild_route(key, entrypoint, &entrypoint.candidates, declared)
+        {
+            *entrypoint = Entrypoint {
+                id: entrypoint.id.clone(),
+                source: entrypoint.source.clone(),
+                ..rebuilt
+            };
+            gone = entrypoint.backends.is_empty() && !entrypoint.answers_without_backend();
+        }
+        if gone {
+            keys_to_remove.push(key.clone());
+        }
+    }
+    for key in &keys_to_remove {
+        info!("Removing entrypoint with no backends: {}", key);
+        storage.remove(key);
+    }
+}
+
 /// Insert `incoming` under `key` in `dest`, or merge backends into the existing
 /// entry when both entrypoints look like replicas of the same service.
 ///
@@ -754,12 +846,7 @@ fn merge_or_insert_entrypoint(
     };
 
     if entrypoints_are_replicas(existing, &incoming) {
-        existing.add_candidates(&incoming.candidates);
-        for backend in incoming.backends {
-            if !existing.backends.contains(&backend) {
-                existing.backends.push(backend);
-            }
-        }
+        merge_replica(existing, incoming, true);
         return;
     }
 
@@ -798,12 +885,8 @@ fn merge_or_insert_entrypoint_btree(
     };
 
     if entrypoints_are_replicas(existing, &incoming) {
-        existing.add_candidates(&incoming.candidates);
-        for backend in incoming.backends {
-            if !existing.backends.contains(&backend) {
-                existing.backends.push(backend);
-            }
-        }
+        let same_provider = existing.source.as_deref() == Some(source_label);
+        merge_replica(existing, incoming, same_provider);
         return;
     }
 
@@ -1284,5 +1367,153 @@ mod stop_cleanup_tests {
         );
 
         assert_eq!(entrypoint.candidates, vec!["container-b"]);
+    }
+}
+
+#[cfg(test)]
+mod rollout_tests {
+    use super::*;
+    use crate::model::RedirectPolicy;
+
+    /// What container `id` declares for route `web`: a forward to `ip`, or a
+    /// redirect.
+    fn declares(id: &str, ip: Option<&str>) -> Entrypoint {
+        let mut entrypoint = super::merge_tests::ep("app.example.com", None, ip.unwrap_or("-"));
+        entrypoint.id = "web".into();
+        entrypoint.source = Some("docker".into());
+        entrypoint.candidates = vec![id.to_string()];
+        if ip.is_none() {
+            entrypoint.backends.clear();
+            entrypoint.config.redirect = Some(RedirectPolicy::Permanent);
+        }
+        entrypoint
+    }
+
+    /// The store and what each container declares, after `containers` start
+    /// in this order.
+    fn started(
+        containers: &[Entrypoint],
+    ) -> (
+        BTreeMap<String, Entrypoint>,
+        HashMap<String, HashMap<String, Entrypoint>>,
+    ) {
+        let mut storage = BTreeMap::new();
+        let mut declared = HashMap::new();
+        for entrypoint in containers {
+            let id = entrypoint.candidates[0].clone();
+            declared.insert(
+                id.clone(),
+                HashMap::from([("web".to_string(), entrypoint.clone())]),
+            );
+            merge_or_insert_entrypoint_btree(
+                &mut storage,
+                "web".into(),
+                entrypoint.clone(),
+                &id,
+                "docker",
+            );
+        }
+        (storage, declared)
+    }
+
+    fn stop(
+        storage: &mut BTreeMap<String, Entrypoint>,
+        declared: &mut HashMap<String, HashMap<String, Entrypoint>>,
+        id: &str,
+        endpoints: &[Backend],
+    ) {
+        declared.remove(id);
+        take_off(storage, id, endpoints, "docker", declared);
+    }
+
+    /// From a forward to a redirect: the route forwards while the old
+    /// container serves it, and redirects once it stops. It used to go with
+    /// the last forwarding container, the redirect with it.
+    #[test]
+    fn a_rollout_to_a_redirect_redirects_once_the_last_backend_goes() {
+        let (mut storage, mut declared) =
+            started(&[declares("old", Some("10.0.0.1")), declares("new", None)]);
+        assert!(!storage["web"].answers_without_backend());
+
+        stop(
+            &mut storage,
+            &mut declared,
+            "old",
+            &[Backend::new("10.0.0.1", 80)],
+        );
+
+        let route = &storage["web"];
+        assert!(route.answers_without_backend());
+        assert_eq!(route.candidates, ["new"]);
+    }
+
+    /// From a redirect to a forward: the new container forwards as soon as it
+    /// starts. The redirect used to keep the route, even after it stopped.
+    #[test]
+    fn a_rollout_to_a_forward_forwards_from_the_first_backend() {
+        let (mut storage, mut declared) =
+            started(&[declares("old", None), declares("new", Some("10.0.0.2"))]);
+        assert!(!storage["web"].answers_without_backend());
+        assert_eq!(storage["web"].backends, [Backend::new("10.0.0.2", 80)]);
+
+        stop(&mut storage, &mut declared, "old", &[]);
+        assert!(!storage["web"].answers_without_backend());
+
+        // And the route goes with the last container.
+        stop(
+            &mut storage,
+            &mut declared,
+            "new",
+            &[Backend::new("10.0.0.2", 80)],
+        );
+        assert!(storage.is_empty());
+    }
+
+    /// A route stored under another key, after a collision, is rebuilt
+    /// from what its containers declared under theirs.
+    #[test]
+    fn a_disambiguated_route_is_rebuilt_too() {
+        let (mut storage, mut declared) =
+            started(&[declares("old", Some("10.0.0.1")), declares("new", None)]);
+        let route = storage.remove("web").unwrap();
+        storage.insert(
+            "web_abc".into(),
+            Entrypoint {
+                id: "web_abc".into(),
+                ..route
+            },
+        );
+
+        stop(
+            &mut storage,
+            &mut declared,
+            "old",
+            &[Backend::new("10.0.0.1", 80)],
+        );
+
+        assert!(storage["web_abc"].answers_without_backend());
+        assert_eq!(storage["web_abc"].id, "web_abc");
+    }
+
+    /// The route takes what its remaining containers declare, not what the
+    /// one that left did.
+    #[test]
+    fn a_route_takes_the_settings_of_the_containers_left() {
+        let mut old = declares("old", Some("10.0.0.1"));
+        old.config.priority = 1;
+        let mut new = declares("new", Some("10.0.0.2"));
+        new.config.priority = 2;
+        let (mut storage, mut declared) = started(&[old, new]);
+        assert_eq!(storage["web"].config.priority, 1);
+
+        stop(
+            &mut storage,
+            &mut declared,
+            "old",
+            &[Backend::new("10.0.0.1", 80)],
+        );
+
+        assert_eq!(storage["web"].config.priority, 2);
+        assert_eq!(storage["web"].backends, [Backend::new("10.0.0.2", 80)]);
     }
 }
