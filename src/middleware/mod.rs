@@ -9,6 +9,7 @@ pub mod ip_allow_list;
 pub mod passive_health;
 mod proxy;
 pub mod rate_limit;
+mod redirect;
 pub(crate) mod request_match;
 pub mod tunnels;
 mod wasm;
@@ -32,6 +33,7 @@ use forward_auth::ForwardAuthMiddleware;
 use in_flight_req::{InFlightLimiter, InFlightReqMiddleware};
 use ip_allow_list::{IpAllowList, IpAllowListMiddleware, TrustedProxies};
 use rate_limit::{RateLimitMiddleware, RateLimiter};
+use redirect::RedirectMiddleware;
 use request_match::RequestMatchMiddleware;
 use sozu_lib::router::DomainRule;
 
@@ -135,6 +137,11 @@ impl PathMatch {
 /// frontend of every route that goes through the middleware. Sōzu drops any
 /// value the client sent, and the middleware drops it before the backend.
 pub const ROUTE_HEADER: &str = "sozune-route";
+
+/// The scheme of the listener a request came in on, which the frontends of a
+/// route whose redirect the middleware answers set (see
+/// [`answers_redirect`]).
+pub const SCHEME_HEADER: &str = "sozune-scheme";
 
 /// The routes one hostname carries, each with the path it was declared with.
 /// `None` is a route with no path: the catch-all for that hostname.
@@ -914,6 +921,17 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || config.failing_shares.is_some()
         // And the header edits of a backend of its own.
         || edits_responses(entrypoint)
+        // And a redirect Sōzu has no status for.
+        || answers_redirect(config)
+}
+
+/// Whether the middleware answers the route's redirect, Sōzu having no
+/// status for it.
+pub fn answers_redirect(config: &EntrypointConfig) -> bool {
+    config
+        .redirect
+        .and_then(crate::model::RedirectPolicy::middleware_redirect_status)
+        .is_some()
 }
 
 /// Build middleware route from entrypoint config.
@@ -993,6 +1011,14 @@ pub fn build_middleware_route(
     // nothing else runs.
     if let Some(answer) = config.answer {
         middlewares.push(Arc::new(FixedAnswerMiddleware(answer)));
+    }
+
+    // So does a route that redirects them with a status Sōzu has not.
+    if answers_redirect(config) {
+        let (path_rule, rewrite) = crate::proxy::sozu::path_and_rewrite(cluster_id, config);
+        if let Some(redirect) = RedirectMiddleware::new(config, &path_rule, rewrite) {
+            middlewares.push(Arc::new(redirect));
+        }
     }
 
     if let Some(cfg) = config.forward_auth.as_ref() {

@@ -457,6 +457,13 @@ pub enum RedirectPolicy {
     Permanent,
     /// A temporary redirect, answered `302`.
     Found,
+    /// A redirect to fetch with `GET`, answered `303` by the middleware.
+    SeeOther,
+    /// A temporary redirect keeping the method, answered `307` by the
+    /// middleware.
+    TemporaryRedirect,
+    /// A permanent redirect keeping the method, answered `308`.
+    PermanentRedirect,
     Unauthorized,
     /// Close the connection without answering, like nginx's 444.
     Close,
@@ -468,8 +475,24 @@ impl RedirectPolicy {
     pub fn answers_without_backend(self) -> bool {
         matches!(
             self,
-            Self::Permanent | Self::Found | Self::Unauthorized | Self::Close
+            Self::Permanent
+                | Self::Found
+                | Self::SeeOther
+                | Self::TemporaryRedirect
+                | Self::PermanentRedirect
+                | Self::Unauthorized
+                | Self::Close
         )
+    }
+
+    /// The status of a redirect Sōzu cannot answer, which the middleware
+    /// answers instead.
+    pub fn middleware_redirect_status(self) -> Option<u16> {
+        match self {
+            Self::SeeOther => Some(303),
+            Self::TemporaryRedirect => Some(307),
+            _ => None,
+        }
     }
 }
 

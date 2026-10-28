@@ -2081,6 +2081,31 @@ pub(crate) fn listener_https_port(entrypoint: &Entrypoint, https_port: u16) -> u
         .unwrap_or(https_port)
 }
 
+/// Whether Sōzu sends a request on the HTTP listener to HTTPS. Not ahead of
+/// a redirect of the route's own, which answers on either listener, as Sōzu's
+/// own redirects do.
+pub(crate) fn redirects_to_https(config: &crate::model::EntrypointConfig) -> bool {
+    config.https_redirect && !middleware::answers_redirect(config)
+}
+
+/// The path rule an entrypoint's frontends carry, and their path rewrite.
+pub(crate) fn path_and_rewrite(
+    cluster_id: &str,
+    config: &crate::model::EntrypointConfig,
+) -> (PathRule, Option<String>) {
+    let (path_rule, rewrite) = build_path_and_rewrite(
+        config.path.as_ref(),
+        config.strip_prefix,
+        config.add_prefix.as_deref(),
+        config.rewrite.as_ref(),
+        cluster_id,
+    );
+    (
+        builders::query_path_rule(config).unwrap_or(path_rule),
+        rewrite,
+    )
+}
+
 /// The listener a frontend is installed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FrontListener {
@@ -2099,31 +2124,36 @@ pub(crate) fn build_http_frontends(
     https_addr: SocketAddress,
 ) -> Vec<(FrontListener, RequestHttpFrontend)> {
     let mut frontends = Vec::new();
-    let frontend_required_auth = if build_authorized_hashes(&entrypoint.config.auth).is_empty() {
+    // A redirect the middleware answers comes before the credentials, as
+    // Sōzu's own redirects do.
+    let frontend_required_auth = if build_authorized_hashes(&entrypoint.config.auth).is_empty()
+        || middleware::answers_redirect(&entrypoint.config)
+    {
         None
     } else {
         Some(true)
     };
     for hostname in &entrypoint.config.hostnames {
-        let (path_rule, frontend_rewrite_path) = build_path_and_rewrite(
-            entrypoint.config.path.as_ref(),
-            entrypoint.config.strip_prefix,
-            entrypoint.config.add_prefix.as_deref(),
-            entrypoint.config.rewrite.as_ref(),
-            cluster_id,
-        );
-        let path_rule = builders::query_path_rule(&entrypoint.config).unwrap_or(path_rule);
+        let (path_rule, frontend_rewrite_path) = path_and_rewrite(cluster_id, &entrypoint.config);
 
         // `Sozune-Route` is reserved on requests: an edit of it could reach
         // the middleware ahead of the route it names. Its response side stays.
         // The middleware makes the response edits when a backend has its own.
         let edits_responses = middleware::edits_responses(entrypoint);
+        // A redirect the middleware answers forwards nothing: a request edit
+        // would only change what its conditions and `Location` are made of.
+        let answers_redirect = middleware::answers_redirect(&entrypoint.config);
         let header_edits: Vec<HeaderConfig> = entrypoint
             .config
             .headers
             .iter()
             .filter_map(|edit| {
                 let edit = &match edit.direction {
+                    HeaderDirection::Request if answers_redirect => return None,
+                    HeaderDirection::Both if answers_redirect => HeaderConfig {
+                        direction: HeaderDirection::Response,
+                        ..edit.clone()
+                    },
                     HeaderDirection::Response if edits_responses => return None,
                     HeaderDirection::Both if edits_responses => HeaderConfig {
                         direction: HeaderDirection::Request,
@@ -2169,7 +2199,34 @@ pub(crate) fn build_http_frontends(
         // middleware instead (see `middleware::url_rewrite_host`).
         let frontend_rewrite_host = entrypoint.config.rewrite_host.clone();
         let frontend_rewrite_port = entrypoint.config.rewrite_port.map(|p| p as u32);
+        // A redirect the middleware answers gets the request as the client
+        // sent it, and builds its `Location` from it.
+        let (frontend_rewrite_path, frontend_rewrite_host, frontend_rewrite_port) =
+            if middleware::answers_redirect(&entrypoint.config) {
+                (None, None, None)
+            } else {
+                (
+                    frontend_rewrite_path,
+                    frontend_rewrite_host,
+                    frontend_rewrite_port,
+                )
+            };
         let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
+
+        // The scheme a redirect the middleware answers keeps, set by the
+        // listener rather than taken from the client's `X-Forwarded-Proto`.
+        let with_scheme = |scheme: &str| {
+            let mut headers = frontend_headers.clone();
+            if answers_redirect {
+                headers.extend(build_frontend_headers(&[HeaderConfig {
+                    name: middleware::SCHEME_HEADER.to_string(),
+                    value: scheme.to_string(),
+                    direction: HeaderDirection::Request,
+                    append: false,
+                }]));
+            }
+            headers
+        };
 
         for method in methods_for_frontend(&entrypoint.config.methods) {
             let front = RequestHttpFrontend {
@@ -2186,7 +2243,7 @@ pub(crate) fn build_http_frontends(
                 method: method.clone(),
                 position: RulePosition::Pre as i32,
                 tags: BTreeMap::new(),
-                headers: frontend_headers.clone(),
+                headers: with_scheme("http"),
                 required_auth: frontend_required_auth,
                 rewrite_path: frontend_rewrite_path.clone(),
                 rewrite_host: frontend_rewrite_host.clone(),
@@ -2200,6 +2257,7 @@ pub(crate) fn build_http_frontends(
             if entrypoint.config.tls {
                 let https_front = RequestHttpFrontend {
                     address: listener_https_addr(entrypoint, https_addr),
+                    headers: with_scheme("https"),
                     ..front.clone()
                 };
                 // Served over HTTPS alone: nothing on the HTTP listener.
@@ -2290,7 +2348,7 @@ fn configure_http_entrypoint(
     let cluster = Cluster {
         cluster_id: cluster_id.to_string(),
         sticky_session: entrypoint.config.sticky_session,
-        https_redirect: entrypoint.config.https_redirect,
+        https_redirect: redirects_to_https(&entrypoint.config),
         proxy_protocol: None,
         load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
         load_metric: None,
@@ -5389,6 +5447,42 @@ mod tests {
 
     /// The middleware cannot tell apart two routes on one host and path, so
     /// the frontend names the one Sōzu picked, replacing any client value.
+    #[test]
+    fn a_middleware_redirect_learns_the_scheme_from_its_listener() {
+        let mut ep = base_ep(Vec::new());
+        ep.config.tls = true;
+        ep.config.redirect = Some(crate::model::RedirectPolicy::SeeOther);
+        let fronts =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        let schemes: Vec<(FrontListener, Vec<String>)> = fronts
+            .iter()
+            .map(|(listener, front)| {
+                let values = front
+                    .headers
+                    .iter()
+                    .filter(|h| h.key == middleware::SCHEME_HEADER)
+                    .map(|h| h.val.clone())
+                    .collect();
+                (*listener, values)
+            })
+            .collect();
+        assert_eq!(
+            schemes,
+            vec![
+                (FrontListener::Http, vec![String::new(), "http".to_string()]),
+                (
+                    FrontListener::Https,
+                    vec![String::new(), "https".to_string()]
+                ),
+            ]
+        );
+        // Sōzu forwards it to the middleware, which answers it.
+        assert_eq!(
+            fronts[0].1.redirect,
+            Some(sozu_command_lib::proto::command::RedirectPolicy::Forward as i32)
+        );
+    }
+
     #[test]
     fn a_middleware_route_names_itself_to_the_middleware() {
         let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
