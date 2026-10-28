@@ -376,7 +376,7 @@ pub fn redirect_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<Redirec
 ///
 /// `None` means "we can't faithfully represent this redirect", so the rule
 /// is dropped rather than emitting a misleading `Location`: a status other
-/// than `301` and `302`, or an empty path block.
+/// than `301`, `302`, `303`, `307` and `308`, or an empty path block.
 fn redirect_from_redirect_filter(
     rr: &HTTPRouteRulesFiltersRequestRedirect,
 ) -> Option<RedirectMapping> {
@@ -386,10 +386,14 @@ fn redirect_from_redirect_filter(
         None => None,
     };
 
-    // Gateway API core status values are 301 and 302.
+    // Gateway API core status values are 301 and 302; 303, 307 and 308
+    // are extended.
     let policy = match rr.status_code {
         None | Some(301) => RedirectPolicy::Permanent,
         Some(302) => RedirectPolicy::Found,
+        Some(303) => RedirectPolicy::SeeOther,
+        Some(307) => RedirectPolicy::TemporaryRedirect,
+        Some(308) => RedirectPolicy::PermanentRedirect,
         _ => return None,
     };
 
@@ -534,8 +538,22 @@ mod tests {
     }
 
     #[test]
-    fn status_other_than_301_and_302_is_unsupported() {
-        let f = vec![redirect_filter(None, None, None, Some(307))];
+    fn extended_statuses_keep_their_code() {
+        for (status, policy) in [
+            (303, RedirectPolicy::SeeOther),
+            (307, RedirectPolicy::TemporaryRedirect),
+            (308, RedirectPolicy::PermanentRedirect),
+        ] {
+            let f = vec![redirect_filter(None, None, None, Some(status))];
+            assert!(rule_filters_supported(&f));
+            let mapping = redirect_from_filter(&f).expect("a redirect");
+            assert_eq!(mapping.policy, policy);
+        }
+    }
+
+    #[test]
+    fn a_status_that_is_no_redirect_is_unsupported() {
+        let f = vec![redirect_filter(None, None, None, Some(304))];
         assert!(!rule_filters_supported(&f));
     }
 

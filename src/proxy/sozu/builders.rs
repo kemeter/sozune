@@ -109,6 +109,11 @@ pub(super) fn map_redirect_policy(policy: RedirectPolicy) -> i32 {
         RedirectPolicy::Forward => SozuRedirectPolicy::Forward as i32,
         RedirectPolicy::Permanent => SozuRedirectPolicy::Permanent as i32,
         RedirectPolicy::Found => SozuRedirectPolicy::Found as i32,
+        RedirectPolicy::PermanentRedirect => SozuRedirectPolicy::PermanentRedirect as i32,
+        // Answered by the middleware, which the request goes to.
+        RedirectPolicy::SeeOther | RedirectPolicy::TemporaryRedirect => {
+            SozuRedirectPolicy::Forward as i32
+        }
         RedirectPolicy::Unauthorized => SozuRedirectPolicy::Unauthorized as i32,
         RedirectPolicy::Close => SozuRedirectPolicy::SilentClose as i32,
     }

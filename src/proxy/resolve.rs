@@ -425,7 +425,15 @@ pub async fn resolve(
             )),
         ));
     }
-    if served.config.answer == Some(crate::model::FixedAnswer::InvalidBackends) {
+    if let Some(status) = served
+        .config
+        .redirect
+        .and_then(crate::model::RedirectPolicy::middleware_redirect_status)
+    {
+        resolution.outcome = Outcome::Redirected;
+        resolution.status = Some(status);
+        resolution.summary = format!("redirected ({status}) by route `{}`", served.name);
+    } else if served.config.answer == Some(crate::model::FixedAnswer::InvalidBackends) {
         resolution.outcome = Outcome::Rejected;
         resolution.status = Some(500);
         resolution.summary = format!(
@@ -838,7 +846,9 @@ fn frontend_answer(
         }
         RedirectPolicy::Forward => {}
     }
-    if entrypoint.config.https_redirect && target.listener == FrontListener::Http {
+    if crate::proxy::sozu::redirects_to_https(&entrypoint.config)
+        && target.listener == FrontListener::Http
+    {
         return Some((
             Outcome::Redirected,
             Some(301),
