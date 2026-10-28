@@ -747,7 +747,7 @@ A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which 
 
 ## Gateway API (TCPRoute)
 
-`TCPRoute` forwards a whole listener port to its backends — plain TCP, no SNI, no TLS, no matching. It is the raw-TCP counterpart to TLSRoute: where TLSRoute routes by the name in the ClientHello, TCPRoute routes nothing and hands the entire connection to its backend.
+`TCPRoute` forwards a whole listener port to its backends — plain TCP, no SNI, no TLS, no matching. It is the raw-TCP counterpart to TLSRoute: where TLSRoute routes by the name in the ClientHello, TCPRoute routes nothing and hands the entire connection to its backend. A port takes one route: when several TCPRoutes bind the same listener port, the oldest is served, and the others, still `Accepted`, take over in turn when it goes.
 
 `TCPRoute` is `v1alpha2` and ships only in the Gateway API **experimental** channel; the watcher probes for the CRD and skips quietly when it is absent.
 
@@ -800,7 +800,7 @@ proxy:
 
 ## Gateway API (UDPRoute)
 
-`UDPRoute` is the datagram counterpart to TCPRoute: it forwards a whole UDP listener port to its backends. Same shape, same constraints — the only difference is the listener protocol (`UDP`) and that it resolves against `proxy.udp` listeners rather than `proxy.tcp`.
+`UDPRoute` is the datagram counterpart to TCPRoute: it forwards a whole UDP listener port to its backends. Same shape, same constraints — the only difference is the listener protocol (`UDP`) and that it resolves against `proxy.udp` listeners rather than `proxy.tcp`. Likewise, when several UDPRoutes bind the same listener port, the oldest is served.
 
 `UDPRoute` is `v1alpha2`/experimental; the watcher probes for the CRD and skips quietly when it is absent.
 

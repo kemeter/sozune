@@ -6234,6 +6234,27 @@ fn tcp_rule_backends(
     weigh_backend_refs(resolved)
 }
 
+/// The ports routes older than the one of `meta`, among `others`, bind: the
+/// routes on one TCP or UDP port cannot share it, so the oldest is served, the
+/// first by namespace and name of those as old.
+fn ports_of_older_routes<'a>(
+    meta: &kube::api::ObjectMeta,
+    others: impl Iterator<Item = (&'a kube::api::ObjectMeta, BTreeSet<i32>)>,
+) -> BTreeSet<i32> {
+    let age = |m: &kube::api::ObjectMeta| {
+        (
+            m.creation_timestamp.as_ref().map(|t| t.0),
+            m.namespace.clone(),
+            m.name.clone(),
+        )
+    };
+    let own = age(meta);
+    others
+        .filter(|(other, _)| other.uid != meta.uid && age(other) < own)
+        .flat_map(|(_, ports)| ports)
+        .collect()
+}
+
 /// Resolve a TCPRoute to its entrypoints and swap them into storage. Mirrors
 /// [`apply_tls_route`], minus hostnames.
 fn apply_tcp_route(
@@ -6268,12 +6289,23 @@ fn apply_tcp_route(
     // stays accepted.
     let outcome = l4_outcome(route, accepted, resolver, scope);
     report_l4_status(route, outcome, resolver, scope, status_tx);
+    let held = match index.read() {
+        Ok(tracked) => ports_of_older_routes(
+            &route.metadata,
+            tracked
+                .values()
+                .filter(|t| scope.accepts_tcp_route(&t.route))
+                .map(|t| (&t.route.metadata, scope.effective_tcp_ports(&t.route))),
+        ),
+        Err(_) => BTreeSet::new(),
+    };
     let new_entrypoints = if !accepted {
         Vec::new()
     } else {
         scope
             .effective_tcp_ports(route)
             .into_iter()
+            .filter(|port| !held.contains(port))
             .flat_map(|port| match listener_ports.get(port) {
                 Some(listener_name) => {
                     tcp_route_to_entrypoints(route, resolver, scope, &listener_name, port)
@@ -6439,14 +6471,19 @@ pub async fn run_tcproute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_tcp_route("apply", &route);
+                    // The routes on its ports are decided again: an older one
+                    // takes them over at once.
                     apply_tcp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
+                        | re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_tcp_route("delete", &route);
                     if let Some(uid) = route.metadata.uid.as_deref() {
                         scope.forget_attachments("TCPRoute", uid);
                     }
+                    // The next route on its ports takes them over at once.
                     delete_tcp_route(&route, &storage, &index)
+                        | re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: TCPRoute init");
@@ -6463,7 +6500,10 @@ pub async fn run_tcproute_watcher(
                             |t: &TrackedTcpRoute| t.entrypoint_ids.as_slice(),
                             &storage,
                             &scope,
-                        ),
+                        )
+                        // The routes the dropped ones kept off their ports
+                        // take them over.
+                        | re_resolve_all_tcp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx)),
                         None => false,
                     }
                 }
@@ -6635,12 +6675,23 @@ fn apply_udp_route(
     // As for TCPRoutes.
     let outcome = l4_outcome(route, accepted, resolver, scope);
     report_l4_status(route, outcome, resolver, scope, status_tx);
+    let held = match index.read() {
+        Ok(tracked) => ports_of_older_routes(
+            &route.metadata,
+            tracked
+                .values()
+                .filter(|t| scope.accepts_udp_route(&t.route))
+                .map(|t| (&t.route.metadata, scope.effective_udp_ports(&t.route))),
+        ),
+        Err(_) => BTreeSet::new(),
+    };
     let new_entrypoints = if !accepted {
         Vec::new()
     } else {
         scope
             .effective_udp_ports(route)
             .into_iter()
+            .filter(|port| !held.contains(port))
             .flat_map(|port| match listener_ports.get(port) {
                 Some(listener_name) => {
                     udp_route_to_entrypoints(route, resolver, scope, &listener_name, port)
@@ -6806,14 +6857,19 @@ pub async fn run_udproute_watcher(
                         uids.insert(uid.to_string());
                     }
                     log_udp_route("apply", &route);
+                    // The routes on its ports are decided again: an older one
+                    // takes them over at once.
                     apply_udp_route(&route, &storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
+                        | re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Delete(route))) => {
                     log_udp_route("delete", &route);
                     if let Some(uid) = route.metadata.uid.as_deref() {
                         scope.forget_attachments("UDPRoute", uid);
                     }
+                    // The next route on its ports takes them over at once.
                     delete_udp_route(&route, &storage, &index)
+                        | re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx))
                 }
                 Some(Ok(Event::Init)) => {
                     debug!("Gateway API: UDPRoute init");
@@ -6830,7 +6886,10 @@ pub async fn run_udproute_watcher(
                             |t: &TrackedUdpRoute| t.entrypoint_ids.as_slice(),
                             &storage,
                             &scope,
-                        ),
+                        )
+                        // The routes the dropped ones kept off their ports
+                        // take them over.
+                        | re_resolve_all_udp(&storage, &index, resolver.as_ref(), &scope, &listener_ports, Some(&status_tx)),
                         None => false,
                     }
                 }
@@ -7943,6 +8002,40 @@ mod tests {
 
     fn tcp_ports() -> TcpListenerPorts {
         Arc::new([(9000, "tcpgw".to_string())].into_iter().collect())
+    }
+
+    /// Of the routes on one TCP or UDP port, the oldest is served.
+    #[test]
+    fn the_oldest_route_takes_a_port() {
+        use kube::api::ObjectMeta;
+        let meta = |name: &str, second: i64| ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some("ns".into()),
+            uid: Some(name.into()),
+            creation_timestamp: Some(Time(
+                k8s_openapi::chrono::DateTime::from_timestamp(second, 0).unwrap(),
+            )),
+            ..Default::default()
+        };
+        let older = meta("older", 1);
+        let newer = meta("newer", 2);
+        let twin = meta("twin", 2);
+        let ports = |p: &[i32]| p.iter().copied().collect::<BTreeSet<i32>>();
+        let routes = [
+            (&older, ports(&[9000])),
+            (&newer, ports(&[9000, 9001])),
+            (&twin, ports(&[9001])),
+        ];
+        assert!(ports_of_older_routes(&older, routes.clone().into_iter()).is_empty());
+        assert_eq!(
+            ports_of_older_routes(&newer, routes.clone().into_iter()),
+            ports(&[9000])
+        );
+        // As old: the first by name.
+        assert_eq!(
+            ports_of_older_routes(&twin, routes.into_iter()),
+            ports(&[9000, 9001])
+        );
     }
 
     #[test]
