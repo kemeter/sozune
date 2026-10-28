@@ -40,6 +40,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- A route going through the middleware could not reach a backend with an IPv6 address: the middleware wrote it unbracketed into the URL it forwarded to, which failed to parse, and the client got `502`. It is now bracketed.
 - A route going through the middleware (rate limit, auth, compression, timeouts…) had its Sōzu frontend removed and added again whenever its backends changed, a rollout or a scale for instance: its requests got `404` in between. Sōzu's only backend for such a route is the middleware, so its frontend now stays, and only the middleware's table changes.
 - The HTTP provider only applied a change to a route it already served when its backends or hostnames changed: a new path, condition, TLS setting or middleware was ignored until Sōzune restarted. Any change is now applied on the next poll.
 - Sōzune could hang on shutdown, never exiting until killed with `SIGKILL`: a Sōzu worker that read the closing of its command channel as an error kept running, and the process waited for it. Every worker is now told to stop, and a proxy still stuck after the 10 s grace period no longer keeps the process alive.
