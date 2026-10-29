@@ -546,7 +546,7 @@ impl AcmeManager {
         let server_url = match resolver_ca {
             Some(url) => url,
             None if self.config.staging => "https://acme-staging-v02.api.letsencrypt.org/directory",
-            None => "https://acme-v02.api.letsencrypt.org/directory",
+            None => PRODUCTION_DIRECTORY,
         };
 
         let account = self.get_or_create_account(server_url).await?;
@@ -686,27 +686,35 @@ impl AcmeManager {
     /// staging, a third-party ACME) has its own credentials file, so switching
     /// or mixing CAs never reuses an account that belongs to a different
     /// server. The production Let's Encrypt URL keeps the historical filename
-    /// (`account_credentials.json`) for backwards compatibility.
+    /// (`account_credentials.json`) for backwards compatibility: see
+    /// [`account_files_for`].
     async fn get_or_create_account(&self, server_url: &str) -> anyhow::Result<Account> {
-        let store = FileAccountStore::new(self.certs_dir.join(account_file_for(server_url)));
-
-        match store.load() {
-            Ok(Some(credentials)) => match account_builder(server_url)?
-                .from_credentials(credentials)
-                .await
-            {
-                Ok(account) => {
-                    info!("Loaded existing ACME account");
-                    return Ok(account);
+        let files = account_files_for(server_url);
+        for file in &files {
+            match FileAccountStore::new(self.certs_dir.join(file)).load() {
+                // The historical file served staging too: an account of
+                // another server is not this one's.
+                Ok(Some(credentials)) if !credentials_belong_to(&credentials, server_url) => {
+                    info!(
+                        "ACME account in {} belongs to another server, skipped",
+                        file
+                    );
                 }
-                Err(e) => warn!("Failed to restore ACME account, creating new one: {}", e),
-            },
-            Ok(None) => {}
-            Err(e) => warn!(
-                "Failed to load account credentials, creating new one: {}",
-                e
-            ),
+                Ok(Some(credentials)) => match account_builder(server_url)?
+                    .from_credentials(credentials)
+                    .await
+                {
+                    Ok(account) => {
+                        info!("Loaded existing ACME account");
+                        return Ok(account);
+                    }
+                    Err(e) => warn!("Failed to restore ACME account from {}: {}", file, e),
+                },
+                Ok(None) => {}
+                Err(e) => warn!("Failed to load account credentials from {}: {}", file, e),
+            }
         }
+        let store = FileAccountStore::new(self.certs_dir.join(&files[0]));
 
         let contact = if self.config.email.is_empty() {
             vec![]
@@ -1179,6 +1187,41 @@ fn account_builder(server_url: &str) -> anyhow::Result<instant_acme::AccountBuil
         }
         _ => Ok(Account::builder()?),
     }
+}
+
+/// Let's Encrypt's production directory, the default ACME server.
+const PRODUCTION_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+/// The account file of the production directory before each CA got its own.
+const LEGACY_ACCOUNT_FILE: &str = "account_credentials.json";
+
+/// The files an ACME account for `server_url` may be stored in, the one a new
+/// account is saved to first. The production directory keeps its historical
+/// file, and still reads the per-CA one releases 0.14 and 0.15 wrote instead.
+fn account_files_for(server_url: &str) -> Vec<String> {
+    let own = account_file_for(server_url);
+    if server_url == PRODUCTION_DIRECTORY {
+        vec![LEGACY_ACCOUNT_FILE.to_string(), own]
+    } else {
+        vec![own]
+    }
+}
+
+/// Whether `credentials` are an account of the ACME server at `server_url`:
+/// they name its directory, or, saved by an older library, its endpoints.
+fn credentials_belong_to(credentials: &instant_acme::AccountCredentials, server_url: &str) -> bool {
+    let Ok(saved) = serde_json::to_value(credentials) else {
+        return false;
+    };
+    if let Some(directory) = saved.get("directory").and_then(|d| d.as_str()) {
+        return directory == server_url;
+    }
+    let host = |url: &str| url.split('/').nth(2).map(str::to_ascii_lowercase);
+    saved
+        .get("urls")
+        .and_then(|urls| urls.get("newAccount"))
+        .and_then(|url| url.as_str())
+        .is_some_and(|url| host(url).is_some() && host(url) == host(server_url))
 }
 
 /// Credentials filename for an ACME account, derived from the directory URL so
@@ -1800,6 +1843,49 @@ mod tests {
             prod,
             account_file_for("https://acme-v02.api.letsencrypt.org/directory")
         );
+    }
+
+    #[test]
+    fn production_keeps_its_historical_account_file() {
+        assert_eq!(
+            account_files_for(PRODUCTION_DIRECTORY),
+            vec![
+                LEGACY_ACCOUNT_FILE.to_string(),
+                account_file_for(PRODUCTION_DIRECTORY)
+            ]
+        );
+        let staging = "https://acme-staging-v02.api.letsencrypt.org/directory";
+        assert_eq!(account_files_for(staging), vec![account_file_for(staging)]);
+    }
+
+    #[test]
+    fn credentials_belong_to_the_server_they_name() {
+        let staging = "https://acme-staging-v02.api.letsencrypt.org/directory";
+        let credentials = |saved: serde_json::Value| -> instant_acme::AccountCredentials {
+            serde_json::from_value(saved).unwrap()
+        };
+        let with_directory = credentials(serde_json::json!({
+            "id": "https://acme-staging-v02.api.letsencrypt.org/acme/acct/1",
+            "key_pkcs8": "AAAA",
+            "directory": staging,
+        }));
+        assert!(credentials_belong_to(&with_directory, staging));
+        assert!(!credentials_belong_to(
+            &with_directory,
+            PRODUCTION_DIRECTORY
+        ));
+        // Saved by an older library: the endpoints instead of the directory.
+        let with_urls = credentials(serde_json::json!({
+            "id": "https://acme-v02.api.letsencrypt.org/acme/acct/1",
+            "key_pkcs8": "AAAA",
+            "urls": {
+                "newNonce": "https://acme-v02.api.letsencrypt.org/acme/new-nonce",
+                "newAccount": "https://acme-v02.api.letsencrypt.org/acme/new-acct",
+                "newOrder": "https://acme-v02.api.letsencrypt.org/acme/new-order",
+            },
+        }));
+        assert!(credentials_belong_to(&with_urls, PRODUCTION_DIRECTORY));
+        assert!(!credentials_belong_to(&with_urls, staging));
     }
 
     #[test]
