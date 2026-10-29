@@ -1,4 +1,5 @@
 pub mod gateway;
+mod gateway_compat;
 pub mod gateway_filters;
 pub mod gateway_matches;
 pub mod gateway_tls;
@@ -703,6 +704,7 @@ impl KubernetesProvider {
         let ips: Vec<String> = slice
             .endpoints
             .iter()
+            .flatten()
             .filter(|ep| ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
             .flat_map(|ep| ep.addresses.iter().cloned())
             .filter(|ip| !ip.is_empty())
@@ -1556,17 +1558,19 @@ mod tests {
                 labels: Some(labels),
                 ..Default::default()
             },
-            endpoints: endpoints
-                .into_iter()
-                .map(|(addrs, ready)| Endpoint {
-                    addresses: addrs.into_iter().map(|s| s.to_string()).collect(),
-                    conditions: ready.map(|r| EndpointConditions {
-                        ready: Some(r),
+            endpoints: Some(
+                endpoints
+                    .into_iter()
+                    .map(|(addrs, ready)| Endpoint {
+                        addresses: addrs.into_iter().map(|s| s.to_string()).collect(),
+                        conditions: ready.map(|r| EndpointConditions {
+                            ready: Some(r),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-                .collect(),
+                    })
+                    .collect(),
+            ),
             ports: None,
         }
     }
