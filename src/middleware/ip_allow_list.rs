@@ -101,6 +101,37 @@ impl TrustedProxies {
     }
 }
 
+/// The `X-Forwarded-For` entries from the right: Sōzu appends to the last
+/// line, and a client may send several.
+pub fn forwarded_for_right_to_left(headers: &axum::http::HeaderMap) -> impl Iterator<Item = &str> {
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|value| value.rsplit(','))
+}
+
+/// The address that connected to Sōzu, and whether Sōzu already wrote it as
+/// the last `X-Forwarded-For` entry: the middleware's own TCP peer is Sōzu
+/// on loopback, which stands for nobody (see [`resolve_client_ip`]).
+pub fn connection_peer(
+    headers: &axum::http::HeaderMap,
+    client_addr: Option<std::net::SocketAddr>,
+) -> Option<(IpAddr, bool)> {
+    let tcp_peer = client_addr.map(|a| a.ip())?;
+    if !unmap_ipv4(tcp_peer).is_loopback() {
+        return Some((tcp_peer, false));
+    }
+    let appended = forwarded_for_right_to_left(headers)
+        .next()
+        .and_then(|last| IpAddr::from_str(last.trim()).ok());
+    Some(match appended {
+        Some(ip) => (ip, true),
+        None => (tcp_peer, false),
+    })
+}
+
 /// Resolve the client IP from the request and the TCP peer.
 ///
 /// The middleware server listens on loopback and only Sōzu connects to it, so
@@ -126,12 +157,7 @@ pub fn resolve_client_ip(
     let tcp_peer = ctx.client_addr.map(|a| a.ip())?;
 
     // Right to left: the entry Sōzu appended comes first.
-    let mut hops = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .into_iter()
-        .flat_map(|value| value.rsplit(','))
+    let mut hops = forwarded_for_right_to_left(req.headers())
         .filter_map(|token| IpAddr::from_str(token.trim()).ok());
 
     let peer = if unmap_ipv4(tcp_peer).is_loopback() {
@@ -314,6 +340,24 @@ mod tests {
     }
 
     // ---- Client-IP resolution: the trust model ---------------------------
+
+    /// Several `X-Forwarded-For` lines: Sōzu's entry ends the last one, so
+    /// the client's own lines name nobody.
+    #[test]
+    fn the_peer_is_read_from_the_last_line() {
+        let trusted = TrustedProxies::default();
+        let r = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .header("x-forwarded-for", "198.51.100.7")
+            .body(Body::empty())
+            .unwrap();
+        let c = ctx(Some("127.0.0.1"));
+        assert_eq!(
+            resolve_client_ip(&r, &c, &trusted),
+            Some(ip("198.51.100.7"))
+        );
+    }
 
     #[test]
     fn no_trusted_proxies_ignores_xff_entirely() {

@@ -56,6 +56,7 @@ pub async fn evaluate(
     snapshot: AuthRequestSnapshot,
     client_addr: Option<SocketAddr>,
 ) -> ForwardAuthOutcome {
+    let peer = super::ip_allow_list::connection_peer(&snapshot.headers, client_addr);
     let url = match reqwest::Url::parse(&cfg.address) {
         Ok(u) => u,
         Err(e) => {
@@ -64,8 +65,7 @@ pub async fn evaluate(
         }
     };
 
-    let mut headers =
-        build_outgoing_headers(&snapshot.headers, client_addr, cfg.trust_forward_header);
+    let mut headers = build_outgoing_headers(&snapshot.headers, peer, cfg.trust_forward_header);
 
     let proto = if snapshot.is_tls { "https" } else { "http" };
 
@@ -194,9 +194,12 @@ impl Middleware for ForwardAuthMiddleware {
     }
 }
 
+/// The headers sent to the auth service. `peer` is the address that
+/// connected, and whether `incoming`'s `X-Forwarded-For` already ends with
+/// it (see [`super::ip_allow_list::connection_peer`]).
 fn build_outgoing_headers(
     incoming: &HeaderMap,
-    client_addr: Option<SocketAddr>,
+    peer: Option<(std::net::IpAddr, bool)>,
     trust_forward_header: bool,
 ) -> HeaderMap {
     let mut out = HeaderMap::new();
@@ -211,17 +214,20 @@ fn build_outgoing_headers(
         out.append(name.clone(), value.clone());
     }
 
-    let client_ip = client_addr.map(|a| a.ip().to_string());
-    let appended_xff = match (
-        trust_forward_header,
-        incoming
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok()),
-        client_ip,
-    ) {
-        (true, Some(existing), Some(ip)) => format!("{existing}, {ip}"),
+    // Every line, joined: Sōzu's entry ends the last one.
+    let lines: Vec<&str> = incoming
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let joined = lines.join(", ");
+    let existing = (!lines.is_empty()).then_some(joined.as_str());
+    let appended_xff = match (trust_forward_header, existing, peer) {
+        // The chain already ends with the peer, which Sōzu wrote.
+        (true, Some(existing), Some((_, true))) => existing.to_string(),
+        (true, Some(existing), Some((ip, false))) => format!("{existing}, {ip}"),
         (true, Some(existing), None) => existing.to_string(),
-        (_, _, Some(ip)) => ip,
+        (_, _, Some((ip, _))) => ip.to_string(),
         _ => String::new(),
     };
     if !appended_xff.is_empty()
@@ -278,8 +284,8 @@ mod tests {
             ("X-Forwarded-For", "9.9.9.9"),
             ("X-Forwarded-Proto", "https"),
         ]);
-        let addr: SocketAddr = "203.0.113.1:5555".parse().unwrap();
-        let out = build_outgoing_headers(&h, Some(addr), false);
+        let peer = Some(("203.0.113.1".parse().unwrap(), false));
+        let out = build_outgoing_headers(&h, peer, false);
         assert_eq!(out.get("x-forwarded-for").unwrap(), "203.0.113.1");
         assert!(!out.contains_key("x-forwarded-proto"));
     }
@@ -287,8 +293,42 @@ mod tests {
     #[test]
     fn trusted_appends_to_x_forwarded_for() {
         let h = headers(&[("X-Forwarded-For", "9.9.9.9")]);
-        let addr: SocketAddr = "203.0.113.1:5555".parse().unwrap();
-        let out = build_outgoing_headers(&h, Some(addr), true);
+        let peer = Some(("203.0.113.1".parse().unwrap(), false));
+        let out = build_outgoing_headers(&h, peer, true);
+        assert_eq!(out.get("x-forwarded-for").unwrap(), "9.9.9.9, 203.0.113.1");
+    }
+
+    /// A client sending several lines does not get to name the peer: Sōzu's
+    /// entry ends the last one.
+    #[test]
+    fn the_peer_ends_the_last_line() {
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("6.6.6.6"));
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("9.9.9.9, 203.0.113.1"),
+        );
+        let sozu: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peer = crate::middleware::ip_allow_list::connection_peer(&h, Some(sozu));
+        assert_eq!(peer, Some(("203.0.113.1".parse().unwrap(), true)));
+        let out = build_outgoing_headers(&h, peer, true);
+        assert_eq!(
+            out.get("x-forwarded-for").unwrap(),
+            "6.6.6.6, 9.9.9.9, 203.0.113.1"
+        );
+    }
+
+    /// Behind Sōzu, the middleware's own peer is loopback: the client is the
+    /// address Sōzu appended, never `127.0.0.1`.
+    #[test]
+    fn the_peer_is_the_address_sozu_saw() {
+        let h = headers(&[("X-Forwarded-For", "9.9.9.9, 203.0.113.1")]);
+        let sozu: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peer = crate::middleware::ip_allow_list::connection_peer(&h, Some(sozu));
+        assert_eq!(peer, Some(("203.0.113.1".parse().unwrap(), true)));
+        let out = build_outgoing_headers(&h, peer, false);
+        assert_eq!(out.get("x-forwarded-for").unwrap(), "203.0.113.1");
+        let out = build_outgoing_headers(&h, peer, true);
         assert_eq!(out.get("x-forwarded-for").unwrap(), "9.9.9.9, 203.0.113.1");
     }
 }

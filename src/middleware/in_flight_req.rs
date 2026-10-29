@@ -93,11 +93,12 @@ impl Drop for InFlightGuard {
 /// into the request context so the slot is held for the request's lifetime.
 pub struct InFlightReqMiddleware {
     limiter: InFlightLimiter,
+    trusted: super::ip_allow_list::TrustedProxies,
 }
 
 impl InFlightReqMiddleware {
-    pub fn new(limiter: InFlightLimiter) -> Self {
-        Self { limiter }
+    pub fn new(limiter: InFlightLimiter, trusted: super::ip_allow_list::TrustedProxies) -> Self {
+        Self { limiter, trusted }
     }
 }
 
@@ -108,15 +109,8 @@ impl Middleware for InFlightReqMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestCtx, req: &mut Request<Body>) -> Flow {
-        // Prefer the leftmost X-Forwarded-For entry; fall back to the host,
-        // matching the rate-limit middleware's source-IP resolution.
-        let source_ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| ctx.host.clone());
+        // The client as the rate limit resolves it, `trusted_proxies` applied.
+        let source_ip = super::rate_limit::source_key(req, ctx, &self.trusted);
 
         match self.limiter.try_acquire(&source_ip) {
             Some(guard) => {
@@ -198,5 +192,46 @@ mod tests {
         drop(g1);
         // Dropping the last guard for an IP removes its map entry.
         assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    /// The client is the address Sōzu saw, not what it claims in
+    /// `X-Forwarded-For`: a forged leftmost entry gets no slot of its own.
+    #[tokio::test]
+    async fn the_client_cannot_pick_its_own_slot() {
+        let middleware = InFlightReqMiddleware::new(
+            InFlightLimiter::new(1),
+            super::super::ip_allow_list::TrustedProxies::new(&[]),
+        );
+        let request = |forged: &str| {
+            Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", format!("{forged}, 203.0.113.7"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ctx = || RequestCtx {
+            host: "example.com".to_string(),
+            client_addr: Some("127.0.0.1:40000".parse().unwrap()),
+            is_tls: false,
+            method: axum::http::Method::GET,
+            path: "/".to_string(),
+            client_encoding: None,
+            pending_response_headers: Vec::new(),
+            in_flight_guards: Vec::new(),
+        };
+        let mut first = ctx();
+        assert!(matches!(
+            middleware
+                .on_request(&mut first, &mut request("10.0.0.1"))
+                .await,
+            Flow::Continue
+        ));
+        // Same client, another forged entry: still its one slot, taken.
+        assert!(matches!(
+            middleware
+                .on_request(&mut ctx(), &mut request("10.0.0.2"))
+                .await,
+            Flow::ShortCircuit(_)
+        ));
     }
 }
