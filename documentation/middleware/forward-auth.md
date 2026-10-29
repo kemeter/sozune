@@ -17,7 +17,7 @@ labels:
 |---|---|
 | `forwardAuth.address` | URL of the verification endpoint. Required to enable forward auth. |
 | `forwardAuth.responseHeaders` | Comma-separated list of headers to copy from the auth response onto the request before forwarding to the backend. Common: `X-User,X-Email,X-Groups`. |
-| `forwardAuth.trustForwardHeader` | When `true`, the existing `X-Forwarded-*` headers from the client are forwarded to the auth service as-is. When `false` (default), Sōzune strips them and sets fresh ones based on its own observation of the connection. Set to `true` only if Sōzune sits behind another trusted proxy. |
+| `forwardAuth.trustForwardHeader` | When `true`, the existing `X-Forwarded-*` headers from the client are forwarded to the auth service as-is. When `false` (default), Sōzune strips them and sets `X-Forwarded-For` to the address that connected to it. Set to `true` only if Sōzune sits behind another trusted proxy. |
 
 If `forwardAuth.address` is absent, forward auth is disabled for the service.
 
@@ -77,7 +77,7 @@ labels:
   - `X-Forwarded-Uri` — original request URI (path + query)
   - `X-Forwarded-Host` — original `Host` header
   - `X-Forwarded-Proto` — `http` or `https`
-  - `X-Forwarded-For` — appended with the immediate client IP (or replaced with a fresh chain when `trustForwardHeader=false`)
+  - `X-Forwarded-For` — the client's chain ending with the address that connected to Sōzune, or that address alone when `trustForwardHeader=false`
 - Body: empty. Forward auth never streams the request body to the auth service.
 
 ### How Sōzune interprets the response

@@ -50,12 +50,9 @@ The field is exposed as `in_flight_req` on the entrypoint configuration object r
 
 ## Source IP detection
 
-Sōzune resolves the client IP exactly like [rate limiting](rate-limit.md#source-ip-detection):
+The client is the address that connected to Sōzu, resolved as the [IP allow-list](ip-allow-list.md#client-ip-resolution) does: behind proxies listed in `proxy.trusted_proxies`, the first `X-Forwarded-For` entry from the right that is not one of them. An `X-Forwarded-For` entry the client wrote itself is never taken for its address.
 
-1. The first entry of the `X-Forwarded-For` header, if present.
-2. Otherwise, the `Host` header value.
-
-If you run Sōzune behind another proxy or a load balancer, make sure that proxy sets `X-Forwarded-For` correctly — otherwise every request appears to come from the same upstream IP and shares a single counter.
+If you run Sōzune behind another proxy or a load balancer, list it in `proxy.trusted_proxies`: otherwise every request appears to come from that proxy and shares a single counter.
 
 ## Memory
 

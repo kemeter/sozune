@@ -157,7 +157,11 @@ impl RateLimiter {
 /// when the peer is a trusted proxy. Keying on the leftmost entry — which the
 /// client writes — handed every request a fresh bucket, so the limiter never
 /// fired, and each forged value left a permanent map entry behind.
-fn source_key(req: &Request<Body>, ctx: &RequestCtx, trusted: &TrustedProxies) -> String {
+pub(super) fn source_key(
+    req: &Request<Body>,
+    ctx: &RequestCtx,
+    trusted: &TrustedProxies,
+) -> String {
     match resolve_client_ip(req, ctx, trusted) {
         Some(ip) => ip.to_string(),
         // No peer and nothing trustworthy to read: charge the hostname, so a

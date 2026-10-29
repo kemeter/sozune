@@ -1063,9 +1063,10 @@ pub fn build_middleware_route(
     }
 
     if let Some(max) = config.in_flight_req {
-        middlewares.push(Arc::new(InFlightReqMiddleware::new(InFlightLimiter::new(
-            max,
-        ))));
+        middlewares.push(Arc::new(InFlightReqMiddleware::new(
+            InFlightLimiter::new(max),
+            trusted_proxies.clone(),
+        )));
     }
 
     // WASM plugins run after the native request-phase middlewares, in the order
