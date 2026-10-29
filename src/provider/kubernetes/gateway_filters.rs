@@ -13,8 +13,8 @@
 //! [`rule_filters_supported`].
 
 use crate::model::entrypoint::{
-    HeaderConfig, HeaderDirection, MirrorFraction, PathRewrite, RedirectPolicy, RedirectScheme,
-    UrlRewrite,
+    CorsConfig, HeaderConfig, HeaderDirection, MirrorFraction, PathRewrite, RedirectPolicy,
+    RedirectScheme, UrlRewrite,
 };
 use gateway_api::apis::standard::httproutes::{
     HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
@@ -56,6 +56,10 @@ pub fn rule_filters_supported(filters: &[HttpRouteRulesFilters]) -> bool {
     let has_rewrite = filters.iter().any(|f| f.url_rewrite.is_some());
     if has_redirect && has_rewrite {
         // Conflicting intents over the same frontend rewrite — refuse.
+        return false;
+    }
+    // One CORS policy per rule: a second would be silently dropped.
+    if filters.iter().filter(|f| f.cors.is_some()).count() > 1 {
         return false;
     }
     filters.iter().all(filter_supported)
@@ -153,6 +157,14 @@ fn filter_supported(filter: &HttpRouteRulesFilters) -> bool {
     if filter.extension_ref.is_some() {
         return false;
     }
+    // Nor is a `cors` entry carrying anything else.
+    if filter.cors.is_some() {
+        return filter.request_mirror.is_none()
+            && filter.request_redirect.is_none()
+            && filter.request_header_modifier.is_none()
+            && filter.response_header_modifier.is_none()
+            && filter.url_rewrite.is_none();
+    }
     // A `requestMirror` entry carries nothing else: one doing more at once
     // is not a filter the spec describes.
     if filter.request_mirror.is_some() {
@@ -189,6 +201,19 @@ fn filter_supported(filter: &HttpRouteRulesFilters) -> bool {
             filter.request_header_modifier.is_some() || filter.response_header_modifier.is_some()
         }
     }
+}
+
+/// The CORS policy of a rule's `cors` filter, the first when it has several.
+pub fn cors_from_filters(filters: &[HttpRouteRulesFilters]) -> Option<CorsConfig> {
+    let cors = filters.iter().find_map(|f| f.cors.as_ref())?;
+    Some(CorsConfig {
+        allow_origins: cors.allow_origins.clone().unwrap_or_default(),
+        allow_methods: cors.allow_methods.clone().unwrap_or_default(),
+        allow_headers: cors.allow_headers.clone().unwrap_or_default(),
+        expose_headers: cors.expose_headers.clone().unwrap_or_default(),
+        allow_credentials: cors.allow_credentials.unwrap_or(false),
+        max_age: cors.max_age.and_then(|age| u32::try_from(age).ok()),
+    })
 }
 
 /// A rule's `requestMirror` filters.
@@ -712,6 +737,38 @@ mod tests {
             denominator: None,
         });
         assert_eq!(mirror_fraction(&mirror), share(25, 100));
+    }
+
+    #[test]
+    fn a_cors_filter_maps_onto_the_route_policy() {
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersCors;
+        let cors = HttpRouteRulesFilters {
+            cors: Some(HttpRouteRulesFiltersCors {
+                allow_origins: Some(vec!["https://*.bar.com".into()]),
+                allow_methods: Some(vec!["GET".into()]),
+                allow_credentials: Some(true),
+                max_age: Some(3600),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(rule_filters_supported(std::slice::from_ref(&cors)));
+        assert_eq!(
+            cors_from_filters(std::slice::from_ref(&cors)),
+            Some(CorsConfig {
+                allow_origins: vec!["https://*.bar.com".into()],
+                allow_methods: vec!["GET".into()],
+                allow_credentials: true,
+                max_age: Some(3600),
+                ..Default::default()
+            })
+        );
+        // A rule takes one policy.
+        assert!(!rule_filters_supported(&[cors.clone(), cors.clone()]));
+        // Nor does it carry another filter's settings.
+        let mut both = cors;
+        both.request_header_modifier = Some(Default::default());
+        assert!(!rule_filters_supported(&[both]));
     }
 
     use gateway_api::apis::standard::httproutes::{

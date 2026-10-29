@@ -885,7 +885,7 @@ enum MiddlewareResult {
 const NEEDS_CLIENT_IP: &str = "depends on the client address: pass `client_ip`";
 
 /// Middlewares that decide from the request alone, and can be run here.
-const EVALUATED: [&str; 2] = ["ip-allow-list", "request-match"];
+const EVALUATED: [&str; 3] = ["ip-allow-list", "request-match", "cors"];
 
 /// Finds the route the middleware server would pick, and walks its chain.
 async fn run_middleware(

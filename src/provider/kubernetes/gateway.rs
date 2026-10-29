@@ -5651,6 +5651,12 @@ fn rule_to_entrypoints(
     };
 
     let (request_timeout, backend_timeout) = rule_timeouts_ms(rule);
+    // A redirect answers every request, preflights included.
+    let cors = if answers {
+        None
+    } else {
+        gateway_filters::cors_from_filters(&filters)
+    };
     let mirrors = if answers {
         // A redirect forwards nothing to copy.
         Vec::new()
@@ -5773,6 +5779,7 @@ fn rule_to_entrypoints(
                     mirrors: mirrors.clone(),
                     mirror_of: None,
                     failing_shares,
+                    cors: cors.clone(),
                 },
                 source: Some(id),
                 candidates: Vec::new(),
@@ -7214,6 +7221,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         mirrors: Vec::new(),
         mirror_of: None,
         failing_shares: None,
+        cors: None,
         ip_allow_list: Vec::new(),
     }
 }

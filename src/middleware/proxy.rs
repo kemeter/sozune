@@ -113,6 +113,9 @@ pub async fn handle_proxy(
         .remove(super::ROUTE_HEADER)
         .and_then(|v| String::from_utf8(v.as_bytes().to_vec()).ok());
 
+    // Kept for the route's CORS policy, which marks whatever answers it.
+    let origin = req.headers().get(axum::http::header::ORIGIN).cloned();
+
     // The route the request matched, whose response edits apply to whatever
     // answers it.
     let matched = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -611,6 +614,9 @@ pub async fn handle_proxy(
     let mut response = fut.instrument(span).await;
     if let Some(route) = matched.get() {
         route.edit_response(&mut response);
+        if let Some(cors) = route.cors.as_ref() {
+            cors.mark_response(origin.as_ref(), &mut response);
+        }
     }
     response
 }

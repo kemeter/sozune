@@ -1389,6 +1389,7 @@ impl IngressParseCtx<'_> {
                 mirrors: Vec::new(),
                 mirror_of: None,
                 failing_shares: None,
+                cors: None,
                 ip_allow_list: Vec::new(),
             },
             source: Some(self.provider.name.to_string()),
