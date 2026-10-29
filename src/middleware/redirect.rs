@@ -46,7 +46,7 @@ impl RedirectMiddleware {
         path_rule: &sozu_command_lib::proto::command::PathRule,
         rewrite: Option<String>,
     ) -> Option<Self> {
-        let status = config.redirect?.middleware_redirect_status()?;
+        let status = config.middleware_redirect_status()?;
         let path_rule = match path_rule.kind {
             0 => PathCaptures::Prefix(path_rule.value.clone()),
             1 => match Regex::new(&format!("^(?:{})$", path_rule.value)) {
@@ -64,9 +64,10 @@ impl RedirectMiddleware {
             // A redirect's own path wins over the route's rewrite, as on
             // Sōzu's frontends.
             path: config.rewrite_path.clone().or(rewrite),
-            keeps_query: config.rewrite_path.as_deref().is_some_and(|path| {
-                !path.contains('?') && !path.contains("$PATH[") && !path.contains("$HOST[")
-            }),
+            keeps_query: config
+                .rewrite_path
+                .as_deref()
+                .is_some_and(crate::model::fixed_redirect_path),
             template: config
                 .redirect_template
                 .clone()
@@ -309,6 +310,35 @@ mod tests {
             ..Default::default()
         };
         assert!(RedirectMiddleware::new(&config, &prefix("/"), None).is_none());
+    }
+
+    /// To a fixed path, Sōzu would send the `Location` without the request's
+    /// query: the middleware answers such a redirect, whatever its status.
+    #[test]
+    fn a_redirect_to_a_fixed_path_keeps_the_query_whatever_its_status() {
+        for (policy, status) in [
+            (RedirectPolicy::Permanent, 301),
+            (RedirectPolicy::Found, 302),
+            (RedirectPolicy::PermanentRedirect, 308),
+        ] {
+            let config = EntrypointConfig {
+                redirect: Some(policy),
+                rewrite_path: Some("/new".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(config.middleware_redirect_status(), Some(status));
+            let m = middleware(&config, prefix("/"), None);
+            assert_eq!(
+                m.location(false, "example.com", "/old?x=1"),
+                "http://example.com/new?x=1"
+            );
+            // A path built from the request's keeps it already: Sōzu answers.
+            let config = EntrypointConfig {
+                rewrite_path: Some("/v2$PATH[1]".to_string()),
+                ..config
+            };
+            assert_eq!(config.middleware_redirect_status(), None);
+        }
     }
 
     #[test]

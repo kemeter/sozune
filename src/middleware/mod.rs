@@ -945,13 +945,10 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || config.cors.is_some()
 }
 
-/// Whether the middleware answers the route's redirect, Sōzu having no
-/// status for it.
+/// Whether the middleware answers the route's redirect instead of Sōzu: see
+/// [`EntrypointConfig::middleware_redirect_status`].
 pub fn answers_redirect(config: &EntrypointConfig) -> bool {
-    config
-        .redirect
-        .and_then(crate::model::RedirectPolicy::middleware_redirect_status)
-        .is_some()
+    config.middleware_redirect_status().is_some()
 }
 
 /// Build middleware route from entrypoint config.

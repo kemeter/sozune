@@ -623,10 +623,10 @@ rules:
 | `requestRedirect` field | Mapped to | Notes |
 |---|---|---|
 | `scheme` (`http` / `https`) | redirect scheme | omitted → preserve the request scheme |
-| `statusCode` | redirect policy | `301` (default) → permanent redirect, `302` → temporary redirect, `303` → see other, `307` → temporary redirect keeping the method, `308` → permanent redirect keeping the method. Sōzu answers `301`, `302` and `308` itself, the middleware `303` and `307` |
+| `statusCode` | redirect policy | `301` (default) → permanent redirect, `302` → temporary redirect, `303` → see other, `307` → temporary redirect keeping the method, `308` → permanent redirect keeping the method. Sōzu answers `301`, `302` and `308` itself, the middleware `303` and `307`, and any redirect with `replaceFullPath` |
 | `hostname` | `rewrite_host` | rewrites the `Location` authority |
 | `port` | `rewrite_port` | rewrites the `Location` port |
-| `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value |
+| `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value, the request's query kept: `/old?x=1` → `/new?x=1` |
 | `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix in the `Location` path and keeps the rest, as [`urlRewrite`](#urlrewrite) does. On a match that is not a `PathPrefix`, the route is dropped, as the spec says |
 
 A `requestRedirect` with a `statusCode` other than `301`, `302`, `303`, `307` and `308`, or on a match with query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on `Host` or `Cookie`), is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`): Sōzu answers a redirect itself, so these conditions would not be checked.
