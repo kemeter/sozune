@@ -345,6 +345,24 @@ pub fn anchored_regex(pattern: &str) -> Option<regex::Regex> {
 }
 
 impl EntrypointConfig {
+    /// The status of a redirect the middleware answers instead of Sōzu: one
+    /// Sōzu has no status for, or one to a fixed path, which Sōzu would send
+    /// without the request's query.
+    pub fn middleware_redirect_status(&self) -> Option<u16> {
+        let fixed_path = self
+            .rewrite_path
+            .as_deref()
+            .is_some_and(fixed_redirect_path);
+        match self.redirect? {
+            RedirectPolicy::SeeOther => Some(303),
+            RedirectPolicy::TemporaryRedirect => Some(307),
+            RedirectPolicy::Permanent if fixed_path => Some(301),
+            RedirectPolicy::Found if fixed_path => Some(302),
+            RedirectPolicy::PermanentRedirect if fixed_path => Some(308),
+            _ => None,
+        }
+    }
+
     /// The first header or query regex condition that cannot be served: one
     /// naming no key, or whose regex does not compile.
     pub fn invalid_match_regex(&self) -> Option<&MatchCondition> {
@@ -522,16 +540,13 @@ impl RedirectPolicy {
                 | Self::Close
         )
     }
+}
 
-    /// The status of a redirect Sōzu cannot answer, which the middleware
-    /// answers instead.
-    pub fn middleware_redirect_status(self) -> Option<u16> {
-        match self {
-            Self::SeeOther => Some(303),
-            Self::TemporaryRedirect => Some(307),
-            _ => None,
-        }
-    }
+/// Whether a redirect's `rewrite_path` carries nothing of the request's: no
+/// query of its own, no capture of its path or host. Sōzu then builds the
+/// `Location` without the request's query, which the middleware keeps.
+pub fn fixed_redirect_path(path: &str) -> bool {
+    !path.contains('?') && !path.contains("$PATH[") && !path.contains("$HOST[")
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]

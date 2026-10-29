@@ -2185,7 +2185,12 @@ pub(crate) fn build_http_frontends(
                 append: false,
             }]));
         }
-        let frontend_redirect = entrypoint.config.redirect.map(map_redirect_policy);
+        // A redirect the middleware answers is forwarded to it.
+        let frontend_redirect = if middleware::answers_redirect(&entrypoint.config) {
+            Some(map_redirect_policy(crate::model::RedirectPolicy::Forward))
+        } else {
+            entrypoint.config.redirect.map(map_redirect_policy)
+        };
         let frontend_redirect_scheme = entrypoint.config.redirect_scheme.map(map_redirect_scheme);
         let frontend_redirect_template = entrypoint.config.redirect_template.clone();
         // A redirect target's path rewrite wins over the prefix rewrite:

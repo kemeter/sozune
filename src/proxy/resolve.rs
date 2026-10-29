@@ -425,11 +425,7 @@ pub async fn resolve(
             )),
         ));
     }
-    if let Some(status) = served
-        .config
-        .redirect
-        .and_then(crate::model::RedirectPolicy::middleware_redirect_status)
-    {
+    if let Some(status) = served.config.middleware_redirect_status() {
         resolution.outcome = Outcome::Redirected;
         resolution.status = Some(status);
         resolution.summary = format!("redirected ({status}) by route `{}`", served.name);
