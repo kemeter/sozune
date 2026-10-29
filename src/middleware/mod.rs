@@ -211,10 +211,12 @@ pub struct MiddlewareRoute {
     pub failing_shares: Option<WeightedRoundRobin>,
 }
 
-/// One of a route's mirrors: its backends, and how to pick one.
+/// One of a route's mirrors: its backends, how to pick one, and which
+/// requests to copy.
 pub struct MirrorTarget {
     pub backends: Vec<(String, u16)>,
     pub balancer: WeightedRoundRobin,
+    fraction: Option<crate::model::MirrorFraction>,
 }
 
 /// How many copies to mirrors may be under way at once, all routes together:
@@ -261,7 +263,19 @@ impl MirrorTarget {
                 .map(|b| (b.address.clone(), b.port))
                 .collect(),
             balancer: WeightedRoundRobin::new(&weights),
+            fraction: mirror.fraction,
         }
+    }
+
+    /// Whether to copy the next request: drawn at random, with a chance of
+    /// `numerator` in `denominator`. Without a state, so a route rebuilt on a
+    /// reload keeps copying its share from its first request.
+    pub fn copies_next(&self) -> bool {
+        let Some(fraction) = self.fraction else {
+            return true;
+        };
+        let denominator = u64::from(fraction.denominator.max(1));
+        random_u64() % denominator < u64::from(fraction.numerator)
     }
 
     /// The backend the next copy goes to.
@@ -1144,6 +1158,33 @@ pub async fn serve(
 #[cfg(test)]
 mod route_key_tests {
     use super::*;
+
+    #[test]
+    fn a_mirror_copies_its_fraction_of_the_requests() {
+        let copies = |fraction: Option<crate::model::MirrorFraction>, requests: usize| {
+            let mirror = MirrorTarget::new(&crate::model::Mirror {
+                backends: Vec::new(),
+                fraction,
+            });
+            (0..requests).filter(|_| mirror.copies_next()).count()
+        };
+        let fraction = |numerator, denominator| {
+            Some(crate::model::MirrorFraction {
+                numerator,
+                denominator,
+            })
+        };
+        assert_eq!(copies(None, 10), 10);
+        assert_eq!(copies(fraction(0, 100), 1000), 0);
+        assert_eq!(copies(fraction(100, 100), 1000), 1000);
+        // A numerator past the denominator copies every request.
+        assert_eq!(copies(fraction(5, 2), 1000), 1000);
+        // About the share asked for, drawn at random.
+        let copied = copies(fraction(20, 100), 10_000);
+        assert!((1_500..=2_500).contains(&copied), "{copied}");
+        let copied = copies(fraction(1, 3), 9_000);
+        assert!((2_500..=3_500).contains(&copied), "{copied}");
+    }
 
     /// A route over backends `b0`, `b1`… with these weights.
     #[test]

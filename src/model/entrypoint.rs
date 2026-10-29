@@ -268,10 +268,20 @@ pub struct FailingShares {
 }
 
 /// Where a route's requests are copied to: one of `backends`, picked by
-/// weight, gets each of them.
+/// weight, gets each of them, or the share `fraction` says.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Mirror {
     pub backends: Vec<Backend>,
+    /// The share of the requests copied; all of them when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fraction: Option<MirrorFraction>,
+}
+
+/// `numerator` requests out of every `denominator`.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorFraction {
+    pub numerator: u32,
+    pub denominator: u32,
 }
 
 /// One key/value match condition used by header and query matching. An empty

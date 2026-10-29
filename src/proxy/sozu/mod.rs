@@ -1513,6 +1513,7 @@ pub(crate) fn with_mirror_routes(
             {
                 route.config.mirrors.push(crate::model::Mirror {
                     backends: mirror.backends.clone(),
+                    fraction: None,
                 });
             }
         }
@@ -5930,6 +5931,7 @@ mod tests {
     fn a_middleware_route_changing_only_for_the_middleware_keeps_its_frontend() {
         let mirror = |address: &str| crate::model::Mirror {
             backends: vec![Backend::new(address, 8080)],
+            fraction: None,
         };
         let mut old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
         old.config.mirrors = vec![mirror("10.0.1.1")];

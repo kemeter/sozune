@@ -5165,9 +5165,11 @@ fn rule_mirrors(
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Vec<Mirror> {
-    gateway_filters::mirror_backend_refs(filters)
+    gateway_filters::request_mirrors(filters)
         .into_iter()
-        .map(|m| {
+        .map(|mirror| {
+            let fraction = gateway_filters::mirror_fraction(mirror);
+            let m = &mirror.backend_ref;
             let parts = BackendRefParts {
                 group: m.group.as_deref(),
                 kind: m.kind.as_deref(),
@@ -5181,6 +5183,7 @@ fn rule_mirrors(
                 );
                 return Mirror {
                     backends: Vec::new(),
+                    fraction,
                 };
             }
             let target_ns = m.namespace.as_deref().unwrap_or(namespace);
@@ -5195,7 +5198,7 @@ fn rule_mirrors(
                     }])
                 })
                 .unwrap_or_default();
-            Mirror { backends }
+            Mirror { backends, fraction }
         })
         .collect()
 }
@@ -9832,7 +9835,7 @@ mod tests {
                     ..Default::default()
                 },
                 fraction: None,
-                percent: None,
+                percent: Some(20),
             }),
             ..Default::default()
         };
@@ -9851,6 +9854,13 @@ mod tests {
         assert_eq!(mirrors.len(), 1);
         assert_eq!(mirrors[0].backends.len(), 1);
         assert_eq!(mirrors[0].backends[0].port, 8080);
+        assert_eq!(
+            mirrors[0].fraction,
+            Some(crate::model::MirrorFraction {
+                numerator: 20,
+                denominator: 100
+            })
+        );
         assert!(crate::middleware::needs_middleware(&eps[0]));
         // A mirror with no ready pod stays, copying nothing: the route keeps
         // going through the middleware.

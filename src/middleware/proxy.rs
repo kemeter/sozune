@@ -375,6 +375,9 @@ pub async fn handle_proxy(
             // A copy to each mirror, its answer ignored: the client's response
             // waits for none of them, and a mirror failing changes nothing.
             for mirror in &route.mirrors {
+                if !mirror.copies_next() {
+                    continue;
+                }
                 // Too many copies under way already: this one is dropped.
                 let Ok(permit) = super::mirror_permits().try_acquire_owned() else {
                     debug!("Mirror busy, request not copied");

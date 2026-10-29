@@ -13,11 +13,12 @@
 //! [`rule_filters_supported`].
 
 use crate::model::entrypoint::{
-    HeaderConfig, HeaderDirection, PathRewrite, RedirectPolicy, RedirectScheme, UrlRewrite,
+    HeaderConfig, HeaderDirection, MirrorFraction, PathRewrite, RedirectPolicy, RedirectScheme,
+    UrlRewrite,
 };
 use gateway_api::apis::standard::httproutes::{
     HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
-    HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestMirrorBackendRef,
+    HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestMirror,
     HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectScheme,
     HttpRouteRulesFiltersResponseHeaderModifier, HttpRouteRulesFiltersUrlRewrite,
     HttpRouteRulesFiltersUrlRewritePath, HttpRouteRulesFiltersUrlRewritePathType,
@@ -190,15 +191,34 @@ fn filter_supported(filter: &HttpRouteRulesFilters) -> bool {
     }
 }
 
-/// The backendRefs a rule's `requestMirror` filters copy its requests to.
-pub fn mirror_backend_refs(
+/// A rule's `requestMirror` filters.
+pub fn request_mirrors(
     filters: &[HttpRouteRulesFilters],
-) -> Vec<&HttpRouteRulesFiltersRequestMirrorBackendRef> {
+) -> Vec<&HttpRouteRulesFiltersRequestMirror> {
     filters
         .iter()
         .filter_map(|f| f.request_mirror.as_ref())
-        .map(|m| &m.backend_ref)
         .collect()
+}
+
+/// The share of the requests a `requestMirror` copies, from its `percent`
+/// or its `fraction` (out of `100` when it names no denominator); all of
+/// them when it sets neither.
+pub fn mirror_fraction(mirror: &HttpRouteRulesFiltersRequestMirror) -> Option<MirrorFraction> {
+    let share = |numerator: i32, denominator: i32| {
+        let denominator = u32::try_from(denominator).unwrap_or(0).max(1);
+        MirrorFraction {
+            numerator: u32::try_from(numerator).unwrap_or(0).min(denominator),
+            denominator,
+        }
+    };
+    if let Some(percent) = mirror.percent {
+        return Some(share(percent, 100));
+    }
+    mirror
+        .fraction
+        .as_ref()
+        .map(|f| share(f.numerator, f.denominator.unwrap_or(100)))
 }
 
 /// Map a header modifier's `set` / `add` / `remove` lists onto
@@ -663,7 +683,35 @@ mod tests {
             ..Default::default()
         };
         assert!(rule_filters_supported(&[mirror.clone(), headers]));
-        assert_eq!(mirror_backend_refs(&[mirror]).len(), 1);
+        assert_eq!(request_mirrors(&[mirror]).len(), 1);
+    }
+
+    #[test]
+    fn a_mirror_copies_its_percent_or_fraction() {
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestMirrorFraction;
+        let share = |numerator, denominator| {
+            Some(MirrorFraction {
+                numerator,
+                denominator,
+            })
+        };
+        let mut mirror = HttpRouteRulesFiltersRequestMirror::default();
+        assert_eq!(mirror_fraction(&mirror), None);
+        mirror.percent = Some(20);
+        assert_eq!(mirror_fraction(&mirror), share(20, 100));
+        mirror.percent = Some(0);
+        assert_eq!(mirror_fraction(&mirror), share(0, 100));
+        mirror.percent = None;
+        mirror.fraction = Some(HttpRouteRulesFiltersRequestMirrorFraction {
+            numerator: 1,
+            denominator: Some(3),
+        });
+        assert_eq!(mirror_fraction(&mirror), share(1, 3));
+        mirror.fraction = Some(HttpRouteRulesFiltersRequestMirrorFraction {
+            numerator: 25,
+            denominator: None,
+        });
+        assert_eq!(mirror_fraction(&mirror), share(25, 100));
     }
 
     use gateway_api::apis::standard::httproutes::{
