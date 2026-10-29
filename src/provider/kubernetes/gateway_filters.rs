@@ -16,11 +16,11 @@ use crate::model::entrypoint::{
     HeaderConfig, HeaderDirection, PathRewrite, RedirectPolicy, RedirectScheme, UrlRewrite,
 };
 use gateway_api::apis::standard::httproutes::{
-    HTTPRouteRules, HTTPRouteRulesBackendRefs, HTTPRouteRulesFilters,
-    HTTPRouteRulesFiltersRequestHeaderModifier, HTTPRouteRulesFiltersRequestMirrorBackendRef,
-    HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectScheme,
-    HTTPRouteRulesFiltersResponseHeaderModifier, HTTPRouteRulesFiltersUrlRewrite,
-    HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
+    HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
+    HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestMirrorBackendRef,
+    HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectScheme,
+    HttpRouteRulesFiltersResponseHeaderModifier, HttpRouteRulesFiltersUrlRewrite,
+    HttpRouteRulesFiltersUrlRewritePath, HttpRouteRulesFiltersUrlRewritePathType,
 };
 
 /// The redirect settings a `requestRedirect` filter maps onto. These line
@@ -50,7 +50,7 @@ pub struct RedirectMapping {
 /// so a rule carrying both is refused. `requestMirror` and `extensionRef`
 /// remain unsupported; a rule carrying either (alone or mixed) is refused,
 /// since partial execution would misrepresent intent.
-pub fn rule_filters_supported(filters: &[HTTPRouteRulesFilters]) -> bool {
+pub fn rule_filters_supported(filters: &[HttpRouteRulesFilters]) -> bool {
     let has_redirect = filters.iter().any(|f| f.request_redirect.is_some());
     let has_rewrite = filters.iter().any(|f| f.url_rewrite.is_some());
     if has_redirect && has_rewrite {
@@ -67,9 +67,9 @@ pub fn rule_filters_supported(filters: &[HTTPRouteRulesFilters]) -> bool {
 /// backend's are left to the middleware, which edits what it sends that
 /// backend (see [`backend_ref_header_edits`]).
 pub fn effective_rule_filters(
-    rule: &HTTPRouteRules,
-    usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
-) -> Option<Vec<HTTPRouteRulesFilters>> {
+    rule: &HttpRouteRules,
+    usable: &dyn Fn(&HttpRouteRulesBackendRefs) -> bool,
+) -> Option<Vec<HttpRouteRulesFilters>> {
     let mut filters = rule.filters.clone().unwrap_or_default();
     // A redirect forwards nothing: no backend filter runs.
     if filters.iter().any(|f| f.request_redirect.is_some()) {
@@ -94,8 +94,8 @@ pub fn effective_rule_filters(
 /// Whether the backendRefs that can take traffic carry the same filters,
 /// which then apply to the whole rule.
 pub fn backend_refs_share_filters(
-    rule: &HTTPRouteRules,
-    usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
+    rule: &HttpRouteRules,
+    usable: &dyn Fn(&HttpRouteRulesBackendRefs) -> bool,
 ) -> bool {
     let backend_refs = usable_backend_refs(rule, usable);
     let Some(first) = backend_refs.first() else {
@@ -110,14 +110,14 @@ pub fn backend_refs_share_filters(
 /// The header edits of a backendRef's own filters, for the middleware to
 /// make on what it sends that backend. Empty when one is not a header
 /// modifier: such a rule is refused (see [`effective_rule_filters`]).
-pub fn backend_ref_header_edits(backend: &HTTPRouteRulesBackendRefs) -> Vec<HeaderConfig> {
+pub fn backend_ref_header_edits(backend: &HttpRouteRulesBackendRefs) -> Vec<HeaderConfig> {
     header_edits_from_filters(&backend_ref_filters(backend).unwrap_or_default())
 }
 
 fn usable_backend_refs<'a>(
-    rule: &'a HTTPRouteRules,
-    usable: &dyn Fn(&HTTPRouteRulesBackendRefs) -> bool,
-) -> Vec<&'a HTTPRouteRulesBackendRefs> {
+    rule: &'a HttpRouteRules,
+    usable: &dyn Fn(&HttpRouteRulesBackendRefs) -> bool,
+) -> Vec<&'a HttpRouteRulesBackendRefs> {
     rule.backend_refs
         .iter()
         .flatten()
@@ -127,11 +127,11 @@ fn usable_backend_refs<'a>(
 
 /// A backendRef's filters as rule filters, `None` when one is not a header
 /// modifier.
-fn backend_ref_filters(backend: &HTTPRouteRulesBackendRefs) -> Option<Vec<HTTPRouteRulesFilters>> {
+fn backend_ref_filters(backend: &HttpRouteRulesBackendRefs) -> Option<Vec<HttpRouteRulesFilters>> {
     let mut filters = Vec::new();
     for filter in backend.filters.iter().flatten() {
         // Same schema as a rule filter: converted through its JSON form.
-        let converted: HTTPRouteRulesFilters =
+        let converted: HttpRouteRulesFilters =
             serde_json::from_value(serde_json::to_value(filter).ok()?).ok()?;
         let headers_only = converted.request_redirect.is_none()
             && converted.url_rewrite.is_none()
@@ -147,7 +147,7 @@ fn backend_ref_filters(backend: &HTTPRouteRulesBackendRefs) -> Option<Vec<HTTPRo
     Some(filters)
 }
 
-fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
+fn filter_supported(filter: &HttpRouteRulesFilters) -> bool {
     // An entry carrying a still-unsupported variant fails outright.
     if filter.extension_ref.is_some() {
         return false;
@@ -192,8 +192,8 @@ fn filter_supported(filter: &HTTPRouteRulesFilters) -> bool {
 
 /// The backendRefs a rule's `requestMirror` filters copy its requests to.
 pub fn mirror_backend_refs(
-    filters: &[HTTPRouteRulesFilters],
-) -> Vec<&HTTPRouteRulesFiltersRequestMirrorBackendRef> {
+    filters: &[HttpRouteRulesFilters],
+) -> Vec<&HttpRouteRulesFiltersRequestMirrorBackendRef> {
     filters
         .iter()
         .filter_map(|f| f.request_mirror.as_ref())
@@ -245,7 +245,7 @@ fn header_edits_from_modifier(
 /// `requestHeaderModifier` entries map to [`HeaderDirection::Request`],
 /// `responseHeaderModifier` to [`HeaderDirection::Response`]. See
 /// [`header_edits_from_modifier`] for the per-list semantics.
-pub fn header_edits_from_filters(filters: &[HTTPRouteRulesFilters]) -> Vec<HeaderConfig> {
+pub fn header_edits_from_filters(filters: &[HttpRouteRulesFilters]) -> Vec<HeaderConfig> {
     let mut out = Vec::new();
     for filter in filters {
         if let Some(m) = filter.request_header_modifier.as_ref() {
@@ -272,7 +272,7 @@ pub fn header_edits_from_filters(filters: &[HTTPRouteRulesFilters]) -> Vec<Heade
 }
 
 fn push_request_header_edits(
-    m: &HTTPRouteRulesFiltersRequestHeaderModifier,
+    m: &HttpRouteRulesFiltersRequestHeaderModifier,
     out: &mut Vec<HeaderConfig>,
 ) {
     let set: Option<Vec<(String, String)>> = m.set.as_ref().map(|s| {
@@ -295,7 +295,7 @@ fn push_request_header_edits(
 }
 
 fn push_response_header_edits(
-    m: &HTTPRouteRulesFiltersResponseHeaderModifier,
+    m: &HttpRouteRulesFiltersResponseHeaderModifier,
     out: &mut Vec<HeaderConfig>,
 ) {
     let set: Option<Vec<(String, String)>> = m.set.as_ref().map(|s| {
@@ -324,7 +324,7 @@ fn push_response_header_edits(
 /// (the caller then leaves `EntrypointConfig.rewrite` unset). The unsupported
 /// cases (empty rewrite, redirect+rewrite conflict) never reach here —
 /// [`rule_filters_supported`] gates them first.
-pub fn url_rewrite_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<UrlRewrite> {
+pub fn url_rewrite_from_filter(filters: &[HttpRouteRulesFilters]) -> Option<UrlRewrite> {
     filters
         .iter()
         .find_map(|f| f.url_rewrite.as_ref())
@@ -337,7 +337,7 @@ pub fn url_rewrite_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<UrlR
 /// hostname). A path's `ReplaceFullPath` / `ReplacePrefixMatch` carries its
 /// replacement string; an empty path block (a `type` with neither field
 /// populated) is treated as no path rewrite.
-fn url_rewrite_mapping(rw: &HTTPRouteRulesFiltersUrlRewrite) -> Option<UrlRewrite> {
+fn url_rewrite_mapping(rw: &HttpRouteRulesFiltersUrlRewrite) -> Option<UrlRewrite> {
     let path = rw.path.as_ref().and_then(path_rewrite_mapping);
     let hostname = rw.hostname.clone();
     if path.is_none() && hostname.is_none() {
@@ -346,13 +346,13 @@ fn url_rewrite_mapping(rw: &HTTPRouteRulesFiltersUrlRewrite) -> Option<UrlRewrit
     Some(UrlRewrite { path, hostname })
 }
 
-fn path_rewrite_mapping(p: &HTTPRouteRulesFiltersUrlRewritePath) -> Option<PathRewrite> {
+fn path_rewrite_mapping(p: &HttpRouteRulesFiltersUrlRewritePath) -> Option<PathRewrite> {
     match p.r#type {
-        HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => p
+        HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => p
             .replace_full_path
             .clone()
             .map(PathRewrite::ReplaceFullPath),
-        HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => p
+        HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => p
             .replace_prefix_match
             .clone()
             .map(PathRewrite::ReplacePrefixMatch),
@@ -365,7 +365,7 @@ fn path_rewrite_mapping(p: &HTTPRouteRulesFiltersUrlRewritePath) -> Option<PathR
 /// we can map. Returns `None` when the rule has no filters (the caller
 /// routes normally) — and the unsupported case never reaches here
 /// because [`rule_filters_supported`] gates it first.
-pub fn redirect_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<RedirectMapping> {
+pub fn redirect_from_filter(filters: &[HttpRouteRulesFilters]) -> Option<RedirectMapping> {
     filters
         .iter()
         .find_map(|f| f.request_redirect.as_ref())
@@ -378,11 +378,11 @@ pub fn redirect_from_filter(filters: &[HTTPRouteRulesFilters]) -> Option<Redirec
 /// is dropped rather than emitting a misleading `Location`: a status other
 /// than `301`, `302`, `303`, `307` and `308`, or an empty path block.
 fn redirect_from_redirect_filter(
-    rr: &HTTPRouteRulesFiltersRequestRedirect,
+    rr: &HttpRouteRulesFiltersRequestRedirect,
 ) -> Option<RedirectMapping> {
     let scheme = match rr.scheme.as_ref() {
-        Some(HTTPRouteRulesFiltersRequestRedirectScheme::Http) => Some(RedirectScheme::UseHttp),
-        Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https) => Some(RedirectScheme::UseHttps),
+        Some(HttpRouteRulesFiltersRequestRedirectScheme::Http) => Some(RedirectScheme::UseHttp),
+        Some(HttpRouteRulesFiltersRequestRedirectScheme::Https) => Some(RedirectScheme::UseHttps),
         None => None,
     };
 
@@ -430,37 +430,32 @@ fn redirect_from_redirect_filter(
 mod tests {
     use super::*;
     use gateway_api::apis::standard::httproutes::{
-        HTTPRouteRulesFiltersRequestRedirectPath, HTTPRouteRulesFiltersRequestRedirectPathType,
+        HttpRouteRulesFiltersRequestRedirectPath, HttpRouteRulesFiltersRequestRedirectPathType,
     };
     // `HTTPRouteRulesFiltersUrlRewrite*` come in via `super::*`.
 
     fn redirect_filter(
-        scheme: Option<HTTPRouteRulesFiltersRequestRedirectScheme>,
+        scheme: Option<HttpRouteRulesFiltersRequestRedirectScheme>,
         hostname: Option<&str>,
         port: Option<i32>,
         status_code: Option<i64>,
-    ) -> HTTPRouteRulesFilters {
-        HTTPRouteRulesFilters {
-            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+    ) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
                 hostname: hostname.map(String::from),
                 path: None,
                 port,
                 scheme,
                 status_code,
             }),
-            request_header_modifier: None,
-            response_header_modifier: None,
-            request_mirror: None,
-            url_rewrite: None,
-            extension_ref: None,
-            r#type: Default::default(),
+            ..Default::default()
         }
     }
 
     #[test]
     fn scheme_only_redirect_maps_to_permanent_use_https() {
         let f = vec![redirect_filter(
-            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             None,
@@ -477,7 +472,7 @@ mod tests {
     #[test]
     fn hostname_and_port_map_to_rewrite_host_and_port() {
         let f = vec![redirect_filter(
-            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             Some("new.example.com"),
             Some(8443),
             Some(301),
@@ -492,10 +487,10 @@ mod tests {
     fn replace_full_path_maps_to_rewrite_path() {
         let mut f = redirect_filter(None, None, None, None);
         f.request_redirect.as_mut().unwrap().path =
-            Some(HTTPRouteRulesFiltersRequestRedirectPath {
+            Some(HttpRouteRulesFiltersRequestRedirectPath {
                 replace_full_path: Some("/new".into()),
                 replace_prefix_match: None,
-                r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
+                r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath,
             });
         let filters = vec![f];
         assert!(rule_filters_supported(&filters));
@@ -506,16 +501,16 @@ mod tests {
     #[test]
     fn replace_prefix_match_keeps_the_rest_of_the_path() {
         let mut f = redirect_filter(
-            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             None,
         );
         f.request_redirect.as_mut().unwrap().path =
-            Some(HTTPRouteRulesFiltersRequestRedirectPath {
+            Some(HttpRouteRulesFiltersRequestRedirectPath {
                 replace_full_path: None,
                 replace_prefix_match: Some("/new".into()),
-                r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
+                r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
             });
         let filters = vec![f];
         assert!(rule_filters_supported(&filters));
@@ -527,7 +522,7 @@ mod tests {
     #[test]
     fn status_302_is_a_temporary_redirect() {
         let f = vec![redirect_filter(
-            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             Some(302),
@@ -557,8 +552,8 @@ mod tests {
         assert!(!rule_filters_supported(&f));
     }
 
-    fn url_rewrite_filter(rw: HTTPRouteRulesFiltersUrlRewrite) -> HTTPRouteRulesFilters {
-        HTTPRouteRulesFilters {
+    fn url_rewrite_filter(rw: HttpRouteRulesFiltersUrlRewrite) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
             url_rewrite: Some(rw),
             ..Default::default()
         }
@@ -568,18 +563,18 @@ mod tests {
     fn empty_url_rewrite_is_unsupported() {
         // A `urlRewrite` block with neither path nor hostname carries an
         // intent we can't see — refuse rather than route it as a no-op.
-        let f = url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite::default());
+        let f = url_rewrite_filter(HttpRouteRulesFiltersUrlRewrite::default());
         assert!(!rule_filters_supported(&[f]));
     }
 
     #[test]
     fn url_rewrite_replace_full_path_is_supported() {
-        let f = vec![url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+        let f = vec![url_rewrite_filter(HttpRouteRulesFiltersUrlRewrite {
             hostname: None,
-            path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
                 replace_full_path: Some("/new".into()),
                 replace_prefix_match: None,
-                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplaceFullPath,
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath,
             }),
         })];
         assert!(rule_filters_supported(&f));
@@ -590,12 +585,12 @@ mod tests {
 
     #[test]
     fn url_rewrite_replace_prefix_match_is_supported() {
-        let f = vec![url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+        let f = vec![url_rewrite_filter(HttpRouteRulesFiltersUrlRewrite {
             hostname: None,
-            path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
                 replace_full_path: None,
                 replace_prefix_match: Some("/v2".into()),
-                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
             }),
         })];
         assert!(rule_filters_supported(&f));
@@ -605,7 +600,7 @@ mod tests {
 
     #[test]
     fn url_rewrite_hostname_is_supported() {
-        let f = vec![url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+        let f = vec![url_rewrite_filter(HttpRouteRulesFiltersUrlRewrite {
             hostname: Some("internal.svc".into()),
             path: None,
         })];
@@ -619,12 +614,12 @@ mod tests {
     fn redirect_combined_with_url_rewrite_is_unsupported() {
         // Conflicting intents over the same frontend rewrite — refuse.
         let redirect = redirect_filter(
-            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             None,
         );
-        let rewrite = url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+        let rewrite = url_rewrite_filter(HttpRouteRulesFiltersUrlRewrite {
             hostname: Some("internal.svc".into()),
             path: None,
         });
@@ -633,16 +628,16 @@ mod tests {
 
     #[test]
     fn url_rewrite_mixed_with_header_modifier_is_supported() {
-        let mut f = url_rewrite_filter(HTTPRouteRulesFiltersUrlRewrite {
+        let mut f = url_rewrite_filter(HttpRouteRulesFiltersUrlRewrite {
             hostname: None,
-            path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
                 replace_full_path: None,
                 replace_prefix_match: Some("/v2".into()),
-                r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
             }),
         });
-        f.request_header_modifier = Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-            set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+        f.request_header_modifier = Some(HttpRouteRulesFiltersRequestHeaderModifier {
+            set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                 name: "X-Env".into(),
                 value: "prod".into(),
             }]),
@@ -656,12 +651,12 @@ mod tests {
 
     #[test]
     fn a_request_mirror_is_supported_alone_in_its_entry() {
-        let mirror = HTTPRouteRulesFilters {
+        let mirror = HttpRouteRulesFilters {
             request_mirror: Some(Default::default()),
             ..Default::default()
         };
-        let headers = HTTPRouteRulesFilters {
-            request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
+        let headers = HttpRouteRulesFilters {
+            request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
                 remove: Some(vec!["X-A".into()]),
                 ..Default::default()
             }),
@@ -672,20 +667,20 @@ mod tests {
     }
 
     use gateway_api::apis::standard::httproutes::{
-        HTTPRouteRulesFiltersRequestHeaderModifier, HTTPRouteRulesFiltersRequestHeaderModifierAdd,
-        HTTPRouteRulesFiltersRequestHeaderModifierSet, HTTPRouteRulesFiltersResponseHeaderModifier,
-        HTTPRouteRulesFiltersResponseHeaderModifierSet,
+        HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestHeaderModifierAdd,
+        HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersResponseHeaderModifier,
+        HttpRouteRulesFiltersResponseHeaderModifierSet,
     };
 
-    fn req_header_filter(m: HTTPRouteRulesFiltersRequestHeaderModifier) -> HTTPRouteRulesFilters {
-        HTTPRouteRulesFilters {
+    fn req_header_filter(m: HttpRouteRulesFiltersRequestHeaderModifier) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
             request_header_modifier: Some(m),
             ..Default::default()
         }
     }
 
-    fn resp_header_filter(m: HTTPRouteRulesFiltersResponseHeaderModifier) -> HTTPRouteRulesFilters {
-        HTTPRouteRulesFilters {
+    fn resp_header_filter(m: HttpRouteRulesFiltersResponseHeaderModifier) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
             response_header_modifier: Some(m),
             ..Default::default()
         }
@@ -694,8 +689,8 @@ mod tests {
     #[test]
     fn request_header_modifier_set_maps_to_request_direction_with_value() {
         let f = vec![req_header_filter(
-            HTTPRouteRulesFiltersRequestHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+            HttpRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                     name: "X-Env".into(),
                     value: "prod".into(),
                 }]),
@@ -713,7 +708,7 @@ mod tests {
     #[test]
     fn request_header_modifier_remove_maps_to_empty_value() {
         let f = vec![req_header_filter(
-            HTTPRouteRulesFiltersRequestHeaderModifier {
+            HttpRouteRulesFiltersRequestHeaderModifier {
                 remove: Some(vec!["X-Secret".into()]),
                 ..Default::default()
             },
@@ -729,8 +724,8 @@ mod tests {
     #[test]
     fn request_header_modifier_add_appends() {
         let f = vec![req_header_filter(
-            HTTPRouteRulesFiltersRequestHeaderModifier {
-                add: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierAdd {
+            HttpRouteRulesFiltersRequestHeaderModifier {
+                add: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierAdd {
                     name: "X-Trace".into(),
                     value: "on".into(),
                 }]),
@@ -751,15 +746,15 @@ mod tests {
     #[test]
     fn backend_ref_header_filters_apply_to_the_rule() {
         use gateway_api::apis::standard::httproutes::{
-            HTTPRouteRulesBackendRefs, HTTPRouteRulesBackendRefsFilters,
-            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
-            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
-            HTTPRouteRulesBackendRefsFiltersRequestMirror,
+            HttpRouteRulesBackendRefs, HttpRouteRulesBackendRefsFilters,
+            HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+            HttpRouteRulesBackendRefsFiltersRequestMirror,
         };
-        let set = |value: &str| HTTPRouteRulesBackendRefsFilters {
-            request_header_modifier: Some(HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+        let set = |value: &str| HttpRouteRulesBackendRefsFilters {
+            request_header_modifier: Some(HttpRouteRulesBackendRefsFiltersRequestHeaderModifier {
                 set: Some(vec![
-                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                    HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
                         name: "X-Header-Set".into(),
                         value: value.into(),
                     },
@@ -768,13 +763,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let backend = |filters: Vec<HTTPRouteRulesBackendRefsFilters>| HTTPRouteRulesBackendRefs {
+        let backend = |filters: Vec<HttpRouteRulesBackendRefsFilters>| HttpRouteRulesBackendRefs {
             name: "svc".into(),
             port: Some(80),
             filters: Some(filters),
             ..Default::default()
         };
-        let rule = |refs: Vec<HTTPRouteRulesBackendRefs>| HTTPRouteRules {
+        let rule = |refs: Vec<HttpRouteRulesBackendRefs>| HttpRouteRules {
             backend_refs: Some(refs),
             ..Default::default()
         };
@@ -799,8 +794,8 @@ mod tests {
         // Checked as the rule's would be: an empty value is refused.
         let empty = rule(vec![backend(vec![set("a")]), backend(vec![set("")])]);
         assert!(effective_rule_filters(&empty, &|_| true).is_none());
-        let mirror = HTTPRouteRulesBackendRefsFilters {
-            request_mirror: Some(HTTPRouteRulesBackendRefsFiltersRequestMirror::default()),
+        let mirror = HttpRouteRulesBackendRefsFilters {
+            request_mirror: Some(HttpRouteRulesBackendRefsFiltersRequestMirror::default()),
             ..Default::default()
         };
         assert!(effective_rule_filters(&rule(vec![backend(vec![mirror])]), &|_| true).is_none());
@@ -819,8 +814,8 @@ mod tests {
     #[test]
     fn a_later_set_replaces_an_earlier_one() {
         let set = |value: &str| {
-            req_header_filter(HTTPRouteRulesFiltersRequestHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+            req_header_filter(HttpRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                     name: "X-Env".into(),
                     value: value.into(),
                 }]),
@@ -835,8 +830,8 @@ mod tests {
     #[test]
     fn an_empty_header_value_to_set_or_add_is_unsupported() {
         let f = vec![req_header_filter(
-            HTTPRouteRulesFiltersRequestHeaderModifier {
-                add: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierAdd {
+            HttpRouteRulesFiltersRequestHeaderModifier {
+                add: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierAdd {
                     name: "X-Trace".into(),
                     value: String::new(),
                 }]),
@@ -849,8 +844,8 @@ mod tests {
     #[test]
     fn response_header_modifier_set_maps_to_response_direction() {
         let f = vec![resp_header_filter(
-            HTTPRouteRulesFiltersResponseHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersResponseHeaderModifierSet {
+            HttpRouteRulesFiltersResponseHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierSet {
                     name: "X-Powered-By".into(),
                     value: "sozune".into(),
                 }]),
@@ -869,13 +864,13 @@ mod tests {
         // A rule may carry both a mappable requestRedirect and a header
         // modifier — both are honoured, neither drops the route.
         let mut f = redirect_filter(
-            Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             None,
             None,
             None,
         );
-        f.request_header_modifier = Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-            set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+        f.request_header_modifier = Some(HttpRouteRulesFiltersRequestHeaderModifier {
+            set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                 name: "X-Env".into(),
                 value: "prod".into(),
             }]),
@@ -891,7 +886,7 @@ mod tests {
 
     #[test]
     fn header_modifier_mixed_with_mirror_is_unsupported() {
-        let f = HTTPRouteRulesFilters {
+        let f = HttpRouteRulesFilters {
             request_header_modifier: Some(Default::default()),
             request_mirror: Some(Default::default()),
             ..Default::default()
@@ -902,14 +897,14 @@ mod tests {
     #[test]
     fn combined_request_and_response_modifiers_keep_both_directions() {
         let f = vec![
-            req_header_filter(HTTPRouteRulesFiltersRequestHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+            req_header_filter(HttpRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                     name: "X-Req".into(),
                     value: "1".into(),
                 }]),
                 ..Default::default()
             }),
-            resp_header_filter(HTTPRouteRulesFiltersResponseHeaderModifier {
+            resp_header_filter(HttpRouteRulesFiltersResponseHeaderModifier {
                 remove: Some(vec!["Server".into()]),
                 ..Default::default()
             }),

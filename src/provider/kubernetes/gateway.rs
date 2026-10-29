@@ -27,6 +27,7 @@
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gatewayclass/>
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gateway/>
 
+use super::gateway_compat::ReferenceGrant;
 use super::gateway_filters;
 use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
@@ -34,30 +35,29 @@ use crate::model::{
     Backend, Entrypoint, EntrypointConfig, HeaderConfig, LoadBalancer, Mirror, PathConfig,
     PathRewrite, PathRuleType, Protocol, UrlRewrite,
 };
+use crate::provider::kubernetes::gateway_compat::{
+    TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteStatusParents,
+    TcpRouteStatusParentsParentRef,
+};
+use crate::provider::kubernetes::gateway_compat::{
+    TlsRoute, TlsRouteParentRefs, TlsRouteRules, TlsRouteStatusParents,
+    TlsRouteStatusParentsParentRef,
+};
+use crate::provider::kubernetes::gateway_compat::{
+    UdpRoute, UdpRouteParentRefs, UdpRouteRules, UdpRouteStatusParents,
+    UdpRouteStatusParentsParentRef,
+};
 use futures_util::StreamExt;
-use gateway_api::apis::experimental::tcproutes::{
-    TCPRoute, TCPRouteParentRefs, TCPRouteRules, TCPRouteStatusParents,
-    TCPRouteStatusParentsParentRef,
-};
-use gateway_api::apis::experimental::tlsroutes::{
-    TLSRoute, TLSRouteParentRefs, TLSRouteRules, TLSRouteStatusParents,
-    TLSRouteStatusParentsParentRef,
-};
-use gateway_api::apis::experimental::udproutes::{
-    UDPRoute, UDPRouteParentRefs, UDPRouteRules, UDPRouteStatusParents,
-    UDPRouteStatusParentsParentRef,
-};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
 };
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HTTPRouteParentRefs, HTTPRouteRules, HTTPRouteRulesBackendRefs,
-    HTTPRouteRulesFilters, HTTPRouteRulesMatches, HTTPRouteRulesMatchesPathType, HTTPRouteStatus,
-    HTTPRouteStatusParents, HTTPRouteStatusParentsParentRef,
+    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
+    HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteRulesMatchesPathType, HttpRouteStatus,
+    HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
-use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{Patch, PatchParams};
 use kube::runtime::watcher::{self, Event};
@@ -88,7 +88,7 @@ const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 struct TrackedRoute {
     /// Last seen HTTPRoute payload, kept verbatim so re-resolution is just
     /// `route_to_entrypoints(stored, resolver)`.
-    route: HTTPRoute,
+    route: HttpRoute,
     /// Entrypoint ids the previous apply produced.
     entrypoint_ids: Vec<String>,
 }
@@ -315,10 +315,10 @@ macro_rules! impl_parent_ref {
     };
 }
 
-impl_parent_ref!(HTTPRouteParentRefs);
-impl_parent_ref!(TLSRouteParentRefs);
-impl_parent_ref!(TCPRouteParentRefs);
-impl_parent_ref!(UDPRouteParentRefs);
+impl_parent_ref!(HttpRouteParentRefs);
+impl_parent_ref!(TlsRouteParentRefs);
+impl_parent_ref!(TcpRouteParentRefs);
+impl_parent_ref!(UdpRouteParentRefs);
 
 #[derive(Default, Debug)]
 pub struct ScopeState {
@@ -1091,7 +1091,7 @@ impl GatewayScope {
     fn accepts_tls_parent_ref(
         &self,
         route_namespace: &str,
-        parent_ref: &TLSRouteParentRefs,
+        parent_ref: &TlsRouteParentRefs,
     ) -> bool {
         self.accepts_parent_ref_where(
             route_namespace,
@@ -1103,7 +1103,7 @@ impl GatewayScope {
 
     /// True iff at least one `parentRef` binds this TLSRoute to a listener we
     /// can serve.
-    pub fn accepts_tls_route(&self, route: &TLSRoute) -> bool {
+    pub fn accepts_tls_route(&self, route: &TlsRoute) -> bool {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let Some(refs) = route.spec.parent_refs.as_ref() else {
             return false;
@@ -1123,7 +1123,7 @@ impl GatewayScope {
     fn accepts_tcp_parent_ref(
         &self,
         route_namespace: &str,
-        parent_ref: &TCPRouteParentRefs,
+        parent_ref: &TcpRouteParentRefs,
     ) -> bool {
         self.accepts_parent_ref_where(
             route_namespace,
@@ -1135,7 +1135,7 @@ impl GatewayScope {
 
     /// True iff at least one `parentRef` binds this TCPRoute to a listener we
     /// can serve.
-    pub fn accepts_tcp_route(&self, route: &TCPRoute) -> bool {
+    pub fn accepts_tcp_route(&self, route: &TcpRoute) -> bool {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let Some(refs) = route.spec.parent_refs.as_ref() else {
             return false;
@@ -1149,7 +1149,7 @@ impl GatewayScope {
     /// so this yields just the set of ports, resolved to `proxy.tcp` listeners
     /// by the caller. A route may bind several listeners on different ports;
     /// each gets its own entrypoint.
-    fn effective_tcp_ports(&self, route: &TCPRoute) -> std::collections::BTreeSet<i32> {
+    fn effective_tcp_ports(&self, route: &TcpRoute) -> std::collections::BTreeSet<i32> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let mut ports = std::collections::BTreeSet::new();
         let Some(refs) = route.spec.parent_refs.as_ref() else {
@@ -1185,7 +1185,7 @@ impl GatewayScope {
     fn accepts_udp_parent_ref(
         &self,
         route_namespace: &str,
-        parent_ref: &UDPRouteParentRefs,
+        parent_ref: &UdpRouteParentRefs,
     ) -> bool {
         self.accepts_parent_ref_where(
             route_namespace,
@@ -1197,7 +1197,7 @@ impl GatewayScope {
 
     /// True iff at least one `parentRef` binds this UDPRoute to a listener we
     /// can serve.
-    pub fn accepts_udp_route(&self, route: &UDPRoute) -> bool {
+    pub fn accepts_udp_route(&self, route: &UdpRoute) -> bool {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let Some(refs) = route.spec.parent_refs.as_ref() else {
             return false;
@@ -1209,7 +1209,7 @@ impl GatewayScope {
     /// The Gateway listener ports this UDPRoute binds to, resolved to
     /// `proxy.udp` listeners by the caller. Like TCPRoute, no hostnames — a
     /// datagram listener forwards the whole port.
-    fn effective_udp_ports(&self, route: &UDPRoute) -> std::collections::BTreeSet<i32> {
+    fn effective_udp_ports(&self, route: &UdpRoute) -> std::collections::BTreeSet<i32> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let mut ports = std::collections::BTreeSet::new();
         let Some(refs) = route.spec.parent_refs.as_ref() else {
@@ -1247,7 +1247,7 @@ impl GatewayScope {
     /// hostnames of its own inherits the listener's; if neither names anything,
     /// there is no SNI to match on and the route is refused rather than
     /// silently serving nothing.
-    fn effective_tls_hostnames_by_port(&self, route: &TLSRoute) -> BTreeMap<i32, Vec<String>> {
+    fn effective_tls_hostnames_by_port(&self, route: &TlsRoute) -> BTreeMap<i32, Vec<String>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let mut by_port: BTreeMap<i32, Vec<String>> = BTreeMap::new();
         for p in route
@@ -1273,8 +1273,8 @@ impl GatewayScope {
     /// `parentRef` selects.
     fn tls_parent_hostnames_by_port(
         &self,
-        route: &TLSRoute,
-        p: &TLSRouteParentRefs,
+        route: &TlsRoute,
+        p: &TlsRouteParentRefs,
     ) -> BTreeMap<i32, Vec<String>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
@@ -1361,7 +1361,7 @@ impl GatewayScope {
     /// when no bound listener constrains hostnames.
     fn effective_hostnames_for_route(
         &self,
-        route: &HTTPRoute,
+        route: &HttpRoute,
         listener_ok: &dyn Fn(&ListenerInfo) -> bool,
     ) -> Option<Vec<String>> {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
@@ -1413,7 +1413,7 @@ impl GatewayScope {
     /// route is not attached to, whose hostname one the route binds there
     /// covers. A request for such a host belongs to that listener alone.
     /// Likewise between the `HTTPS` listeners on a port of their own.
-    fn isolated_hostnames(&self, route: &HTTPRoute) -> Vec<IsolatedHost> {
+    fn isolated_hostnames(&self, route: &HttpRoute) -> Vec<IsolatedHost> {
         let mut isolated = self.isolated_hostnames_of(route, false);
         isolated.extend(self.isolated_hostnames_of(route, true));
         isolated
@@ -1421,12 +1421,12 @@ impl GatewayScope {
 
     /// [`Self::isolated_hostnames`] between the plain HTTP listeners, or the
     /// `HTTPS` ones on a port of their own when `secure`.
-    fn isolated_hostnames_of(&self, route: &HTTPRoute, secure: bool) -> Vec<IsolatedHost> {
+    fn isolated_hostnames_of(&self, route: &HttpRoute, secure: bool) -> Vec<IsolatedHost> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let Some(refs) = route.spec.parent_refs.as_ref() else {
             return Vec::new();
         };
-        let accepted: Vec<&HTTPRouteParentRefs> = refs
+        let accepted: Vec<&HttpRouteParentRefs> = refs
             .iter()
             .filter(|p| self.accepts_parent_ref(route_ns, *p))
             .collect();
@@ -1570,7 +1570,7 @@ impl GatewayScope {
     }
 
     /// The own ports of the plain HTTP listeners the route binds.
-    fn own_http_ports(&self, route: &HTTPRoute) -> BTreeSet<u16> {
+    fn own_http_ports(&self, route: &HttpRoute) -> BTreeSet<u16> {
         self.bound_listeners(route, &Self::listener_is_plain_http)
             .into_iter()
             .flatten()
@@ -1579,7 +1579,7 @@ impl GatewayScope {
     }
 
     /// The own ports of the `HTTPS` listeners the route binds.
-    fn own_https_ports(&self, route: &HTTPRoute) -> BTreeSet<u16> {
+    fn own_https_ports(&self, route: &HttpRoute) -> BTreeSet<u16> {
         self.bound_listeners(route, &Self::listener_serves_https)
             .into_iter()
             .flatten()
@@ -1591,7 +1591,7 @@ impl GatewayScope {
     /// over HTTPS on the main HTTPS port: the port of the `HTTPS` listeners
     /// served there it binds, when they all share one other than 443. `None`
     /// keeps the default port.
-    fn https_redirect_port(&self, route: &HTTPRoute) -> Option<u16> {
+    fn https_redirect_port(&self, route: &HttpRoute) -> Option<u16> {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
         let ports: HashSet<i32> = self
             .bound_listeners(route, &|l| {
@@ -1610,7 +1610,7 @@ impl GatewayScope {
 
     /// Whether a listener the route binds admits one of its hostnames, an
     /// `HTTPS` listener counting whether it has a certificate or not.
-    fn listener_hostname_matches(&self, route: &HTTPRoute) -> bool {
+    fn listener_hostname_matches(&self, route: &HttpRoute) -> bool {
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
         self.bound_listeners_where(route, &Self::listener_serves_http, false)
             .iter()
@@ -1621,7 +1621,7 @@ impl GatewayScope {
     /// `listener_ok` takes, one list per parentRef that binds any.
     fn bound_listeners(
         &self,
-        route: &HTTPRoute,
+        route: &HttpRoute,
         listener_ok: &dyn Fn(&ListenerInfo) -> bool,
     ) -> Vec<Vec<ListenerInfo>> {
         self.bound_listeners_where(route, listener_ok, true)
@@ -1631,7 +1631,7 @@ impl GatewayScope {
     /// certificate left out only when `need_certificate`.
     fn bound_listeners_where(
         &self,
-        route: &HTTPRoute,
+        route: &HttpRoute,
         listener_ok: &dyn Fn(&ListenerInfo) -> bool,
         need_certificate: bool,
     ) -> Vec<Vec<ListenerInfo>> {
@@ -1666,7 +1666,7 @@ impl GatewayScope {
     /// True iff at least one of the route's `parentRefs` points to an
     /// accepted Gateway. A route with no parentRefs at all is rejected —
     /// Gateway API requires every Route to declare its parent(s).
-    pub fn accepts_route(&self, route: &HTTPRoute) -> bool {
+    pub fn accepts_route(&self, route: &HttpRoute) -> bool {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let Some(refs) = route.spec.parent_refs.as_ref() else {
             return false;
@@ -2552,7 +2552,7 @@ pub async fn run_httproute_watcher(
     // than holding everything in memory. Lost status writes are
     // observability-only; routing keeps working.
     let (status_tx, status_rx) =
-        mpsc::channel::<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>(256);
+        mpsc::channel::<(HttpRoute, RouteOutcome, Option<InvalidRef>)>(256);
     {
         let client = client.clone();
         let scope = scope.clone();
@@ -2561,7 +2561,7 @@ pub async fn run_httproute_watcher(
         });
     }
 
-    let api: Api<HTTPRoute> = Api::all(client);
+    let api: Api<HttpRoute> = Api::all(client);
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
     // Drives a re-resolve of every tracked route on a fixed cadence so
@@ -2936,7 +2936,7 @@ pub async fn run_gateway_watcher(
 /// genuine apiserver issues that deserve operator attention.
 async fn run_status_writer(
     client: Client,
-    mut rx: mpsc::Receiver<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>,
+    mut rx: mpsc::Receiver<(HttpRoute, RouteOutcome, Option<InvalidRef>)>,
     scope: GatewayScope,
 ) {
     info!("Gateway API: HTTPRoute status writer started");
@@ -2950,8 +2950,8 @@ async fn run_status_writer(
         if !changed {
             continue;
         }
-        let api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
-        let parents = |r: &HTTPRoute| {
+        let api: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
+        let parents = |r: &HttpRoute| {
             r.status
                 .as_ref()
                 .map(|s| s.parents.clone())
@@ -3093,10 +3093,10 @@ macro_rules! l4_parent_status {
     };
 }
 
-impl L4Route for TLSRoute {
+impl L4Route for TlsRoute {
     const KIND: &'static str = "TLSRoute";
     const PROTOCOL: &'static str = "TCP";
-    type Parent = TLSRouteStatusParents;
+    type Parent = TlsRouteStatusParents;
 
     fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>> {
         l4_backend_refs!(self)
@@ -3140,8 +3140,8 @@ impl L4Route for TLSRoute {
         .into_iter()
         .map(|(p, conditions)| {
             l4_parent_status!(
-                TLSRouteStatusParents,
-                TLSRouteStatusParentsParentRef,
+                TlsRouteStatusParents,
+                TlsRouteStatusParentsParentRef,
                 p,
                 conditions
             )
@@ -3150,10 +3150,10 @@ impl L4Route for TLSRoute {
     }
 }
 
-impl L4Route for TCPRoute {
+impl L4Route for TcpRoute {
     const KIND: &'static str = "TCPRoute";
     const PROTOCOL: &'static str = "TCP";
-    type Parent = TCPRouteStatusParents;
+    type Parent = TcpRouteStatusParents;
 
     fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>> {
         l4_backend_refs!(self)
@@ -3187,8 +3187,8 @@ impl L4Route for TCPRoute {
         .into_iter()
         .map(|(p, conditions)| {
             l4_parent_status!(
-                TCPRouteStatusParents,
-                TCPRouteStatusParentsParentRef,
+                TcpRouteStatusParents,
+                TcpRouteStatusParentsParentRef,
                 p,
                 conditions
             )
@@ -3197,10 +3197,10 @@ impl L4Route for TCPRoute {
     }
 }
 
-impl L4Route for UDPRoute {
+impl L4Route for UdpRoute {
     const KIND: &'static str = "UDPRoute";
     const PROTOCOL: &'static str = "UDP";
-    type Parent = UDPRouteStatusParents;
+    type Parent = UdpRouteStatusParents;
 
     fn backend_refs(&self) -> Vec<Vec<L4BackendRef<'_>>> {
         l4_backend_refs!(self)
@@ -3234,8 +3234,8 @@ impl L4Route for UDPRoute {
         .into_iter()
         .map(|(p, conditions)| {
             l4_parent_status!(
-                UDPRouteStatusParents,
-                UDPRouteStatusParentsParentRef,
+                UdpRouteStatusParents,
+                UdpRouteStatusParentsParentRef,
                 p,
                 conditions
             )
@@ -3346,7 +3346,7 @@ fn l4_outcome<R: L4Route>(
 /// condition to the spec revision it reflects, so a stale status is
 /// visible in `kubectl get`.
 fn build_gateway_conditions(gateway: &Gateway, accepted: bool) -> Vec<Condition> {
-    let now = Time(k8s_openapi::chrono::Utc::now());
+    let now = Time(k8s_openapi::jiff::Timestamp::now());
     let generation = gateway.metadata.generation;
     let (status, accepted_msg, programmed_msg) = if accepted {
         (
@@ -3475,7 +3475,7 @@ fn build_listener_status(
         _ => (None, None),
     };
 
-    let now = Time(k8s_openapi::chrono::Utc::now());
+    let now = Time(k8s_openapi::jiff::Timestamp::now());
     let generation = gateway.metadata.generation;
     let condition = |type_: &str, ok: bool, reason: &str, message: String| Condition {
         type_: type_.to_string(),
@@ -3631,13 +3631,14 @@ fn build_listener_status(
         attached_routes: i32::try_from(attached_routes).unwrap_or(i32::MAX),
         conditions,
         name: listener.name.clone(),
-        supported_kinds: kind
-            .map(|kind| GatewayStatusListenersSupportedKinds {
+        supported_kinds: Some(
+            kind.map(|kind| GatewayStatusListenersSupportedKinds {
                 group: Some(GATEWAY_API_GROUP.to_string()),
                 kind: kind.to_string(),
             })
             .into_iter()
             .collect(),
+        ),
     }
 }
 
@@ -3662,13 +3663,14 @@ fn merge_listener_statuses(
                     let (conditions, conditions_changed) =
                         merge_conditions(Some(&prev.conditions), ours.conditions.clone());
                     ours.conditions = conditions;
+                    let prev_kinds = prev.supported_kinds.as_deref().unwrap_or_default();
+                    let our_kinds = ours.supported_kinds.as_deref().unwrap_or_default();
                     changed |= conditions_changed
                         || prev.attached_routes != ours.attached_routes
-                        || prev.supported_kinds.len() != ours.supported_kinds.len()
-                        || prev
-                            .supported_kinds
+                        || prev_kinds.len() != our_kinds.len()
+                        || prev_kinds
                             .iter()
-                            .zip(&ours.supported_kinds)
+                            .zip(our_kinds)
                             .any(|(a, b)| a.kind != b.kind || a.group != b.group);
                 }
                 None => changed = true,
@@ -3688,7 +3690,7 @@ fn build_gatewayclass_conditions(class: &GatewayClass) -> Vec<Condition> {
         status: "True".to_string(),
         reason: REASON_ACCEPTED.to_string(),
         message: "GatewayClass accepted by sōzune".to_string(),
-        last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
         observed_generation: class.metadata.generation,
     }]
 }
@@ -3893,12 +3895,12 @@ async fn patch_gatewayclass_status(client: &Client, scope: &GatewayScope, class:
 /// it, even when this apply produced zero entrypoints (Service had no
 /// ready endpoints yet, or the route's parent isn't sōzune-owned).
 fn apply_route(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &RouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
-    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>>,
+    status_tx: Option<&mpsc::Sender<(HttpRoute, RouteOutcome, Option<InvalidRef>)>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -4180,7 +4182,7 @@ fn drop_routes_not_relisted<T>(
 }
 
 fn delete_route(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &RouteIndex,
 ) -> bool {
@@ -4227,9 +4229,9 @@ fn re_resolve_all(
     index: &RouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
-    status_tx: Option<&mpsc::Sender<(HTTPRoute, RouteOutcome, Option<InvalidRef>)>>,
+    status_tx: Option<&mpsc::Sender<(HttpRoute, RouteOutcome, Option<InvalidRef>)>>,
 ) -> bool {
-    let routes: Vec<HTTPRoute> = match index.read() {
+    let routes: Vec<HttpRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
         Err(e) => {
             error!("Gateway API: index lock poisoned: {}", e);
@@ -4256,7 +4258,7 @@ fn re_resolve_all(
 /// sozune). Without retry we'd permanently disable the watcher on a
 /// transient race and require a sozune restart.
 pub async fn httproute_crd_installed(client: &Client) -> bool {
-    let api: Api<HTTPRoute> = Api::all(client.clone());
+    let api: Api<HttpRoute> = Api::all(client.clone());
     for attempt in 1..=5 {
         match api.list(&Default::default()).await {
             Ok(_) => return true,
@@ -4478,7 +4480,7 @@ impl ServiceResolver for crate::provider::kubernetes::KubernetesProvider {
 /// is used by the unit tests.
 #[cfg(test)]
 pub fn route_to_entrypoints(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Vec<Entrypoint> {
@@ -4494,7 +4496,7 @@ pub fn route_to_entrypoints(
 /// entrypoints, told apart by a suffix on their ids. `https_port` is where a
 /// redirect to HTTPS points, `None` for the default port.
 pub fn route_entrypoints_by_scheme(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
     plain: Option<Vec<String>>,
@@ -4617,7 +4619,7 @@ pub fn route_entrypoints_by_scheme(
 /// a port of their own: served on that port's listener, plain HTTP only. With
 /// `secure`, on the `HTTPS` listeners it binds there, HTTPS only.
 fn own_port_entrypoints(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
     port: u16,
@@ -4880,7 +4882,7 @@ fn specificity_groups(hostnames: Vec<String>) -> Vec<Vec<String>> {
 /// - matches that aren't `Path` (header/query/method-only matches)
 /// - a `RegularExpression` path match (the route is rejected upstream)
 pub fn route_to_entrypoints_with_hostnames(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
     hostnames: &[String],
@@ -4914,12 +4916,12 @@ pub fn route_to_entrypoints_with_hostnames(
 /// this as an early reject so the user sees a clear log line and a
 /// `ResolvedRefs=False` status condition rather than wrong behaviour.
 pub fn route_has_unsupported_filters(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> bool {
     let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
-    let usable = |b: &HTTPRouteRulesBackendRefs| backend_ref_usable(namespace, b, resolver, grants);
+    let usable = |b: &HttpRouteRulesBackendRefs| backend_ref_usable(namespace, b, resolver, grants);
     route
         .spec
         .rules
@@ -4941,8 +4943,8 @@ pub fn route_has_unsupported_filters(
 /// `requestRedirect` or `urlRewrite`) on a match that is not a path prefix:
 /// Gateway API allows it with a `PathPrefix` match only.
 fn replaces_prefix_off_a_prefix_match(
-    rule: &HTTPRouteRules,
-    filters: &[gateway_api::apis::standard::httproutes::HTTPRouteRulesFilters],
+    rule: &HttpRouteRules,
+    filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
 ) -> bool {
     let replaces_prefix = filters.iter().any(|f| {
         f.request_redirect
@@ -4959,7 +4961,7 @@ fn replaces_prefix_off_a_prefix_match(
             m.path
                 .as_ref()
                 .and_then(|p| p.r#type.as_ref())
-                .is_some_and(|t| *t != HTTPRouteRulesMatchesPathType::PathPrefix)
+                .is_some_and(|t| *t != HttpRouteRulesMatchesPathType::PathPrefix)
         })
 }
 
@@ -4977,7 +4979,7 @@ fn redirect_skips_conditions(ep: &Entrypoint) -> bool {
 /// rejected (logged, and reflected as `ResolvedRefs=False
 /// reason=UnsupportedValue`) rather than served with the condition dropped,
 /// which would route more traffic than the author asked for.
-pub fn route_has_unsupported_matches(route: &HTTPRoute) -> bool {
+pub fn route_has_unsupported_matches(route: &HttpRoute) -> bool {
     route
         .spec
         .rules
@@ -5035,7 +5037,7 @@ impl InvalidRef {
 /// Why `backend` cannot be used by a route of `namespace`, if it cannot.
 fn check_backend_ref(
     namespace: &str,
-    backend: &HTTPRouteRulesBackendRefs,
+    backend: &HttpRouteRulesBackendRefs,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Result<(), InvalidRef> {
@@ -5135,7 +5137,7 @@ fn l4_route_invalid_ref<R: L4Route>(
 /// Whether `backend` can take traffic: weighted, usable, with a ready pod.
 fn backend_ref_usable(
     namespace: &str,
-    backend: &HTTPRouteRulesBackendRefs,
+    backend: &HttpRouteRulesBackendRefs,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> bool {
@@ -5159,7 +5161,7 @@ fn rule_mirrors(
     namespace: &str,
     route_name: &str,
     rule_index: usize,
-    filters: &[HTTPRouteRulesFilters],
+    filters: &[HttpRouteRulesFilters],
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Vec<Mirror> {
@@ -5200,7 +5202,7 @@ fn rule_mirrors(
 
 /// The first backendRef of `route` that cannot be used, if any.
 fn route_invalid_ref(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Option<InvalidRef> {
@@ -5272,11 +5274,11 @@ pub enum RouteOutcome {
 /// accepts the route or not: `False` for unsupported filters, a backendRef
 /// that cannot be used (`invalid_ref`), or no ready endpoint.
 fn build_route_status(
-    route: &HTTPRoute,
+    route: &HttpRoute,
     scope: &GatewayScope,
     outcome: RouteOutcome,
     invalid_ref: Option<InvalidRef>,
-) -> Vec<HTTPRouteStatusParents> {
+) -> Vec<HttpRouteStatusParents> {
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     parent_conditions(
         scope,
@@ -5290,9 +5292,9 @@ fn build_route_status(
         invalid_ref,
     )
     .into_iter()
-    .map(|(p, conditions)| HTTPRouteStatusParents {
+    .map(|(p, conditions)| HttpRouteStatusParents {
         controller_name: SOZUNE_CONTROLLER_NAME.to_string(),
-        parent_ref: HTTPRouteStatusParentsParentRef {
+        parent_ref: HttpRouteStatusParentsParentRef {
             group: p.group.clone(),
             kind: p.kind.clone(),
             name: p.name.clone(),
@@ -5300,7 +5302,7 @@ fn build_route_status(
             port: p.port,
             section_name: p.section_name.clone(),
         },
-        conditions: Some(conditions),
+        conditions,
     })
     .collect()
 }
@@ -5322,7 +5324,7 @@ fn parent_conditions<'a, P: ParentRef>(
     outcome: &dyn Fn(&P) -> RouteOutcome,
     invalid_ref: Option<InvalidRef>,
 ) -> Vec<(&'a P, Vec<Condition>)> {
-    let now = Time(k8s_openapi::chrono::Utc::now());
+    let now = Time(k8s_openapi::jiff::Timestamp::now());
     let condition = |type_: &str, status: &str, reason: &str, message: String| Condition {
         type_: type_.to_string(),
         status: status.to_string(),
@@ -5440,9 +5442,9 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
 /// indicating whether anything changed compared to what was on the
 /// object — callers use that to skip no-op writes.
 fn merge_route_status(
-    existing: Option<&HTTPRouteStatus>,
-    ours: Vec<HTTPRouteStatusParents>,
-) -> (Vec<HTTPRouteStatusParents>, bool) {
+    existing: Option<&HttpRouteStatus>,
+    ours: Vec<HttpRouteStatusParents>,
+) -> (Vec<HttpRouteStatusParents>, bool) {
     merge_parent_status(
         existing.map(|s| s.parents.as_slice()).unwrap_or_default(),
         ours,
@@ -5456,6 +5458,24 @@ trait ParentStatus: Clone {
     fn equivalent(&self, other: &Self) -> bool;
 }
 
+/// The `conditions` of a status entry, which HTTPRoutes require and the
+/// `v1alpha2` routes leave optional.
+trait EntryConditions {
+    fn entry_conditions(&self) -> Option<&[Condition]>;
+}
+
+impl EntryConditions for Vec<Condition> {
+    fn entry_conditions(&self) -> Option<&[Condition]> {
+        Some(self)
+    }
+}
+
+impl EntryConditions for Option<Vec<Condition>> {
+    fn entry_conditions(&self) -> Option<&[Condition]> {
+        self.as_deref()
+    }
+}
+
 macro_rules! impl_parent_status {
     ($t:ty) => {
         impl ParentStatus for $t {
@@ -5465,18 +5485,18 @@ macro_rules! impl_parent_status {
             fn equivalent(&self, other: &Self) -> bool {
                 self.parent_ref == other.parent_ref
                     && conditions_equivalent(
-                        self.conditions.as_deref(),
-                        other.conditions.as_deref(),
+                        self.conditions.entry_conditions(),
+                        other.conditions.entry_conditions(),
                     )
             }
         }
     };
 }
 
-impl_parent_status!(HTTPRouteStatusParents);
-impl_parent_status!(TLSRouteStatusParents);
-impl_parent_status!(TCPRouteStatusParents);
-impl_parent_status!(UDPRouteStatusParents);
+impl_parent_status!(HttpRouteStatusParents);
+impl_parent_status!(TlsRouteStatusParents);
+impl_parent_status!(TcpRouteStatusParents);
+impl_parent_status!(UdpRouteStatusParents);
 
 /// [`merge_route_status`] for a route of any kind.
 fn merge_parent_status<T: ParentStatus>(existing: &[T], ours: Vec<T>) -> (Vec<T>, bool) {
@@ -5529,7 +5549,7 @@ fn rule_to_entrypoints(
     route_name: &str,
     rule_index: usize,
     hostnames: &[String],
-    rule: &HTTPRouteRules,
+    rule: &HttpRouteRules,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
 ) -> Vec<Entrypoint> {
@@ -5547,7 +5567,7 @@ fn rule_to_entrypoints(
     // `route_has_unsupported_filters` to set the route status, but we
     // re-check here so a direct call can't slip an unsupported filter
     // through.
-    let usable = |b: &HTTPRouteRulesBackendRefs| backend_ref_usable(namespace, b, resolver, grants);
+    let usable = |b: &HttpRouteRulesBackendRefs| backend_ref_usable(namespace, b, resolver, grants);
     let Some(filters) = gateway_filters::effective_rule_filters(rule, &usable) else {
         return Vec::new();
     };
@@ -5578,7 +5598,7 @@ fn rule_to_entrypoints(
     // forwarded, answered 500, answered 503.
     let mut shares = [0u128; 3];
     let ref_weight =
-        |b: &HTTPRouteRulesBackendRefs| u128::try_from(b.weight.unwrap_or(1)).unwrap_or(0);
+        |b: &HttpRouteRulesBackendRefs| u128::try_from(b.weight.unwrap_or(1)).unwrap_or(0);
     for b in backend_refs {
         if let Err(reason) = check_backend_ref(namespace, b, resolver, grants) {
             warn!(
@@ -5641,7 +5661,7 @@ fn rule_to_entrypoints(
     // per match. A rule with no matches at all is "match anything" —
     // emit a single entrypoint with no path constraint to preserve that
     // semantic.
-    let matches: Vec<Option<&HTTPRouteRulesMatches>> = match rule.matches.as_deref() {
+    let matches: Vec<Option<&HttpRouteRulesMatches>> = match rule.matches.as_deref() {
         Some(ms) if !ms.is_empty() => ms.iter().map(Some).collect(),
         _ => vec![None],
     };
@@ -5654,10 +5674,10 @@ fn rule_to_entrypoints(
             let path = m.and_then(|m| m.path.as_ref()).and_then(|p| {
                 let value = p.value.clone()?;
                 let rule_type = match p.r#type {
-                    Some(HTTPRouteRulesMatchesPathType::Exact) => PathRuleType::Exact,
-                    Some(HTTPRouteRulesMatchesPathType::PathPrefix) | None => PathRuleType::Prefix,
+                    Some(HttpRouteRulesMatchesPathType::Exact) => PathRuleType::Exact,
+                    Some(HttpRouteRulesMatchesPathType::PathPrefix) | None => PathRuleType::Prefix,
                     // Refused upstream (see `route_has_unsupported_matches`).
-                    Some(HTTPRouteRulesMatchesPathType::RegularExpression) => return None,
+                    Some(HttpRouteRulesMatchesPathType::RegularExpression) => return None,
                 };
                 Some(PathConfig { rule_type, value })
             });
@@ -5761,7 +5781,7 @@ fn rule_to_entrypoints(
 /// The rule's `request` and `backendRequest` timeouts in milliseconds.
 /// `backendRequest: 0s` stays `Some(0)`, which disables the backend timeout;
 /// `request: 0s` sets no request timeout. An invalid duration is ignored.
-fn rule_timeouts_ms(rule: &HTTPRouteRules) -> (Option<u64>, Option<u64>) {
+fn rule_timeouts_ms(rule: &HttpRouteRules) -> (Option<u64>, Option<u64>) {
     let parse = |raw: Option<&str>| {
         let raw = raw?;
         let ms = gateway_duration_ms(raw);
@@ -5813,7 +5833,7 @@ fn gateway_duration_ms(raw: &str) -> Option<u64> {
 }
 
 struct TrackedTlsRoute {
-    route: TLSRoute,
+    route: TlsRoute,
     entrypoint_ids: Vec<String>,
 }
 
@@ -5826,13 +5846,13 @@ type TlsRouteIndex = Arc<RwLock<HashMap<String, TrackedTlsRoute>>>;
 /// route whose Gateway port has no matching `proxy.tcp` listener cannot be
 /// served, so it is tracked with zero entrypoints and reported unresolvable.
 fn apply_tls_route(
-    route: &TLSRoute,
+    route: &TlsRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &TlsRouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
-    status_tx: Option<&L4StatusTx<TLSRoute>>,
+    status_tx: Option<&L4StatusTx<TlsRoute>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -5937,7 +5957,7 @@ fn apply_tls_route(
 }
 
 fn delete_tls_route(
-    route: &TLSRoute,
+    route: &TlsRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &TlsRouteIndex,
 ) -> bool {
@@ -5982,9 +6002,9 @@ fn re_resolve_all_tls(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
-    status_tx: Option<&L4StatusTx<TLSRoute>>,
+    status_tx: Option<&L4StatusTx<TlsRoute>>,
 ) -> bool {
-    let tracked: Vec<TLSRoute> = match index.read() {
+    let tracked: Vec<TlsRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
         Err(e) => {
             error!("Gateway API: index lock poisoned: {}", e);
@@ -6022,7 +6042,7 @@ pub async fn run_tlsroute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<TLSRoute> = Api::all(client.clone());
+    let api: Api<TlsRoute> = Api::all(client.clone());
     // Distinguish "CRD absent" from "not allowed to list it": both stop the
     // watcher, but only the first is routine. Reporting a 403 as a missing CRD
     // would send an operator hunting for the wrong thing.
@@ -6049,7 +6069,7 @@ pub async fn run_tlsroute_watcher(
         return Ok(());
     }
 
-    let status_tx = spawn_l4_status_writer::<TLSRoute>(client, scope.clone());
+    let status_tx = spawn_l4_status_writer::<TlsRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: TlsRouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -6120,7 +6140,7 @@ pub async fn run_tlsroute_watcher(
     Ok(())
 }
 
-fn log_tls_route(action: &str, route: &TLSRoute) {
+fn log_tls_route(action: &str, route: &TlsRoute) {
     let ns = route
         .metadata
         .namespace
@@ -6146,7 +6166,7 @@ fn log_tls_route(action: &str, route: &TLSRoute) {
 // one catch-all TCP entrypoint per (route, port), `sni: None`.
 
 struct TrackedTcpRoute {
-    route: TCPRoute,
+    route: TcpRoute,
     entrypoint_ids: Vec<String>,
 }
 
@@ -6157,7 +6177,7 @@ type TcpRouteIndex = Arc<RwLock<HashMap<String, TrackedTcpRoute>>>;
 /// entrypoint takes the whole port — exactly a Docker `sozune.tcp.*` route with
 /// no `sni` label.
 pub fn tcp_route_to_entrypoints(
-    route: &TCPRoute,
+    route: &TcpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
     listener_name: &str,
@@ -6200,7 +6220,7 @@ pub fn tcp_route_to_entrypoints(
 /// duplicated rather than shared because `TCPRouteRules` and `TLSRouteRules` are
 /// distinct generated types.
 fn tcp_rule_backends(
-    rule: &TCPRouteRules,
+    rule: &TcpRouteRules,
     namespace: &str,
     route_name: &str,
     resolver: &dyn ServiceResolver,
@@ -6258,13 +6278,13 @@ fn ports_of_older_routes<'a>(
 /// Resolve a TCPRoute to its entrypoints and swap them into storage. Mirrors
 /// [`apply_tls_route`], minus hostnames.
 fn apply_tcp_route(
-    route: &TCPRoute,
+    route: &TcpRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &TcpRouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
-    status_tx: Option<&L4StatusTx<TCPRoute>>,
+    status_tx: Option<&L4StatusTx<TcpRoute>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -6365,7 +6385,7 @@ fn apply_tcp_route(
 }
 
 fn delete_tcp_route(
-    route: &TCPRoute,
+    route: &TcpRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &TcpRouteIndex,
 ) -> bool {
@@ -6407,9 +6427,9 @@ fn re_resolve_all_tcp(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &TcpListenerPorts,
-    status_tx: Option<&L4StatusTx<TCPRoute>>,
+    status_tx: Option<&L4StatusTx<TcpRoute>>,
 ) -> bool {
-    let tracked: Vec<TCPRoute> = match index.read() {
+    let tracked: Vec<TcpRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
         Err(e) => {
             error!("Gateway API: index lock poisoned: {}", e);
@@ -6444,14 +6464,14 @@ pub async fn run_tcproute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<TCPRoute> = Api::all(client.clone());
+    let api: Api<TcpRoute> = Api::all(client.clone());
     if api.list(&Default::default()).await.is_err() {
         info!(
             "Gateway API: TCPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
         );
         return Ok(());
     }
-    let status_tx = spawn_l4_status_writer::<TCPRoute>(client, scope.clone());
+    let status_tx = spawn_l4_status_writer::<TcpRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: TcpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -6530,7 +6550,7 @@ pub async fn run_tcproute_watcher(
     Ok(())
 }
 
-fn log_tcp_route(action: &str, route: &TCPRoute) {
+fn log_tcp_route(action: &str, route: &TcpRoute) {
     let ns = route
         .metadata
         .namespace
@@ -6564,7 +6584,7 @@ pub fn udp_listener_ports(
 }
 
 struct TrackedUdpRoute {
-    route: UDPRoute,
+    route: UdpRoute,
     entrypoint_ids: Vec<String>,
 }
 
@@ -6573,7 +6593,7 @@ type UdpRouteIndex = Arc<RwLock<HashMap<String, TrackedUdpRoute>>>;
 /// Convert a UDPRoute into `Protocol::Udp` entrypoints, one catch-all per rule
 /// on the resolved listener.
 pub fn udp_route_to_entrypoints(
-    route: &UDPRoute,
+    route: &UdpRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
     listener_name: &str,
@@ -6610,7 +6630,7 @@ pub fn udp_route_to_entrypoints(
 /// Resolve a UDPRoute rule's `backendRefs` to pod IPs. Same handling as the TCP
 /// path; duplicated because `UDPRouteRules` is a distinct generated type.
 fn udp_rule_backends(
-    rule: &UDPRouteRules,
+    rule: &UdpRouteRules,
     namespace: &str,
     route_name: &str,
     resolver: &dyn ServiceResolver,
@@ -6645,13 +6665,13 @@ fn udp_rule_backends(
 }
 
 fn apply_udp_route(
-    route: &UDPRoute,
+    route: &UdpRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &UdpRouteIndex,
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &UdpListenerPorts,
-    status_tx: Option<&L4StatusTx<UDPRoute>>,
+    status_tx: Option<&L4StatusTx<UdpRoute>>,
 ) -> bool {
     let uid = match route.metadata.uid.as_deref() {
         Some(u) => u.to_string(),
@@ -6751,7 +6771,7 @@ fn apply_udp_route(
 }
 
 fn delete_udp_route(
-    route: &UDPRoute,
+    route: &UdpRoute,
     storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
     index: &UdpRouteIndex,
 ) -> bool {
@@ -6793,9 +6813,9 @@ fn re_resolve_all_udp(
     resolver: &dyn ServiceResolver,
     scope: &GatewayScope,
     listener_ports: &UdpListenerPorts,
-    status_tx: Option<&L4StatusTx<UDPRoute>>,
+    status_tx: Option<&L4StatusTx<UdpRoute>>,
 ) -> bool {
-    let tracked: Vec<UDPRoute> = match index.read() {
+    let tracked: Vec<UdpRoute> = match index.read() {
         Ok(g) => g.values().map(|t| t.route.clone()).collect(),
         Err(e) => {
             error!("Gateway API: index lock poisoned: {}", e);
@@ -6830,14 +6850,14 @@ pub async fn run_udproute_watcher(
     scope: GatewayScope,
     listener_ports: UdpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<UDPRoute> = Api::all(client.clone());
+    let api: Api<UdpRoute> = Api::all(client.clone());
     if api.list(&Default::default()).await.is_err() {
         info!(
             "Gateway API: UDPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
         );
         return Ok(());
     }
-    let status_tx = spawn_l4_status_writer::<UDPRoute>(client, scope.clone());
+    let status_tx = spawn_l4_status_writer::<UdpRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
     let index: UdpRouteIndex = Arc::new(RwLock::new(HashMap::new()));
@@ -6916,7 +6936,7 @@ pub async fn run_udproute_watcher(
     Ok(())
 }
 
-fn log_udp_route(action: &str, route: &UDPRoute) {
+fn log_udp_route(action: &str, route: &UdpRoute) {
     let ns = route
         .metadata
         .namespace
@@ -7016,7 +7036,7 @@ pub fn tcp_listener_ports(
 /// entrypoints carry it in `config.entrypoint`, exactly as a Docker-labelled
 /// TCP route does.
 pub fn tls_route_to_entrypoints(
-    route: &TLSRoute,
+    route: &TlsRoute,
     resolver: &dyn ServiceResolver,
     grants: &dyn BackendRefAuthorizer,
     hostnames: &[String],
@@ -7108,7 +7128,7 @@ pub fn tls_route_to_entrypoints(
 /// HTTP path's backend handling, including the ReferenceGrant check that makes
 /// a cross-namespace ref opt-in.
 fn tls_rule_backends(
-    rule: &TLSRouteRules,
+    rule: &TlsRouteRules,
     namespace: &str,
     route_name: &str,
     resolver: &dyn ServiceResolver,
@@ -7195,7 +7215,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
     }
 }
 
-fn log_route(action: &str, route: &HTTPRoute) {
+fn log_route(action: &str, route: &HttpRoute) {
     let ns = route
         .metadata
         .namespace
@@ -7225,11 +7245,11 @@ mod tests {
         GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
     };
     use gateway_api::apis::standard::httproutes::{
-        HTTPRouteRulesBackendRefs, HTTPRouteRulesFiltersRequestRedirect,
-        HTTPRouteRulesFiltersRequestRedirectScheme, HTTPRouteRulesMatches,
-        HTTPRouteRulesMatchesHeaders, HTTPRouteRulesMatchesHeadersType,
-        HTTPRouteRulesMatchesMethod, HTTPRouteRulesMatchesPath, HTTPRouteRulesMatchesQueryParams,
-        HTTPRouteRulesMatchesQueryParamsType, HTTPRouteSpec,
+        HttpRouteRulesBackendRefs, HttpRouteRulesFiltersRequestRedirect,
+        HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesMatches,
+        HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
+        HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesQueryParams,
+        HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
     };
     use kube::api::ObjectMeta;
 
@@ -7271,8 +7291,8 @@ mod tests {
     /// Single parentRef pointing at `default/gw` — the Gateway
     /// `default_scope()` accepts. Helper because most route fixtures
     /// just want "this route is in scope, please".
-    fn parent_default_gw() -> HTTPRouteParentRefs {
-        HTTPRouteParentRefs {
+    fn parent_default_gw() -> HttpRouteParentRefs {
+        HttpRouteParentRefs {
             name: "gw".into(),
             ..Default::default()
         }
@@ -7285,9 +7305,9 @@ mod tests {
     /// test fails at compile time.
     #[test]
     fn httproute_shape_matches_what_we_read() {
-        let r = HTTPRoute::default();
+        let r = HttpRoute::default();
         let _: Option<Vec<String>> = r.spec.hostnames;
-        let _: Option<Vec<HTTPRouteRules>> = r.spec.rules;
+        let _: Option<Vec<HttpRouteRules>> = r.spec.rules;
     }
 
     /// Same guard as `httproute_shape_matches_what_we_read`, for TLSRoute.
@@ -7295,10 +7315,10 @@ mod tests {
     /// generated types differ, and assuming otherwise would not compile.
     #[test]
     fn tlsroute_shape_matches_what_we_read() {
-        let r = TLSRoute::default();
+        let r = TlsRoute::default();
         let _: Option<Vec<String>> = r.spec.hostnames;
-        let _: Vec<TLSRouteRules> = r.spec.rules;
-        let _: Option<Vec<TLSRouteParentRefs>> = r.spec.parent_refs;
+        let _: Vec<TlsRouteRules> = r.spec.rules;
+        let _: Option<Vec<TlsRouteParentRefs>> = r.spec.parent_refs;
     }
 
     /// A Gateway carrying one `TLS`/`Passthrough` listener, which is what a
@@ -7342,23 +7362,23 @@ mod tests {
         scope
     }
 
-    fn tls_route(hostnames: Vec<&str>, backend_port: i32) -> TLSRoute {
-        TLSRoute {
+    fn tls_route(hostnames: Vec<&str>, backend_port: i32) -> TlsRoute {
+        TlsRoute {
             metadata: ObjectMeta {
                 name: Some("passthrough".into()),
                 namespace: Some("default".into()),
                 uid: Some("uid-tls-1".into()),
                 ..Default::default()
             },
-            spec: gateway_api::apis::experimental::tlsroutes::TLSRouteSpec {
+            spec: crate::provider::kubernetes::gateway_compat::TlsRouteSpec {
                 hostnames: Some(hostnames.into_iter().map(Into::into).collect()),
-                parent_refs: Some(vec![TLSRouteParentRefs {
+                parent_refs: Some(vec![TlsRouteParentRefs {
                     name: "gw".into(),
                     ..Default::default()
                 }]),
-                rules: vec![TLSRouteRules {
+                rules: vec![TlsRouteRules {
                     backend_refs: Some(vec![
-                        gateway_api::apis::experimental::tlsroutes::TLSRouteRulesBackendRefs {
+                        crate::provider::kubernetes::gateway_compat::TlsRouteRulesBackendRefs {
                             name: "svc".into(),
                             port: Some(backend_port),
                             ..Default::default()
@@ -7504,7 +7524,7 @@ mod tests {
     fn a_tls_route_reports_its_status() {
         let scope = tls_scope(Some("*.example.com"), 8443);
         let route = tls_route(vec!["a.example.com"], 8443);
-        let status = |route: &TLSRoute, outcome| {
+        let status = |route: &TlsRoute, outcome| {
             let invalid = l4_route_invalid_ref(route, &r1(), &scope);
             let parents = route.build_status(&scope, outcome, invalid);
             assert_eq!(parents.len(), 1);
@@ -7550,7 +7570,7 @@ mod tests {
             .parent_refs
             .as_mut()
             .unwrap()
-            .push(TLSRouteParentRefs {
+            .push(TlsRouteParentRefs {
                 name: "gw2".into(),
                 ..Default::default()
             });
@@ -7918,22 +7938,22 @@ mod tests {
         scope
     }
 
-    fn tcp_route(backend_port: i32) -> TCPRoute {
-        TCPRoute {
+    fn tcp_route(backend_port: i32) -> TcpRoute {
+        TcpRoute {
             metadata: ObjectMeta {
                 name: Some("raw".into()),
                 namespace: Some("default".into()),
                 uid: Some("uid-tcp-1".into()),
                 ..Default::default()
             },
-            spec: gateway_api::apis::experimental::tcproutes::TCPRouteSpec {
-                parent_refs: Some(vec![TCPRouteParentRefs {
+            spec: crate::provider::kubernetes::gateway_compat::TcpRouteSpec {
+                parent_refs: Some(vec![TcpRouteParentRefs {
                     name: "gw".into(),
                     ..Default::default()
                 }]),
-                rules: vec![TCPRouteRules {
+                rules: vec![TcpRouteRules {
                     backend_refs: Some(vec![
-                        gateway_api::apis::experimental::tcproutes::TCPRouteRulesBackendRefs {
+                        crate::provider::kubernetes::gateway_compat::TcpRouteRulesBackendRefs {
                             name: "svc".into(),
                             port: Some(backend_port),
                             ..Default::default()
@@ -8013,7 +8033,7 @@ mod tests {
             namespace: Some("ns".into()),
             uid: Some(name.into()),
             creation_timestamp: Some(Time(
-                k8s_openapi::chrono::DateTime::from_timestamp(second, 0).unwrap(),
+                k8s_openapi::jiff::Timestamp::from_second(second).unwrap(),
             )),
             ..Default::default()
         };
@@ -8162,22 +8182,22 @@ mod tests {
         scope
     }
 
-    fn udp_route(backend_port: i32) -> UDPRoute {
-        UDPRoute {
+    fn udp_route(backend_port: i32) -> UdpRoute {
+        UdpRoute {
             metadata: ObjectMeta {
                 name: Some("dgram".into()),
                 namespace: Some("default".into()),
                 uid: Some("uid-udp-1".into()),
                 ..Default::default()
             },
-            spec: gateway_api::apis::experimental::udproutes::UDPRouteSpec {
-                parent_refs: Some(vec![UDPRouteParentRefs {
+            spec: crate::provider::kubernetes::gateway_compat::UdpRouteSpec {
+                parent_refs: Some(vec![UdpRouteParentRefs {
                     name: "gw".into(),
                     ..Default::default()
                 }]),
-                rules: vec![UDPRouteRules {
+                rules: vec![UdpRouteRules {
                     backend_refs: Some(vec![
-                        gateway_api::apis::experimental::udproutes::UDPRouteRulesBackendRefs {
+                        crate::provider::kubernetes::gateway_compat::UdpRouteRulesBackendRefs {
                             name: "svc".into(),
                             port: Some(backend_port),
                             ..Default::default()
@@ -8300,22 +8320,22 @@ mod tests {
     /// `parentRef` to the Gateway that `default_scope()` accepts so the
     /// route is in scope without ceremony. Tests that need a different
     /// parent build the route directly or use [`route_with_parents`].
-    fn route_with(rules: Vec<HTTPRouteRules>, hostnames: Vec<String>) -> HTTPRoute {
+    fn route_with(rules: Vec<HttpRouteRules>, hostnames: Vec<String>) -> HttpRoute {
         route_with_parents(rules, hostnames, vec![parent_default_gw()])
     }
 
     fn route_with_parents(
-        rules: Vec<HTTPRouteRules>,
+        rules: Vec<HttpRouteRules>,
         hostnames: Vec<String>,
-        parent_refs: Vec<HTTPRouteParentRefs>,
-    ) -> HTTPRoute {
-        HTTPRoute {
+        parent_refs: Vec<HttpRouteParentRefs>,
+    ) -> HttpRoute {
+        HttpRoute {
             metadata: ObjectMeta {
                 name: Some("web".into()),
                 namespace: Some("default".into()),
                 ..Default::default()
             },
-            spec: HTTPRouteSpec {
+            spec: HttpRouteSpec {
                 hostnames: if hostnames.is_empty() {
                     None
                 } else {
@@ -8332,8 +8352,8 @@ mod tests {
         }
     }
 
-    fn backend(name: &str, port: i32) -> HTTPRouteRulesBackendRefs {
-        HTTPRouteRulesBackendRefs {
+    fn backend(name: &str, port: i32) -> HttpRouteRulesBackendRefs {
+        HttpRouteRulesBackendRefs {
             name: name.into(),
             port: Some(port),
             weight: Some(100),
@@ -8342,19 +8362,19 @@ mod tests {
     }
 
     fn rule(
-        matches: Option<Vec<HTTPRouteRulesMatches>>,
-        backends: Vec<HTTPRouteRulesBackendRefs>,
-    ) -> HTTPRouteRules {
-        HTTPRouteRules {
+        matches: Option<Vec<HttpRouteRulesMatches>>,
+        backends: Vec<HttpRouteRulesBackendRefs>,
+    ) -> HttpRouteRules {
+        HttpRouteRules {
             matches,
             backend_refs: Some(backends),
             ..Default::default()
         }
     }
 
-    fn path_match(value: &str, ty: HTTPRouteRulesMatchesPathType) -> HTTPRouteRulesMatches {
-        HTTPRouteRulesMatches {
-            path: Some(HTTPRouteRulesMatchesPath {
+    fn path_match(value: &str, ty: HttpRouteRulesMatchesPathType) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            path: Some(HttpRouteRulesMatchesPath {
                 r#type: Some(ty),
                 value: Some(value.into()),
             }),
@@ -8365,10 +8385,10 @@ mod tests {
     fn header_match(
         name: &str,
         value: &str,
-        ty: HTTPRouteRulesMatchesHeadersType,
-    ) -> HTTPRouteRulesMatches {
-        HTTPRouteRulesMatches {
-            headers: Some(vec![HTTPRouteRulesMatchesHeaders {
+        ty: HttpRouteRulesMatchesHeadersType,
+    ) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            headers: Some(vec![HttpRouteRulesMatchesHeaders {
                 name: name.into(),
                 value: value.into(),
                 r#type: Some(ty),
@@ -8380,10 +8400,10 @@ mod tests {
     fn query_match(
         name: &str,
         value: &str,
-        ty: HTTPRouteRulesMatchesQueryParamsType,
-    ) -> HTTPRouteRulesMatches {
-        HTTPRouteRulesMatches {
-            query_params: Some(vec![HTTPRouteRulesMatchesQueryParams {
+        ty: HttpRouteRulesMatchesQueryParamsType,
+    ) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            query_params: Some(vec![HttpRouteRulesMatchesQueryParams {
                 name: name.into(),
                 value: value.into(),
                 r#type: Some(ty),
@@ -8392,8 +8412,8 @@ mod tests {
         }
     }
 
-    fn method_match(method: HTTPRouteRulesMatchesMethod) -> HTTPRouteRulesMatches {
-        HTTPRouteRulesMatches {
+    fn method_match(method: HttpRouteRulesMatchesMethod) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
             method: Some(method),
             ..Default::default()
         }
@@ -8401,12 +8421,12 @@ mod tests {
 
     #[test]
     fn route_without_rules_yields_no_entrypoints() {
-        let r = HTTPRoute {
+        let r = HttpRoute {
             metadata: ObjectMeta {
                 name: Some("web".into()),
                 ..Default::default()
             },
-            spec: HTTPRouteSpec::default(),
+            spec: HttpRouteSpec::default(),
             status: Default::default(),
         };
         assert!(route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs).is_empty());
@@ -8414,9 +8434,9 @@ mod tests {
 
     #[test]
     fn route_without_name_yields_no_entrypoints() {
-        let r = HTTPRoute {
+        let r = HttpRoute {
             metadata: ObjectMeta::default(),
-            spec: HTTPRouteSpec {
+            spec: HttpRouteSpec {
                 rules: Some(vec![rule(None, vec![backend("svc", 80)])]),
                 ..Default::default()
             },
@@ -8440,10 +8460,10 @@ mod tests {
     /// zero `backendRequest` disables the backend timeout.
     #[test]
     fn rule_timeouts_map_to_request_and_backend_timeouts() {
-        use gateway_api::apis::standard::httproutes::HTTPRouteRulesTimeouts;
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
         let with = |request: Option<&str>, backend_request: Option<&str>| {
             let mut r = rule(None, vec![backend("api", 80)]);
-            r.timeouts = Some(HTTPRouteRulesTimeouts {
+            r.timeouts = Some(HttpRouteRulesTimeouts {
                 request: request.map(String::from),
                 backend_request: backend_request.map(String::from),
             });
@@ -8484,20 +8504,20 @@ mod tests {
     #[test]
     fn a_prefix_replacement_on_an_exact_match_is_refused() {
         use gateway_api::apis::standard::httproutes::{
-            HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectPath,
-            HTTPRouteRulesFiltersRequestRedirectPathType,
+            HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
+            HttpRouteRulesFiltersRequestRedirectPathType,
         };
         let redirect = |path_type| {
             let mut r = rule(
                 Some(vec![path_match("/original", path_type)]),
                 vec![backend("api", 80)],
             );
-            r.filters = Some(vec![HTTPRouteRulesFilters {
-                request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
-                    path: Some(HTTPRouteRulesFiltersRequestRedirectPath {
+            r.filters = Some(vec![HttpRouteRulesFilters {
+                request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                    path: Some(HttpRouteRulesFiltersRequestRedirectPath {
                         replace_full_path: None,
                         replace_prefix_match: Some("/replacement".into()),
-                        r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
+                        r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
                     }),
                     ..Default::default()
                 }),
@@ -8506,12 +8526,12 @@ mod tests {
             route_with(vec![r], vec!["app.example.com".into()])
         };
         assert!(route_has_unsupported_filters(
-            &redirect(HTTPRouteRulesMatchesPathType::Exact),
+            &redirect(HttpRouteRulesMatchesPathType::Exact),
             &r1(),
             &AllowAllBackendRefs
         ));
         assert!(!route_has_unsupported_filters(
-            &redirect(HTTPRouteRulesMatchesPathType::PathPrefix),
+            &redirect(HttpRouteRulesMatchesPathType::PathPrefix),
             &r1(),
             &AllowAllBackendRefs
         ));
@@ -8522,22 +8542,22 @@ mod tests {
     #[test]
     fn a_prefix_redirect_rewrites_the_location_path() {
         use gateway_api::apis::standard::httproutes::{
-            HTTPRouteRulesFiltersRequestRedirect, HTTPRouteRulesFiltersRequestRedirectPath,
-            HTTPRouteRulesFiltersRequestRedirectPathType,
+            HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
+            HttpRouteRulesFiltersRequestRedirectPathType,
         };
         let mut r = rule(
             Some(vec![path_match(
                 "/original",
-                HTTPRouteRulesMatchesPathType::PathPrefix,
+                HttpRouteRulesMatchesPathType::PathPrefix,
             )]),
             vec![backend("api", 80)],
         );
-        r.filters = Some(vec![HTTPRouteRulesFilters {
-            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
-                path: Some(HTTPRouteRulesFiltersRequestRedirectPath {
+        r.filters = Some(vec![HttpRouteRulesFilters {
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                path: Some(HttpRouteRulesFiltersRequestRedirectPath {
                     replace_full_path: None,
                     replace_prefix_match: Some("/replacement".into()),
-                    r#type: HTTPRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
+                    r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
                 }),
                 ..Default::default()
             }),
@@ -8560,16 +8580,16 @@ mod tests {
     #[test]
     fn unusable_backend_refs_do_not_have_to_agree_on_filters() {
         use gateway_api::apis::standard::httproutes::{
-            HTTPRouteRulesBackendRefsFilters,
-            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
-            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+            HttpRouteRulesBackendRefsFilters,
+            HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
         };
         let set = |value: &str| {
-            Some(vec![HTTPRouteRulesBackendRefsFilters {
+            Some(vec![HttpRouteRulesBackendRefsFilters {
                 request_header_modifier: Some(
-                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+                    HttpRouteRulesBackendRefsFiltersRequestHeaderModifier {
                         set: Some(vec![
-                            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                            HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
                                 name: "X-Backend".into(),
                                 value: value.into(),
                             },
@@ -8603,16 +8623,16 @@ mod tests {
     #[test]
     fn backend_refs_keep_filters_of_their_own() {
         use gateway_api::apis::standard::httproutes::{
-            HTTPRouteRulesBackendRefsFilters,
-            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier,
-            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
+            HttpRouteRulesBackendRefsFilters,
+            HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
+            HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
         };
         let set = |value: &str| {
-            Some(vec![HTTPRouteRulesBackendRefsFilters {
+            Some(vec![HttpRouteRulesBackendRefsFilters {
                 request_header_modifier: Some(
-                    HTTPRouteRulesBackendRefsFiltersRequestHeaderModifier {
+                    HttpRouteRulesBackendRefsFiltersRequestHeaderModifier {
                         set: Some(vec![
-                            HTTPRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
+                            HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet {
                                 name: "X-Backend".into(),
                                 value: value.into(),
                             },
@@ -8628,9 +8648,9 @@ mod tests {
         let mut web = backend("web", 80);
         web.filters = set("web");
         let mut shared = rule(None, vec![api, web]);
-        shared.filters = Some(vec![HTTPRouteRulesFilters {
+        shared.filters = Some(vec![HttpRouteRulesFilters {
             response_header_modifier: Some(
-                gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersResponseHeaderModifier {
+                gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersResponseHeaderModifier {
                     remove: Some(vec!["Server".into()]),
                     ..Default::default()
                 },
@@ -8658,7 +8678,7 @@ mod tests {
     #[test]
     fn a_rule_without_backends_answers_500() {
         let r = route_with(
-            vec![HTTPRouteRules {
+            vec![HttpRouteRules {
                 backend_refs: None,
                 ..Default::default()
             }],
@@ -8675,11 +8695,11 @@ mod tests {
     /// A redirect answers by itself: its rule needs no backend.
     #[test]
     fn a_redirect_rule_without_backends_redirects() {
-        use gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersRequestRedirect;
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirect;
         let r = route_with(
-            vec![HTTPRouteRules {
-                filters: Some(vec![HTTPRouteRulesFilters {
-                    request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+            vec![HttpRouteRules {
+                filters: Some(vec![HttpRouteRulesFilters {
+                    request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
                         hostname: Some("example.org".into()),
                         ..Default::default()
                     }),
@@ -8842,7 +8862,7 @@ mod tests {
 
     // A ReferenceGrant in `to_ns` trusting `HTTPRoute` from `from_ns`.
     fn reference_grant(to_ns: &str, from_ns: &str) -> ReferenceGrant {
-        use gateway_api::apis::standard::referencegrants::{
+        use crate::provider::kubernetes::gateway_compat::{
             ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
         };
         ReferenceGrant {
@@ -8958,7 +8978,7 @@ mod tests {
 
     #[test]
     fn grant_to_secret_does_not_authorise_service_ref() {
-        use gateway_api::apis::standard::referencegrants::{
+        use crate::provider::kubernetes::gateway_compat::{
             ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
         };
         let grant = ReferenceGrant {
@@ -8990,7 +9010,7 @@ mod tests {
 
     #[test]
     fn grant_from_tcproute_authorises_a_cross_namespace_service_ref() {
-        use gateway_api::apis::standard::referencegrants::{
+        use crate::provider::kubernetes::gateway_compat::{
             ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
         };
         // A ReferenceGrant naming TCPRoute (not HTTPRoute) must be recognised,
@@ -9025,7 +9045,7 @@ mod tests {
             vec![rule(
                 Some(vec![path_match(
                     "/api",
-                    HTTPRouteRulesMatchesPathType::PathPrefix,
+                    HttpRouteRulesMatchesPathType::PathPrefix,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9043,7 +9063,7 @@ mod tests {
             vec![rule(
                 Some(vec![path_match(
                     "/health",
-                    HTTPRouteRulesMatchesPathType::Exact,
+                    HttpRouteRulesMatchesPathType::Exact,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9061,7 +9081,7 @@ mod tests {
             vec![rule(
                 Some(vec![path_match(
                     "/api/v[0-9]+",
-                    HTTPRouteRulesMatchesPathType::RegularExpression,
+                    HttpRouteRulesMatchesPathType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9077,7 +9097,7 @@ mod tests {
                 Some(vec![header_match(
                     "X-Canary",
                     "v(",
-                    HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                    HttpRouteRulesMatchesHeadersType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9098,7 +9118,7 @@ mod tests {
                     Some(vec![header_match(
                         "X-Canary",
                         pattern,
-                        HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                        HttpRouteRulesMatchesHeadersType::RegularExpression,
                     )]),
                     vec![backend("api", 80)],
                 )],
@@ -9115,7 +9135,7 @@ mod tests {
                 Some(vec![header_match(
                     "X-Canary",
                     "yes",
-                    HTTPRouteRulesMatchesHeadersType::Exact,
+                    HttpRouteRulesMatchesHeadersType::Exact,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9135,7 +9155,7 @@ mod tests {
                 Some(vec![query_match(
                     "debug",
                     "1",
-                    HTTPRouteRulesMatchesQueryParamsType::Exact,
+                    HttpRouteRulesMatchesQueryParamsType::Exact,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9152,7 +9172,7 @@ mod tests {
     fn method_match_becomes_an_uppercase_verb() {
         let r = route_with(
             vec![rule(
-                Some(vec![method_match(HTTPRouteRulesMatchesMethod::Post)]),
+                Some(vec![method_match(HttpRouteRulesMatchesMethod::Post)]),
                 vec![backend("api", 80)],
             )],
             vec!["app.example.com".into()],
@@ -9164,13 +9184,13 @@ mod tests {
 
     #[test]
     fn header_query_and_method_are_anded_on_one_match() {
-        let mut m = header_match("X-Canary", "yes", HTTPRouteRulesMatchesHeadersType::Exact);
-        m.query_params = Some(vec![HTTPRouteRulesMatchesQueryParams {
+        let mut m = header_match("X-Canary", "yes", HttpRouteRulesMatchesHeadersType::Exact);
+        m.query_params = Some(vec![HttpRouteRulesMatchesQueryParams {
             name: "debug".into(),
             value: "1".into(),
-            r#type: Some(HTTPRouteRulesMatchesQueryParamsType::Exact),
+            r#type: Some(HttpRouteRulesMatchesQueryParamsType::Exact),
         }]);
-        m.method = Some(HTTPRouteRulesMatchesMethod::Get);
+        m.method = Some(HttpRouteRulesMatchesMethod::Get);
         let r = route_with(
             vec![rule(Some(vec![m]), vec![backend("api", 80)])],
             vec!["app.example.com".into()],
@@ -9189,7 +9209,7 @@ mod tests {
                 Some(vec![header_match(
                     "X-Canary",
                     "v[0-9]+",
-                    HTTPRouteRulesMatchesHeadersType::RegularExpression,
+                    HttpRouteRulesMatchesHeadersType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9207,7 +9227,7 @@ mod tests {
                 Some(vec![query_match(
                     "v",
                     "[0-9]+",
-                    HTTPRouteRulesMatchesQueryParamsType::RegularExpression,
+                    HttpRouteRulesMatchesQueryParamsType::RegularExpression,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -9225,8 +9245,8 @@ mod tests {
         let r = route_with(
             vec![rule(
                 Some(vec![
-                    header_match("X-A", "1", HTTPRouteRulesMatchesHeadersType::Exact),
-                    method_match(HTTPRouteRulesMatchesMethod::Delete),
+                    header_match("X-A", "1", HttpRouteRulesMatchesHeadersType::Exact),
+                    method_match(HttpRouteRulesMatchesMethod::Delete),
                 ]),
                 vec![backend("api", 80)],
             )],
@@ -9298,7 +9318,7 @@ mod tests {
         );
     }
 
-    fn route_with_uid(uid: &str, rules: Vec<HTTPRouteRules>, hostnames: Vec<String>) -> HTTPRoute {
+    fn route_with_uid(uid: &str, rules: Vec<HttpRouteRules>, hostnames: Vec<String>) -> HttpRoute {
         let mut r = route_with(rules, hostnames);
         r.metadata.uid = Some(uid.into());
         r
@@ -9637,17 +9657,17 @@ mod tests {
 
     use crate::model::entrypoint::{HeaderDirection, PathRewrite};
     use gateway_api::apis::standard::httproutes::{
-        HTTPRouteRulesFilters, HTTPRouteRulesFiltersRequestHeaderModifier,
-        HTTPRouteRulesFiltersRequestHeaderModifierSet, HTTPRouteRulesFiltersResponseHeaderModifier,
-        HTTPRouteRulesFiltersResponseHeaderModifierSet, HTTPRouteRulesFiltersUrlRewrite,
-        HTTPRouteRulesFiltersUrlRewritePath, HTTPRouteRulesFiltersUrlRewritePathType,
+        HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
+        HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersResponseHeaderModifier,
+        HttpRouteRulesFiltersResponseHeaderModifierSet, HttpRouteRulesFiltersUrlRewrite,
+        HttpRouteRulesFiltersUrlRewritePath, HttpRouteRulesFiltersUrlRewritePathType,
     };
 
     fn rule_with_filter(
-        backends: Vec<HTTPRouteRulesBackendRefs>,
-        filters: Vec<HTTPRouteRulesFilters>,
-    ) -> HTTPRouteRules {
-        HTTPRouteRules {
+        backends: Vec<HttpRouteRulesBackendRefs>,
+        filters: Vec<HttpRouteRulesFilters>,
+    ) -> HttpRouteRules {
+        HttpRouteRules {
             backend_refs: Some(backends),
             filters: if filters.is_empty() {
                 None
@@ -9667,7 +9687,7 @@ mod tests {
         let r = route_with(
             vec![rule_with_filter(
                 vec![backend("api", 80)],
-                vec![HTTPRouteRulesFilters::default()],
+                vec![HttpRouteRulesFilters::default()],
             )],
             vec!["app.example.com".into()],
         );
@@ -9683,9 +9703,9 @@ mod tests {
     fn route_with_request_redirect_maps_to_native_redirect() {
         // A scheme-only requestRedirect (the HTTP→HTTPS case) is mapped
         // onto Sōzu's native frontend redirect instead of being dropped.
-        let redirect = HTTPRouteRulesFilters {
-            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
-                scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+        let redirect = HttpRouteRulesFilters {
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                scheme: Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
                 ..Default::default()
             }),
             ..Default::default()
@@ -9710,9 +9730,9 @@ mod tests {
 
     #[test]
     fn route_with_request_header_modifier_populates_headers() {
-        let filter = HTTPRouteRulesFilters {
-            request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+        let filter = HttpRouteRulesFilters {
+            request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                     name: "X-Env".into(),
                     value: "prod".into(),
                 }]),
@@ -9739,9 +9759,9 @@ mod tests {
 
     #[test]
     fn route_with_response_header_modifier_uses_response_direction() {
-        let filter = HTTPRouteRulesFilters {
-            response_header_modifier: Some(HTTPRouteRulesFiltersResponseHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersResponseHeaderModifierSet {
+        let filter = HttpRouteRulesFilters {
+            response_header_modifier: Some(HttpRouteRulesFiltersResponseHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierSet {
                     name: "X-Powered-By".into(),
                     value: "sozune".into(),
                 }]),
@@ -9768,13 +9788,13 @@ mod tests {
 
     #[test]
     fn route_mixing_redirect_and_header_modifier_is_accepted() {
-        let filter = HTTPRouteRulesFilters {
-            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
-                scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+        let filter = HttpRouteRulesFilters {
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                scheme: Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
                 ..Default::default()
             }),
-            request_header_modifier: Some(HTTPRouteRulesFiltersRequestHeaderModifier {
-                set: Some(vec![HTTPRouteRulesFiltersRequestHeaderModifierSet {
+            request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
+                set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
                     name: "X-Env".into(),
                     value: "prod".into(),
                 }]),
@@ -9802,15 +9822,17 @@ mod tests {
     #[test]
     fn route_with_request_mirror_copies_its_requests() {
         use gateway_api::apis::standard::httproutes::{
-            HTTPRouteRulesFiltersRequestMirror, HTTPRouteRulesFiltersRequestMirrorBackendRef,
+            HttpRouteRulesFiltersRequestMirror, HttpRouteRulesFiltersRequestMirrorBackendRef,
         };
-        let filter = HTTPRouteRulesFilters {
-            request_mirror: Some(HTTPRouteRulesFiltersRequestMirror {
-                backend_ref: HTTPRouteRulesFiltersRequestMirrorBackendRef {
+        let filter = HttpRouteRulesFilters {
+            request_mirror: Some(HttpRouteRulesFiltersRequestMirror {
+                backend_ref: HttpRouteRulesFiltersRequestMirrorBackendRef {
                     name: "mirror".into(),
                     port: Some(8080),
                     ..Default::default()
                 },
+                fraction: None,
+                percent: None,
             }),
             ..Default::default()
         };
@@ -9847,13 +9869,13 @@ mod tests {
 
     #[test]
     fn route_with_url_rewrite_replace_prefix_maps_to_rewrite_field() {
-        let filter = HTTPRouteRulesFilters {
-            url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+        let filter = HttpRouteRulesFilters {
+            url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
                 hostname: None,
-                path: Some(HTTPRouteRulesFiltersUrlRewritePath {
+                path: Some(HttpRouteRulesFiltersUrlRewritePath {
                     replace_full_path: None,
                     replace_prefix_match: Some("/v2".into()),
-                    r#type: HTTPRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                    r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
                 }),
             }),
             ..Default::default()
@@ -9876,8 +9898,8 @@ mod tests {
 
     #[test]
     fn route_with_url_rewrite_hostname_sets_rewrite_hostname() {
-        let filter = HTTPRouteRulesFilters {
-            url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+        let filter = HttpRouteRulesFilters {
+            url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
                 hostname: Some("internal.svc".into()),
                 path: None,
             }),
@@ -9902,15 +9924,15 @@ mod tests {
     fn route_mixing_redirect_and_url_rewrite_is_unsupported() {
         // Conflicting intents over the frontend rewrite — the whole route
         // is dropped, not partially applied.
-        let redirect = HTTPRouteRulesFilters {
-            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
-                scheme: Some(HTTPRouteRulesFiltersRequestRedirectScheme::Https),
+        let redirect = HttpRouteRulesFilters {
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                scheme: Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let rewrite = HTTPRouteRulesFilters {
-            url_rewrite: Some(HTTPRouteRulesFiltersUrlRewrite {
+        let rewrite = HttpRouteRulesFilters {
+            url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
                 hostname: Some("internal.svc".into()),
                 path: None,
             }),
@@ -9957,9 +9979,9 @@ mod tests {
         let r = route_with(
             vec![rule(
                 Some(vec![
-                    path_match("/api", HTTPRouteRulesMatchesPathType::PathPrefix),
-                    path_match("/v2", HTTPRouteRulesMatchesPathType::PathPrefix),
-                    path_match("/healthz", HTTPRouteRulesMatchesPathType::Exact),
+                    path_match("/api", HttpRouteRulesMatchesPathType::PathPrefix),
+                    path_match("/v2", HttpRouteRulesMatchesPathType::PathPrefix),
+                    path_match("/healthz", HttpRouteRulesMatchesPathType::Exact),
                 ]),
                 vec![backend("api", 80)],
             )],
@@ -9993,7 +10015,7 @@ mod tests {
             vec![rule(
                 Some(vec![path_match(
                     "/api",
-                    HTTPRouteRulesMatchesPathType::PathPrefix,
+                    HttpRouteRulesMatchesPathType::PathPrefix,
                 )]),
                 vec![backend("api", 80)],
             )],
@@ -10028,20 +10050,18 @@ mod tests {
 
     fn route_with_uid_parents(
         uid: &str,
-        rules: Vec<HTTPRouteRules>,
+        rules: Vec<HttpRouteRules>,
         hostnames: Vec<String>,
-        parent_refs: Vec<HTTPRouteParentRefs>,
-    ) -> HTTPRoute {
+        parent_refs: Vec<HttpRouteParentRefs>,
+    ) -> HttpRoute {
         let mut r = route_with_parents(rules, hostnames, parent_refs);
         r.metadata.uid = Some(uid.into());
         r
     }
 
-    fn condition(parents: &[HTTPRouteStatusParents], idx: usize, ty: &str) -> Condition {
+    fn condition(parents: &[HttpRouteStatusParents], idx: usize, ty: &str) -> Condition {
         parents[idx]
             .conditions
-            .as_ref()
-            .unwrap()
             .iter()
             .find(|c| c.type_ == ty)
             .expect("expected condition not found")
@@ -10168,7 +10188,7 @@ mod tests {
             vec!["a.example.com".into()],
             vec![
                 parent("foreign-gw"),
-                HTTPRouteParentRefs {
+                HttpRouteParentRefs {
                     name: "gw".into(),
                     namespace: Some("infra".into()),
                     ..Default::default()
@@ -10180,7 +10200,7 @@ mod tests {
         let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].parent_ref.name, "gw");
-        let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+        let conditions = &parents[0].conditions;
         assert_eq!(conditions.len(), 2);
         assert_eq!(conditions[0].type_, CONDITION_TYPE_ACCEPTED);
         assert_eq!(conditions[0].status, "False");
@@ -10208,7 +10228,7 @@ mod tests {
             (InvalidRef::NotFound, REASON_BACKEND_NOT_FOUND),
         ] {
             let parents = build_route_status(&r, &scope, RouteOutcome::Accepted, Some(invalid));
-            let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+            let conditions = &parents[0].conditions;
             assert_eq!(conditions[0].status, "True");
             assert_eq!(conditions[1].type_, CONDITION_TYPE_RESOLVED_REFS);
             assert_eq!(conditions[1].status, "False");
@@ -10229,7 +10249,7 @@ mod tests {
             vec![parent("gw")],
         );
         let parents = build_route_status(&r, &scope, RouteOutcome::UnsupportedMatches, None);
-        let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+        let conditions = &parents[0].conditions;
         assert_eq!(conditions[0].status, "False");
         assert_eq!(conditions[0].reason, REASON_UNSUPPORTED_VALUE);
         assert_eq!(conditions[1].status, "True");
@@ -10248,7 +10268,7 @@ mod tests {
         );
         let parents =
             build_route_status(&r, &scope, RouteOutcome::NoMatchingListenerHostname, None);
-        let conditions = parents[0].conditions.as_deref().unwrap_or_default();
+        let conditions = &parents[0].conditions;
         assert_eq!(conditions[0].status, "False");
         assert_eq!(conditions[0].reason, REASON_NO_MATCHING_LISTENER_HOSTNAME);
         assert_eq!(conditions[1].status, "True");
@@ -10256,22 +10276,22 @@ mod tests {
 
     #[test]
     fn merge_status_preserves_other_controllers_entries() {
-        let foreign = HTTPRouteStatusParents {
+        let foreign = HttpRouteStatusParents {
             controller_name: "traefik.io/gateway-controller".into(),
-            parent_ref: HTTPRouteStatusParentsParentRef {
+            parent_ref: HttpRouteStatusParentsParentRef {
                 name: "their-gw".into(),
                 ..Default::default()
             },
-            conditions: Some(vec![Condition {
+            conditions: vec![Condition {
                 type_: "Accepted".into(),
                 status: "True".into(),
                 reason: "Accepted".into(),
                 message: "their message".into(),
-                last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+                last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
                 observed_generation: None,
-            }]),
+            }],
         };
-        let existing = HTTPRouteStatus {
+        let existing = HttpRouteStatus {
             parents: vec![foreign.clone()],
         };
 
@@ -10315,7 +10335,7 @@ mod tests {
         // Simulate a status write having already happened: the
         // existing object now contains our slice. A second computation
         // of the same outcome should be detected as a no-op.
-        let existing = HTTPRouteStatus {
+        let existing = HttpRouteStatus {
             parents: first.clone(),
         };
         // Sleep a few ms so timestamps actually differ.
@@ -10338,7 +10358,7 @@ mod tests {
             vec![parent_default_gw()],
         );
         let accepted = build_route_status(&r, &scope, RouteOutcome::Accepted, None);
-        let existing = HTTPRouteStatus {
+        let existing = HttpRouteStatus {
             parents: accepted.clone(),
         };
         let unsupported = build_route_status(&r, &scope, RouteOutcome::UnsupportedFilters, None);
@@ -10392,7 +10412,7 @@ mod tests {
                 status: if accepted { "True" } else { "False" }.to_string(),
                 reason: String::new(),
                 message: String::new(),
-                last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+                last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
                 observed_generation: None,
             }],
             ..Default::default()
@@ -10458,7 +10478,7 @@ mod tests {
             status: "True".into(),
             reason: "Programmed".into(),
             message: "set by another actor".into(),
-            last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
             observed_generation: Some(1),
         }];
         // Ours only sets Accepted; the foreign Programmed must survive.
@@ -10538,8 +10558,8 @@ mod tests {
         }
     }
 
-    fn parent(name: &str) -> HTTPRouteParentRefs {
-        HTTPRouteParentRefs {
+    fn parent(name: &str) -> HttpRouteParentRefs {
+        HttpRouteParentRefs {
             name: name.into(),
             ..Default::default()
         }
@@ -10861,7 +10881,7 @@ mod tests {
     /// grant names one.
     #[test]
     fn a_reference_grant_opens_a_secret_of_another_namespace() {
-        use gateway_api::apis::standard::referencegrants::{
+        use crate::provider::kubernetes::gateway_compat::{
             ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
         };
         let scope = GatewayScope::new();
@@ -11416,11 +11436,11 @@ mod tests {
     /// scheme or names one.
     #[test]
     fn a_redirect_on_its_own_port_keeps_it() {
-        use gateway_api::apis::standard::httproutes::HTTPRouteRulesFiltersRequestRedirect;
-        let route = |redirect: HTTPRouteRulesFiltersRequestRedirect| {
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirect;
+        let route = |redirect: HttpRouteRulesFiltersRequestRedirect| {
             route_with(
-                vec![HTTPRouteRules {
-                    filters: Some(vec![HTTPRouteRulesFilters {
+                vec![HttpRouteRules {
+                    filters: Some(vec![HttpRouteRulesFilters {
                         request_redirect: Some(redirect),
                         ..Default::default()
                     }]),
@@ -11442,14 +11462,14 @@ mod tests {
             .rewrite_port
         };
         assert_eq!(
-            port_of(HTTPRouteRulesFiltersRequestRedirect {
+            port_of(HttpRouteRulesFiltersRequestRedirect {
                 hostname: Some("example.org".into()),
                 ..Default::default()
             }),
             Some(8080)
         );
         assert_eq!(
-            port_of(HTTPRouteRulesFiltersRequestRedirect {
+            port_of(HttpRouteRulesFiltersRequestRedirect {
                 port: Some(9090),
                 ..Default::default()
             }),
@@ -11599,7 +11619,7 @@ mod tests {
                 vec![rule(
                     Some(vec![path_match(
                         "/x",
-                        HTTPRouteRulesMatchesPathType::PathPrefix,
+                        HttpRouteRulesMatchesPathType::PathPrefix,
                     )]),
                     vec![backend("api", 80)],
                 )],
@@ -11851,7 +11871,14 @@ mod tests {
         };
 
         let http_only = status(&["HTTPRoute"]);
-        assert_eq!(http_only.supported_kinds.len(), 1);
+        assert_eq!(
+            http_only
+                .supported_kinds
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+            1
+        );
         assert_eq!(
             condition_of(&http_only, CONDITION_TYPE_PROGRAMMED).status,
             "True"
@@ -11862,7 +11889,10 @@ mod tests {
         );
 
         let mixed = status(&["HTTPRoute", "GRPCRoute"]);
-        assert_eq!(mixed.supported_kinds.len(), 1);
+        assert_eq!(
+            mixed.supported_kinds.as_deref().unwrap_or_default().len(),
+            1
+        );
         assert_eq!(
             condition_of(&mixed, CONDITION_TYPE_PROGRAMMED).status,
             "True"
@@ -11872,7 +11902,13 @@ mod tests {
         assert_eq!(resolved.reason, REASON_INVALID_ROUTE_KINDS);
 
         let grpc_only = status(&["GRPCRoute"]);
-        assert!(grpc_only.supported_kinds.is_empty());
+        assert!(
+            grpc_only
+                .supported_kinds
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
         assert_eq!(
             condition_of(&grpc_only, CONDITION_TYPE_PROGRAMMED).status,
             "False"
@@ -11904,7 +11940,10 @@ mod tests {
             condition_of(&http, CONDITION_TYPE_PROGRAMMED).status,
             "True"
         );
-        assert_eq!(http.supported_kinds[0].kind, "HTTPRoute");
+        assert_eq!(
+            http.supported_kinds.as_deref().unwrap_or_default()[0].kind,
+            "HTTPRoute"
+        );
 
         // An HTTP listener is served whatever its port, on Sōzune's.
         let other = status(8080, "HTTP");
@@ -11916,7 +11955,10 @@ mod tests {
         let programmed = condition_of(&https, CONDITION_TYPE_PROGRAMMED);
         assert_eq!(programmed.status, "True");
         assert!(programmed.message.contains("port 443"));
-        assert_eq!(https.supported_kinds[0].kind, "HTTPRoute");
+        assert_eq!(
+            https.supported_kinds.as_deref().unwrap_or_default()[0].kind,
+            "HTTPRoute"
+        );
         // Passthrough is for TLS listeners.
         let passthrough = ListenerInfo {
             name: "l".into(),
@@ -11932,7 +11974,13 @@ mod tests {
             condition_of(&passthrough, CONDITION_TYPE_ACCEPTED).reason,
             REASON_UNSUPPORTED_PROTOCOL
         );
-        assert!(passthrough.supported_kinds.is_empty());
+        assert!(
+            passthrough
+                .supported_kinds
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
 
         assert_eq!(
             condition_of(&status(5432, "TCP"), CONDITION_TYPE_PROGRAMMED).status,
@@ -11965,7 +12013,12 @@ mod tests {
             condition_of(&grpc, CONDITION_TYPE_ACCEPTED).reason,
             REASON_UNSUPPORTED_PROTOCOL
         );
-        assert!(grpc.supported_kinds.is_empty());
+        assert!(
+            grpc.supported_kinds
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     /// A port of `gateway_ports` the proxy could not open is not served.
@@ -12144,7 +12197,13 @@ mod tests {
         assert_eq!(accepted.status, "False");
         assert_eq!(accepted.reason, REASON_UNSUPPORTED_PROTOCOL);
         assert!(accepted.message.contains("Passthrough"));
-        assert!(status.supported_kinds.is_empty());
+        assert!(
+            status
+                .supported_kinds
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
 
         let status = build_listener_status(&gw, &passthrough, &served(), 0, None);
         assert_eq!(
@@ -12157,7 +12216,7 @@ mod tests {
     /// its generation or message moves on.
     #[test]
     fn a_condition_keeps_its_transition_time_until_its_status_changes() {
-        let at = |secs| Time(k8s_openapi::chrono::DateTime::from_timestamp(secs, 0).unwrap());
+        let at = |secs| Time(k8s_openapi::jiff::Timestamp::from_second(secs).unwrap());
         let condition = |status: &str, generation, time| Condition {
             type_: "Accepted".into(),
             status: status.into(),
@@ -12266,7 +12325,7 @@ mod tests {
         let mut previous = build_listener_status(&gw, &listener, &served(), 1, None);
         for condition in &mut previous.conditions {
             condition.last_transition_time =
-                Time(k8s_openapi::chrono::DateTime::from_timestamp(1_000, 0).unwrap());
+                Time(k8s_openapi::jiff::Timestamp::from_second(1_000).unwrap());
         }
 
         let (merged, changed) = merge_listener_statuses(
@@ -12400,7 +12459,7 @@ mod tests {
 
         // Naming `infra/gw` reaches the Gateway, whose listener only admits
         // routes of its own namespace by default.
-        r.spec.parent_refs = Some(vec![HTTPRouteParentRefs {
+        r.spec.parent_refs = Some(vec![HttpRouteParentRefs {
             name: "gw".into(),
             namespace: Some("infra".into()),
             ..Default::default()
@@ -12468,7 +12527,7 @@ mod tests {
             let mut r = route_with_parents(
                 vec![rule(None, vec![backend("api", 80)])],
                 vec!["a.example.com".into()],
-                vec![HTTPRouteParentRefs {
+                vec![HttpRouteParentRefs {
                     name: "gw".into(),
                     namespace: Some("infra".into()),
                     ..Default::default()
@@ -12506,12 +12565,7 @@ mod tests {
 
     #[test]
     fn only_a_refusal_counts_as_forbidden() {
-        let response = |code: u16| kube::error::ErrorResponse {
-            status: "Failure".into(),
-            message: String::new(),
-            reason: String::new(),
-            code,
-        };
+        let response = |code: u16| kube::core::Status::failure("", "").with_code(code).boxed();
         assert!(is_forbidden(&watcher::Error::WatchError(response(403))));
         assert!(is_forbidden(&watcher::Error::InitialListFailed(
             kube::Error::Api(response(401))
@@ -12578,7 +12632,7 @@ mod tests {
             "uid-1",
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
-            vec![HTTPRouteParentRefs {
+            vec![HttpRouteParentRefs {
                 name: "gw".into(),
                 namespace: Some("infra".into()),
                 ..Default::default()
@@ -12589,7 +12643,7 @@ mod tests {
         let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
         assert_eq!(parents.len(), 1);
         assert_eq!(
-            parents[0].conditions.as_deref().unwrap_or_default()[0].reason,
+            parents[0].conditions[0].reason,
             REASON_NOT_ALLOWED_BY_LISTENERS
         );
     }
@@ -12603,7 +12657,7 @@ mod tests {
         let mut gw = gateway("default", "gw", "sozune");
         gw.spec.listeners = vec![gw_listener("raw", 9000, "TCP")];
         scope.upsert_gateway(&gw);
-        let reason_for = |parent_ref: HTTPRouteParentRefs| {
+        let reason_for = |parent_ref: HttpRouteParentRefs| {
             let r = route_with_uid_parents(
                 "uid-1",
                 vec![rule(None, vec![backend("api", 80)])],
@@ -12613,9 +12667,7 @@ mod tests {
             assert!(!scope.accepts_route(&r));
             let parents = build_route_status(&r, &scope, RouteOutcome::NotMine, None);
             assert_eq!(parents.len(), 1);
-            parents[0].conditions.as_deref().unwrap_or_default()[0]
-                .reason
-                .clone()
+            parents[0].conditions[0].reason.clone()
         };
 
         // Only a TCP listener: nothing carries an HTTPRoute.
@@ -12673,7 +12725,7 @@ mod tests {
 
         let mut route = tcp_route(9000);
         route.metadata.namespace = Some("apps".into());
-        route.spec.parent_refs = Some(vec![TCPRouteParentRefs {
+        route.spec.parent_refs = Some(vec![TcpRouteParentRefs {
             name: "gw".into(),
             namespace: Some("infra".into()),
             ..Default::default()
@@ -12703,7 +12755,7 @@ mod tests {
         assert_eq!(counts, [("open".to_string(), 1), ("own".to_string(), 0)]);
 
         // Naming the listener that refuses it binds nothing.
-        route.spec.parent_refs = Some(vec![TCPRouteParentRefs {
+        route.spec.parent_refs = Some(vec![TcpRouteParentRefs {
             name: "gw".into(),
             namespace: Some("infra".into()),
             section_name: Some("own".into()),
@@ -12718,7 +12770,7 @@ mod tests {
         let r = route_with_parents(
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
-            vec![HTTPRouteParentRefs {
+            vec![HttpRouteParentRefs {
                 name: "gw".into(),
                 kind: Some("Service".into()),
                 ..Default::default()
@@ -12733,7 +12785,7 @@ mod tests {
         let r = route_with_parents(
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
-            vec![HTTPRouteParentRefs {
+            vec![HttpRouteParentRefs {
                 name: "gw".into(),
                 group: Some("networking.example.io".into()),
                 ..Default::default()
@@ -12751,7 +12803,7 @@ mod tests {
         let r = route_with_parents(
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
-            vec![HTTPRouteParentRefs {
+            vec![HttpRouteParentRefs {
                 name: "gw".into(),
                 group: Some(String::new()),
                 ..Default::default()
@@ -12778,7 +12830,7 @@ mod tests {
             vec![rule(None, vec![backend("api", 80)])],
             vec!["a.example.com".into()],
             vec![
-                HTTPRouteParentRefs {
+                HttpRouteParentRefs {
                     name: "other-controller-gw".into(),
                     ..Default::default()
                 },

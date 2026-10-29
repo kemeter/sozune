@@ -22,8 +22,8 @@
 
 use crate::model::MatchCondition;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRouteRulesMatches, HTTPRouteRulesMatchesHeadersType, HTTPRouteRulesMatchesMethod,
-    HTTPRouteRulesMatchesPathType, HTTPRouteRulesMatchesQueryParamsType,
+    HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
+    HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParamsType,
 };
 
 /// Translate a match's `headers[]` into `match_headers` conditions. A
@@ -31,7 +31,7 @@ use gateway_api::apis::standard::httproutes::{
 /// a condition on its value, one with `RegularExpression` a regex condition
 /// the whole value must match. Header names are matched case-insensitively
 /// downstream, matching the spec.
-pub fn match_headers_from(m: &HTTPRouteRulesMatches) -> Vec<MatchCondition> {
+pub fn match_headers_from(m: &HttpRouteRulesMatches) -> Vec<MatchCondition> {
     m.headers
         .as_deref()
         .unwrap_or_default()
@@ -41,7 +41,7 @@ pub fn match_headers_from(m: &HTTPRouteRulesMatches) -> Vec<MatchCondition> {
             value: h.value.clone(),
             regex: matches!(
                 h.r#type,
-                Some(HTTPRouteRulesMatchesHeadersType::RegularExpression)
+                Some(HttpRouteRulesMatchesHeadersType::RegularExpression)
             ),
         })
         .collect()
@@ -49,7 +49,7 @@ pub fn match_headers_from(m: &HTTPRouteRulesMatches) -> Vec<MatchCondition> {
 
 /// Translate a match's `queryParams[]` into `match_query` conditions.
 /// Mirrors [`match_headers_from`].
-pub fn match_query_from(m: &HTTPRouteRulesMatches) -> Vec<MatchCondition> {
+pub fn match_query_from(m: &HttpRouteRulesMatches) -> Vec<MatchCondition> {
     m.query_params
         .as_deref()
         .unwrap_or_default()
@@ -59,7 +59,7 @@ pub fn match_query_from(m: &HTTPRouteRulesMatches) -> Vec<MatchCondition> {
             value: q.value.clone(),
             regex: matches!(
                 q.r#type,
-                Some(HTTPRouteRulesMatchesQueryParamsType::RegularExpression)
+                Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression)
             ),
         })
         .collect()
@@ -68,7 +68,7 @@ pub fn match_query_from(m: &HTTPRouteRulesMatches) -> Vec<MatchCondition> {
 /// Translate a match's `method` into the entrypoint's `methods` list (a
 /// single uppercase verb, or empty for a match with no method constraint).
 /// The verb strings are the ones Sōzu and the label provider already use.
-pub fn methods_from(m: &HTTPRouteRulesMatches) -> Vec<String> {
+pub fn methods_from(m: &HttpRouteRulesMatches) -> Vec<String> {
     match &m.method {
         Some(method) => vec![method_verb(method).to_string()],
         None => Vec::new(),
@@ -78,17 +78,17 @@ pub fn methods_from(m: &HTTPRouteRulesMatches) -> Vec<String> {
 /// Map a Gateway API method enum variant to its uppercase HTTP verb. The
 /// crate enum has no wire-name accessor, so the mapping is explicit; all
 /// nine standard verbs are covered.
-fn method_verb(method: &HTTPRouteRulesMatchesMethod) -> &'static str {
+fn method_verb(method: &HttpRouteRulesMatchesMethod) -> &'static str {
     match method {
-        HTTPRouteRulesMatchesMethod::Get => "GET",
-        HTTPRouteRulesMatchesMethod::Head => "HEAD",
-        HTTPRouteRulesMatchesMethod::Post => "POST",
-        HTTPRouteRulesMatchesMethod::Put => "PUT",
-        HTTPRouteRulesMatchesMethod::Delete => "DELETE",
-        HTTPRouteRulesMatchesMethod::Connect => "CONNECT",
-        HTTPRouteRulesMatchesMethod::Options => "OPTIONS",
-        HTTPRouteRulesMatchesMethod::Trace => "TRACE",
-        HTTPRouteRulesMatchesMethod::Patch => "PATCH",
+        HttpRouteRulesMatchesMethod::Get => "GET",
+        HttpRouteRulesMatchesMethod::Head => "HEAD",
+        HttpRouteRulesMatchesMethod::Post => "POST",
+        HttpRouteRulesMatchesMethod::Put => "PUT",
+        HttpRouteRulesMatchesMethod::Delete => "DELETE",
+        HttpRouteRulesMatchesMethod::Connect => "CONNECT",
+        HttpRouteRulesMatchesMethod::Options => "OPTIONS",
+        HttpRouteRulesMatchesMethod::Trace => "TRACE",
+        HttpRouteRulesMatchesMethod::Patch => "PATCH",
     }
 }
 
@@ -98,13 +98,13 @@ fn method_verb(method: &HTTPRouteRulesMatchesMethod) -> &'static str {
 /// with its query. The caller aggregates this across a route's matches to
 /// reject the route with a clear status rather than serve it with the
 /// condition dropped.
-pub fn match_has_unsupported_conditions(m: &HTTPRouteRulesMatches) -> bool {
+pub fn match_has_unsupported_conditions(m: &HttpRouteRulesMatches) -> bool {
     // Checked as it is served.
     let invalid = |pattern: &str| crate::model::anchored_regex(pattern).is_none();
     let header_regex = m.headers.as_deref().unwrap_or_default().iter().any(|h| {
         matches!(
             h.r#type,
-            Some(HTTPRouteRulesMatchesHeadersType::RegularExpression)
+            Some(HttpRouteRulesMatchesHeadersType::RegularExpression)
         ) && invalid(&h.value)
     });
     let query_regex = m
@@ -115,13 +115,13 @@ pub fn match_has_unsupported_conditions(m: &HTTPRouteRulesMatches) -> bool {
         .any(|q| {
             matches!(
                 q.r#type,
-                Some(HTTPRouteRulesMatchesQueryParamsType::RegularExpression)
+                Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression)
             ) && invalid(&q.value)
         });
     let path_regex = m.path.as_ref().is_some_and(|p| {
         matches!(
             p.r#type,
-            Some(HTTPRouteRulesMatchesPathType::RegularExpression)
+            Some(HttpRouteRulesMatchesPathType::RegularExpression)
         )
     });
     header_regex || query_regex || path_regex
