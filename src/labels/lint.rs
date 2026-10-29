@@ -418,6 +418,7 @@ mod tests {
                 mirrors: Vec::new(),
                 mirror_of: None,
                 failing_shares: None,
+                cors: None,
                 ip_allow_list: Vec::new(),
             },
             source: None,

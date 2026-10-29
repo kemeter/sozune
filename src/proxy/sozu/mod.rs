@@ -5308,6 +5308,7 @@ mod tests {
                 mirrors: Vec::new(),
                 mirror_of: None,
                 failing_shares: None,
+                cors: None,
             },
             candidates: Vec::new(),
         }

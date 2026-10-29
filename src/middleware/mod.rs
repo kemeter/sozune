@@ -1,6 +1,7 @@
 pub mod chain;
 pub mod circuit_breaker;
 mod compress;
+mod cors;
 mod diag;
 mod fixed_answer;
 mod forward_auth;
@@ -209,6 +210,9 @@ pub struct MiddlewareRoute {
     /// Picks, by their weights, whether a request is forwarded (`0`) or
     /// answered `500` (`1`) or `503` (`2`): see [`crate::model::FailingShares`].
     pub failing_shares: Option<WeightedRoundRobin>,
+    /// The route's CORS policy, which marks every response to an origin it
+    /// allows, whatever gave it: the backend, a middleware or an error.
+    pub cors: Option<Arc<cors::CorsMiddleware>>,
 }
 
 /// One of a route's mirrors: its backends, how to pick one, and which
@@ -937,6 +941,8 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || edits_responses(entrypoint)
         // And a redirect Sōzu has no status for.
         || answers_redirect(config)
+        // And a CORS policy.
+        || config.cors.is_some()
 }
 
 /// Whether the middleware answers the route's redirect, Sōzu having no
@@ -1019,6 +1025,16 @@ pub fn build_middleware_route(
             client_ip,
             trusted_proxies.clone(),
         )));
+    }
+
+    // CORS answers the preflight requests it allows before anything else
+    // does: they carry no credentials for auth to check.
+    let cors = config
+        .cors
+        .as_ref()
+        .map(|cors| Arc::new(cors::CorsMiddleware::new(cors)));
+    if let Some(cors) = cors.as_ref() {
+        middlewares.push(Arc::clone(cors) as Arc<dyn Middleware>);
     }
 
     // A route with no valid backend answers the requests it matches, and
@@ -1115,6 +1131,7 @@ pub fn build_middleware_route(
         failing_shares: config
             .failing_shares
             .map(|s| WeightedRoundRobin::new(&[s.forwarded, s.invalid, s.unavailable])),
+        cors,
     })
 }
 
@@ -1258,6 +1275,7 @@ mod route_key_tests {
             rewrite_host: None,
             mirrors: Vec::new(),
             failing_shares: None,
+            cors: None,
             backend_headers: Vec::new(),
             response_headers: Vec::new(),
         }
@@ -1603,6 +1621,7 @@ mod route_key_tests {
             rewrite_host: None,
             mirrors: Vec::new(),
             failing_shares: None,
+            cors: None,
             backend_headers: Vec::new(),
             response_headers: Vec::new(),
         })

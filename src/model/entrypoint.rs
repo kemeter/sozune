@@ -253,6 +253,34 @@ pub struct EntrypointConfig {
     /// take them.
     #[serde(default)]
     pub failing_shares: Option<FailingShares>,
+    /// Which other origins browsers let read the route's responses: Sōzune
+    /// answers their preflight requests and marks the responses they get.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
+}
+
+/// A route's CORS policy, as a Gateway API `CORS` filter states it.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
+pub struct CorsConfig {
+    /// `scheme://host[:port]` origins, `*` for any; a host may start with
+    /// `*.`, matching any name below it.
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
+    /// Methods a cross-origin request may use, `*` for any.
+    #[serde(default)]
+    pub allow_methods: Vec<String>,
+    /// Request headers a cross-origin request may send, `*` for any.
+    #[serde(default)]
+    pub allow_headers: Vec<String>,
+    /// Response headers the page may read beyond the safelisted ones.
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    /// Whether the request may carry cookies or credentials.
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// Seconds a browser may cache a preflight answer; 5 when unset.
+    #[serde(default)]
+    pub max_age: Option<u32>,
 }
 
 /// How a route's requests split between its backends and errors, by the
