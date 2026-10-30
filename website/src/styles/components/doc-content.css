@@ -120,6 +120,51 @@
   color: var(--text-secondary);
 }
 
+.doc-content .doc-since {
+  margin: -4px 0 20px;
+}
+
+.doc-content .since {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 5px 9px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-content .since::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.55;
+}
+
+.doc-content .since-inline {
+  font-size: 11px;
+  padding: 3px 7px;
+  margin-left: 6px;
+  vertical-align: 1px;
+}
+
+.doc-content .since-inline::before {
+  display: none;
+}
+
+.doc-content .since-unreleased {
+  color: var(--color-warning);
+  background: rgba(168, 106, 0, 0.09);
+}
+
 .doc-content hr {
   margin: 48px 0;
   border: none;
