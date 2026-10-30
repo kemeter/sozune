@@ -1,5 +1,7 @@
 # Backend timeout
 
+> Since 0.8
+
 Cap the time Sōzune waits for a backend response before giving up. Useful to avoid stuck connections from blocking workers, or — set to zero — to allow long-lived streams.
 
 ## Label
@@ -38,9 +40,10 @@ labels:
 ## Behaviour
 
 - A `backendTimeout` you set covers each attempt: connecting to the backend, sending the request, and reading the whole response, its body included. A body still streaming past it is cut short. The default 30 seconds only bound the wait for the response's headers.
-- On timeout, the client receives `504 Gateway Timeout`.
+- On timeout, the client receives `504 Gateway Timeout`, or the connection is cut if the response had already started. With [`retry.attempts`](/documentation/middleware/retry), a timeout before the response is retried.
+- Setting `backendTimeout` sends the route's requests through the Sōzune middleware layer, where the timeout is enforced, like any other middleware.
 - On a WebSocket upgrade, the timeout covers only the handshake (connecting and getting the backend's first answer); the tunnel that follows is not bounded by it — see [WebSocket](/documentation/advanced/websocket).
-- The listener's own timeouts still apply. A backend that sends nothing for longer than [`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy) (30 s by default) is cut with a `504`, and so is a client left waiting longer than `proxy.timeouts.client_idle` (60 s), whatever `backendTimeout` says. They are listener-wide, not per route: raise them to let a route wait longer than that. `sozune validate`, `GET /diagnostics` and the dashboard flag a route whose `backendTimeout` the listener cuts short with `W030`.
+- The listener's own timeouts still apply. A backend that sends nothing for longer than [`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy) (30 s by default) is cut with a `504`, and so is a client left waiting longer than `proxy.timeouts.client_idle` (60 s), whatever `backendTimeout` says. They are listener-wide, not per route: raise them to let a route wait longer than that. `sozune validate`, `GET /diagnostics` and the dashboard flag a route whose `backendTimeout` the listener cuts short with `W030` (since 0.15).
 
 ## When to set it
 

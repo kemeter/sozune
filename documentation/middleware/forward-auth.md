@@ -1,5 +1,7 @@
 # Forward auth
 
+> Since 0.14
+
 Delegate authentication and authorization to an external service. For every incoming request, Sōzune calls a configured URL with the request's headers; the response decides whether the request reaches the backend or is rejected.
 
 This is the same pattern as Traefik's `ForwardAuth` middleware and Envoy's `ext_authz` filter. It plugs into anything that exposes a verification endpoint over HTTP — Authelia, Authentik, OAuth2 Proxy, OPA, custom auth services, [Crowdsec's AppSec API](https://docs.crowdsec.net/docs/appsec/intro/), Keycloak with a thin adapter, etc.
@@ -17,7 +19,7 @@ labels:
 |---|---|
 | `forwardAuth.address` | URL of the verification endpoint. Required to enable forward auth. |
 | `forwardAuth.responseHeaders` | Comma-separated list of headers to copy from the auth response onto the request before forwarding to the backend. Common: `X-User,X-Email,X-Groups`. |
-| `forwardAuth.trustForwardHeader` | When `true`, the existing `X-Forwarded-*` headers from the client are forwarded to the auth service as-is. When `false` (default), Sōzune strips them and sets `X-Forwarded-For` to the address that connected to it. Set to `true` only if Sōzune sits behind another trusted proxy. |
+| `forwardAuth.trustForwardHeader` | When `true`, the request's `X-Forwarded-*` headers are passed on to the auth service, and `X-Forwarded-For` keeps the client's chain, ending with the address that connected to Sōzune. When `false` (default), Sōzune drops them and sets `X-Forwarded-For` to that address alone. Either way, `X-Forwarded-Method`, `-Uri`, `-Host` and `-Proto` are set by Sōzune (see below). Set to `true` only if Sōzune sits behind another trusted proxy. |
 
 If `forwardAuth.address` is absent, forward auth is disabled for the service.
 
@@ -71,7 +73,7 @@ labels:
 
 - Method: `GET`.
 - Path: the path of the auth address (the path part of the **incoming** request is **not** rewritten onto the auth URL).
-- Headers copied from the client request: every header except the hop-by-hop ones (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailers`, `Transfer-Encoding`, `Upgrade`).
+- Headers copied from the client request: every header except the hop-by-hop ones (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`).
 - Headers Sōzune adds:
   - `X-Forwarded-Method` — original HTTP method
   - `X-Forwarded-Uri` — original request URI (path + query)
@@ -92,7 +94,7 @@ The forward-auth call uses a fixed 5 second timeout. If you need long-lived auth
 
 ### Order of evaluation
 
-Forward auth runs **before** any other middleware (rate limit, headers, compression). A request rejected by the auth service is never rate-counted against the client's bucket, and no response is compressed. This matches Traefik's behaviour.
+Forward auth runs after the [IP allow-list](ip-allow-list.md), header/query conditions and CORS (which answers the preflight requests it allows), and **before** rate limiting, the in-flight limit and WASM plugins. A request rejected by the auth service is never rate-counted against the client's bucket, and its response is returned without going through compression. [Basic auth](auth.md) is checked by Sōzu itself, before any of them.
 
 ## Limitations
 
@@ -105,4 +107,4 @@ Forward auth runs **before** any other middleware (rate limit, headers, compress
 
 | Code | Meaning |
 |---|---|
-| `W019InvalidForwardAuth` | The `forwardAuth.address` value is not a valid URL. The forward-auth middleware is disabled for this service; routing still works. |
+| `W019InvalidForwardAuth` | The `forwardAuth.address` value is not a valid `http://` or `https://` URL. The forward-auth middleware is disabled for this service; routing still works. |

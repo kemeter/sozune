@@ -1,8 +1,10 @@
 # Response compression
 
+> Since 0.11
+
 Compress backend responses before sending them to the client. Opt-in per service.
 
-Supported algorithms: **zstd**, **brotli (br)**, **gzip**.
+Supported algorithms: **zstd** (since 0.12), **brotli (br)** (since 0.12), **gzip**.
 
 ## Label
 

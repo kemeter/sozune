@@ -1,6 +1,8 @@
 # IP allow-list
 
-Per-route allow-list of client IPs and CIDR ranges. Requests from a client IP that is not in the list are rejected with `403 Forbidden` **before** they reach auth, rate-limit, or the backend.
+> Since 0.14
+
+Per-route allow-list of client IPs and CIDR ranges. Requests from a client IP that is not in the list are rejected with `403 Forbidden` **before** they reach forward auth, rate-limit, or the backend. [Basic auth](auth.md) is checked by Sōzu itself, ahead of every middleware: on a route with both, a request without valid credentials gets `401` before the allow-list sees it.
 
 ## Labels
 
@@ -24,11 +26,11 @@ labels:
   - "sozune.http.api.ipAllowList=10.0.0.0/8,192.168.1.5,2001:db8::/32"
 ```
 
-A request from `10.5.7.99` is served. A request from `203.0.113.7` gets a `403 Forbidden` with body `sozune: client IP not allowed for host 'api.example.com'.`.
+A request from `10.5.7.99` is served. A request from `203.0.113.7` gets a `403 Forbidden` with the header `x-sozune-diagnostic: ip-forbidden`. The body is empty unless `SOZUNE_DEBUG=true`, which makes it `sozune: client IP not allowed for host 'api.example.com'.` (see [Debugging](/documentation/advanced/debugging)).
 
 ## Behaviour
 
-- The middleware runs **first** in the route's stack — a denied client never reaches request-match, auth, rate-limit, or the backend.
+- The middleware runs **first** in the route's middleware stack — a denied client never reaches request-match, CORS, forward auth, rate-limit, or the backend. Basic auth, which Sōzu checks before the stack, still comes first.
 - All `403` rejects are logged at `WARN` level with the denied IP and host.
 - A successful allow is logged at `DEBUG`.
 - Allow-list entries that don't parse are logged and **dropped silently**: a typo can only narrow access, never widen it.
@@ -59,7 +61,7 @@ With this setup, the client IP is resolved like this:
 
 1. **`trusted_proxies` is empty** (the default): `X-Forwarded-For` is ignored entirely. The direct TCP peer is the client. Safe to deploy Sōzune publicly without any further configuration.
 2. **`trusted_proxies` is set but the TCP peer isn't in it**: `X-Forwarded-For` is still ignored — an untrusted peer can't speak about who is behind it.
-3. **`trusted_proxies` is set and the TCP peer is one of them**: walk `X-Forwarded-For` *right to left*, skipping every entry that is itself a trusted proxy. The first non-trusted entry is the client. If every XFF entry is trusted (a long internal chain), fall back to the TCP peer.
+3. **`trusted_proxies` is set and the TCP peer is one of them**: walk `X-Forwarded-For` *right to left*, skipping every entry that is itself a trusted proxy. A request carrying several `X-Forwarded-For` lines is read as one list, the lines in order. The first non-trusted entry is the client. If every XFF entry is trusted (a long internal chain), fall back to the TCP peer.
 
 The TCP peer is the address that connected to Sōzune. Middlewares run in a separate server that only Sōzu talks to, over loopback; Sōzu hands that address over as the last `X-Forwarded-For` entry, and that is the peer the rules above apply to. An entry of `127.0.0.1` therefore matches a client that really connects from the machine itself, not every client.
 
@@ -75,7 +77,9 @@ If neither the TCP peer nor any usable `X-Forwarded-For` entry yields an IP, the
 
 ## Combining with other middleware
 
-The allow-list runs before `request-match`, `forward-auth`, and `rate-limit`. A denied client therefore never consumes a rate-limit token, never triggers a forward-auth call, and never reaches the backend. This is the right order for an IP filter: a blocked client must cost as little as possible.
+The allow-list runs before `request-match`, CORS, `forward-auth`, `rate-limit` and `inFlightReq`. A denied client therefore never consumes a rate-limit token, never triggers a forward-auth call, never gets a CORS preflight answer, and never reaches the backend. This is the right order for an IP filter: a blocked client must cost as little as possible.
+
+Basic auth is the exception: Sōzu checks it before handing the request to the middleware stack, so on a route with both, a client without valid credentials gets `401` whatever its IP, and only an authenticated one reaches the allow-list.
 
 ## REST / YAML surface
 

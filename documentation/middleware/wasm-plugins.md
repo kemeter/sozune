@@ -1,5 +1,7 @@
 # WASM plugins
 
+> Since 0.14
+
 Run third-party HTTP middleware compiled to WebAssembly, without building it into Sōzune. Plugins use the [http-wasm](https://http-wasm.io) ABI — the same one Traefik's WASM plugins target — so a guest written for http-wasm runs unchanged here.
 
 A plugin is a `.wasm` module that exports `handle_request` (and optionally `handle_response`). On each request Sōzune hands the guest the method, URI, headers, client address and body; the guest can read and mutate them, short-circuit with its own response, or let the request continue to the backend.
@@ -101,13 +103,15 @@ TCP/UDP route, or a `plugins.<name>` label with no sub-key, are ignored with a
 
 ## Ordering
 
-WASM plugins run after the native request-phase middlewares (forward-auth, rate-limit) and before compression, in the order the entrypoint lists them. On the response side they run in reverse (onion model), like every other middleware.
+WASM plugins run after the native request-phase middlewares (IP allow-list, header/query conditions, CORS, forward-auth, rate-limit, in-flight limit) and before compression, in the order the entrypoint lists them. On the response side they run in reverse (onion model), like every other middleware.
 
 ## Limits
 
 Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched.
 
 ## Execution policy (`skip_paths`, `skip_methods`, `fail_open`)
+
+> Since 0.15
 
 Three operator-set fields on a plugin declaration control *when* it runs and *what happens if it fails*. They live in `config.yaml` (operator-controlled, never overridable per route).
 
@@ -200,7 +204,7 @@ plugins:
 ```yaml
 # labels on a service
 - "sozune.http.blog.plugins=umami"
-- "sozune.http.blog.plugins.umami.umami_host=https://umami.alpacode.io"
+- "sozune.http.blog.plugins.umami.umami_host=https://umami.example.com"
 - "sozune.http.blog.plugins.umami.websiteId=abc-123"
 ```
 

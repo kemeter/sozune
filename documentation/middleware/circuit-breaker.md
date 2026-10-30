@@ -1,5 +1,7 @@
 # Circuit breaker
 
+> Since 0.14
+
 Stop sending traffic to a backend that is failing. When the recent failure rate crosses a threshold, the breaker **opens** and Sōzune answers `503` immediately instead of forwarding — giving the backend room to recover and failing fast for clients. After a cooldown it probes again and closes once the backend is healthy.
 
 ## Label
@@ -35,10 +37,13 @@ Three states:
 | Backend outcome | Counts as failure? |
 |---|---|
 | Response `>= 500` | ✅ |
-| Connection error / timeout (no response) | ✅ |
+| Connection error / timeout (no response), after every [retry](./retry.md) failed | ✅ |
+| Response whose body fails or is cut short by `backendTimeout`, on a route with one | ✅ |
 | Response `2xx`/`3xx`/`4xx` | ❌ |
 
 `4xx` is a client error, not a backend fault, so it never trips the breaker — matching Traefik's intent.
+
+On a route with a `backendTimeout`, a response is counted once its body has gone through; otherwise on its status, so an endless stream does not hold the breaker.
 
 ## Notes
 
