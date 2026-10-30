@@ -94,3 +94,25 @@
 .feature-card-demo .demo-hint {
   color: #8fb3e0;
 }
+
+.feature-card-description code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+
+.feature-card-link {
+  display: inline-block;
+  margin-top: 16px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--accent);
+}
+
+.feature-card-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}

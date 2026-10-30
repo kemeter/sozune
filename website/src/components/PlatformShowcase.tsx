@@ -53,8 +53,11 @@ service {
     id: 'kubernetes',
     label: 'Kubernetes',
     language: 'yaml',
-    code: `# ingress.yaml
+    code: `# service.yaml — Ingress and Gateway API work too
+apiVersion: v1
+kind: Service
 metadata:
+  name: api
   annotations:
     sozune.http.web.host: api.example.com
     sozune.http.web.tls: "true"`,

@@ -1,10 +1,10 @@
 .hero {
-  padding: 96px 0 80px;
+  padding: 72px 0 0;
 }
 
 @media (max-width: 640px) {
   .hero {
-    padding: 64px 0 56px;
+    padding: 48px 0 0;
   }
   .hero-actions {
     margin-bottom: 40px;
@@ -13,20 +13,6 @@
 
 .hero-inner {
   text-align: center;
-}
-
-.hero-eyebrow {
-  display: inline-block;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.06em;
-  color: var(--text-secondary);
-  margin-bottom: 28px;
-}
-
-.hero-eyebrow strong {
-  color: var(--text-primary);
-  font-weight: 600;
 }
 
 .hero-title {
@@ -45,7 +31,7 @@
 
 .hero-subtitle {
   max-width: 600px;
-  margin: 0 auto 40px;
+  margin: 0 auto 32px;
   font-size: 18px;
   line-height: 1.55;
   color: var(--text-secondary);
@@ -56,7 +42,7 @@
   justify-content: center;
   gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 64px;
+  margin-bottom: 48px;
 }
 
 .btn {
