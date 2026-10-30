@@ -1,5 +1,7 @@
 # Observability
 
+> Since 0.14
+
 Sōzune exposes a Prometheus-compatible `/metrics` endpoint so any Prometheus scraper (or Grafana, VictoriaMetrics, Mimir, etc.) can ingest its state. A reference Grafana stack ships with the repo.
 
 ## The `/metrics` endpoint
@@ -109,7 +111,7 @@ rate(sozune_middleware_request_duration_seconds_sum[5m]) / rate(sozune_middlewar
 
 ### Scope — read this before relying on it
 
-This histogram **only** covers requests that traverse the Sōzune middleware layer: routes that declare auth, forward-auth, rate-limit, header/query/client-IP matching, compression, a backend timeout, an IP allow-list, or a WASM plugin. Those routes are pointed at the in-process Axum handler, which is where the timing happens.
+This histogram **only** covers requests that traverse the Sōzune middleware layer: routes that declare forward-auth, a rate limit, an in-flight limit, query or client-IP matching, compression, a backend timeout, retries, a circuit breaker, a mirror, CORS, an IP allow-list, or a WASM plugin. Basic auth, custom headers, strip prefix and most redirects run natively in Sōzu and do not bring a route there. Those routes are pointed at the in-process Axum handler, which is where the timing happens.
 
 Routes with **no** middleware are served **directly by the Sōzu workers** and never reach this timer — they are *not* counted here. For their latency, use the Sōzu worker `Time` metrics surfaced through the bridge below.
 
@@ -226,6 +228,6 @@ Like the latency histogram and access log, only requests that traverse the Sōzu
 
 ## What it does not do
 
-- **No span for middleware-less routes.** Requests served directly by the Sōzu workers (no auth/rate-limit/etc.) never reach the Axum handler that opens the span, so they are not traced. Same boundary as the access log and the latency histogram.
+- **No span for middleware-less routes.** Requests served directly by the Sōzu workers (no forward-auth, rate limit, etc.) never reach the Axum handler that opens the span, so they are not traced. Same boundary as the access log and the latency histogram.
 - **No _per-route_ latency histograms.** Sōzune exposes one **global** histogram for the middleware path (`sozune_middleware_request_duration_seconds`, see above), but does not break it down per route, host, or method — that would explode cardinality. It also does not cover middleware-less routes (served directly by Sōzu). Sōzu's own `Histogram` and `Percentiles` worker metrics are still skipped on the bridge because their bucket bounds are not part of the protocol contract; only `Gauge`, `Count`, and `Time` worker values are forwarded.
 - **No metric labels for hostnames, paths, or clusters.** Adding them would explode cardinality on large parks. Use Sōzu's per-cluster query directly if you need that granularity.

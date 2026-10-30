@@ -40,7 +40,11 @@ entrypoints:
 
 You can also set `backendTimeout=0` (no timeout) if you don't want to think about it, but a finite cap is safer in production — a stuck backend won't pin a worker forever.
 
+`sozune validate`, `GET /diagnostics` and the dashboard report `W030` for a `backendTimeout` of `0`, or one longer than the listener timeouts below let a request wait.
+
 ### Raise the listener timeouts too
+
+> Since 0.15
 
 `backendTimeout` is not the only clock. The HTTP and HTTPS listeners close a backend connection that stays silent for 30 s, and a client connection that waits for 60 s, whatever the route sets. A poll held longer than that needs them raised in `config.yaml`:
 

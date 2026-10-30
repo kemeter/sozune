@@ -4,7 +4,7 @@ Sōzune proxies WebSocket upgrades transparently. No configuration is required �
 
 ## How it works
 
-When Sōzune receives a request with `Upgrade: websocket`, it:
+A route served directly by Sōzu has the upgrade handled by Sōzu itself. On a route that goes through the Sōzune middleware (rate limit, forward auth, timeouts…), when the middleware receives a request with `Upgrade: websocket`, it:
 
 1. Opens a raw TCP connection to the backend.
 2. Forwards the HTTP upgrade request, preserving the path and headers.
