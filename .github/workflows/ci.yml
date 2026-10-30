@@ -1,10 +1,22 @@
 name: CI
 
+# A change to the docs or the website alone does not touch the binary: no
+# Rust build for it.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'documentation/**'
+      - 'website/**'
+      - '**/*.md'
+      - '.github/workflows/deploy-website.yml'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'documentation/**'
+      - 'website/**'
+      - '**/*.md'
+      - '.github/workflows/deploy-website.yml'
 
 env:
   CARGO_TERM_COLOR: always
