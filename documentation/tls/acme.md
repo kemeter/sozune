@@ -1,5 +1,7 @@
 # ACME / Let's Encrypt
 
+> Since 0.6
+
 Sōzune provisions and renews TLS certificates automatically through ACME (Let's Encrypt). Triggered the moment a service is declared with `tls=true`.
 
 ## Configuration
@@ -30,12 +32,14 @@ acme:
 | `certs_dir` | `/etc/sozune/certs` | Where certificates and the ACME account credentials are stored. |
 | `staging` | `true` | Use Let's Encrypt's staging environment (no rate limit, untrusted certs). **Switch to `false` for production.** |
 | `challenge_port` | `3036` | Port where Sōzune answers HTTP-01 challenges (loopback only). |
-| `tls_alpn_port` | `3040` | Loopback port the TLS-ALPN-01 responder binds. Only used when a `tls-alpn-01` resolver is configured; never exposed directly. |
-| `resolvers` | `{}` | Named challenge resolvers (`http-01`, `dns-01` with a provider, or `tls-alpn-01`). Entrypoints reference one by name. |
+| `tls_alpn_port` | `3040` | Loopback port the TLS-ALPN-01 responder binds. Only used when a `tls-alpn-01` resolver is configured; never exposed directly. (since 0.15) |
+| `resolvers` | `{}` | Named challenge resolvers (`http-01`, `dns-01` with a provider, or `tls-alpn-01`). Entrypoints reference one by name. (since 0.14) |
 
-Top-level fields are overridable through `SOZUNE_ACME_*` environment variables. Provider credentials are always read from environment variables — never inlined in YAML.
+`enabled`, `email`, `certs_dir`, `staging` and `challenge_port` are overridable through `SOZUNE_ACME_ENABLED`, `SOZUNE_ACME_EMAIL`, `SOZUNE_ACME_CERTS_DIR`, `SOZUNE_ACME_STAGING` and `SOZUNE_ACME_CHALLENGE_PORT`; `tls_alpn_port` and `resolvers` are set in YAML only. Provider credentials are always read from environment variables — never inlined in YAML.
 
 ## DNS-01 and wildcards
+
+> Since 0.14
 
 Wildcard certificates (`*.example.com`) cannot be issued through HTTP-01 — they require DNS-01. Declare a DNS-01 resolver and point your entrypoint at it:
 
@@ -97,16 +101,16 @@ Sōzune provisions each entry in `domains` on its own — no entrypoint required
 | OVH | `ovh` | `application_key_env`, `application_secret_env`, `consumer_key_env` | `endpoint`: `ovh-eu` (default), `ovh-ca` or `ovh-us` |
 | Gandi | `gandi` | `personal_access_token_env` | — |
 | Scaleway | `scaleway` | `secret_key_env` | — |
-| deSEC | `desec` | `token_env` | — |
-| DigitalOcean | `digitalocean` | `token_env` | — |
-| Hetzner | `hetzner` | `api_token_env` | — |
-| Infomaniak | `infomaniak` | `access_token_env` | — |
-| Porkbun | `porkbun` | `api_key_env`, `secret_api_key_env` | — |
-| RFC 2136 | `rfc2136` | `tsig_secret_env` | `tsig_algorithm`, `zone` (see below) |
+| deSEC | `desec` | `token_env` | — (since 0.15) |
+| DigitalOcean | `digitalocean` | `token_env` | — (since 0.15) |
+| Hetzner | `hetzner` | `api_token_env` | — (since 0.15) |
+| Infomaniak | `infomaniak` | `access_token_env` | — (since 0.15) |
+| Porkbun | `porkbun` | `api_key_env`, `secret_api_key_env` | — (since 0.15) |
+| RFC 2136 | `rfc2136` | `tsig_secret_env` | `tsig_algorithm`, `zone` (see below) (since 0.15) |
 
 DigitalOcean, Hetzner, Infomaniak and Porkbun are tested against the documented APIs but not yet against live accounts: [report](https://github.com/kemeter/sozune/issues) anything that goes wrong. Porkbun only accepts API calls for a domain whose "API Access" is turned on in its domain settings.
 
-**RFC 2136 (self-hosted DNS).** For an authoritative server you run yourself (BIND, Knot DNS, PowerDNS), records are written through TSIG-signed dynamic updates, with no vendor API:
+**RFC 2136 (self-hosted DNS).** For an authoritative server you run yourself (BIND, Knot DNS, PowerDNS), records are written through TSIG-signed dynamic updates, with no vendor API (since 0.15):
 
 ```yaml
 acme:
@@ -125,13 +129,13 @@ acme:
 
 The server must accept TXT updates under the zone for that key (`update-policy` on BIND). Without `zone`, the zone is found with an SOA lookup through the system resolver, which cannot see a private or split-horizon zone: set `zone` for those.
 
-**Checked at startup.** Each DNS-01 resolver is built once when Sōzune starts. One whose env var is not set or whose fields are invalid (an unknown OVH `endpoint`, a bad `tsig_algorithm`…) is logged as an error naming the problem; Sōzune still starts, and only the certificates ordered through that resolver fail. [`sozune doctor`](/documentation/advanced/debugging) runs the same check.
+**Checked at startup.** Each DNS-01 resolver is built once when Sōzune starts. One whose env var is not set or whose fields are invalid (an unknown OVH `endpoint`, a bad `tsig_algorithm`…) is logged as an error naming the problem; Sōzune still starts, and only the certificates ordered through that resolver fail. [`sozune doctor`](/documentation/advanced/debugging) runs the same check. (since 0.15)
 
 **Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
 
-**Unknown resolver:** a TLS route whose `acme.resolver` names a resolver that `acme.resolvers` does not declare gets diagnostic `W029`, in `sozune validate`, `GET /diagnostics` and the dashboard. A certificate ordered through it would fail. A route whose hostnames are all covered by [certificates from files](/documentation/tls/overview#certificates-from-files) is left alone: ACME orders nothing for it.
+**Unknown resolver:** a TLS route whose `acme.resolver` names a resolver that `acme.resolvers` does not declare gets diagnostic `W029`, in `sozune validate`, `GET /diagnostics` and the dashboard. A certificate ordered through it would fail. A route whose hostnames are all covered by [certificates from files](/documentation/tls/overview#certificates-from-files) is left alone: ACME orders nothing for it. (since 0.15)
 
-**Wildcard on an HTTP-01 resolver:** the order will fail loudly with `wildcard hostname requires a DNS-01 resolver`. Wildcards always need DNS-01.
+**Wildcard on an HTTP-01 resolver:** the order fails loudly with `wildcard hostname <name> requires a DNS-01 resolver` (as on a TLS-ALPN-01 resolver, or with no resolver). Wildcards always need DNS-01.
 
 **Multiple entrypoints sharing a hostname with different resolvers:** Sōzune issues one certificate per hostname; the first resolver seen wins. A warning is logged for the others.
 
@@ -153,9 +157,11 @@ acme:
       domains: ["*.test.example.com"]
 ```
 
-Each distinct `ca_server` keeps its own ACME account on disk (the account file is derived from the directory URL), so switching or mixing CAs never reuses an account that belongs to a different server. `ca_server` also accepts a non-Let's-Encrypt ACME directory (e.g. an internal CA).
+Each distinct `ca_server` keeps its own ACME account on disk (see [Storage layout](#storage-layout)), so switching or mixing CAs never reuses an account that belongs to a different server. `ca_server` also accepts a non-Let's-Encrypt ACME directory (e.g. an internal CA).
 
 ## TLS-ALPN-01 (no port 80, no DNS API)
+
+> Since 0.15
 
 TLS-ALPN-01 ([RFC 8737](https://www.rfc-editor.org/rfc/rfc8737.html)) proves control of a hostname over the TLS handshake on port 443 itself — the CA connects with the ALPN protocol `acme-tls/1` and Sōzune answers with a challenge certificate. It needs **neither port 80** (unlike HTTP-01) **nor DNS API credentials** (unlike DNS-01), so it fits when 80 is closed and DNS-01 is not an option.
 
@@ -192,7 +198,7 @@ The preread neither decrypts nor consumes the connection: normal HTTPS reaches t
 
 ## How it works
 
-When you declare a service with `tls=true`, Sōzune scans every TLS-enabled hostname and triggers an HTTP-01 challenge for each one that is missing a certificate or is expiring within 30 days. A Kubernetes Gateway route is left out: its certificate comes from the Secret its `HTTPS` listener names (see [HTTPS listeners](/documentation/providers/kubernetes#https-listeners)). So is a hostname an Ingress serves with a `spec.tls[].secretName` (see [Ingress resources](/documentation/providers/kubernetes#ingress-resources)).
+When you declare a service with `tls=true`, Sōzune scans every TLS-enabled hostname and orders a certificate for each one that is missing one or has reached its [renewal threshold](#renewal), through the challenge of its resolver (HTTP-01 when it names none, as below). A Kubernetes Gateway route is left out: its certificate comes from the Secret its `HTTPS` listener names (see [HTTPS listeners](/documentation/providers/kubernetes#https-listeners)) (since 0.16). So is a hostname an Ingress serves with a `spec.tls[].secretName` (see [Ingress resources](/documentation/providers/kubernetes#ingress-resources)) (since 0.16).
 
 ```
    tls=true on app.example.com
@@ -226,15 +232,17 @@ The `/.well-known/acme-challenge/` path is registered as a high-priority route o
 - **Initial provisioning** runs at startup (after loading any existing certs from disk).
 - **Periodic check** every 12 hours.
 - **On-demand check** when an entrypoint is added or modified — Sōzune is notified through an internal channel and re-runs the provisioning logic 2 seconds later.
-- **Renewal threshold:** a certificate is renewed when it expires within 30 days.
+- **Renewal threshold:** a certificate is renewed once its remaining lifetime drops below a third of its total lifetime, capped at 30 days: a 90-day Let's Encrypt certificate is renewed 30 days before expiry, a 6-day one 2 days before. (since 0.14)
+- **Retry after a failure:** a hostname whose order failed is retried after 60 seconds, then 5 minutes, 15 minutes, 1 hour, and every 6 hours from then on, or later when Let's Encrypt's rate-limit error names a `retry after` time. A success resets it. (since 0.14)
 
-A certificate that is already valid for more than 30 days is left untouched.
+A certificate that has not reached its threshold is left untouched.
 
 ## Storage layout
 
 ```
 <certs_dir>/
-├── account_credentials.json     # ACME account private key (mode 0600)
+├── account_credentials.json     # ACME account for Let's Encrypt production (mode 0600)
+├── account_<directory URL>.json # ACME account for any other directory (mode 0600)
 ├── app.example.com/
 │   ├── cert.pem                 # Leaf cert + chain
 │   └── key.pem                  # Private key (mode 0600)
@@ -243,6 +251,7 @@ A certificate that is already valid for more than 30 days is left untouched.
     └── key.pem
 ```
 
+- One ACME account per ACME directory. Let's Encrypt production keeps `account_credentials.json`; staging and every other `ca_server` get their own file, named after the directory URL with every non-alphanumeric character turned into `_` (e.g. `account_https___acme_staging_v02_api_letsencrypt_org_directory.json`). Production also still reads the per-directory file 0.14 and 0.15 wrote for it, when there is no `account_credentials.json`. An account file that belongs to another directory is skipped. (since 0.14)
 - One subdirectory per hostname. Wildcard hostnames are stored under `_wildcard_.example.com/` (the `*` is not filesystem-portable).
 - Filenames are fixed: `cert.pem` (full chain) and `key.pem`.
 - Persisting `certs_dir` across restarts is what avoids re-issuing certs at every boot. **Always mount it on a volume in production** — Let's Encrypt enforces rate limits on new orders.
@@ -251,8 +260,8 @@ A certificate that is already valid for more than 30 days is left untouched.
 
 1. Set `staging: false`.
 2. Set a real `email`.
-3. Mount `certs_dir` on a persistent volume.
-4. Open inbound TCP port 80 — required for HTTP-01 challenges to reach Sōzune.
+3. Mount `certs_dir` on a persistent volume, writable by the user Sōzune runs as (`nonroot`, UID `65532`, in the Docker image).
+4. Open inbound TCP port 80 — required for HTTP-01 challenges to reach Sōzune (the default, when a route names no resolver). TLS-ALPN-01 needs port 443 only, DNS-01 neither.
 5. Make sure DNS for every TLS-enabled hostname resolves to the Sōzune host.
 
 ## Existing certificates at startup
@@ -267,10 +276,10 @@ Every TLS hostname is validated before it's used as a directory name. Names cont
 
 ## Limitations
 
-- **HTTP-01 and DNS-01.** DNS-01 is available through named resolvers (Cloudflare, deSEC, DigitalOcean, Gandi, Hetzner, Infomaniak, OVH, Porkbun, Scaleway, and RFC 2136 for self-hosted servers), which also unlocks wildcard certificates. For any other DNS provider, issue the certificate with [certbot](/documentation/tls/certbot) and load it from files. DNS-01 challenge solving is delegated to [cheti](https://github.com/kemeter/cheti).
-- **Let's Encrypt only.** The ACME directory URL is hardcoded. No support for custom ACME providers (ZeroSSL, Buypass, internal CA, Pebble for testing).
+- **HTTP-01, TLS-ALPN-01 and DNS-01.** DNS-01 is available through named resolvers (Cloudflare, deSEC, DigitalOcean, Gandi, Hetzner, Infomaniak, OVH, Porkbun, Scaleway, and RFC 2136 for self-hosted servers), which also unlocks wildcard certificates. For any other DNS provider, issue the certificate with [certbot](/documentation/tls/certbot) and load it from files. DNS-01 challenge solving is delegated to [cheti](https://github.com/kemeter/cheti).
+- **Let's Encrypt by default.** `staging` picks Let's Encrypt's staging or production directory. Another ACME CA is reached through a resolver's [`ca_server`](#per-resolver-acme-server-ca_server), as long as it needs no EAB.
 - **No EAB.** No External Account Binding — incompatible with ACME providers that require it.
-- **Single account.** One ACME account is used for all certificates, stored at `certs_dir/account_credentials.json`. If the file is corrupt, Sōzune creates a new account on the next start.
+- **One account per ACME directory.** Every certificate ordered from the same directory shares its account (see [Storage layout](#storage-layout)). If the file is corrupt, Sōzune creates a new account on the next order.
 
 ## Troubleshooting
 
@@ -285,4 +294,4 @@ Every TLS hostname is validated before it's used as a directory name. Names cont
 
 **`Order still pending after 30 retries`.** The CA didn't validate the challenge in 2.5 minutes. Almost always a network/DNS issue — Let's Encrypt couldn't reach `http://<your-host>/.well-known/acme-challenge/<token>`.
 
-**`Loaded existing certificate for X` then a new request appears.** Sōzune found the cert on disk but the renewal logic decided it needs renewal (less than 30 days remaining). Expected.
+**`Loaded existing certificate for X` then a new request appears.** Sōzune found the cert on disk but it has reached its [renewal threshold](#renewal). Expected.

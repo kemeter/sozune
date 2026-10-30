@@ -1,5 +1,7 @@
 # Retry
 
+> Since 0.14
+
 Retry a request when forwarding it to the backend fails before any response comes back — a refused connection, a dropped connection, or a timeout. Useful for rolling restarts and transient network blips.
 
 ## Label
@@ -29,8 +31,10 @@ After all attempts fail, the client gets the usual error: `504` if the last fail
 ## Notes
 
 - The request body is buffered in memory so it can be replayed on each attempt. Keep that in mind for very large uploads on retried routes.
-- A retry goes to the heaviest backend the request has not tried yet, so with multiple backends it lands on a different one; once every backend was tried, the balancer picks again. When every attempt fails on a route with [backup](/documentation/routing/load-balancing#weighted-load-balancing) backends (weight `0`), each backend not tried yet gets one more try, heaviest first, then each backup.
+- A retry goes to the heaviest backend the request has not tried yet, so with multiple backends it lands on a different one; once every backend was tried, the balancer picks again. When every attempt fails on a route with [backup](/documentation/routing/load-balancing#weighted-load-balancing) backends (weight `0`), each backend not tried yet gets one more try, heaviest first, then each backup. (since 0.16)
 - Retries are attempted back-to-back; there is no backoff delay between them yet.
+- A WebSocket upgrade is never retried: `retry.attempts` does not apply to it. On a route with backup backends, an upgrade no backend answered still goes to each backend not tried yet, then each backup (since 0.16).
+- With a [circuit breaker](./circuit-breaker.md), a request whose every attempt failed counts as one failure.
 - Declaring `retry.attempts` routes the entrypoint through the Sōzune middleware layer (where the retry loop lives), like any other middleware.
 
 ## REST / YAML surface

@@ -16,6 +16,10 @@ export default {
         test: /\.md$/,
         type: 'asset/source',
       },
+      {
+        test: /Cargo\.toml$/,
+        type: 'asset/source',
+      },
     ],
   },
 };

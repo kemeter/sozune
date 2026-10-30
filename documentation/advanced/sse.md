@@ -1,8 +1,10 @@
 # Server-Sent Events
 
-Sōzune proxies Server-Sent Events (`text/event-stream`) transparently. There is nothing to enable — once you set the right backend timeout, the long-lived stream flows through Sōzu chunk by chunk, in real time.
+Sōzune proxies Server-Sent Events (`text/event-stream`) transparently. There is nothing to enable — the long-lived stream flows through Sōzu chunk by chunk, in real time, as long as no timeout cuts it.
 
-## The one knob you need
+## Timeouts
+
+Leave `backendTimeout` unset on an SSE route, or set it to `0`:
 
 ```yaml
 labels:
@@ -11,11 +13,11 @@ labels:
   - "sozune.http.events.backendTimeout=0"
 ```
 
-`backendTimeout=0` is **required** for any SSE endpoint. Without it, Sōzune cuts the connection after the default 30 s and your client reconnects on a loop without ever receiving the next event.
+A `backendTimeout` you set covers the whole response, its body included: a positive value cuts the stream once it is reached, and the client reconnects on a loop. Unset, the default 30 s only bounds the wait for the response's headers, which an SSE backend sends at once. `0` removes the timeout altogether; `sozune validate`, `GET /diagnostics` and the dashboard then report `W030`, a reminder that the listener timeouts below still apply.
 
-See [Backend timeout](/documentation/middleware/backend-timeout) for the full semantics — `0` means *no timeout* on the route.
+See [Backend timeout](/documentation/middleware/backend-timeout) for the full semantics.
 
-The listener still closes a backend connection that sends nothing for 30 s ([`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy)). A stream that can stay quiet longer than that needs either a keep-alive comment from the backend (a `: ping` line every 15–20 s, which most SSE libraries can send) or a higher `backend_idle` and `client_idle`.
+The listener still closes a backend connection that sends nothing for 30 s ([`proxy.timeouts.backend_idle`](/documentation/configuration/overview#proxy)). A stream that can stay quiet longer than that needs either a keep-alive comment from the backend (a `: ping` line every 15–20 s, which most SSE libraries can send) or a higher `backend_idle` and `client_idle` (since 0.15).
 
 ## How it works
 

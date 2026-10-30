@@ -1,17 +1,17 @@
 # Sōzune
 
-Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Podman, Swarm, Kubernetes, Nomad, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
+Sōzune (pronounce *Sozuné*) is a modern reverse proxy built on [Sōzu](https://github.com/sozu-proxy/sozu). It discovers your services across Docker, Podman, Swarm, Kubernetes, Nomad, Consul, Ring, an HTTP endpoint, or a YAML file, manages Let's Encrypt certificates automatically, and applies your changes without restarting.
 
 ![Sōzune dashboard](documentation/assets/dashboard-entrypoints.png)
 
 ## Features
 
-- **Multi-platform service discovery** — Docker, Podman, Swarm, Kubernetes (Ingress + Gateway API), Nomad, an HTTP endpoint, or a YAML file.
-- **Automatic HTTPS** — ACME (Let's Encrypt) provisioning and renewal, no intervention. HTTP-01 and DNS-01 (Cloudflare, OVH, Gandi, Scaleway), including wildcard certificates.
+- **Multi-platform service discovery** — Docker, Podman, Swarm, Kubernetes (Ingress + Gateway API), Nomad, Consul, Ring, an HTTP endpoint, or a YAML file.
+- **Automatic HTTPS** — ACME (Let's Encrypt) provisioning and renewal, no intervention. HTTP-01, TLS-ALPN-01 and DNS-01 (Cloudflare, OVH, Gandi, Scaleway, deSEC, DigitalOcean, Hetzner, Infomaniak, Porkbun, RFC 2136), including wildcard certificates.
 - **HTTP/2** — negotiated through ALPN on every TLS listener.
 - **Hot reload** — REST API applies changes on the fly, no downtime.
 - **Wildcard & regex hostnames** — `*.example.com`, `/cdn[0-9]+/.example.com`.
-- **Multi-protocol** — HTTP, HTTPS, WebSocket, raw TCP passthrough.
+- **Multi-protocol** — HTTP, HTTPS, WebSocket, raw TCP (with SNI-based TLS passthrough) and UDP.
 
 ## Quick start
 
@@ -23,6 +23,10 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    group_add:
+      - "${DOCKER_GID:?export DOCKER_GID=$(stat -c %g /var/run/docker.sock)}"
+    environment:
+      CONFIG_PATH: /etc/sozune/config.yaml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./config.yaml:/etc/sozune/config.yaml
@@ -40,6 +44,8 @@ providers:
   docker:
     enabled: true
 
+api: {}
+
 proxy:
   http:
     listen_address: 80
@@ -48,17 +54,20 @@ proxy:
 ```
 
 ```bash
+export DOCKER_GID=$(stat -c %g /var/run/docker.sock)
 docker compose up -d
 curl -H "Host: whoami.localhost" http://localhost
 ```
 
+The image runs as a non-root user: `group_add` lets it open the Docker socket, and `CONFIG_PATH` points it at the mounted file. See [Installation](documentation/getting-started/installation.md#running-as-non-root).
+
 ## Documentation
 
 - [Installation](documentation/getting-started/installation.md) · [Quick start](documentation/getting-started/quick-start.md)
-- Providers — [Docker](documentation/providers/docker.md) · [Swarm](documentation/providers/swarm.md) · [Kubernetes](documentation/providers/kubernetes.md) · [Nomad](documentation/providers/nomad.md) · [HTTP](documentation/providers/http.md)
+- Providers — [Docker](documentation/providers/docker.md) · [Podman](documentation/providers/podman.md) · [Swarm](documentation/providers/swarm.md) · [Kubernetes](documentation/providers/kubernetes.md) · [Nomad](documentation/providers/nomad.md) · [Consul](documentation/providers/consul.md) · [Ring](documentation/providers/ring.md) · [HTTP](documentation/providers/http.md)
 - [Configuration file & env vars](documentation/configuration/overview.md)
 - [REST API](documentation/configuration/api.md)
-- Routing — [Hostnames](documentation/routing/hostnames.md) · [Path matching](documentation/routing/path-matching.md) · [Load balancing](documentation/routing/load-balancing.md) · [TCP](documentation/routing/tcp.md)
+- Routing — [Hostnames](documentation/routing/hostnames.md) · [Path matching](documentation/routing/path-matching.md) · [Load balancing](documentation/routing/load-balancing.md) · [TCP](documentation/routing/tcp.md) · [UDP](documentation/routing/udp.md)
 - TLS — [Overview](documentation/tls/overview.md) · [ACME / Let's Encrypt](documentation/tls/acme.md) · [Certbot](documentation/tls/certbot.md)
 - Middleware — [Basic auth](documentation/middleware/auth.md) · [Forward auth](documentation/middleware/forward-auth.md) · [Custom headers](documentation/middleware/headers.md) · [Strip prefix](documentation/middleware/strip-prefix.md) · [Add prefix](documentation/middleware/add-prefix.md) · [Redirects](documentation/middleware/redirects.md) · [Rate limit](documentation/middleware/rate-limit.md) · [Response compression](documentation/middleware/compress.md) · [Backend timeout](documentation/middleware/backend-timeout.md) · [Error pages](documentation/middleware/error-pages.md)
 - Advanced — [Health checks](documentation/advanced/health-checks.md) · [WebSocket](documentation/advanced/websocket.md) · [Access logs](documentation/advanced/access-logs.md) · [Debugging](documentation/advanced/debugging.md)
@@ -93,9 +102,12 @@ curl -H "Host: whoami.localhost" http://localhost
 |---|---|
 | `80` | HTTP proxy |
 | `443` | HTTPS proxy |
-| `3035` | REST API |
+| `3035` | REST API (loopback) |
 | `3036` | ACME HTTP-01 challenge (loopback) |
 | `3037` | Internal middleware proxy (loopback) |
+| `3038` | Dashboard (loopback) |
+| `3039` | Dedicated `/metrics` listener (loopback) |
+| `3040` | ACME TLS-ALPN-01 responder (loopback) |
 
 ## Contributing
 

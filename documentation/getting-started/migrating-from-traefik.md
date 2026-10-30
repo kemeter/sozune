@@ -57,18 +57,18 @@ A Traefik rule becomes one label per matcher. All the matchers of a route must m
 | ``HostRegexp(`^cdn[0-9]+\.example\.com$`)`` | `host=/cdn[0-9]+/.example.com`: the regex goes between slashes, and the domain at the end stays written out. A regex that would match any domain is refused. See [Regex hostnames](/documentation/routing/hostnames#regex). |
 | ``PathPrefix(`/api`)`` | `path=/api`. Sōzune matches on segment boundaries: `/api` serves `/api/users` but not `/apiv2`, which Traefik's `PathPrefix` does. `pathRegex=^/api` keeps that broader match, but `stripPrefix` only applies to `path`. |
 | ``PathRegexp(`^/users/[0-9]+`)`` | `pathRegex=^/users/[0-9]+`. Keep the `^`: without it, the regex can match anywhere in the path or in its query string. |
-| ``Path(`/exact`)`` | Exact paths are only available through the [HTTP provider and the API](/documentation/routing/path-matching) |
+| ``Path(`/exact`)`` | No label. Exact paths are available through the [HTTP provider, the file provider and the API](/documentation/routing/path-matching#exact), and from a Kubernetes `Exact` path. |
 | ``Method(`GET`)`` | `methods=GET` (comma-separated for several) |
 | ``Header(`X-Api-Version`, `2`)`` | `matchHeaders=X-Api-Version:2` (see the note below) |
 | ``Query(`beta`, `1`)`` | `matchQuery=beta:1` (see the note below) |
-| ``HeaderRegexp(`X-Version`, `^v[0-9]+$`)`` | `matchHeadersRegex.X-Version=v[0-9]+`. The regex matches the whole value, where Traefik's matches anywhere in it: write `.*v[0-9]+.*` to keep that. See [Regular expressions](/documentation/routing/header-query-matching#regular-expressions). |
-| ``QueryRegexp(`page`, `^[0-9]+$`)`` | `matchQueryRegex.page=[0-9]+`, likewise. |
+| ``HeaderRegexp(`X-Version`, `^v[0-9]+$`)`` | `matchHeadersRegex.X-Version=v[0-9]+`. The regex matches the whole value, where Traefik's matches anywhere in it: write `.*v[0-9]+.*` to keep that. See [Regular expressions](/documentation/routing/header-query-matching#regular-expressions). (since 0.16) |
+| ``QueryRegexp(`page`, `^[0-9]+$`)`` | `matchQueryRegex.page=[0-9]+`, likewise. (since 0.16) |
 | ``ClientIP(`10.0.0.0/8`)`` | `matchClientIP=10.0.0.0/8` (see the note below) |
-| `routers.<r>.priority` | `priority`. Traefik ranks routes by rule length when no priority is set. Sōzune does not: at equal priority, the first route by id wins, even over a longer path. Set `priority` on the more specific route when two routes overlap. |
+| `routers.<r>.priority` | `priority`. Traefik ranks routes by rule length when no priority is set. At equal priority, Sōzune tries the more specific route first: exact hostname, then regex, then wildcard (longer first); exact path, then longer prefix; a route on `methods` before one on any method; more `matchHeaders` conditions first; earlier releases took the first route by id (since 0.16). Set `priority` when that order is not the one you want. See [Priority](/documentation/routing/hostnames#priority). |
 
-`matchHeaders` chooses between routes, as `Header()` does: two routers on the same host and path that differ only by a header translate one to one, and a request without the header goes to the other route. A route whose header conditions hold comes before every route without any, whatever their priority.
+`matchHeaders` chooses between routes, as `Header()` does: two routers on the same host and path that differ only by a header translate one to one, and a request without the header goes to the other route. A route whose header conditions hold comes before every route without any, whatever their priority. (since 0.16)
 
-`matchQuery` chooses between routes too, as `Query()` does, for up to three conditions on a route without `pathRegex`, `stripPrefix` or `addPrefix`. `matchClientIP` filters a route, it does not choose between routes: Sōzune picks the route, then answers `404` when the client IP is not listed, without trying another route. Two Traefik routers on the same host and path that differ only by a client IP need distinct paths in Sōzune. See [Header & query matching](/documentation/routing/header-query-matching).
+`matchQuery` chooses between routes too, as `Query()` does, for up to three conditions on a route without `pathRegex`, `stripPrefix` or `addPrefix` (since 0.16). `matchClientIP` filters a route, it does not choose between routes: Sōzune picks the route, then answers `404` when the client IP is not listed, without trying another route. Two Traefik routers on the same host and path that differ only by a client IP need distinct paths in Sōzune. See [Header & query matching](/documentation/routing/header-query-matching).
 
 A rule that mixes `||` across different matcher types has no single-route equivalent: declare one service per alternative. Each of them needs a `host`, so an alternative on a path alone, on any host, cannot be expressed with labels.
 
@@ -90,12 +90,12 @@ A rule that mixes `||` across different matcher types has no single-route equiva
 |---|---|
 | `services.<s>.loadbalancer.server.port` | `port` |
 | `services.<s>.loadbalancer.sticky.cookie=true` | `stickySession=true` |
-| `services.<s>.loadbalancer.healthcheck.path` | `healthCheck.path`. A backend that fails it leaves the rotation, unless every backend of the route does. See [Health checks](/documentation/advanced/health-checks). |
+| `services.<s>.loadbalancer.healthcheck.path` | `healthCheck.path`. A backend that fails it leaves the rotation, unless every backend of the route does (since 0.16). See [Health checks](/documentation/advanced/health-checks). |
 | `services.<s>.loadbalancer.healthcheck.timeout=2s` | `healthCheck.timeout=2000` (milliseconds) |
-| `services.<s>.loadbalancer.healthcheck.interval=5s` | `healthCheck.interval=5000` (milliseconds) |
-| `services.<s>.loadbalancer.healthcheck.port` | `healthCheck.port` |
-| `services.<s>.loadbalancer.healthcheck.headers.<Name>` | `healthCheck.headers.<Name>` |
-| `services.<s>.loadbalancer.healthcheck.unhealthyInterval`, `followRedirects`, `scheme`, `hostname`, `method` | No equivalent. Thresholds instead: `healthCheck.unhealthyThreshold` / `healthyThreshold`. |
+| `services.<s>.loadbalancer.healthcheck.interval=5s` | `healthCheck.interval=5000` (milliseconds) (since 0.16) |
+| `services.<s>.loadbalancer.healthcheck.port` | `healthCheck.port` (since 0.16) |
+| `services.<s>.loadbalancer.healthcheck.headers.<Name>` | `healthCheck.headers.<Name>` (since 0.16) |
+| `services.<s>.loadbalancer.healthcheck.unhealthyInterval`, `followRedirects`, `scheme`, `hostname`, `method` | No equivalent. Thresholds instead: `healthCheck.unhealthyThreshold` / `healthyThreshold` (since 0.16). |
 | `serverstransport.forwardingtimeouts.responseheadertimeout=2s` | `backendTimeout=2000` (milliseconds). It caps the whole response, not only the wait for its headers: leave room for a long or streamed body. |
 
 Containers that declare the same `<svc>` name with the same hosts and paths are merged as backends of one route, like replicas of a Traefik service. If their hosts or paths differ, the later container gets a route of its own instead.
@@ -125,7 +125,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `errors.status` + `errors.service` | No equivalent for errors returned by the backend. `errorPages.<status>=<html>` only replaces the errors Sōzune answers itself (no route, backend down…), with an inline page. |
 | Traefik plugins | [WASM plugins](/documentation/middleware/wasm-plugins). Traefik's Yaegi plugins do not run as is. |
 
-Not available yet: `chain`, `digestauth`, `buffering`, `redirectregex`, `replacepath`, `replacepathregex` and weighted services. A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring). A weighted split between two versions is written with a `weight` on the containers of one service instead: see [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing).
+Not available yet: `chain`, `digestauth`, `buffering`, `redirectregex`, `replacepath`, `replacepathregex` and weighted services. A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A weighted split between two versions is written with a `weight` on the containers of one service instead: see [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing).
 
 ## TCP
 

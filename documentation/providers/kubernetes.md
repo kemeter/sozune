@@ -1,5 +1,7 @@
 # Kubernetes provider
 
+> Since 0.12
+
 The Kubernetes provider discovers entrypoints from two sources — `Service` annotations and standard `Ingress` resources — and routes traffic directly to ready pod IPs. Sōzune subscribes to the Kubernetes API for near-real-time updates: scaling a Deployment, rolling a pod, or deleting a Service propagates within seconds without any restart.
 
 This is the right provider when your workloads run on a Kubernetes cluster (kind, k3s, EKS, GKE, AKS, on-prem…) and you want a Sōzu-powered ingress for them.
@@ -23,8 +25,8 @@ All fields:
 | `namespace` | *all* | Restrict discovery to a single namespace: Services, Ingresses and the TLS Secrets their certificates come from. Gateway API resources, and the Secrets Gateway listeners name, are watched in every namespace. Omit to watch the whole cluster. |
 | `ingress_class` | `sozune` | Match value for `Ingress.spec.ingressClassName`. Ingresses with a different (or missing) class are ignored. |
 | `expose_by_default` | `false` | If `true`, every Service is a candidate even without a `sozune.*` annotation. |
-| `publish_service` | *none* | The Service, as `namespace/name`, whose load-balancer address the Ingresses Sōzune serves get in `status.loadBalancer`, and the Gateways it owns in `status.addresses` — usually Sōzune's own `LoadBalancer` Service. Followed live (`SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE`). See [Ingress status](#ingress-status). |
-| `publish_addresses` | `[]` | Fixed IPs or hostnames to write there instead, for a Sōzune reached without a `LoadBalancer` Service (host network, an external load balancer). Takes precedence over `publish_service`. |
+| `publish_service` | *none* | The Service, as `namespace/name`, whose load-balancer address the Ingresses Sōzune serves get in `status.loadBalancer`, and the Gateways it owns in `status.addresses` — usually Sōzune's own `LoadBalancer` Service. Followed live (`SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE`). See [Ingress status](#ingress-status). (since 0.16) |
+| `publish_addresses` | `[]` | Fixed IPs or hostnames to write there instead, for a Sōzune reached without a `LoadBalancer` Service (host network, an external load balancer). Takes precedence over `publish_service`. (since 0.16) |
 
 ### Restrict to one namespace, point at a specific kubeconfig
 
@@ -38,13 +40,16 @@ providers:
 
 ## How it works
 
-Sōzune runs three watchers in parallel:
+Sōzune runs these watchers in parallel:
 
 1. **Service watcher.** Every `Service` in scope is inspected. If it carries at least one `sozune.*` annotation (or `expose_by_default` is set), it becomes a candidate. The annotations are parsed by the same engine used for Docker labels, so `sozune validate` and the runtime stay in sync.
-2. **EndpointSlice watcher.** Sōzune maintains a per-service cache of ready pod IPs derived from `discovery.k8s.io/v1` `EndpointSlice` objects. Each Service or Ingress entrypoint is populated with **all** ready pod IPs as backends, so Sōzu round-robins directly between pods — bypassing kube-proxy.
+2. **EndpointSlice watcher.** Sōzune maintains a per-service cache of ready pod IPs derived from `discovery.k8s.io/v1` `EndpointSlice` objects. Each Service, Ingress or Gateway API entrypoint is populated with **all** ready pod IPs as backends, so Sōzu balances directly between pods — bypassing kube-proxy.
 3. **Ingress watcher.** Standard `networking.k8s.io/v1` Ingresses with `spec.ingressClassName` matching `ingress_class` are converted into entrypoints, one per `(rule, path)`.
+4. **TLS Secret watcher.** `kubernetes.io/tls` Secrets, for the certificates Ingresses and Gateway `HTTPS` listeners name (see [Ingress resources](#ingress-resources) and [HTTPS listeners](#https-listeners)). (since 0.16)
 
-When the EndpointSlice cache is empty (cold-start race, ExternalName Service, or selector-less Service), Sōzune falls back to `Service.spec.clusterIP` so traffic still flows.
+The [Gateway API](#gateway-api-httproute) resources have watchers of their own.
+
+For a Service annotation, when the EndpointSlice cache is empty (cold-start race, ExternalName Service, or selector-less Service), Sōzune falls back to `Service.spec.clusterIP` so traffic still flows. Ingresses and Gateway API routes have no such fallback: they wait for a ready pod.
 
 ## Service annotations
 
@@ -102,12 +107,15 @@ spec:
 - Only Ingresses with `spec.ingressClassName` matching the configured `ingress_class` are picked up. Ingresses without an `ingressClassName` are ignored.
 - Each `(rule, path)` pair becomes one entrypoint. The key is `ingress_<namespace>-<name>_r<rule_idx>p<path_idx>`.
 - `pathType: Prefix` and `Exact` map directly. `ImplementationSpecific` is treated as `Prefix`.
-- `spec.tls[].hosts` enables HTTPS termination for those hostnames. With a `secretName`, they are served with the certificate of that `kubernetes.io/tls` Secret in the Ingress's namespace — the one cert-manager writes, for instance — picked up live when it is renewed, and ACME orders nothing for them. Without one, ACME provisions their certificate. A Secret that is missing or unusable (expired, key not matching) leaves those hostnames without a certificate: their handshakes fail, and ACME does not step in. Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). An ACME wildcard declared in a resolver's `domains` still covers such a hostname: Sōzu then presents whichever of the two certificates expires later.
+- A backend's `service.port` names the Service port, by `number` or by `name`; requests go to the port its pods listen on (its `targetPort`), as its EndpointSlices give it. A path whose Service has no ready pod has no backend, and answers `503` until one is ready.
+- `spec.tls[].hosts` enables HTTPS termination for those hostnames. Without a `secretName`, ACME provisions their certificate. With one, they are served with the certificate of that `kubernetes.io/tls` Secret in the Ingress's namespace — the one cert-manager writes, for instance — picked up live when it is renewed, and ACME orders nothing for them (since 0.16). A Secret that is missing or unusable (expired, key not matching) leaves those hostnames without a certificate: their handshakes fail, and ACME does not step in. Sōzune needs to read Secrets for this (see [Minimum RBAC](#minimum-rbac)). An ACME wildcard declared in a resolver's `domains` still covers such a hostname: Sōzu then presents whichever of the two certificates expires later.
 - `spec.defaultBackend` is supported as a catch-all entrypoint with no host filter.
 - Backend Services must live in the **same namespace** as the Ingress (Kubernetes spec).
 - Middleware (auth, rate limit, headers, compression…) goes in `sozune.*` annotations on the Ingress: see below.
 
 ### Ingress annotations
+
+> Since 0.16
 
 The `Ingress` API has no field for middleware, so its annotations carry it. They take the keys of a [Service annotation](#service-annotations) without the `http.<service>` part — `sozune.http.<service>.auth.basic` becomes `sozune.auth.basic` — and apply to every route of the Ingress:
 
@@ -140,6 +148,8 @@ The route itself comes from the spec: `sozune.host`, `port`, `path`, `prefix`, `
 
 ### Ingress status
 
+> Since 0.16
+
 Tools that wait on an Ingress read where it is reachable from its `status.loadBalancer`: external-dns creates its DNS records from it, Argo CD only calls an Ingress healthy once it is set. Sōzune writes it on the Ingresses it serves when `publish_service` or `publish_addresses` is set:
 
 ```yaml
@@ -156,6 +166,8 @@ With `publish_service`, the Ingresses get the addresses that Service's load bala
 ## Deploying Sōzune in-cluster
 
 ### With the Helm chart
+
+> Since 0.16
 
 The chart in [`charts/sozune`](https://github.com/kemeter/sozune/tree/main/charts/sozune) deploys Sōzune with its `ServiceAccount`, RBAC, config and a `LoadBalancer` Service:
 
@@ -182,7 +194,7 @@ The `IngressClass` and `GatewayClass` are cluster-wide: a second release in the 
 
 ### By hand
 
-Run as a `Deployment` with a `ServiceAccount` bound to a `ClusterRole` that grants read access to Services, EndpointSlices, Ingresses, and Namespaces.
+Run as a `Deployment` with a `ServiceAccount` bound to a `ClusterRole` that grants read access to Services, Namespaces, EndpointSlices and Ingresses, and, for the features that need them, the rules marked optional below: the status of Ingresses and Gateway API resources, the Gateway API resources, and Secrets. The Helm chart's `ClusterRole` grants all of them.
 
 ### Minimum RBAC
 
@@ -246,11 +258,11 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-`namespaces` is used for the start-up sanity check and, with the Gateway API, for listeners admitting routes by namespace selector (`allowedRoutes.namespaces.from: Selector`). Without it Sōzune logs a warning, and such listeners admit no route.
+`namespaces` is required: Sōzune lists them at start-up to check its access. Without it, that check fails (`Kubernetes service failed: Failed to list namespaces`) and the Service, EndpointSlice and Ingress watchers do not start, so no Service or Ingress is served, and Gateway API routes find no ready pod. With the Gateway API, namespaces are also watched for listeners admitting routes by namespace selector (`allowedRoutes.namespaces.from: Selector`).
 
 ### Reaching Sōzune from outside
 
-Expose the Sōzune pod with a `Service` of type `LoadBalancer` (cloud) or `NodePort` (kind, on-prem). Sōzune itself listens on the ports declared under `proxy.http.listen_address` and `proxy.https.listen_address`.
+Expose the Sōzune pod with a `Service` of type `LoadBalancer` (cloud) or `NodePort` (kind, on-prem) — the Helm chart creates one. Sōzune itself listens on the ports declared under `proxy.http.listen_address` and `proxy.https.listen_address`, those of the `proxy.tcp` and `proxy.udp` entries, and the ports of `proxy.gateway_ports` it opens for Gateway listeners.
 
 ## Running outside the cluster
 
@@ -260,12 +272,20 @@ Useful for local development. Sōzune uses the current context from `$KUBECONFIG
 
 ## Gateway API (HTTPRoute)
 
-Sōzune watches `gateway.networking.k8s.io` resources alongside Ingress. Five watchers run side by side: `GatewayClass`, `Gateway`, `ReferenceGrant`, `HTTPRoute`, and `TLSRoute` (see [Gateway API (TLSRoute)](#gateway-api-tlsroute)). They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required. The `TLSRoute` watcher exits quietly when its CRD — experimental-channel only — is absent.
+> Since 0.14
+
+Sōzune watches `gateway.networking.k8s.io` resources alongside Ingress. Its watchers run side by side: `GatewayClass`, `Gateway`, `Namespace` (for [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)), `ReferenceGrant`, `HTTPRoute`, `TLSRoute`, `TCPRoute` and `UDPRoute` (see [TLSRoute](#gateway-api-tlsroute), [TCPRoute](#gateway-api-tcproute), [UDPRoute](#gateway-api-udproute)), and the TLS Secrets `HTTPS` listeners name. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required. The `TLSRoute`, `TCPRoute` and `UDPRoute` watchers exit quietly when their CRD — experimental-channel only — is absent.
 
 ### Prerequisites
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+```
+
+The standard channel of v1.2.0 does not have every field Sōzune serves, and the API server refuses a route using one: a `requestRedirect` `statusCode` of `303`, `307` or `308` and a `requestMirror` `percent` or `fraction` need the experimental channel, and the `cors` filter the experimental channel of v1.3.0 or later. For those, and for TLSRoute, TCPRoute and UDPRoute, install the experimental bundle instead:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install.yaml
 ```
 
 If the CRDs are missing, Sōzune logs `HTTPRoute CRD not installed` once and skips the Gateway watchers — Ingress alone keeps working.
@@ -301,7 +321,7 @@ spec:
       protocol: HTTP
 ```
 
-> The listener block is honoured for route selection and hostname narrowing, but not for the actual listening port: real listening ports stay declared via `proxy.http.listen_address` / `proxy.https.listen_address` in `config.yaml`. A `parentRef` can target a specific listener with `sectionName` (matched against a listener `name`) or `port`, and a listener's `hostname` narrows which of a route's hostnames it serves. Binding traffic on the listener's own `port` (multiple live HTTP ports from one Gateway) is a separate, planned enhancement.
+> By default a listener's `port` does not decide where its routes are served: `HTTP` listeners are served on `proxy.http.listen_address`, `HTTPS` ones on `proxy.https.listen_address`, which a Service usually maps the listener's port to. A listener on a port of `proxy.gateway_ports` is served on that port instead (see [HTTP listeners on their own port](#http-listeners-on-their-own-port)). A `parentRef` can target a specific listener with `sectionName` (matched against a listener `name`) or `port`, and a listener's `hostname` narrows which of a route's hostnames it serves.
 
 Finally, the `HTTPRoute` references the `Gateway` via `parentRefs`:
 
@@ -334,7 +354,11 @@ spec:
           port: 80
 ```
 
+Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
+
 ### HTTPS listeners
+
+> Since 0.16
 
 An `HTTPS` listener terminates TLS for the HTTPRoutes attached to it, with the certificates its `tls.certificateRefs` name: `kubernetes.io/tls` Secrets in the Gateway's namespace, or in another one whose `ReferenceGrant` lets Gateways of the Gateway's namespace reference them:
 
@@ -387,6 +411,8 @@ A listener whose certificateRefs cannot be used says so in its status (see [Stat
 
 ### HTTP listeners on their own port
 
+> Since 0.16
+
 By default, every `HTTP` listener is served on `proxy.http.listen_address`, whatever its `port`: a Service maps the listener's port to it, and the listener status names the port. To serve an `HTTP` listener on its own port instead, list that port in `proxy.gateway_ports.http`:
 
 ```yaml
@@ -399,6 +425,8 @@ A listener on such a port is served there: Sōzune opens the port once a route i
 
 ### HTTPS listeners on their own port
 
+> Since 0.16
+
 `HTTPS` listeners work the same way with `proxy.gateway_ports.https`: by default they are all served on `proxy.https.listen_address`, and one on a port listed there is served on that port instead.
 
 ```yaml
@@ -409,29 +437,29 @@ proxy:
 
 Sōzune opens the port once a route is attached to the listener and closes it when none is left. The port serves every certificate Sōzune holds, its listener's included, with the TLS settings of `proxy.https`. The routes attached to that listener answer there only, over HTTPS alone: their plain HTTP requests are not redirected to it. `HTTPS` listeners on one such port are isolated as `HTTP` listeners are (see `spec.hostnames` below). A listed port Sōzune cannot open makes the listener `PortUnavailable`, as for an `HTTP` listener. The ACME `TLS-ALPN-01` challenge is answered on `proxy.https.listen_address` only.
 
-Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently ignored — you'll see them in `kubectl get httproute` but they will not produce any sōzune entrypoint. Routes with no `parentRefs` at all are also rejected (the Gateway API spec requires every Route to declare its parent).
-
 ### What's supported
 
-- Three watchers (`GatewayClass`, `Gateway`, `HTTPRoute`) running cluster-wide and reacting to apply/delete events live.
+- The watchers above, running cluster-wide and reacting to apply/delete events live.
 - Multi-controller scoping via `controllerName: kemeter.io/sozune` (above).
-- `spec.hostnames` — matched against the `Host` header of incoming requests, and narrowed by the bound listener's `hostname` (a listener serving `*.example.com` drops a route hostname outside that suffix). `HTTP` listeners on one port, and `HTTPS` listeners on one port of `proxy.gateway_ports.https`, are isolated: a request goes to the listener whose `hostname` matches its host most closely, and only that listener's routes serve it. A route attached to a `*.example.com` listener therefore answers `404` for `abc.foo.example.com` when another `HTTP` listener of the Gateway, on the same port, takes `abc.foo.example.com` or `*.foo.example.com` — unless the route is attached to that listener too. A header match Sōzu routes on keeps that `404` for the requests carrying the header, even over a route of the more specific listener without one: Sōzu tries the frontends with a header predicate first. A route with none, on a listener with none, serves every host, after the routes naming theirs. A wildcard takes one or more labels, as the spec says: `*.example.com` serves `a.b.example.com` too, unlike a Sōzune label's `*.`.
+- `spec.hostnames` — matched against the `Host` header of incoming requests. They are narrowed by the bound listener's `hostname`: a listener serving `*.example.com` drops a route hostname outside that suffix (since 0.15). `HTTP` listeners on one port, and `HTTPS` listeners on one port of `proxy.gateway_ports.https`, are isolated: a request goes to the listener whose `hostname` matches its host most closely, and only that listener's routes serve it. A route attached to a `*.example.com` listener therefore answers `404` for `abc.foo.example.com` when another `HTTP` listener of the Gateway, on the same port, takes `abc.foo.example.com` or `*.foo.example.com` — unless the route is attached to that listener too. A header match Sōzu routes on keeps that `404` for the requests carrying the header, even over a route of the more specific listener without one: Sōzu tries the frontends with a header predicate first. A route with none, on a listener with none, serves every host, after the routes naming theirs. A wildcard takes one or more labels, as the spec says: `*.example.com` serves `a.b.example.com` too, unlike a Sōzune label's `*.`.
 - `backendRef.port` — the Service port; requests go to the port its pods listen on (its `targetPort`), as its EndpointSlices give it.
-- `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener), as before.
-- Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)).
+- `parentRef.sectionName` / `parentRef.port` — bind the route to a specific `Gateway` listener (by listener `name` or `port`). A ref naming a listener the Gateway doesn't have is refused; an unset `sectionName` and `port` bind to the whole Gateway (any listener). (since 0.15)
+- Listener `allowedRoutes` — only listeners that admit the route take it (see [below](#which-routes-a-listener-admits-allowedroutes)). (since 0.16)
 - `spec.rules[].matches[].path` — `PathPrefix` and `Exact`. A `RegularExpression` path match drops the route with `Accepted=False reason=UnsupportedValue`: Sōzu matches a path regex against the path with its query, which a Gateway API path regex must leave out.
-- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. Among rules on the same host and path, one with a method is tried first, then the one with more header matches. Query matches are routing conditions too, for up to three per match on a rule without a path rewrite. A request that fails a method condition, a header match on `Host` or `Cookie` (which Sōzu cannot route on), or a query match Sōzu does not route on, gets `404`. Header and query matches support `type: Exact` (the default), presence-only (empty value) and `type: RegularExpression`, which must match the whole value. A regex header match is routed by Sōzu like any other; a regex query match is checked by the middleware. A regular expression that does not compile drops the route with `Accepted=False reason=UnsupportedValue`. All nine standard methods are supported.
+- `spec.rules[].matches[].headers[]`, `matches[].queryParams[]`, `matches[].method` — a match can additionally require specific request headers, query parameters, and/or an HTTP method. Within one match these are ANDed with the path (and with each other). Header matches are routing conditions: a request that fails them goes on to the next rule or route, and a rule whose header matches hold is tried before every rule without any, whatever their path. Among rules on the same host and path, one with a method is tried first, then the one with more header matches. Query matches are routing conditions too, for up to three per match on a rule without a path rewrite. A request that fails a method condition, a header match on `Host` or `Cookie` (which Sōzu cannot route on), or a query match Sōzu does not route on, gets `404`. Header and query matches support `type: Exact` (the default), presence-only (empty value) and `type: RegularExpression`, which must match the whole value (since 0.16). A regex header match is routed by Sōzu like any other; a regex query match is checked by the middleware. A regular expression that does not compile drops the route with `Accepted=False reason=UnsupportedValue`. All nine standard methods are supported. (since 0.15)
 - Multiple `matches` per rule — Gateway API treats them as OR, so each match becomes its own sōzune entrypoint sharing the rule's backends.
-- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace; without one the backend is dropped (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below). A backendRef that cannot be used — another kind, another namespace without a grant, a Service that does not exist — keeps its share of the rule's requests, by its weight, answered `500`, and one whose Service has no ready pod its share answered `503`, as the spec requires: `svcb` and a Service that does not exist, both of weight 1, give one `500` every other request. A rule left with no usable backendRef, or declaring none, answers `500` — unless it redirects, which needs no backend; one whose usable backendRefs have no ready pod, and with no invalid one, is not served until a pod is ready. Such a rule goes through the Sōzune middleware. The route's `ResolvedRefs` says why (see [Status conditions](#status-conditions)).
-- `backendRef.filters` — `requestHeaderModifier` and `responseHeaderModifier` edit the requests sent to that backendRef's pods and the responses they give, after the rule's own filters. When every backendRef of the rule that can take traffic carries the same ones, Sōzu makes them for the whole rule; when they differ, the route goes through the middleware, which makes each backend's. Another kind of filter on a backendRef drops the route (`Accepted=False reason=UnsupportedValue`).
+- `spec.rules[].backendRefs[]` — `Service` kind only (the default). Cross-namespace `backendRefs` (`backendRef.namespace` differs from the route's namespace) require a `ReferenceGrant` in the target namespace (see [Cross-namespace backends](#cross-namespace-backends-referencegrant) below). A backendRef that cannot be used — another kind, another namespace without a grant, a Service that does not exist — keeps its share of the rule's requests, by its weight, answered `500`, and one whose Service has no ready pod its share answered `503`, as the spec requires: `svcb` and a Service that does not exist, both of weight 1, give one `500` every other request. A rule left with no usable backendRef, or declaring none, answers `500` — unless it redirects, which needs no backend; one whose usable backendRefs have no ready pod, and with no invalid one, is not served until a pod is ready. Such a rule goes through the Sōzune middleware. The route's `ResolvedRefs` says why (see [Status conditions](#status-conditions)).
+- `backendRef.filters` — `requestHeaderModifier` and `responseHeaderModifier` edit the requests sent to that backendRef's pods and the responses they give, after the rule's own filters. When every backendRef of the rule that can take traffic carries the same ones, Sōzu makes them for the whole rule; when they differ, the route goes through the middleware, which makes each backend's. Another kind of filter on a backendRef drops the route (`Accepted=False reason=UnsupportedValue`). (since 0.16)
 - `backendRef.weight` — the Service's share of the rule's traffic, as the spec defines it: `weight / Σ weights`, however many pods each Service runs (a Service of 3 pods weighted 90 against one of 1 pod weighted 10 is a 90/10 split). An unset weight is `1`; a weight of `0` sends the Service no traffic, and a rule whose backendRefs all weigh `0` forwards nothing (`503`). Each pod carries an integer weight of at most 2³¹−1, so a Service cannot outweigh another by more than 2³¹−1 times the other's pod count: a ratio past that is capped.
-- `spec.rules[].timeouts` — `request` caps the whole request, from its arrival to the end of the response: the middleware, the client's body, every attempt, the response body, and a WebSocket handshake but not the tunnel after it. `backendRequest` caps each attempt on a backend, its response body included, as [`backendTimeout`](../middleware/backend-timeout.md) does. Past either, the client gets `504`, or a response cut short once it has started. `request: 0s` sets no request timeout, `backendRequest: 0s` no backend timeout. Such a rule goes through the middleware.
+- `spec.rules[].timeouts` — `request` caps the whole request, from its arrival to the end of the response: the middleware, the client's body, every attempt, the response body, and a WebSocket handshake but not the tunnel after it. `backendRequest` caps each attempt on a backend, its response body included, as [`backendTimeout`](../middleware/backend-timeout.md) does. Past either, the client gets `504`, or a response cut short once it has started. `request: 0s` sets no request timeout, `backendRequest: 0s` no backend timeout. Such a rule goes through the middleware. (since 0.16)
 - `spec.rules[].filters[]` — `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite`, `requestMirror`, `cors` (see [HTTPRoute filters](#httproute-filters) below). `extensionRef` is not supported yet.
-- Live reconciliation — apply/update/delete of any of the three resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
+- Live reconciliation — apply/update/delete of any of these resources is reflected in routing within seconds, including when the target Service's pods come up after the route was created, or when a `Gateway` appears after the routes that depend on it.
 - Status reporting — Sōzune writes standard conditions back onto the resources it owns, visible via `kubectl describe` / `kubectl get`:
-  - `HTTPRoute`, `TLSRoute`, `TCPRoute` and `UDPRoute` — for every `parentRef` Sōzune owns, `status.parents[]` carries `Accepted` and `ResolvedRefs` (`controllerName: kemeter.io/sozune`). Other controllers' entries are preserved untouched.
-  - `Gateway` — `status.conditions[]` carries `Accepted` and `Programmed`, both reflecting whether Sōzune owns the Gateway's `GatewayClass`.
-  - `GatewayClass` — `status.conditions[]` carries `Accepted` on classes whose `controllerName` is `kemeter.io/sozune`.
+  - `HTTPRoute` — for every `parentRef` Sōzune owns, `status.parents[]` carries `Accepted` and `ResolvedRefs` (`controllerName: kemeter.io/sozune`). Other controllers' entries are preserved untouched.
+  - `TLSRoute`, `TCPRoute` and `UDPRoute` — the same. (since 0.16)
+  - `Gateway` — `status.conditions[]` carries `Accepted` and `Programmed`: whether Sōzune owns the Gateway's `GatewayClass`, and whether its listeners are accepted. (since 0.15)
+  - Gateway listeners — `status.listeners[]` carries, for each listener, `Accepted`, `Programmed` and `ResolvedRefs`, its route kinds and attached routes. (since 0.16)
+  - `GatewayClass` — `status.conditions[]` carries `Accepted` on classes whose `controllerName` is `kemeter.io/sozune`. (since 0.15)
 
 ### Status conditions
 
@@ -441,12 +469,12 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Route is in scope (parent owned), filters are OK |
 | `Accepted` | `False` (`UnsupportedValue`) | Route declares unsupported filters, or a match Sōzune cannot represent (a `RegularExpression` path, a regular expression that does not compile) |
-| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` or `HTTPS` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)) |
-| `Accepted` | `False` (`NoMatchingParent`) | The `parentRef`'s `sectionName` / `port` names no listener of a Gateway Sōzune owns |
-| `Accepted` | `False` (`NoMatchingListenerHostname`) | No listener the route binds to admits any of its `hostnames` |
+| `Accepted` | `False` (`NotAllowedByListeners`) | The `parentRef` names a Gateway Sōzune owns, but none of the listeners it selects is an `HTTP` or `HTTPS` listener that admits the route (see [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)) (since 0.16) |
+| `Accepted` | `False` (`NoMatchingParent`) | The `parentRef`'s `sectionName` / `port` names no listener of a Gateway Sōzune owns (since 0.16) |
+| `Accepted` | `False` (`NoMatchingListenerHostname`) | No listener the route binds to admits any of its `hostnames` (since 0.16) |
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | All backendRefs resolved to ready endpoints |
-| `ResolvedRefs` | `False` (`InvalidKind`) | A backendRef is not a `Service` |
-| `ResolvedRefs` | `False` (`RefNotPermitted`) | A backendRef names a Service of another namespace that no `ReferenceGrant` opens to the route |
+| `ResolvedRefs` | `False` (`InvalidKind`) | A backendRef is not a `Service` (since 0.16) |
+| `ResolvedRefs` | `False` (`RefNotPermitted`) | A backendRef names a Service of another namespace that no `ReferenceGrant` opens to the route (since 0.16) |
 | `ResolvedRefs` | `False` (`BackendNotFound`) | A backendRef names a Service that does not exist, or one or more backendRefs has no ready endpoint yet — sōzune retries every 2 s |
 | `ResolvedRefs` | `False` (`UnsupportedValue`) | Route was rejected because of unsupported filters |
 
@@ -454,22 +482,22 @@ Routes whose `parentRefs` point to a `Gateway` Sōzune does not own are silently
 
 Routes whose parent is not sōzune-owned receive **no status entry** from sōzune (per Gateway API spec — implementations only report on parents they own).
 
-**TLSRoute** (`status.parents[].conditions[]`): the same conditions, minus those about filters and matches, which a TLSRoute does not have. `NotAllowedByListeners` speaks of `TLS` listeners in `Passthrough` mode. A route on a listener port Sōzune does not serve stays `Accepted`: the listener's status says `PortUnavailable`.
+**TLSRoute** (`status.parents[].conditions[]`) (since 0.16): the same conditions, minus those about filters and matches, which a TLSRoute does not have. `NotAllowedByListeners` speaks of `TLS` listeners in `Passthrough` mode. A route on a listener port Sōzune does not serve stays `Accepted`: the listener's status says `PortUnavailable`.
 
-**TCPRoute**, **UDPRoute** (`status.parents[].conditions[]`): likewise, without hostnames: `NotAllowedByListeners` speaks of `TCP`, or `UDP`, listeners.
+**TCPRoute**, **UDPRoute** (`status.parents[].conditions[]`) (since 0.16): likewise, without hostnames: `NotAllowedByListeners` speaks of `TCP`, or `UDP`, listeners.
 
-**Gateway** (`status.conditions[]`):
+**Gateway** (`status.conditions[]`) (since 0.15):
 
 | Condition | Status | Reason | When |
 |---|---|---|---|
 | `Accepted` | `True` (`Accepted`) | Gateway's `gatewayClassName` points at a class sōzune owns |
 | `Programmed` | `True` (`Programmed`) | Same instant as acceptance — sōzune does not stage programming |
-| `Accepted` | `True` (`ListenersNotValid`) | Some of its listeners are not accepted (see the listener conditions below), others are |
-| `Accepted`, `Programmed` | `False` (`ListenersNotValid`, `Invalid`) | None of its listeners is accepted |
+| `Accepted` | `True` (`ListenersNotValid`) | Some of its listeners are not accepted (see the listener conditions below), others are (since 0.16) |
+| `Accepted`, `Programmed` | `False` (`ListenersNotValid`, `Invalid`) | None of its listeners is accepted (since 0.16) |
 
-With `publish_service` or `publish_addresses` set, `status.addresses` carries Sōzune's address (see [Ingress status](#ingress-status)).
+With `publish_service` or `publish_addresses` set, `status.addresses` carries Sōzune's address (see [Ingress status](#ingress-status)). (since 0.16)
 
-**Gateway listeners** (`status.listeners[]`), one entry per listener:
+**Gateway listeners** (`status.listeners[]`), one entry per listener (since 0.16):
 
 - `supportedKinds` — the route kind the listener carries: `HTTPRoute` for `HTTP` and `HTTPS`, `TLSRoute` for `TLS`, `TCPRoute` for `TCP`, `UDPRoute` for `UDP`; none when its `allowedRoutes.kinds` leaves that kind out.
 - `attachedRoutes` — how many routes select the listener through their `parentRefs` (by `sectionName`/`port`, or all of a Gateway's listeners when neither is set) and are admitted by its `allowedRoutes` and its `hostname`, whether or not the routes are accepted.
@@ -483,7 +511,7 @@ With `publish_service` or `publish_addresses` set, `status.addresses` carries S�
 | `ResolvedRefs` | `False` (`InvalidCertificateRef`, `RefNotPermitted`) | An `HTTPS` listener's certificateRef cannot be used (see [HTTPS listeners](#https-listeners)); `Programmed` is `False` (`Invalid`) too |
 | `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | An `HTTPS` listener in `Passthrough` mode (that belongs on a `TLS` listener), a `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`), or any other protocol |
 
-**GatewayClass** (`status.conditions[]`):
+**GatewayClass** (`status.conditions[]`) (since 0.15):
 
 | Condition | Status | Reason | When |
 |---|---|---|---|
@@ -493,7 +521,9 @@ Gateways and GatewayClasses that belong to another controller receive **no statu
 
 ### Which routes a listener admits (allowedRoutes)
 
-A listener only takes the routes its `allowedRoutes` admits, for every route kind (HTTPRoute, TLSRoute, TCPRoute, UDPRoute). An HTTPRoute only attaches through `HTTP` listeners, a TLSRoute through `TLS` ones, and so on:
+> Since 0.16
+
+A listener only takes the routes its `allowedRoutes` admits, for every route kind (HTTPRoute, TLSRoute, TCPRoute, UDPRoute). An HTTPRoute only attaches through `HTTP` and `HTTPS` listeners, a TLSRoute through `TLS` ones in `Passthrough` mode, a TCPRoute through `TCP` ones and a UDPRoute through `UDP` ones:
 
 | Field | Behaviour |
 |---|---|
@@ -514,11 +544,13 @@ listeners:
         from: All
 ```
 
-A `parentRef` none of whose listeners admits the route is not served; an HTTPRoute reports it with `Accepted=False` (`NotAllowedByListeners`).
+A `parentRef` none of whose listeners admits the route is not served; the route reports it with `Accepted=False` (`NotAllowedByListeners`).
 
 ### Cross-namespace backends (ReferenceGrant)
 
-An `HTTPRoute` may reference a `Service` in another namespace via `backendRef.namespace`. Per the Gateway API spec, the *target* namespace must opt in with a `ReferenceGrant`: without one, the reference is a potential privilege escalation (any route author could route traffic to any Service cluster-wide), so Sōzune **drops** the backend and logs a `WARN`. Same-namespace references never need a grant.
+> Since 0.15
+
+An `HTTPRoute` (or a `TLSRoute`, `TCPRoute`, `UDPRoute`) may reference a `Service` in another namespace via `backendRef.namespace`. Per the Gateway API spec, the *target* namespace must opt in with a `ReferenceGrant`: without one, the reference is a potential privilege escalation (any route author could route traffic to any Service cluster-wide), so Sōzune sends it no traffic and logs a `WARN`. On an HTTPRoute, that backendRef keeps its share of the rule's requests, by its weight, answered `500` (since 0.16). Same-namespace references never need a grant.
 
 The grant lives in the namespace that owns the `Service` and names the route's namespace as trusted:
 
@@ -538,7 +570,7 @@ spec:
       kind: Service
 ```
 
-With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` with `RefNotPermitted` once the backend is dropped, and a rule left without backend answers `500`). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs. A `to` entry with a `name` opens that Service only.
+With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backend`. Removing the grant revokes access on the next reconcile (the route falls back to `ResolvedRefs=False` with `RefNotPermitted`, and the backendRef's share of requests is answered `500`). Grants naming a non-`Service` `to` kind (e.g. `Secret`) do not authorise backendRefs. A `to` entry with a `name` opens that Service only.
 
 ### What's not supported (yet)
 
@@ -553,13 +585,15 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 | `requestHeaderModifier` | Yes | `set`, `add` and `remove` map directly (see below) |
 | `responseHeaderModifier` | Yes | Same as above, on the response |
 | `urlRewrite` | Yes | Transparent path/host rewrite (no redirect); `ReplaceFullPath`, `ReplacePrefixMatch`, `hostname` (see below) |
-| `requestMirror` | Yes | A copy of each request to another Service, its answer ignored (see below) |
-| `cors` | Yes | Answers preflight requests and marks the responses for the origins it allows (see below) |
+| `requestMirror` | Yes | A copy of each request to another Service, its answer ignored (see below) (since 0.16) |
+| `cors` | Yes | Answers preflight requests and marks the responses for the origins it allows (see below) (since 0.16) |
 | `extensionRef` | No | Route dropped with `Accepted=False reason=UnsupportedValue` |
 
 A rule may combine a header modifier with **either** a `requestRedirect` **or** a `urlRewrite` (e.g. a `requestRedirect` together with a `requestHeaderModifier`); all are honoured together. `requestRedirect` and `urlRewrite` **conflict** — one redirects the client, the other transparently rewrites the forwarded request, and both target the same frontend rewrite — so a rule carrying both is rejected. A rule carrying any unsupported filter drops the whole route.
 
 #### requestMirror
+
+> Since 0.16
 
 ```yaml
 filters:
@@ -577,6 +611,8 @@ Such a route goes through the Sōzune middleware, which reads the whole request 
 `percent: 20`, or `fraction` (`numerator: 1`, `denominator: 3`; the denominator defaults to `100`), copies only that share of the requests, each drawn at random: with `percent: 20`, about one request in five. `percent: 0` copies none. Without either, every request is copied.
 
 #### cors
+
+> Since 0.16
 
 ```yaml
 filters:
@@ -601,7 +637,7 @@ Such a route goes through the Sōzune middleware. The preflight is answered befo
 
 #### requestRedirect
 
-Sōzune maps the `requestRedirect` filter onto Sōzu's native frontend redirect — no extra middleware hop. A rule may declare a redirect alongside its `backendRefs`:
+Sōzune maps the `requestRedirect` filter onto Sōzu's native frontend redirect — no extra middleware hop — except for a `303` or `307`, and a `replaceFullPath`, which the middleware answers so the request's query is kept. A rule may declare a redirect alongside its `backendRefs`:
 
 ```yaml
 rules:
@@ -623,17 +659,17 @@ rules:
 | `requestRedirect` field | Mapped to | Notes |
 |---|---|---|
 | `scheme` (`http` / `https`) | redirect scheme | omitted → preserve the request scheme |
-| `statusCode` | redirect policy | `301` (default) → permanent redirect, `302` → temporary redirect, `303` → see other, `307` → temporary redirect keeping the method, `308` → permanent redirect keeping the method. Sōzu answers `301`, `302` and `308` itself, the middleware `303` and `307`, and any redirect with `replaceFullPath` |
+| `statusCode` | redirect policy | `302` (the default the CRD sets) → temporary redirect (since 0.16), `301` → permanent redirect. `303` → see other, `307` → temporary redirect keeping the method, `308` → permanent redirect keeping the method (since 0.16). Sōzu answers `301`, `302` and `308` itself, the middleware `303` and `307`, and any redirect with `replaceFullPath` |
 | `hostname` | `rewrite_host` | rewrites the `Location` authority |
 | `port` | `rewrite_port` | rewrites the `Location` port |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole `Location` path with a fixed value, the request's query kept: `/old?x=1` → `/new?x=1` |
-| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix in the `Location` path and keeps the rest, as [`urlRewrite`](#urlrewrite) does. On a match that is not a `PathPrefix`, the route is dropped, as the spec says |
+| `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix in the `Location` path and keeps the rest, as [`urlRewrite`](#urlrewrite) does. On a match that is not a `PathPrefix`, the route is dropped, as the spec says (since 0.16) |
 
 A `requestRedirect` with a `statusCode` other than `301`, `302`, `303`, `307` and `308`, or on a match with query or header conditions Sōzu cannot route on (a prefix redirect with query matches, a header match on `Host` or `Cookie`), is treated as unsupported and the whole route is dropped (`Accepted=False reason=UnsupportedValue`): Sōzu answers a redirect itself, so these conditions would not be checked.
 
 #### urlRewrite
 
-Unlike `requestRedirect`, the `urlRewrite` filter is **transparent**: the backend receives the rewritten request and the client sees no redirect. It maps onto Sōzu's native frontend `rewrite_path` / `rewrite_host` — no extra middleware hop.
+Unlike `requestRedirect`, the `urlRewrite` filter is **transparent**: the backend receives the rewritten request and the client sees no redirect. A path rewrite maps onto Sōzu's native frontend `rewrite_path` — no extra middleware hop; a `hostname` rewrite goes through the middleware.
 
 ```yaml
 rules:
@@ -663,7 +699,7 @@ When set, `urlRewrite` takes precedence over the `strip_prefix` / `add_prefix` S
 
 #### requestHeaderModifier / responseHeaderModifier
 
-Header modifiers map onto Sōzu's native frontend header edits — no extra middleware hop. `requestHeaderModifier` edits the request before it reaches the backend; `responseHeaderModifier` edits the response on the way back.
+Header modifiers map onto Sōzu's native frontend header edits — no extra middleware hop, unless a rule's backendRefs carry different ones (see `backendRef.filters` above). `requestHeaderModifier` edits the request before it reaches the backend; `responseHeaderModifier` edits the response on the way back.
 
 ```yaml
 rules:
@@ -695,9 +731,11 @@ A `set` or `add` with an empty value cannot be represented — Sōzu reads an em
 
 ### How resolution works
 
-When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready pod IPs from the matching Service's `EndpointSlice`s. Sōzu requires `IpAddr` backends and refuses cluster-DNS hostnames, so a route that targets a Service with no ready endpoints registers no entrypoint and is retried every 2 seconds until the endpoints appear. Once at least one ready endpoint exists the route becomes live without any user intervention.
+When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready pod IPs from the matching Service's `EndpointSlice`s. Sōzu requires `IpAddr` backends and refuses cluster-DNS hostnames, so a rule none of whose backendRefs has a ready endpoint (and none of which is invalid) registers no entrypoint and is retried every 2 seconds until the endpoints appear. Once at least one ready endpoint exists the rule becomes live without any user intervention. In a rule whose other backendRefs have ready pods, a Service with none keeps its share of the requests, answered `503` (since 0.16).
 
 ## Gateway API (TLSRoute)
+
+> Since 0.15
 
 `TLSRoute` routes TLS connections to different backends by the server name in the ClientHello, **without decrypting**. The client's handshake completes with the backend, against the backend's own certificate. Use it when the backend must own its certificates: end-to-end encryption to the service, a tenant terminating its own TLS, or a protocol Sōzune does not speak.
 
@@ -738,7 +776,7 @@ spec:
 A Gateway listener on port `8443` is served in one of two cases:
 
 - **A `proxy.tcp` entry listens on that port.** Sōzune binds it at startup, and the entry's settings (`ip_allow_list`, `rate_limit`, `idle_timeout`, …) apply to the Gateway's routes.
-- **`proxy.gateway_ports.tcp` lists the port.** Sōzune opens it once a route is served on the listener, and closes it when no route is left. Nothing else can open a port: the list is how you choose which ones a Gateway may take.
+- **`proxy.gateway_ports.tcp` lists the port.** Sōzune opens it once a route is served on the listener, and closes it when no route is left. Nothing else can open a port: the list is how you choose which ones a Gateway may take. (since 0.16)
 
 ```yaml
 proxy:
@@ -753,7 +791,7 @@ proxy:
 
 A declared entry wins when both apply. A port opened from `gateway_ports` has none of the entry settings: declare a `proxy.tcp` entry to filter or rate-limit it.
 
-With `proxy.https.passthrough`, a `TLS` listener on `proxy.https.listen_address` is served too, by the passthrough listener of the HTTPS port, next to the `HTTPS` listeners there: a ClientHello naming one of its routes is forwarded undecrypted, any other is served over HTTPS (see [Passthrough on the HTTPS port](/documentation/routing/tcp#passthrough-on-the-https-port)).
+With `proxy.https.passthrough`, a `TLS` listener on `proxy.https.listen_address` is served too, by the passthrough listener of the HTTPS port, next to the `HTTPS` listeners there: a ClientHello naming one of its routes is forwarded undecrypted, any other is served over HTTPS (see [Passthrough on the HTTPS port](/documentation/routing/tcp#passthrough-on-the-https-port)). (since 0.16)
 
 A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which port it wanted, and the Gateway's listener status says `PortUnavailable` (see [Status conditions](#status-conditions)). Declare the listener or list the port and the route goes live on the next reload, with no need to re-apply it. If a listed port cannot be bound, because another process holds it, the listener status says `PortUnavailable` with the reason, and Sōzune tries again on the next reload.
 
@@ -762,16 +800,18 @@ A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which 
 | Aspect | Behaviour |
 |---|---|
 | `tls.mode` | `Passthrough` only. `Terminate` means the Gateway decrypts, which is what [`HTTPS` listeners](#https-listeners) do for HTTPRoutes — such a `TLS` listener is ignored here. |
-| `hostnames` | Each becomes one SNI route. Exact names and a single leading `*.` wildcard label, per spec. A route with no hostname serves nothing: there is no name to match a ClientHello against. |
+| `hostnames` | Each becomes one SNI route. Exact names and a single leading `*.` wildcard label, per spec. A route with no hostname takes the `hostname` of the listener it binds; when neither names one, it serves nothing: there is no name to match a ClientHello against. |
 | Listener `hostname` | Intersected with the route's hostnames, exactly as for HTTPRoute. |
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
 | `parentRefs` | `sectionName` and `port` select a listener, as for HTTPRoute, among those whose [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes) admit the route. A route may bind listeners on several ports; each serves only the names its own `hostname` admits. |
 | Invalid hostnames | A name Sōzu could not route (a wildcard beyond one leading `*.` label, `/`, an empty label, non-ASCII) is dropped with a warning; the route's other names still serve. |
 | Unmatched SNI | Dropped. Once a listener carries SNI routes there is no catch-all — declare a route for every name you serve. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough). |
 
-`TLSRoute` has no matches, filters or paths — the SNI is the whole routing decision — so none of the HTTPRoute filter machinery applies. Its status reports `Accepted` and `ResolvedRefs` as an HTTPRoute's does (see [Status conditions](#status-conditions)); writing it needs the `tlsroutes/status` RBAC.
+`TLSRoute` has no matches, filters or paths — the SNI is the whole routing decision — so none of the HTTPRoute filter machinery applies. Its status reports `Accepted` and `ResolvedRefs` as an HTTPRoute's does (see [Status conditions](#status-conditions)); writing it needs the `tlsroutes/status` RBAC. (since 0.16)
 
 ## Gateway API (TCPRoute)
+
+> Since 0.15
 
 `TCPRoute` forwards a whole listener port to its backends — plain TCP, no SNI, no TLS, no matching. It is the raw-TCP counterpart to TLSRoute: where TLSRoute routes by the name in the ClientHello, TCPRoute routes nothing and hands the entire connection to its backend. A port takes one route: when several TCPRoutes bind the same listener port, the oldest is served, and the others, still `Accepted`, take over in turn when it goes.
 
@@ -822,9 +862,11 @@ proxy:
 | Routing | None — the whole port goes to the backend. One rule → one entrypoint. No hostnames, matches, or filters (a TCPRoute has none). |
 | `backendRefs` | Service-typed, resolved to ready pod IPs. Cross-namespace refs need a [`ReferenceGrant`](#cross-namespace-backends-referencegrant). `weight` is the Service's share, divided between its pods; unset is `1`, `0` sends no traffic. |
 | `parentRefs` | `sectionName` and `port` select a listener, among those whose [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes) admit the route. A route may bind listeners on several ports; each gets its own entrypoint. |
-| Status | `Accepted` and `ResolvedRefs`, as for an HTTPRoute (see [Status conditions](#status-conditions)); writing it needs the `tcproutes/status` RBAC, `udproutes/status` for a UDPRoute. |
+| Status | `Accepted` and `ResolvedRefs`, as for an HTTPRoute (see [Status conditions](#status-conditions)); writing it needs the `tcproutes/status` RBAC, `udproutes/status` for a UDPRoute. (since 0.16) |
 
 ## Gateway API (UDPRoute)
+
+> Since 0.15
 
 `UDPRoute` is the datagram counterpart to TCPRoute: it forwards a whole UDP listener port to its backends. Same shape, same constraints — the only difference is the listener protocol (`UDP`) and that it resolves against `proxy.udp` listeners rather than `proxy.tcp`. Likewise, when several UDPRoutes bind the same listener port, the oldest is served.
 
@@ -865,11 +907,11 @@ proxy:
       listen: 53
 ```
 
-Support is the same as TCPRoute — one catch-all entrypoint per rule, Service-typed backends, `ReferenceGrant` for cross-namespace, no hostnames or filters — on a `UDP` listener.
+Support is the same as TCPRoute — one catch-all entrypoint per rule, Service-typed backends, `ReferenceGrant` for cross-namespace, no hostnames or filters, the same status — on a `UDP` listener.
 
 ## ACME / Let's Encrypt
 
-When a Service is annotated with `sozune.http.<svc>.tls=true`, or an Ingress declares `spec.tls[].hosts`, Sōzune provisions a certificate for the declared hostnames. The HTTP-01 challenge responder runs inside the Sōzune pod, so:
+When a Service is annotated with `sozune.http.<svc>.tls=true`, or an Ingress declares `spec.tls[].hosts` in an entry without `secretName`, Sōzune provisions a certificate for the declared hostnames. A hostname served with a Secret's certificate — an Ingress `secretName`, a Gateway `HTTPS` listener's `certificateRefs` — gets none from ACME. The HTTP-01 challenge responder runs inside the Sōzune pod, so:
 
 - Sōzune must be reachable on port 80 from the public internet for the challenge to succeed.
 - `acme.certs_dir` should point to a `PersistentVolume` so issued certs survive pod restarts.
@@ -880,10 +922,9 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 
 - **Multi-cluster.** A single Sōzune instance watches a single API server. Run one Sōzune per cluster.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
-- **UDP entrypoints** are recognised at the annotation level but not yet proxied (same caveat as the Docker provider).
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
 - **Gateway API: `GRPCRoute` and the `extensionRef` HTTPRoute filter are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite`, `requestMirror` and `cors` filters. See the Gateway API section above for details.
-- **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what [`HTTPS` listeners](#https-listeners) are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
+- **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports`, or, for a `TLS` listener, be the HTTPS port with `proxy.https.passthrough` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what [`HTTPS` listeners](#https-listeners) are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables
 
@@ -894,3 +935,4 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 | `providers.kubernetes.namespace` | `SOZUNE_PROVIDER_KUBERNETES_NAMESPACE` |
 | `providers.kubernetes.ingress_class` | `SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS` |
 | `providers.kubernetes.expose_by_default` | `SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT` |
+| `providers.kubernetes.publish_service` | `SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE` (since 0.16) |

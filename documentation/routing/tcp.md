@@ -1,11 +1,13 @@
 # TCP routing
 
+> Since 0.12
+
 Sōzune can forward raw TCP traffic to your services. Two pieces:
 
 - **Listeners are declared statically** in `config.yaml`. Each listener binds a port at startup.
 - **Backends attach dynamically** through Docker labels and reference a listener by name.
 
-A label that points at an undeclared listener is ignored with a warning. Sōzune does not open ports on the fly from labels alone — by design, to keep startup state predictable.
+A label that points at an undeclared listener drops the route, with an error in the log. Sōzune does not open ports on the fly from labels alone — by design, to keep startup state predictable.
 
 ## Declare listeners
 
@@ -27,10 +29,11 @@ proxy:
 |---|---|
 | `name` | Identifier referenced by service labels. Must be unique across `proxy.tcp`. `gateway:tcp:<port>` is reserved for the listeners Kubernetes Gateways open. |
 | `listen` | Port to bind on `0.0.0.0`. |
-| `ip_allow_list` | CIDRs / bare IPs allowed to connect, checked at `accept()`. Empty (default) = allow all. See [Source-IP allow-list](#source-ip-allow-list). |
-| `idle_timeout` | Seconds a connection may stay silent in both directions before it is closed. Absent keeps Sōzu's defaults (closed after `30`s of silence). See [Idle timeout](#idle-timeout). |
-| `sni_preread_timeout` | Seconds to wait for a complete TLS ClientHello before dropping the connection. Default `5`. Only consulted when the listener carries SNI routes. See [Route by SNI](#route-by-sni-tls-passthrough). |
-| `sni_preread_max_bytes` | Cap on the bytes buffered while looking for the ClientHello. Default `16384`. Bounds the hello, not the connection. |
+| `ip_allow_list` | CIDRs / bare IPs allowed to connect, checked at `accept()`. Empty (default) = allow all. See [Source-IP allow-list](#source-ip-allow-list). (since 0.14) |
+| `rate_limit` | Per-source connection rate cap: `max_conns`, `per_seconds`, `exempt`. Absent (default) = no limit. See [Anti-flood](#anti-flood-per-source-connection-rate). (since 0.14) |
+| `idle_timeout` | Seconds a connection may stay silent in both directions before it is closed. Absent keeps Sōzu's defaults (closed after `30`s of silence). See [Idle timeout](#idle-timeout). (since 0.15) |
+| `sni_preread_timeout` | Seconds to wait for a complete TLS ClientHello before dropping the connection. Default `5`. Only consulted when the listener carries SNI routes. See [Route by SNI](#route-by-sni-tls-passthrough). (since 0.15) |
+| `sni_preread_max_bytes` | Cap on the bytes buffered while looking for the ClientHello. Default `16384`. Bounds the hello, not the connection. (since 0.15) |
 
 ## Attach a backend with Docker labels
 
@@ -48,12 +51,18 @@ services:
 |---|---|
 | `sozune.tcp.<svc>.entrypoint` | Name of a listener declared under `proxy.tcp`. **Required.** Routes are dropped with diagnostic `E005` if missing. |
 | `sozune.tcp.<svc>.port` | Backend port on the container. Defaults to `8080` (informational diagnostic emitted). |
-| `sozune.tcp.<svc>.priority` | Higher wins when multiple services share the same listener (default `0`). |
-| `sozune.tcp.<svc>.sni` | Route TLS connections to this backend by the name in the ClientHello, without terminating TLS. Absent (default) = the listener forwards everything to one backend. See [Route by SNI](#route-by-sni-tls-passthrough). |
+| `sozune.tcp.<svc>.priority` | Not used on TCP routes: a listener serves one catch-all route, or one route per SNI name. See [One route per listener](#one-route-per-listener). |
+| `sozune.tcp.<svc>.sni` | Route TLS connections to this backend by the name in the ClientHello, without terminating TLS. Absent (default) = the listener forwards everything to one backend. See [Route by SNI](#route-by-sni-tls-passthrough). (since 0.15) |
 
 The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/providers/docker) and `sozune.network` to pick a network when the container is on several.
 
+### One route per listener
+
+Without SNI routes, a listener forwards every connection to a single route. Several containers of the same service are fine — they are its backends — but declare one catch-all service per listener. When several name the same listener, `priority` does not pick between them: the one applied last takes the listener's connections. Give each its own listener, or route them [by SNI](#route-by-sni-tls-passthrough). Of Kubernetes TCPRoutes sharing a port, only the oldest is served, see [Gateway API](/documentation/providers/kubernetes#gateway-api-tcproute). (since 0.16)
+
 ## Source-IP allow-list
+
+> Since 0.14
 
 A TCP listener can restrict which source IPs may connect, set on the **listener** (not the backend) since it gates the public port:
 
@@ -80,6 +89,8 @@ Sōzune neither reads nor manages these rules — they live entirely in your fir
 
 ## Anti-flood (per-source connection rate)
 
+> Since 0.14
+
 A listener can cap the connection rate per source IP, enforced by the same forwarder:
 
 ```yaml
@@ -99,6 +110,8 @@ It covers the same ground as HAProxy's `stick-table … conn_rate(3s)` + `reject
 
 ## Idle timeout
 
+> Since 0.15
+
 A TCP connection that carries no byte in either direction is closed after a while. By default that is 30 seconds, which suits request/response protocols and is too short for a database: a query that takes longer to answer, or a pooled connection waiting for its next use, sends nothing for longer than that and gets cut.
 
 ```yaml
@@ -116,6 +129,8 @@ Pick a value above the longest silence you expect: the slowest query, or the idl
 The value must be greater than zero. There is no "never" setting; use a large number of seconds instead. Sōzune refuses to start on `idle_timeout: 0` rather than close every connection as it opens.
 
 ## Route by SNI (TLS passthrough)
+
+> Since 0.15
 
 Without an `sni` label, a TCP listener forwards everything it accepts to a single backend. Add one and Sōzune reads the server name from the TLS ClientHello — which travels in the clear, before any key exchange — and picks a backend from it. TLS is never terminated: the client completes its handshake with the backend, using the backend's own certificate.
 
@@ -150,6 +165,8 @@ Both share one public port; the name decides where each connection lands. Use th
 
 ### Passthrough on the HTTPS port
 
+> Since 0.16
+
 To route by SNI on the HTTPS port itself, next to the routes Sōzune serves over HTTPS there, turn on `proxy.https.passthrough`:
 
 ```yaml
@@ -174,10 +191,10 @@ A name served both ways goes to passthrough. Routes on `https-passthrough` need 
 ## Limitations
 
 - **No TLS termination.** Sōzu's TCP path is pure passthrough — TLS bytes flow as-is. For client-side STARTTLS protocols (PostgreSQL, MySQL) this is fine; for terminating TLS, use an HTTPS entrypoint instead. Passthrough can still *route* by name without decrypting — see [Route by SNI](#route-by-sni-tls-passthrough).
-- **Connections follow their backend out.** When a backend leaves the route, its open connections are closed and clients reconnect to the backends that are left — see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves).
+- **Connections follow their backend out.** When a backend leaves the route, its open connections are closed and clients reconnect to the backends that are left — see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves). (since 0.16)
 - **No half-close.** Sōzu treats a client `FIN` as a full disconnect, so protocols that rely on half-closing one direction to signal end-of-stream may misbehave. Most request/response and long-lived stream protocols are unaffected.
 - **The allow-list and rate limit are filtered after `accept()`**, not before the handshake — see the firewall note above for pre-handshake dropping.
-- **The rate limit resets on restart.** Token buckets are in-memory per process; a Sōzune restart clears them. Listeners (and their limits) are static config, applied at boot.
+- **The rate limit resets on restart.** Token buckets are in-memory per process; a Sōzune restart clears them. Listeners (and their limits) are static config, applied at boot: changing one takes a restart.
 
 ## Errors and diagnostics
 

@@ -1,5 +1,7 @@
 # Rate limiting
 
+> Since 0.9
+
 Token-bucket rate limiter, scoped per source IP. Use to protect backends from abuse or accidental traffic spikes.
 
 ## Labels
@@ -15,7 +17,7 @@ labels:
 | `ratelimit.average` | Sustained rate, in requests per second per IP |
 | `ratelimit.burst` | Maximum burst size. Defaults to `average` when omitted. |
 
-If neither label is present, rate limiting is disabled for the service.
+If neither label is present, rate limiting is disabled for the service. A value that is not an integer, or `burst` without `average`, raises a `W004` diagnostic and disables the limit, except an invalid `burst`, which falls back to `average` (since 0.11). A `burst` lower than `average` raises `W017` (since 0.13).
 
 ## Example
 
@@ -33,21 +35,18 @@ A client gets up to 20 requests in a burst, then steady traffic is capped at 10 
 - Each IP gets its own token bucket; one IP being throttled does not affect another.
 - A new bucket starts **full** (`burst` tokens), so the very first burst from a fresh IP goes through.
 - Tokens refill linearly at `average` per second, capped at `burst`.
-- When a request finds the bucket empty, Sōzune returns `429 Too Many Requests` with body `Too Many Requests`.
-- The check runs in Sōzune's middleware proxy. Basic auth runs natively in Sōzu, separately from rate limiting; the two enforcement layers are independent.
+- When a request finds the bucket empty, Sōzune returns `429 Too Many Requests` with the header `x-sozune-diagnostic: rate-limited`. The body is empty unless `SOZUNE_DEBUG=true` (see [Debugging](/documentation/advanced/debugging)).
+- The check runs in Sōzune's middleware proxy, after the [IP allow-list](ip-allow-list.md), header/query conditions, CORS and [forward auth](forward-auth.md), and before the [in-flight limit](in-flight-req.md). Basic auth is checked by Sōzu itself, before the request reaches the middleware: a request it rejects never takes a token.
 
 ## Source IP detection
 
-Sōzune extracts the client IP from:
+The client is the address that connected to Sōzu, resolved as the [IP allow-list](ip-allow-list.md#client-ip-resolution) does: when that address is one of `proxy.trusted_proxies`, `X-Forwarded-For` is read right to left, every line of it in order, and the first entry that is not a trusted proxy is the client. An `X-Forwarded-For` entry the client wrote itself is never taken for its address.
 
-1. The first entry of the `X-Forwarded-For` header, if present.
-2. Otherwise, the `Host` header value.
-
-If you run Sōzune behind another proxy or a load balancer, ensure that proxy sets `X-Forwarded-For` correctly — otherwise every request will appear to come from the same upstream IP and share a single bucket.
+If you run Sōzune behind another proxy or a load balancer, list it in `proxy.trusted_proxies`: otherwise every request appears to come from that proxy and shares a single bucket.
 
 ## Memory
 
-Idle buckets are evicted automatically after 1 hour of inactivity. There is no hard cap on the number of concurrent IPs tracked.
+Buckets live in memory, one per source. Once a route tracks 10,000 sources, the next new one first triggers a sweep: buckets idle for an hour are dropped, then, if the map is still full, those holding at least half of `burst` (sources not being held back), and if it is still full, all of them.
 
 ## Limitations
 

@@ -2,6 +2,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import rehypeSlug from 'rehype-slug';
+import rehypeSince from '../lib/since';
 import Head from 'aplos/head';
 import CodeBlock from './CodeBlock';
 import DocSidebar from './DocSidebar';
@@ -24,7 +25,7 @@ export default function MarkdownPage({ content, title }: MarkdownPageProps) {
             <article className="doc-content">
               <Markdown
                 remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeRaw, rehypeSlug]}
+                rehypePlugins={[rehypeRaw, rehypeSlug, rehypeSince]}
                 components={{
                   code({ className, children, ...props }) {
                     const match = /language-(\w+)/.exec(className || '');

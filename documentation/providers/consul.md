@@ -1,5 +1,7 @@
 # Consul provider
 
+> Since 0.14
+
 The Consul provider discovers entrypoints from a HashiCorp [Consul](https://www.consul.net/) catalog. Sōzune connects to a Consul agent, lists registered services, reads each instance's health, and turns `sozune.*` service tags into routing configuration.
 
 This is the right provider when your services register in Consul (directly, via Nomad's `provider = "consul"`, or through any other registrator) and you want a Sōzu-powered ingress in front of them.
@@ -43,7 +45,7 @@ Every Consul instance carries one or more checks. Sōzune computes the instance'
 
 The default `["passing", "warning"]` matches Traefik's `strictChecks`: a `warning` instance still answers requests, so it keeps taking traffic — only `critical` (and Consul `maintenance`) instances are pulled out of rotation. Tighten to `["passing"]` if you want any non-green check to remove an instance.
 
-> Sōzu runs its own backend health checks on top of this. `strict_checks` is the Consul-side gate (it knows about application checks Sōzu can't see); Sōzu's checks are the proxy-side safety net.
+> Sōzune runs its own [backend health checks](/documentation/advanced/health-checks) on top of this. `strict_checks` is the Consul-side gate (it knows about application checks Sōzune can't see); Sōzune's checks are the proxy-side safety net.
 
 ## Tags
 
@@ -65,7 +67,7 @@ A service registered directly against Consul:
 }
 ```
 
-Every annotation listed under [Docker labels](/documentation/providers/docker) — host, path, headers, rate limit, basic auth, redirects, sticky sessions, compression — is supported as-is on Consul services.
+Every annotation listed under [Docker labels](/documentation/providers/docker) — host, path, headers, rate limit, basic auth, redirects, sticky sessions, compression, TCP and UDP routes — is supported as-is on Consul services.
 
 ## Backend resolution
 
@@ -74,7 +76,7 @@ For each instance, Sōzune uses:
 - the service's `Service.Address` as the backend IP, falling back to the node's `Node.Address` when the service registers no address of its own (the common case for host-network services).
 - the instance's `Service.Port` as the backend port.
 
-If you declare `sozune.<proto>.<svc>.host` **without** an explicit `sozune.<proto>.<svc>.port`, Sōzune injects the Consul-registered port automatically. Explicit port tags always win.
+If you declare `sozune.<proto>.<svc>.host` **without** an explicit `sozune.<proto>.<svc>.port`, Sōzune injects the Consul-registered port automatically. Explicit port tags always win. TCP and UDP services declare no `host`, so they get no injected port: set `sozune.<proto>.<svc>.port` (required on UDP).
 
 Consul's built-in `consul` service (the agents themselves) is always skipped.
 
@@ -82,7 +84,6 @@ Consul's built-in `consul` service (the agents themselves) is always skipped.
 
 - **One Consul agent per Sōzune instance.** For multiple datacenters, run one Sōzune per datacenter (or set `datacenter` and run several instances).
 - **Catalog only.** Consul Connect / service mesh and the KV store are not used.
-- **UDP services** are recognised at the tag level but not yet proxied (same caveat as the Docker provider).
 
 ## Environment variables
 

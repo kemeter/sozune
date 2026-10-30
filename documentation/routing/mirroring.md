@@ -1,5 +1,7 @@
 # Mirroring
 
+> Since 0.16
+
 Send a copy of a route's traffic to another service, to try a new version on real requests before it serves any. The copy's answer is thrown away: clients only ever get the route's own answer, whatever the mirror does.
 
 ## Labels
@@ -35,6 +37,7 @@ Each request `app` serves is copied to one container of `app-next`, picked by `w
 - A mirrored route goes through the Sōzune middleware, which reads the whole request body before forwarding it.
 - A WebSocket upgrade is not copied: the copy would open a tunnel on the mirror with nobody at the other end.
 - A mirror naming a route that does not exist, or one of another provider, mirrors nothing.
+- `mirrorOf` copies every request. To copy only a share of them, use the `mirrors` field of an entrypoint (REST API, HTTP provider, YAML config file), whose entries each list `backends` and an optional `fraction` (`{"numerator": 1, "denominator": 5}` copies about one request in five, drawn at random), or a Kubernetes `requestMirror` with `percent` or `fraction`.
 
 ## Kubernetes
 

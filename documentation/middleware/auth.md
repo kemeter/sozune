@@ -1,5 +1,7 @@
 # Basic auth
 
+> Since 0.6
+
 Protect a route with HTTP Basic Authentication. Sōzune validates credentials against a list of `username:password_hash` pairs configured per service.
 
 ## Label
@@ -12,6 +14,8 @@ labels:
 Multiple users are comma-separated.
 
 ## Password format
+
+> Since 0.11
 
 The password must be supplied as a **lowercase hex SHA-256** of the plaintext password. The hash is compared in constant-time on every authenticated request, so a fast hash is required at the proxy layer.
 
@@ -34,6 +38,8 @@ echo -n 'secret' | sha256sum | awk '{print $1}'
 The `-n` flag is essential — without it, `echo` appends a newline and the hash will not match.
 
 ## Custom realm
+
+> Since 0.11
 
 The `WWW-Authenticate` realm presented to the client on a `401` response defaults to a generic value. Override it with:
 

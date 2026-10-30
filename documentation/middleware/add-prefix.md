@@ -1,5 +1,7 @@
 # Add prefix
 
+> Since 0.14
+
 Prepend a fixed path prefix to incoming requests before forwarding them to the backend. The reverse of [Strip prefix](/documentation/middleware/strip-prefix).
 
 The typical use case is exposing a sub-path of an existing app under a dedicated subdomain — e.g. serving `example.com/foo/*` from a separate `foo.example.com` host.
@@ -43,7 +45,9 @@ labels:
 | HTTP provider | yes | `add_prefix` field on the entrypoint JSON |
 | YAML config file | yes | `add_prefix` field on the entrypoint |
 | REST API | yes | `add_prefix` field on the entrypoint payload |
-| Kubernetes (Ingress) | no — coming with the upcoming Gateway API provider |
+| Kubernetes (Service) | yes | `sozune.http.<svc>.addPrefix=/foo` annotation |
+| Kubernetes (Ingress) | yes | `sozune.addPrefix=/foo` annotation on the Ingress, applied to each of its routes (since 0.16) |
+| Kubernetes (Gateway API) | no | rewrite the path with an HTTPRoute [`urlRewrite`](/documentation/providers/kubernetes#urlrewrite) filter instead |
 
 ## Notes
 

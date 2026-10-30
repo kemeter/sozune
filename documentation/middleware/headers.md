@@ -1,5 +1,7 @@
 # Custom headers
 
+> Since 0.6
+
 Add, override, or delete headers on requests forwarded to the backend, on responses returned to the client, or on both directions. Applied natively by Sōzu — no extra hop.
 
 ## Label
@@ -16,8 +18,8 @@ One label per header. The direction is determined by the prefix after `headers.`
 | Form | Direction |
 |---|---|
 | `headers.<name>=<value>` | Request (sent to the backend) |
-| `headers.response.<name>=<value>` | Response (sent to the client) |
-| `headers.both.<name>=<value>` | Both directions |
+| `headers.response.<name>=<value>` | Response (sent to the client) (since 0.11) |
+| `headers.both.<name>=<value>` | Both directions (since 0.11) |
 
 ## Example
 
@@ -45,6 +47,8 @@ X-Trace-Id: abc-123
 
 ## Deleting a header
 
+> Since 0.11
+
 An empty value deletes the header. Useful to strip headers added by an upstream component, or hide implementation details from the response.
 
 ```yaml
@@ -71,4 +75,4 @@ For security, the following headers are dropped if injected from a Docker label 
 
 This protects against request smuggling, host header attacks, and credential injection from a compromised label source.
 
-`Sozune-Route` is reserved on requests: on a route that goes through the Sōzune middleware (rate limit, compression, auth…), Sōzu uses it to tell the middleware which route it picked, replacing any value the client sent, and the middleware removes it before the backend. A request edit of it is ignored; a response edit applies as usual.
+`Sozune-Route` is reserved on requests: on a route that goes through the Sōzune middleware (rate limit, compression, auth…), Sōzu uses it to tell the middleware which route it picked, replacing any value the client sent, and the middleware removes it before the backend. A request edit of it is ignored; a response edit applies as usual. (since 0.16)

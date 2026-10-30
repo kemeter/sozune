@@ -1,5 +1,7 @@
 # Ring provider
 
+> Since 0.14
+
 The Ring provider discovers entrypoints from a [Ring](https://github.com/kemeter/ring) cluster. Ring is a lightweight orchestrator that runs workloads as containers or microVMs (Firecracker / Cloud Hypervisor). Sōzune reads Ring's deployment list over its HTTP API and turns the `sozune.*` labels declared on each deployment into routing configuration.
 
 Like the Docker / Nomad / Consul providers, Sōzune *observes* Ring — it never registers anything back, so Ring does not need to know Sōzune exists. This is the right provider when your workloads run on Ring and you want a Sōzu-powered ingress in front of them.
@@ -26,10 +28,10 @@ providers:
 
 ## How it works
 
-1. Sōzune issues `GET /deployments` against the Ring API every `poll_interval` seconds. A single call returns everything needed: each deployment's `sozune.*` labels, its published `ports`, and its running `instances` (each carrying its routable guest `address`). There is no per-deployment second round-trip.
+1. Sōzune issues `GET /deployments?status=running&instances=true` against the Ring API every `poll_interval` seconds. A single call returns everything needed: each deployment's `sozune.*` labels, its published `ports`, and its running `instances` (each carrying its routable guest `address`). There is no per-deployment second round-trip.
 2. Only deployments with `status = "running"` are considered. Each running instance with a routable address becomes one backend, so a multi-replica deployment fans out to N backends — same host and labels, different IPs (the Nomad / Consul model).
 3. Labels are parsed by the same engine that handles Docker / Swarm / Kubernetes / Nomad annotations, so `sozune validate` and the runtime stay in sync.
-4. Sōzune diffs the new Ring-sourced view against the previous one and only triggers a reload when something changed (deployment added or removed, scaled, address changed).
+4. Sōzune diffs the new Ring-sourced view against the previous one and only triggers a reload when something changed (deployment added or removed, scaled, address changed, labels edited). A failed poll — Ring unreachable, a non-2xx answer — is logged and leaves the current routes in place.
 
 ## Labels
 
@@ -47,7 +49,7 @@ labels:
 
 > **Ports and replicas.** Ring forbids a `ports` block once `replicas > 1` — every replica would race for the same host port. With multiple replicas you therefore declare the backend port with an explicit `sozune.<proto>.<svc>.port` label (as above). With a single replica you may instead declare a `ports` entry, and Sōzune will use its `target` as the backend port automatically (see [Backend resolution](#backend-resolution)). Sōzune always routes to each instance's guest IP directly, never through a host-published port.
 
-Every annotation listed under [Docker labels](/documentation/providers/docker) — host, path, headers, rate limit, basic auth, redirects, sticky sessions, compression — is supported as-is on Ring deployments.
+Every annotation listed under [Docker labels](/documentation/providers/docker) — host, path, headers, rate limit, basic auth, redirects, sticky sessions, compression, TCP and UDP routes — is supported as-is on Ring deployments.
 
 ## Backend resolution
 
@@ -56,8 +58,8 @@ For each running instance, Sōzune uses:
 - the instance's `address` (the routable guest IP reported by Ring) as the backend IP
 - the backend port, resolved in this order:
   1. an explicit `sozune.<proto>.<svc>.port` label, if set (always wins);
-  2. otherwise the first `ports` entry's `target` (only possible with a single replica, since Ring forbids `ports` when `replicas > 1`);
-  3. otherwise the default (`80` for HTTP), which is why a whoami-style service on port 80 routes with no port label at all.
+  2. otherwise the first `ports` entry's `target` (only possible with a single replica, since Ring forbids `ports` when `replicas > 1`), for a service that declares a `host`;
+  3. otherwise the default: `80` for HTTP, which is why a whoami-style service on port 80 routes with no port label at all, and `8080` for TCP. A UDP service has no default and needs its `port` label.
 
 So a single-replica deployment can rely on its `ports` entry, while a multi-replica deployment must carry an explicit `sozune.<proto>.<svc>.port` label unless its container happens to listen on the default port.
 
@@ -67,7 +69,6 @@ An instance with no routable `address` — typically one that is still starting 
 
 - **One Ring endpoint per Sōzune instance.** Point at the API of the cluster you want to route to.
 - **Interval-based discovery.** Ring has no blocking-query / watch mechanism, so reaction time is bounded by `poll_interval` rather than near-instant like the Consul/Nomad providers.
-- **UDP services** are recognised at the label level but not yet proxied (same caveat as the Docker provider).
 
 ## Environment variables
 

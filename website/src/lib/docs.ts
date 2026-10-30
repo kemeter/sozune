@@ -31,13 +31,21 @@ function extractDescription(markdown: string): string {
       if (buffer.length > 0) break;
       continue;
     }
+    // A `> Since 0.X` version marker is not the page's summary.
+    if (/^>\s*Since \d+\.\d+$/.test(line)) {
+      continue;
+    }
     if (line.startsWith('#') || line.startsWith('```') || line.startsWith('|') || line.startsWith('- ') || line.startsWith('* ')) {
       if (buffer.length > 0) break;
       continue;
     }
     buffer.push(line);
   }
-  const text = buffer.join(' ').replace(/`([^`]+)`/g, '$1').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+  const text = buffer
+    .join(' ')
+    .replace(/\s*\(since \d+\.\d+\)/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
   if (text.length <= 200) return text;
   return text.slice(0, 197).replace(/\s+\S*$/, '') + '…';
 }

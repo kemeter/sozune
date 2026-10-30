@@ -1,5 +1,7 @@
 # Swarm provider
 
+> Since 0.12
+
 The Swarm provider discovers entrypoints from Docker Swarm services. Sōzune connects to a Swarm **manager**, lists services, and reads `sozune.*` labels declared on the service spec (not on the underlying tasks/containers).
 
 This is the right provider when your stack is deployed with `docker stack deploy` or `docker service create` instead of plain `docker run`.
@@ -19,7 +21,7 @@ providers:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enables the Swarm provider |
-| `endpoint` | `/var/run/docker.sock` | Docker socket. Must point to a **Swarm manager** node. |
+| `endpoint` | `/var/run/docker.sock` | Docker socket, as a path or a `unix://` URL. Must point to a **Swarm manager** node. Only Unix sockets are supported, as for the [Docker provider](/documentation/providers/docker#configuration). |
 | `expose_by_default` | `false` | If `true`, every service is a candidate even without `sozune.enable=true` |
 | `network` | `""` | Optional overlay network name. When set, Sōzune ignores VIPs on other networks. |
 | `refresh_interval` | `15` | Periodic poll interval in seconds (safety net behind the event stream) |
@@ -28,9 +30,9 @@ providers:
 
 1. Sōzune subscribes to Docker events filtered on `type=service` for near-real-time reactions to `service create`, `service update` and `service rm`.
 2. A periodic poll (`refresh_interval`) re-runs the same diff against the Swarm API. This is a safety net for missed events or disconnected streams.
-3. On every diff, Sōzune replaces the full set of `source: "swarm"` entrypoints in storage and triggers a reload.
+3. When the result differs from what it holds, Sōzune replaces the full set of `source: "swarm"` entrypoints in storage and triggers a reload.
 
-Service labels are parsed by the same engine the other providers use (Docker, Podman, Kubernetes, Nomad, HTTP, config file), so `sozune validate` reports the exact diagnostics the runtime applies.
+Service labels are parsed by the same engine as the other label-based providers (Docker, Podman, Kubernetes annotations, Nomad, Consul, Ring), so `sozune validate` reports the exact diagnostics the runtime applies. Every label listed under [Docker labels](/documentation/providers/docker) works on a Swarm service.
 
 ## Example service
 
@@ -89,7 +91,7 @@ Each provider tags its entries with a distinct `source` (`swarm` vs `docker`), s
 
 ## Requirements
 
-- The `endpoint` socket **must** point to a manager node. On a worker, the Docker daemon refuses Swarm API calls and Sōzune logs an error per poll.
+- The `endpoint` socket **must** point to a manager node. Sōzune checks it once at startup: on a worker, a daemon not in Swarm mode or an unreachable socket, it logs `Swarm provider disabled: …` and the provider stays off until Sōzune restarts.
 - Sōzune itself must be able to reach the chosen overlay network. The simplest setup is to run Sōzune as a Swarm service attached to the same overlay as the discovered services. Otherwise, expose ports with `mode=host`.
 
 ## Environment variables

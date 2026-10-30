@@ -6,10 +6,14 @@
 docker run -d \
   --name sozune \
   -p 80:80 -p 443:443 \
+  --group-add $(stat -c %g /var/run/docker.sock) \
+  -e CONFIG_PATH=/etc/sozune/config.yaml \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v $(pwd)/config.yaml:/etc/sozune/config.yaml \
   ghcr.io/kemeter/sozune:latest
 ```
+
+The image does not set `CONFIG_PATH`: without it, Sōzune looks for `config.yaml` in its working directory (`/home/nonroot`), ignores the mounted file and starts with the default configuration. `--group-add` gives it the host's `docker` group, needed to open the Docker socket (see [Running as non-root](#running-as-non-root)).
 
 ### Image tags
 
@@ -21,6 +25,8 @@ docker run -d \
 | `sha-<full commit hash>` | The `main` build of that commit, never rebuilt. |
 
 ## Kubernetes (Helm)
+
+> Since 0.16
 
 ```bash
 git clone https://github.com/kemeter/sozune
@@ -42,25 +48,25 @@ cargo build --release
 
 ## Running as non-root
 
-The image runs as `root` by default so it works out of the box: it can bind to ports `80`/`443` and read `/var/run/docker.sock` without extra configuration.
+> Since 0.14
 
-If you'd rather run as the unprivileged `nonroot` user (UID `65532`) baked into the distroless base image, override `user` and grant the necessary capability + group:
+The image runs as the unprivileged `nonroot` user (UID `65532`) of its distroless base. Binding ports `80`/`443` inside the container works as is. Two things need care:
+
+- **The Docker socket.** It is usually `root:docker` with mode `660` on the host, so the container needs the socket's group: `--group-add $(stat -c %g /var/run/docker.sock)` with `docker run`, `group_add` in Compose, which takes it from `DOCKER_GID`: `export DOCKER_GID=$(stat -c %g /var/run/docker.sock)` before `docker compose up`. Without it, the Docker provider fails with `client error (Connect)`.
+- **Writable paths.** Anything Sōzune writes, such as the ACME `certs_dir`, must be a volume UID `65532` can write to.
 
 ```yaml
 services:
   sozune:
     image: ghcr.io/kemeter/sozune:latest
-    user: "65532:65532"
-    cap_add:
-      - NET_BIND_SERVICE
     group_add:
-      - "997"  # GID of the `docker` group on the host (varies — check with `getent group docker`)
+      - "${DOCKER_GID:?export DOCKER_GID=$(stat -c %g /var/run/docker.sock)}"
+    environment:
+      CONFIG_PATH: /etc/sozune/config.yaml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./config.yaml:/config.yaml:ro
+      - ./config.yaml:/etc/sozune/config.yaml:ro
 ```
-
-The `group_add` value must match your host's `docker` group GID. Without it, sozune cannot read the Docker socket.
 
 ## Verify the install
 
@@ -69,5 +75,7 @@ The `group_add` value must match your host's `docker` group GID. Without it, soz
 ```bash
 curl http://127.0.0.1:3035/health
 ```
+
+In a container, that address is the container's own loopback: set `api.listen_address: "0.0.0.0:3035"` and publish the port on the host's loopback (`-p 127.0.0.1:3035:3035`) to reach it from the host.
 
 You should get `200 OK`. Next: [Quick start](/documentation/getting-started/quick-start).

@@ -1,5 +1,7 @@
 # Strip prefix
 
+> Since 0.6
+
 Remove the matched path prefix before forwarding the request to the backend. Useful when the backend is unaware of the public-facing prefix.
 
 ## Label
