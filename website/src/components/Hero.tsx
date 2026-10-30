@@ -4,15 +4,15 @@ export default function Hero() {
   return (
     <section className="hero">
       <div className="container hero-inner">
-        <div className="hero-eyebrow">discovery · routing · TLS · diagnostics</div>
         <h1 className="hero-title">
-          The reverse proxy that
+          Routes that follow
           <br />
-          <span className="hero-title-accent">configures itself.</span>
+          <span className="hero-title-accent">your services.</span>
         </h1>
         <p className="hero-subtitle">
-          Declare routing where your services already live. Sōzune discovers them,
-          secures them with automatic HTTPS, and keeps the routing table in sync.
+          Declare routes alongside your services. Sōzune discovers backends and keeps
+          routing up to date as your services change. Sōzune automatically manages
+          HTTPS certificates with ACME.
         </p>
         <div className="hero-actions">
           <Link to="/documentation/getting-started/quick-start" className="btn btn-primary">

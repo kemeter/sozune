@@ -1,0 +1,261 @@
+.flow {
+  padding: 8px 0 88px;
+}
+
+/*
+ * Providers on top feed Sōzune (dashed, configuration); traffic runs left to
+ * right on the main axis (solid). The same layout scales down to phones: only
+ * the sizes change, so no arrow crosses a box.
+ */
+.flow-diagram {
+  display: grid;
+  grid-template-columns: 1fr 96px minmax(0, 1.3fr) 96px 1fr;
+  grid-template-areas:
+    'providers providers providers providers providers'
+    '.         .         updates   .         .'
+    'clients   in        sozune    out       backends'
+    '.         .         note      .         .';
+  align-items: center;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.flow-providers {
+  grid-area: providers;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.flow-providers li {
+  padding: 5px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.flow-updates {
+  grid-area: updates;
+  justify-self: center;
+  position: relative;
+  height: 64px;
+  border-left: 2px dashed var(--border-strong);
+}
+
+.flow-updates::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: -7px;
+  border: 6px solid transparent;
+  border-top: 8px solid var(--border-strong);
+  border-bottom: 0;
+}
+
+.flow-updates span {
+  position: absolute;
+  top: 50%;
+  left: 12px;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.flow-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 16px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-card);
+  text-align: center;
+}
+
+.flow-node strong {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.flow-clients {
+  grid-area: clients;
+}
+
+.flow-backends {
+  grid-area: backends;
+}
+
+.flow-sozune {
+  grid-area: sozune;
+  padding: 22px 20px;
+  border: 1.5px solid var(--accent);
+  background: var(--accent-soft);
+}
+
+.flow-sozune strong {
+  font-size: 20px;
+  color: var(--accent);
+}
+
+.flow-stages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.flow-stages li {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.flow-link {
+  position: relative;
+  height: 3px;
+  margin-right: 2px;
+  background: var(--accent);
+}
+
+.flow-link-in {
+  grid-area: in;
+}
+
+.flow-link-out {
+  grid-area: out;
+}
+
+.flow-link::after {
+  content: '';
+  position: absolute;
+  right: -2px;
+  top: -6px;
+  border: 7.5px solid transparent;
+  border-left: 10px solid var(--accent);
+  border-right: 0;
+}
+
+.flow-note {
+  grid-area: note;
+  margin: 14px 0 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.flow-legend {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  list-style: none;
+  padding: 0;
+  margin: 32px 0 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.flow-legend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.flow-legend li::before {
+  content: '';
+  width: 24px;
+}
+
+.flow-legend-traffic::before {
+  border-top: 3px solid var(--accent);
+}
+
+.flow-legend-updates::before {
+  border-top: 2px dashed var(--border-strong);
+}
+
+@media (max-width: 640px) {
+  .flow-diagram {
+    grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1.8fr) 24px minmax(0, 1fr);
+  }
+
+  .flow-providers li {
+    padding: 4px 9px;
+    font-size: 11px;
+  }
+
+  .flow-updates {
+    height: 56px;
+  }
+
+  .flow-updates span {
+    width: 96px;
+    white-space: normal;
+    font-size: 11px;
+    line-height: 1.35;
+  }
+
+  .flow-note {
+    grid-column: 1 / -1;
+  }
+
+  .flow-node {
+    padding: 14px 6px;
+  }
+
+  .flow-node strong {
+    font-size: 13px;
+  }
+
+  .flow-sozune {
+    padding: 14px 8px;
+  }
+
+  .flow-sozune strong {
+    font-size: 16px;
+  }
+
+  .flow-stages li {
+    padding: 3px 6px;
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 360px) {
+  .flow-diagram {
+    grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1.7fr) 18px minmax(0, 1fr);
+  }
+
+  .flow-node {
+    padding: 12px 2px;
+  }
+
+  .flow-node strong {
+    font-size: 11.5px;
+  }
+
+  .flow-sozune strong {
+    font-size: 15px;
+  }
+}
