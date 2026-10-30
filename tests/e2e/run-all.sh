@@ -129,6 +129,8 @@ proxy:
       listen: $TCP_SNI_PORT
       sni_preread_timeout: 5
       sni_preread_max_bytes: 16384
+    - name: tcpshared
+      listen: $TCP_SHARED_PORT
   udp:
     - name: udpecho
       listen: $UDP_ECHO_PORT

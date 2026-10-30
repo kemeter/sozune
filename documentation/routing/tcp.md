@@ -51,14 +51,14 @@ services:
 |---|---|
 | `sozune.tcp.<svc>.entrypoint` | Name of a listener declared under `proxy.tcp`. **Required.** Routes are dropped with diagnostic `E005` if missing. |
 | `sozune.tcp.<svc>.port` | Backend port on the container. Defaults to `8080` (informational diagnostic emitted). |
-| `sozune.tcp.<svc>.priority` | Not used on TCP routes: a listener serves one catch-all route, or one route per SNI name. See [One route per listener](#one-route-per-listener). |
+| `sozune.tcp.<svc>.priority` | On a listener without SNI routes, which catch-all route serves it: the highest. See [One route per listener](#one-route-per-listener). (since 0.16) |
 | `sozune.tcp.<svc>.sni` | Route TLS connections to this backend by the name in the ClientHello, without terminating TLS. Absent (default) = the listener forwards everything to one backend. See [Route by SNI](#route-by-sni-tls-passthrough). (since 0.15) |
 
 The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/providers/docker) and `sozune.network` to pick a network when the container is on several.
 
 ### One route per listener
 
-Without SNI routes, a listener forwards every connection to a single route. Several containers of the same service are fine — they are its backends — but declare one catch-all service per listener. When several name the same listener, `priority` does not pick between them: the one applied last takes the listener's connections. Give each its own listener, or route them [by SNI](#route-by-sni-tls-passthrough). Of Kubernetes TCPRoutes sharing a port, only the oldest is served, see [Gateway API](/documentation/providers/kubernetes#gateway-api-tcproute). (since 0.16)
+Without SNI routes, a listener forwards every connection to a single route. Several containers of the same service are fine — they are its backends — but declare one catch-all service per listener. When several name the same listener, the highest `priority` serves it, the lowest route id on a tie; the others wait, logged as such, and the next takes over once it goes. Give each its own listener, or route them [by SNI](#route-by-sni-tls-passthrough). Of Kubernetes TCPRoutes sharing a port, only the oldest is served, see [Gateway API](/documentation/providers/kubernetes#gateway-api-tcproute). (since 0.16)
 
 ## Source-IP allow-list
 
