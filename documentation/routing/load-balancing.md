@@ -8,6 +8,8 @@ Sōzu spreads requests across all healthy backends of a cluster, evenly unless t
 
 ## Choosing the algorithm
 
+> Since 0.14
+
 Set `loadBalancer` to pick how requests are distributed across the backends:
 
 ```yaml
@@ -23,7 +25,7 @@ labels:
 | `power_of_two` | Sample two backends at random, pick the one less loaded per unit of weight. Cheaper than full least-connections at scale, nearly as good. |
 | `random` | Pick a backend at random, weighted by its weight. |
 
-Values are case-insensitive and accept hyphens or underscores (`least-connections` == `least_connections`); common aliases work too (`leastconn`, `rr`, `p2c`). An unrecognised value falls back to round-robin and raises a `W022` diagnostic. The setting applies to both HTTP and TCP entrypoints, and is also available as `load_balancer` on the REST/YAML entrypoint payload.
+Values are case-insensitive and accept hyphens or underscores (`least-connections` == `least_connections`); common aliases work too (`leastconn`, `rr`, `p2c`). An unrecognised value falls back to round-robin and raises a `W022` diagnostic. The setting applies to HTTP, TCP and UDP entrypoints, and is also available as `load_balancer` on the REST/YAML entrypoint payload. UDP entrypoints also take the flow-affine hashing algorithms `hrw` and `maglev` — see [UDP routing](/documentation/routing/udp#load-balancing); on HTTP or TCP they raise `W022` and fall back to round-robin.
 
 ## Multiple backends from Docker
 
@@ -48,7 +50,7 @@ Both containers register as backends of the `app` service (the part of `sozune.h
 
 The Compose service name (`app-instance-1`, `app-instance-2`) is irrelevant — only the Sōzune service name in the label matters.
 
-Containers merged into one service share its route, with the settings of the first one Sōzune found: during a rolling update, the old containers' settings stay until the last of them stops, then the route takes those of the new ones. One exception: a container that forwards to a backend wins over one that answers itself (`redirect=permanent`, `unauthorized` or `close`). A rollout that turns a service into a redirect keeps serving it until its last container stops, then redirects; one that turns a redirect into a service forwards as soon as its first container starts. Sōzune logs a warning while containers of one service disagree.
+Containers merged into one service share its route, with the settings of the first one Sōzune found: during a rolling update, the old containers' settings stay until the last of them stops, then the route takes those of the new ones. One exception: a container that forwards to a backend wins over one that answers itself (`redirect=permanent`, `unauthorized` or `close`). A rollout that turns a service into a redirect keeps serving it until its last container stops, then redirects; one that turns a redirect into a service forwards as soon as its first container starts. Sōzune logs a warning while containers of one service disagree. (since 0.16)
 
 ## Multiple backends from the API
 
@@ -67,6 +69,8 @@ POST /entrypoints
 
 ## Weighted load balancing
 
+> Since 0.10
+
 Weights live on each backend via the `weight` field (default `100`). Higher weight = more traffic.
 
 ```json
@@ -80,7 +84,7 @@ Weights live on each backend via the `weight` field (default `100`). Higher weig
 }
 ```
 
-From Docker (or any label source), a backend sets its own weight with the `weight` label:
+From Docker (or any label source), a backend sets its own weight with the `weight` label (since 0.14):
 
 ```yaml
 services:
@@ -101,19 +105,22 @@ services:
 
 The two containers join the same `app` service, so `app.example.com` is split 90% / 10% between them — a simple canary.
 
-Every algorithm honours the weight:
+Every algorithm honours the weight (since 0.16):
 
 - `round_robin` gives a backend of weight `w` exactly `w` requests out of every `Σw`, interleaved: weights `5`, `1`, `1` serve `a a b a c a a`, not `a a a a a b c`.
 - `least_connections` and `power_of_two` compare each backend's load divided by its weight.
 - `random` draws in proportion to the weights, so the split is statistical.
+- `hrw` and `maglev` (UDP) give each backend a share of the flows in proportion to its weight.
 
 The weight belongs to a backend, not to a service: three replicas of `app-stable` labelled `weight=90` carry 270 shares between them.
 
-A weight of `0` makes the backend a **backup**: it takes no traffic while another backend can serve, and takes over when none can. A negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
+A weight of `0` makes the backend a **backup**: it takes no traffic while another backend can serve, and takes over when none can (since 0.16). A negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
 
-A route that goes through the Sōzune middleware (rate limit, compression, auth, retry…) is balanced by the middleware, by the same `loadBalancer` and weights. There, `least_connections` and `power_of_two` count the requests waiting for a backend's response headers; a WebSocket tunnel or a response body still streaming is not counted. Also there, a backup takes over a request no backend gave a response to: once the [retries](/documentation/middleware/retry) are spent, each backend the request has not tried yet gets one try, heaviest first, then each backup. A WebSocket upgrade, which is not retried, goes through the same order when its backend refuses it.
+A route that goes through the Sōzune middleware (rate limit, compression, auth, retry…) is balanced by the middleware, by the same `loadBalancer` and weights. There, `least_connections` and `power_of_two` count the requests waiting for a backend's response headers; a WebSocket tunnel or a response body still streaming is not counted. Also there, a backup takes over a request no backend gave a response to: once the [retries](/documentation/middleware/retry) are spent, each backend the request has not tried yet gets one try, heaviest first, then each backup. A WebSocket upgrade, which is not retried, goes through the same order when its backend refuses it. A backend that gives no response to 3 requests in a row is left out for 10 seconds, as Sōzu does for the routes it serves itself — see [Without a health check](/documentation/advanced/health-checks#without-a-health-check). (since 0.16)
 
 ## When a backend leaves
+
+> Since 0.16
 
 When a backend leaves a route — its container stops, the service scales down, a rollout replaces it, its [health check](/documentation/advanced/health-checks) fails, or the route itself goes away — Sōzune removes it, then closes the connections still tied to it, so clients reconnect to a backend that is still there:
 
@@ -124,6 +131,8 @@ When a backend leaves a route — its container stops, the service scales down, 
 A route change that keeps a backend (another header, another weight) leaves its connections open, and so does a change Sōzune could not apply: the route keeps what it had. When a route is changed, its connections are closed once its new version is in place, so a client that reconnects at once is served. On a route that goes through the Sōzune middleware, a WebSocket tunnel the middleware opened to a backend that left is closed too, once the new version of the route is in place. A backend the route keeps keeps its tunnels, even when the route stops going through the middleware.
 
 ## Sticky sessions
+
+> Since 0.10
 
 Pin a client to the same backend for the duration of its session:
 
@@ -137,6 +146,8 @@ When enabled, Sōzu sets a session cookie and routes subsequent requests with th
 
 Sticky sessions are best-effort affinity, not absolute pinning.
 
+They have no effect on a route that goes through the Sōzune middleware (rate limit, compression, auth, retry…): Sōzu's only backend for such a route is the middleware, which balances each request on its own.
+
 ## What's not supported
 
-- **Custom hashing** (consistent hashing, IP hash) — not exposed by Sōzu.
+- **Hashing on HTTP and TCP** (consistent hashing, IP hash) — Sōzu hashes UDP flows only (`hrw`, `maglev`).

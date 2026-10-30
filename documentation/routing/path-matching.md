@@ -7,8 +7,8 @@ A path rule narrows down which paths under a hostname go to a service. By defaul
 | Type | Label | Match |
 |---|---|---|
 | Prefix | `path` or `prefix` | Path starts with the value, segment-aware |
-| Regex | `pathRegex` | Path matches the regex |
-| Exact | (API only) | Path equals the value |
+| Regex | `pathRegex` | Path matches the regex (since 0.11) |
+| Exact | (no label) | Path equals the value (since 0.11) |
 
 ## Prefix
 
@@ -26,9 +26,11 @@ labels:
 | `/api/` | yes |
 | `/api/users` | yes |
 | `/api?page=2` | yes |
-| `/apidocs` | no — segment-aware |
+| `/apidocs` | no — segment-aware (since 0.15) |
 
 ## Regex
+
+> Since 0.11
 
 ```yaml
 labels:
@@ -42,7 +44,9 @@ The regex is searched anywhere in what Sōzu matches, which is the path **with i
 
 ## Exact
 
-There is no Docker label for exact path matches. Create the entrypoint through the [REST API](/documentation/configuration/api) with a `PathConfig` of `rule_type: Exact`.
+> Since 0.11
+
+There is no label for exact path matches. Set a `path` of `rule_type: Exact` on an entrypoint of the [REST API](/documentation/configuration/api), the HTTP provider or the YAML config file. On Kubernetes, an Ingress `pathType: Exact` and an HTTPRoute `type: Exact` path match give one too.
 
 An exact path is compared without the query string: `/login` matches `/login` and `/login?next=/`, but not `/login/` or `/login/reset`.
 

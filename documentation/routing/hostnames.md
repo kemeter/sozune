@@ -11,7 +11,7 @@ labels:
 
 A literal hostname. Matched against the request's `Host` header.
 
-Every label must be non-empty: `.example.com`, `example..com` and a trailing `.` are refused.
+Every label must be non-empty: `.example.com`, `example..com` and a trailing `.` are refused. (since 0.15)
 
 ## Wildcard
 
@@ -24,7 +24,7 @@ labels:
 
 `foo.example.com` matches; `bar.foo.example.com` does not. The leading `*` is required — patterns like `app*.example.com` are rejected.
 
-A bare `*`, which would match every host, is refused: one service could otherwise take the traffic of every other route on the proxy.
+A bare `*`, which would match every host, is refused: one service could otherwise take the traffic of every other route on the proxy. (since 0.15)
 
 ## Regex
 
@@ -39,7 +39,7 @@ The example matches `cdn1.example.com`, `cdn42.example.com`, but not `cdnabc.exa
 
 You can have several regex segments in the same hostname, e.g. `/v[0-9]+/./api[a-z]/.example.com`.
 
-A regex hostname must stay inside one domain, so that it cannot match hosts given to other services:
+A regex hostname must stay inside one domain, so that it cannot match hosts given to other services (since 0.15):
 
 - it ends with at least two literal labels (`.example.com`): `/.*/` and `/.*/.com` are refused;
 - a regex segment does not alternate at its top level: write `/(?:eu|us)-cdn/.example.com`, not `/eu-cdn|us-cdn/.example.com`, whose alternation would escape the anchoring and match any host.
@@ -69,11 +69,13 @@ labels:
 
 For `admin.example.com`, the `specific` entrypoint wins. Other subdomains hit `catchall`.
 
-The default priority is `0`. Higher numbers win. Among routes of the same priority, the more specific one is tried first: an exact hostname before a regex, a wildcard (the longer first), then any host; then an exact path before a prefix, the longer prefix first (a regex counts as the literal text it starts with); then a route on `methods` before one on any method, and the one with more `matchHeaders` conditions first. A route listing several hostnames is placed by its most specific one: give a wildcard its own route for it to be tried after other routes' exact names. Gateway API routes are split that way on their own.
+The default priority is `0`. Higher numbers win.
 
-One exception: a route whose [header conditions](/documentation/routing/header-query-matching) hold is tried before every route without header conditions, whatever their priority. This applies to conditions on any header but `Host` and `Cookie`, which Sōzu cannot route on. Priority still orders routes with header conditions among themselves.
+Among routes of the same priority, the more specific one is tried first: an exact hostname before a regex, a wildcard (the longer first), then any host; then an exact path before a prefix, the longer prefix first (a regex counts as the literal text it starts with); then a route on `methods` before one on any method; then the one with more header conditions Sōzu routes on, then the one with more query conditions Sōzu routes on (see [Header & query matching](/documentation/routing/header-query-matching)). A route listing several hostnames is placed by its most specific one: give a wildcard its own route for it to be tried after other routes' exact names. Gateway API routes are split that way on their own. (since 0.16)
+
+One exception: a route whose [header conditions](/documentation/routing/header-query-matching) hold is tried before every route without header conditions, whatever their priority. This applies to conditions on any header but `Host` and `Cookie`, which Sōzu cannot route on. Priority still orders routes with header conditions among themselves. (since 0.16)
 
 ## Notes
 
-- **Wildcard quirk**: due to an upstream issue ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)), wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds. Sōzune ships a patched build that guards against this.
+- **Wildcard quirk**: wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)). The Sōzu release Sōzune uses (2.3.2) is not affected.
 - Hostnames are passed as-is to Sōzu, which is responsible for the actual matching at request time.

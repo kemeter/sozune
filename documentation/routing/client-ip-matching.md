@@ -1,5 +1,7 @@
 # Client-IP matching
 
+> Since 0.14
+
 Scope a route to requests coming from specific client IPs or CIDR ranges, on top of the usual host/path matching. Use it to serve an admin route only to your office network, or to pin a route to a known set of upstreams.
 
 `matchClientIP` is a **routing matcher**: when the client IP is not in the list, the request gets `404 Not Found` — the route simply *does not apply*. Unlike [header & query matching](./header-query-matching.md), it does not go on to another route. This is what distinguishes it from the [IP allow-list middleware](../middleware/ip-allow-list.md), which is an *access filter* that returns `403 Forbidden`. Pick the matcher when "this IP shouldn't see this route at all"; pick the middleware when "this IP is forbidden from a route it would otherwise reach".
@@ -31,7 +33,8 @@ A request from `10.5.7.99` is served. A request from `203.0.113.7` gets a `404 N
 ## Behaviour
 
 - All conditions are **AND**-combined with any `matchHeaders` / `matchQuery` on the same route: every condition must hold for the route to serve.
-- Sōzu routes on host/path/method only, so matching is enforced by a Sōzune middleware: the request is routed to the cluster, then rejected with `404 Not Found` if the client IP is not in the list.
+- Sōzu cannot route on the client IP, so matching is enforced by a Sōzune middleware: Sōzu picks the route first, on its host, path, method and the header and query conditions it routes on, then the middleware rejects the request with `404 Not Found` if the client IP is not in the list.
+- A request failing one of the header or query conditions Sōzu routes on goes on to the next route; one failing the client IP does not. (since 0.16)
 - Entries that don't parse are logged and **dropped**: a typo can only ever narrow the match, never widen it.
 - If **every** entry is invalid, the constraint is dropped and the route stays reachable (the route is not silently black-holed). The per-entry warnings remain in the logs.
 
@@ -41,7 +44,7 @@ The client IP is resolved **identically to the IP allow-list middleware** — `X
 
 ## Limitation
 
-Like header/query matching, this builds on a Sōzu frontend keyed on host + path + method. **Two routes that share the same host and path but differ only by client IP cannot be distinguished** — Sōzu sees a single frontend. `matchClientIP` can *filter* a route (serve it only for matching clients) but cannot *select between* two otherwise-identical routes. Give such routes distinct paths if you need both live at once.
+Sōzu cannot route on the client IP. **Two routes that share the same host and path (and the same method, header and query conditions) but differ only by client IP cannot be distinguished** — Sōzu sees a single frontend. `matchClientIP` can *filter* a route (serve it only for matching clients) but cannot *select between* two otherwise-identical routes. Give such routes distinct paths if you need both live at once.
 
 ## REST / YAML surface
 
