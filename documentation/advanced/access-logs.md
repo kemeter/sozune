@@ -74,27 +74,23 @@ Unknown values are ignored and the default (`text`) stands.
 
 ## Configuring log verbosity
 
-Sōzune reads the `RUST_LOG` environment variable, then applies its own filter on top:
+Sōzune starts from these levels:
 
 ```
-sozune=info, bollard=warn, hyper=warn, hyper_util=warn, rustls=warn, sozu_lib=warn,
-sozu_command_lib=warn, mio=warn, h2=warn, kube=warn, tower=warn
+sozune=info, access=info, bollard=warn, hyper=warn, hyper_util=warn, rustls=warn,
+sozu_lib=warn, sozu_command_lib=warn, mio=warn, h2=warn, kube=warn, tower=warn
 ```
 
-Every other target, `access` included, logs only errors unless `RUST_LOG` names it. **The access log is therefore off by default**; turn it on by enabling its target:
+Every other target logs only errors. The access log is on: one line per request the middleware handles, errors included.
+
+`RUST_LOG` is applied on top: a directive on one of these targets replaces its level (since 0.16), any other adds one.
 
 ```bash
-RUST_LOG=access=info sozune
-```
+# Verbose Sōzune logs
+RUST_LOG=sozune=debug sozune
 
-Because the filter above is applied after `RUST_LOG`, a `RUST_LOG` directive on one of those exact targets (`sozune=debug`, `hyper=info`) has no effect. Target a module below them instead:
-
-```bash
-# Verbose middleware logs
-RUST_LOG=sozune::middleware=debug sozune
-
-# Access log plus verbose provider logs
-RUST_LOG=access=info,sozune::provider=debug sozune
+# No access log, verbose provider logs
+RUST_LOG=access=off,sozune::provider=debug sozune
 ```
 
 ## Limitations

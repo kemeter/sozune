@@ -247,6 +247,15 @@ pub async fn handle_proxy(
                 state
                     .request_metrics
                     .record(start.elapsed(), resp.status().as_u16());
+                access_log(
+                    &source_ip,
+                    &method,
+                    &host,
+                    &path,
+                    resp.status().as_u16(),
+                    start.elapsed(),
+                    "middleware",
+                );
                 return resp;
             }
             admitted.store(
@@ -276,6 +285,15 @@ pub async fn handle_proxy(
                     state
                         .request_metrics
                         .record(start.elapsed(), resp.status().as_u16());
+                    access_log(
+                        &source_ip,
+                        &method,
+                        &host,
+                        &path,
+                        resp.status().as_u16(),
+                        start.elapsed(),
+                        "middleware",
+                    );
                     return resp;
                 }
             };
@@ -352,6 +370,15 @@ pub async fn handle_proxy(
                     state
                         .request_metrics
                         .record(start.elapsed(), resp.status().as_u16());
+                    access_log(
+                        &source_ip,
+                        &method,
+                        &host,
+                        &path,
+                        resp.status().as_u16(),
+                        start.elapsed(),
+                        "middleware",
+                    );
                     return resp;
                 }
             };
@@ -371,6 +398,15 @@ pub async fn handle_proxy(
                     state
                         .request_metrics
                         .record(start.elapsed(), resp.status().as_u16());
+                    access_log(
+                        &source_ip,
+                        &method,
+                        &host,
+                        &path,
+                        resp.status().as_u16(),
+                        start.elapsed(),
+                        "middleware",
+                    );
                     return resp;
                 }
             };
@@ -536,6 +572,15 @@ pub async fn handle_proxy(
                     state
                         .request_metrics
                         .record(start.elapsed(), resp.status().as_u16());
+                    access_log(
+                        &source_ip,
+                        &method,
+                        &host,
+                        &path,
+                        resp.status().as_u16(),
+                        start.elapsed(),
+                        "backend",
+                    );
                     return resp;
                 }
             };
@@ -606,6 +651,15 @@ pub async fn handle_proxy(
                 state
                     .request_metrics
                     .record(start.elapsed(), resp.status().as_u16());
+                access_log(
+                    &source_ip,
+                    &method,
+                    &host,
+                    &path,
+                    resp.status().as_u16(),
+                    start.elapsed(),
+                    "backend",
+                );
                 resp
             }
         }
