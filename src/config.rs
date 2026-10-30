@@ -323,7 +323,10 @@ pub struct ProvidersConfig {
 pub struct DockerConfig {
     #[serde(default, deserialize_with = "deserialize_docker_enabled_with_env")]
     pub enabled: bool,
-    #[serde(default, deserialize_with = "deserialize_docker_endpoint_with_env")]
+    #[serde(
+        default = "default_docker_endpoint",
+        deserialize_with = "deserialize_docker_endpoint_with_env"
+    )]
     pub endpoint: String,
     #[serde(
         default,
@@ -336,7 +339,10 @@ pub struct DockerConfig {
 pub struct PodmanConfig {
     #[serde(default, deserialize_with = "deserialize_podman_enabled_with_env")]
     pub enabled: bool,
-    #[serde(default, deserialize_with = "deserialize_podman_endpoint_with_env")]
+    #[serde(
+        default = "default_podman_endpoint",
+        deserialize_with = "deserialize_podman_endpoint_with_env"
+    )]
     pub endpoint: String,
     #[serde(
         default,
@@ -515,7 +521,10 @@ pub struct ConsulConfig {
 pub struct ApiConfig {
     #[serde(default, deserialize_with = "deserialize_api_enabled_with_env")]
     pub enabled: bool,
-    #[serde(default, deserialize_with = "deserialize_api_listen_address_with_env")]
+    #[serde(
+        default = "default_api_listen_address",
+        deserialize_with = "deserialize_api_listen_address_with_env"
+    )]
     pub listen_address: String,
     #[serde(default)]
     pub users: Vec<ApiUser>,
@@ -574,7 +583,10 @@ pub struct ConfigFileConfig {
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_config_file_path_with_env")]
     pub path: String,
-    #[serde(default, deserialize_with = "deserialize_config_file_watch_with_env")]
+    #[serde(
+        default = "default_config_file_watch",
+        deserialize_with = "deserialize_config_file_watch_with_env"
+    )]
     pub watch: bool,
 }
 
@@ -1102,11 +1114,15 @@ impl Default for MiddlewareConfig {
     }
 }
 
+fn default_docker_endpoint() -> String {
+    "/var/run/docker.sock".to_string()
+}
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: "/var/run/docker.sock".to_string(),
+            endpoint: default_docker_endpoint(),
             expose_by_default: false,
         }
     }
@@ -1296,6 +1312,10 @@ pub(crate) fn default_command_buffer_max_bytes() -> u64 {
     65536
 }
 
+fn default_config_file_watch() -> bool {
+    true
+}
+
 fn default_api_listen_address() -> String {
     "127.0.0.1:3035".to_string()
 }
@@ -1438,8 +1458,7 @@ deserialize_bool_with_env!(
 deserialize_string_with_env!(
     deserialize_docker_endpoint_with_env,
     "SOZUNE_PROVIDER_DOCKER_ENDPOINT",
-    "/var/run/docker.sock",
-    literal
+    default_docker_endpoint
 );
 deserialize_bool_with_env!(
     deserialize_docker_expose_by_default_with_env,
@@ -1602,7 +1621,7 @@ deserialize_string_with_env!(
 deserialize_bool_with_env!(
     deserialize_config_file_watch_with_env,
     "SOZUNE_PROVIDER_CONFIG_FILE_WATCH",
-    true
+    default_config_file_watch()
 );
 
 deserialize_bool_with_env!(
@@ -1870,7 +1889,7 @@ impl ProvidersConfig {
                 .get_or_insert_with(|| ConfigFileConfig {
                     enabled: false,
                     path: String::new(),
-                    watch: true,
+                    watch: default_config_file_watch(),
                 })
                 .apply_env_overrides();
         }
@@ -2357,6 +2376,41 @@ acme:
         let acme = config.acme.expect("acme present in YAML");
         assert_eq!(acme.email, "override@example.com");
         assert!(acme.enabled, "yaml-only fields untouched");
+    }
+
+    #[test]
+    fn omitted_keys_keep_their_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let yaml = r#"
+providers:
+  docker:
+    enabled: true
+  podman:
+    enabled: true
+  config_file:
+    enabled: true
+    path: /etc/sozune/entrypoints.yaml
+api:
+  enabled: true
+proxy:
+  http:
+    listen_address: 80
+  https:
+    listen_address: 443
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.api.listen_address, default_api_listen_address());
+        let providers = config.providers;
+        assert_eq!(
+            providers.docker.expect("docker present").endpoint,
+            default_docker_endpoint()
+        );
+        assert_eq!(
+            providers.podman.expect("podman present").endpoint,
+            default_podman_endpoint()
+        );
+        assert!(providers.config_file.expect("config_file present").watch);
     }
 
     #[test]
