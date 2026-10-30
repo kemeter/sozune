@@ -43,7 +43,7 @@ All notable changes to this project will be documented in this file.
 - Ingress TLS Secrets — an Ingress `spec.tls[]` entry with a `secretName` now serves its hostnames with the certificate of that `kubernetes.io/tls` Secret (cert-manager's, for instance), picked up live when renewed, instead of ordering one through ACME. An entry without `secretName` still goes through ACME. Sōzune needs to read Secrets: without the RBAC for it, it logs a warning. See [Ingress resources](documentation/providers/kubernetes.md#ingress-resources).
 - Gateway HTTPS listeners — an `HTTPS` listener (`tls.mode: Terminate`, the default) now terminates TLS for the HTTPRoutes attached to it, with the certificates its `certificateRefs` name: `kubernetes.io/tls` Secrets in the Gateway's namespace, or in another one whose `ReferenceGrant` lets Gateways of that namespace reference them, picked up live when renewed and no longer served once no Gateway references them. Its routes are served on Sōzune's HTTPS port. A hostname only an `HTTPS` listener admits is served over HTTPS, its plain HTTP requests redirected there; one an `HTTP` listener admits too is served over both. A certificateRef that cannot be used is reported `ResolvedRefs=False` (`InvalidCertificateRef`, or `RefNotPermitted` for another namespace without a `ReferenceGrant`) and the listener is not `Programmed`. ACME orders no certificate for a Gateway route. Sōzune needs to read Secrets: the RBAC example now lists them. See [HTTPS listeners](documentation/providers/kubernetes.md#https-listeners).
 
-- Route order — among routes of the same priority, the more specific one is tried first: exact hostname, regex, wildcard (longer first), then any host; exact path before prefix, longer prefix first; a route on `methods` before one on any method; more `matchHeaders` conditions first. They used to be tried by id, so a `/` route could capture `/api` requests from an `/api` route depending on their names. `sozune route resolve` and `POST /routes/resolve` say when specificity decided. See [Priority](documentation/routing/hostnames.md#priority).
+- Route order — among routes of the same priority, the more specific one is tried first: exact hostname, regex, wildcard (longer first), then any host; exact path before prefix, longer prefix first; a route on `methods` before one on any method; more `matchHeaders` conditions first. They used to be tried by id, so a `/` route could capture `/api` requests from an `/api` route depending on their names. `sozune route` and `POST /routes/resolve` say when specificity decided. See [Priority](documentation/routing/hostnames.md#priority).
 
 ### Reliability
 
@@ -92,7 +92,7 @@ All notable changes to this project will be documented in this file.
 - An unknown label (`W013`) is reported without its value: a misspelt label can carry a secret, and the diagnostic reaches the logs and the API.
 - A route Sōzu refused during a reload that failed further on was recorded as applied, and never retried until it changed again. It is retried on the next reload, as when the reload succeeds.
 - When a backend leaves a route (container stopped, scale down, rollout, route removed), its open connections are now closed after it is removed, so clients reconnect to a backend that is still there. They used to stay tied to it — a WebSocket or a TCP connection for as long as it lived. An HTTP request in flight finishes first. See [When a backend leaves](documentation/routing/load-balancing.md#when-a-backend-leaves).
-- Health checks take unhealthy backends out of rotation. They used to only report them: an unhealthy backend kept its share of requests in Sōzu and the middleware. It now leaves its route until a probe succeeds again, and the connections Sōzu holds to it are closed. When every backend of a route is unhealthy, none is taken out, so a failing probe cannot empty a route. `GET /entrypoints` and `sozune route resolve` tell whether each backend is in rotation (`in_rotation`), and so does the dashboard. See [Health checks](documentation/advanced/health-checks.md).
+- Health checks take unhealthy backends out of rotation. They used to only report them: an unhealthy backend kept its share of requests in Sōzu and the middleware. It now leaves its route until a probe succeeds again, and the connections Sōzu holds to it are closed. When every backend of a route is unhealthy, none is taken out, so a failing probe cannot empty a route. `GET /entrypoints` and `sozune route` tell whether each backend is in rotation (`in_rotation`), and so does the dashboard. See [Health checks](documentation/advanced/health-checks.md).
 
 ### TLS / ACME
 
@@ -176,7 +176,7 @@ All notable changes to this project will be documented in this file.
 
 - Two routes on one hostname with different paths (e.g. `/api` and `/`) shared the middleware stack of whichever was stored last, so a rate limit, IP allow-list or forward auth on the other route could be skipped. Each request now runs the middleware of the route it matched: exact paths first, then the longest prefix, regex paths as declared.
 - The rate limiter keyed clients on `X-Forwarded-For` whatever sent it. It now trusts the header only from a trusted proxy, like the IP allow-list, and its per-client map is bounded.
-- Middlewares that act on the client address (`ipAllowList`, `matchClientIP`, `rateLimit`, `inFlightReq`) saw every client as `127.0.0.1`, the address Sōzu reaches them from. An allow-list naming `127.0.0.1` let every client in, any other allow-list refused them all, and all clients of a route shared one rate-limit bucket. They now see the address that connected to Sōzune, with `trusted_proxies` applied as documented.
+- Middlewares that act on the client address (`ipAllowList`, `matchClientIP`, `rateLimit`) saw every client as `127.0.0.1`, the address Sōzu reaches them from. An allow-list naming `127.0.0.1` let every client in, any other allow-list refused them all, and all clients of a route shared one rate-limit bucket. They now see the address that connected to Sōzune, with `trusted_proxies` applied as documented.
 - `GET /config` returned the HTTP provider URL as configured, credentials included. Its user name, password and query string are now masked.
 
 ### Reliability
@@ -209,8 +209,8 @@ All notable changes to this project will be documented in this file.
 - Resolver-managed `domains` — a DNS-01 resolver can list `domains` (e.g. `*.example.com`) it provisions on its own, with no placeholder entrypoint. Sōzu serves the cert by SNI for every matching subdomain, so apps keep their exact-host routes and a busy domain no longer needs a per-host ACME order. Composes with the per-entrypoint `acme.resolver` binding; the resolver binding wins if a hostname is claimed by both.
 - Per-resolver `ca_server` — a resolver can pin its own ACME directory URL, overriding the global staging/prod default, so a staging and a production resolver can coexist (also accepts a non-Let's-Encrypt ACME directory). Each distinct CA keeps its own account file on disk (derived from the directory URL), so switching or mixing CAs never reuses another server's account.
 - Entrypoints with `tls: true` but no `acme.resolver` keep the existing HTTP-01 behaviour on `challenge_port` — no migration needed.
-- ACME account persistence and certificate renewal checks now use cheti (`FileAccountStore`, `needs_renewal`), replacing the in-tree X.509 parser. Storage layout is unchanged (`certs_dir/account_credentials.json`).
-- `GET /certificates` endpoint — inspect every certificate Sōzune manages (domains, issuer, validity window, renewal state) over the REST API. Renewal is now driven by a lifetime ratio: a cert is renewed once it has consumed a configurable fraction of its validity, rather than a fixed day threshold, so short- and long-lived certs are handled uniformly. See [API docs](documentation/configuration/api.md).
+- ACME account persistence and certificate renewal checks now use cheti (`FileAccountStore`, `needs_renewal`), replacing the in-tree X.509 parser. On Let's Encrypt's production server, the account saved in `certs_dir/account_credentials.json` by earlier releases was no longer read, and a new one was registered: fixed in the next release.
+- `GET /certificates` endpoint — inspect every certificate Sōzune manages (domains, issuer, validity window, renewal state) over the REST API. Renewal is now driven by a lifetime ratio: a cert is renewed once it has consumed a fixed fraction of its validity, rather than a fixed day threshold, so short- and long-lived certs are handled uniformly. See [API docs](documentation/configuration/api.md).
 - HTTP/2 listener tuning — `proxy.https.http2.alpn_protocols` and `http2.disable_http11` let you control ALPN on the TLS listener (force HTTP/1.1-only, or h2-only). Both default to unset, keeping the existing behaviour (ALPN `["h2", "http/1.1"]`, HTTP/2 negotiated by default).
 
 ### Routing
@@ -242,7 +242,7 @@ All notable changes to this project will be documented in this file.
 
 ### HTTP provider
 
-- Optional auth header on outgoing fetches — `providers.http.auth.header` and `auth.value` send an arbitrary header (typically `Authorization: Bearer <token>`) with every poll. Useful when the upstream config service sits behind its own auth layer.
+- Optional auth header on outgoing fetches — `providers.http.auth_header` and `auth_value` send an arbitrary header (typically `Authorization: Bearer <token>`) with every poll. Useful when the upstream config service sits behind its own auth layer.
 
 ### Health checks
 
@@ -253,7 +253,7 @@ All notable changes to this project will be documented in this file.
 
 - Prometheus `/metrics` endpoint — exposes Sōzune metrics in Prometheus text format, including Sōzu proxy series bridged from `QueryMetrics` (`sozune_proxy_*`), a middleware request-latency histogram, and per-HTTP-status-class response counters. Content negotiation: send `Accept: application/json` for a JSON rendering instead of the Prometheus text format. A ready-to-use Grafana + Prometheus stack ships under `tests/observability/`. See [Observability docs](documentation/advanced/observability.md).
 - Dedicated `/metrics` listener — scrape Prometheus metrics without enabling (or exposing) the admin API. Enable with `metrics.enabled: true` (or `SOZUNE_METRICS_ENABLED=true`); binds `127.0.0.1:3039` by default (`metrics.listen_address` / `SOZUNE_METRICS_LISTEN_ADDRESS`). Off by default. When the API is also enabled, `/metrics` keeps being served there too, unchanged. See [Observability docs](documentation/advanced/observability.md#the-metrics-endpoint).
-- Distributed tracing (OpenTelemetry) — emit one span per proxied request and export it over OTLP/gRPC to a collector (Jaeger, Grafana Tempo, Zipkin via OTel). Enable with `tracing.endpoint`; `tracing.service_name` and `tracing.sampler` (`parent_based_always_on` default, plus `always_on`/`always_off`/`ratio:<0..1>`) tune it. W3C `traceparent` is honoured inbound and injected toward the backend, and each access-log line carries the `trace_id`. Disabled by default — zero overhead when off. See [Distributed tracing docs](documentation/advanced/observability.md#distributed-tracing-opentelemetry).
+- Distributed tracing (OpenTelemetry) — emit one span per proxied request and export it over OTLP/gRPC to a collector (Jaeger, Grafana Tempo, Zipkin via OTel). Enable with `tracing.enabled`, `tracing.endpoint` naming the collector; `tracing.service_name` and `tracing.sampler` (`parent_based_always_on` default, plus `always_on`/`always_off`/`ratio:<0..1>`) tune it. W3C `traceparent` is honoured inbound and injected toward the backend, and each access-log line carries the `trace_id`. Disabled by default — zero overhead when off. See [Distributed tracing docs](documentation/advanced/observability.md#distributed-tracing-opentelemetry).
 - JSON log format — set `log.format: json` to emit every log line (including the per-request access log) as one structured JSON object per line, no regex parsing needed downstream; defaults to human-readable `text`. Access-log events carry `client_ip`, `method`, `host`, `path`, `status`, `duration_ms`, `phase`, and `trace_id`. See [Access logs docs](documentation/advanced/access-logs.md).
 
 ### Dashboard
@@ -268,7 +268,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixes
 
-- Environment variable overrides (e.g. `SOZUNE_PROXY_HTTP_LISTEN_ADDRESS`) now apply when `config.yaml` is absent, instead of silently using defaults.
+- Environment variable overrides (e.g. `SOZUNE_HTTP_PORT`) now apply when `config.yaml` is absent, instead of silently using defaults.
 - Docker provider: `send_to_worker` now returns an error on Sōzu worker ack timeout instead of `Ok(())`, so configuration desync becomes visible in the logs.
 - Proxy backend addresses: IPv6 (bracketed or bare literal) is now supported in addition to IPv4. Previously IPv6 backends were dropped with a `bail!`.
 - WASM plugin routes no longer silently truncate large bodies. A request or response body over the 1 MiB guest-buffer limit is now streamed through to the backend / client untouched (the guest just doesn't see it), instead of being dropped to an empty body. Works for both `Content-Length` and chunked transfers, since the decision is made from bytes actually read.
@@ -310,7 +310,6 @@ New diagnostic codes surfaced by `sozune validate`:
 - `W016` `httpsRedirect=true` without `tls=true`
 - `W017` `rate_limit.burst < average` (burst window disabled)
 - `W018` route collision: same `(host, path)` declared by multiple candidates
-- `W026` invalid or ignored plugin-config label: no sub-key, nested past the depth limit, or set on a TCP/UDP route (plugins are HTTP-only)
 
 ### API
 
