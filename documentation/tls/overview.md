@@ -13,7 +13,7 @@ labels:
 When `tls=true` and no [certificate from a file](#certificates-from-files) covers the hostname, Sōzune:
 
 1. Adds the hostname to the list of names needing a certificate.
-2. Triggers ACME provisioning for the hostname (HTTP-01 challenge).
+2. Triggers ACME provisioning for the hostname, through the challenge of its [resolver](/documentation/tls/acme#dns-01-and-wildcards) (HTTP-01 by default).
 3. Hot-loads the certificate into the HTTPS listener once issued.
 4. Renews automatically before expiration.
 
@@ -21,7 +21,7 @@ When `tls=true` and no [certificate from a file](#certificates-from-files) cover
 
 HTTP/2 is enabled out of the box: TLS ALPN advertises both `h2` and `http/1.1`, so clients that support h2 get h2 and the rest fall back to HTTP/1.1.
 
-You can override the ALPN negotiation through the `proxy.https.http2` config block. Leaving it unset keeps the default above.
+You can override the ALPN negotiation through the `proxy.https.http2` config block (since 0.14). Leaving it unset keeps the default above.
 
 ```yaml
 proxy:
@@ -51,11 +51,13 @@ Sōzune supports SNI natively (inherited from Sōzu). Many domains, each with it
 The name serves two distinct purposes, depending on the entrypoint:
 
 - **On an HTTPS entrypoint**, Sōzune terminates TLS and uses the name to pick which certificate to present. That is the case described above.
-- **On a TCP entrypoint**, TLS is never terminated. Sōzune reads the name to choose a backend and forwards the encrypted bytes untouched; the client's handshake completes with the backend, against the backend's certificate. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough).
+- **On a TCP entrypoint**, TLS is never terminated. Sōzune reads the name to choose a backend and forwards the encrypted bytes untouched; the client's handshake completes with the backend, against the backend's certificate. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough). (since 0.15)
 
 Use the first when Sōzune should own the certificates, the second when the backend must.
 
 ## Certificates from files
+
+> Since 0.15
 
 A certificate issued outside Sōzune — a wildcard from certbot, a purchased certificate, an internal PKI — is declared under `proxy.https.tls.certificates`:
 
@@ -89,6 +91,8 @@ Force HTTP traffic to HTTPS — see [Redirects](/documentation/middleware/redire
 
 ## TLS versions and ciphers
 
+> Since 0.15
+
 Harden the HTTPS listener under `proxy.https.tls`. All fields are optional; each absent one keeps Sōzu's default.
 
 ```yaml
@@ -114,6 +118,8 @@ proxy:
 **These are listener-wide.** Sōzu applies versions and ciphers at bind time, so every hostname served on the HTTPS port shares them — they cannot vary per route. An invalid version (unknown value, `max_version` below `min_version`) fails startup rather than being silently ignored.
 
 ## Client certificates (mutual TLS)
+
+> Since 0.16
 
 Ask clients for a certificate during the handshake, and accept only those signed by a CA you trust:
 

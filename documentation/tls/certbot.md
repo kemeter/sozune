@@ -1,5 +1,7 @@
 # Certbot
 
+> Since 0.15
+
 Sōzune can serve certificates that [certbot](https://certbot.eff.org) obtains and renews, through [certificates from files](/documentation/tls/overview#certificates-from-files). Use it when:
 
 - your DNS provider has a certbot plugin but no [DNS-01 resolver](/documentation/tls/acme) in Sōzune, and you need a wildcard;
@@ -61,6 +63,8 @@ services:
     image: ghcr.io/kemeter/sozune:latest
     container_name: sozune
     user: "0:0"
+    environment:
+      CONFIG_PATH: /etc/sozune/config.yaml
     ports:
       - "80:80"
       - "443:443"
@@ -72,7 +76,9 @@ services:
 
 The files in `live/` are symlinks into `../../archive/`. Mounting `live/` alone leaves them dangling, and Sōzune refuses to start because it cannot read them.
 
-Certbot creates `privkey.pem` readable by root only, while the image runs as the unprivileged `nonroot` user (UID `65532`). `user: "0:0"` runs it as root so it can read the key. To keep `nonroot`, give UID `65532` read access to the key instead, and restore it after each renewal from the hook below, since certbot writes a new key every time.
+The image reads `config.yaml` from its working directory unless `CONFIG_PATH` names another path: without it, the file mounted at `/etc/sozune/config.yaml` is ignored.
+
+Certbot creates `privkey.pem` readable by root only, while the image runs as the unprivileged `nonroot` user (UID `65532`). `user: "0:0"` runs it as root so it can read the key (and the Docker socket). To keep `nonroot`, give UID `65532` read access to the key instead, and restore it after each renewal from the hook below, since certbot writes a new key every time; it then also needs the host's `docker` group (`group_add`, see [Installation](/documentation/getting-started/installation)) to read the Docker socket.
 
 ## 4. Reload after each renewal
 
