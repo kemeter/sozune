@@ -68,23 +68,46 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Built-in log levels: Sōzune and its access log at `info`, the libraries
+/// it pulls in at `warn`.
+const DEFAULT_LOG_DIRECTIVES: &[&str] = &[
+    "sozune=info",
+    "access=info",
+    "bollard=warn",
+    "hyper=warn",
+    "hyper_util=warn",
+    "rustls=warn",
+    "sozu_lib=warn",
+    "sozu_command_lib=warn",
+    "mio=warn",
+    "h2=warn",
+    "kube=warn",
+    "tower=warn",
+];
+
 fn log_env_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("sozune=info".parse().expect("valid log directive"))
-        .add_directive("bollard=warn".parse().expect("valid log directive"))
-        .add_directive("hyper=warn".parse().expect("valid log directive"))
-        .add_directive("hyper_util=warn".parse().expect("valid log directive"))
-        .add_directive("rustls=warn".parse().expect("valid log directive"))
-        .add_directive("sozu_lib=warn".parse().expect("valid log directive"))
-        .add_directive(
-            "sozu_command_lib=warn"
-                .parse()
-                .expect("valid log directive"),
-        )
-        .add_directive("mio=warn".parse().expect("valid log directive"))
-        .add_directive("h2=warn".parse().expect("valid log directive"))
-        .add_directive("kube=warn".parse().expect("valid log directive"))
-        .add_directive("tower=warn".parse().expect("valid log directive"))
+    log_filter(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// The built-in levels, with `RUST_LOG` applied on top: a directive on one of
+/// their targets (`sozune=debug`, `access=off`) replaces the built-in one.
+fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let mut filter = tracing_subscriber::EnvFilter::new(DEFAULT_LOG_DIRECTIVES.join(","));
+    for directive in rust_log.unwrap_or_default().split(',') {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        match directive.parse() {
+            Ok(parsed) => {
+                filter = filter.add_directive(parsed);
+            }
+            Err(e) => {
+                eprintln!("ignoring RUST_LOG directive `{directive}`: {e}");
+            }
+        }
+    }
+    filter
 }
 
 /// Install the global tracing subscriber: a fmt layer (text or JSON) plus,
@@ -618,6 +641,42 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
 
     debug!("All tasks completed");
     Ok(())
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    fn directives(rust_log: Option<&str>) -> Vec<String> {
+        log_filter(rust_log)
+            .to_string()
+            .split(',')
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn access_log_is_on_by_default() {
+        let d = directives(None);
+        assert!(d.contains(&"access=info".to_string()), "{d:?}");
+        assert!(d.contains(&"sozune=info".to_string()), "{d:?}");
+    }
+
+    #[test]
+    fn rust_log_replaces_a_built_in_target() {
+        let d = directives(Some("sozune=debug, access=off"));
+        assert!(d.contains(&"sozune=debug".to_string()), "{d:?}");
+        assert!(!d.contains(&"sozune=info".to_string()), "{d:?}");
+        assert!(d.contains(&"access=off".to_string()), "{d:?}");
+        assert!(d.contains(&"hyper=warn".to_string()), "{d:?}");
+    }
+
+    #[test]
+    fn invalid_rust_log_directive_is_skipped() {
+        let d = directives(Some("sozune=nope,kube=info"));
+        assert!(d.contains(&"sozune=info".to_string()), "{d:?}");
+        assert!(d.contains(&"kube=info".to_string()), "{d:?}");
+    }
 }
 
 /// Shared lock serialising every test that mutates `std::env`. Tests across

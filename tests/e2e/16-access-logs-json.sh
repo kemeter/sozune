@@ -13,6 +13,29 @@ log "[16] JSON logs: process started with log.format=json emits JSON lines"
 
 JSON_CFG=$(mktemp /tmp/sozune-jsonlog-XXXXXX.yaml)
 JSON_OUT=$(mktemp /tmp/sozune-jsonlog-out-XXXXXX.log)
+JSON_ENTRYPOINTS=$(mktemp /tmp/sozune-jsonlog-ep-XXXXXX.yaml)
+
+# One route through the middleware (a rate limit puts it there), so a request
+# to it writes an access log line. Its backend refuses connections: the
+# middleware answers 502, which is logged all the same.
+cat >"$JSON_ENTRYPOINTS" <<'YAML'
+entrypoints:
+  - id: jsonlog
+    name: jsonlog
+    protocol: Http
+    backends:
+      - address: "127.0.0.1"
+        port: 1
+    config:
+      hostnames:
+        - "jsonlog.test"
+      tls: false
+      strip_prefix: false
+      priority: 0
+      rate_limit:
+        average: 100
+        burst: 100
+YAML
 
 # Dedicated ports, well clear of the main suite's (HTTP 18080 / API 18888).
 cat >"$JSON_CFG" <<'YAML'
@@ -21,6 +44,10 @@ log:
 providers:
   docker:
     enabled: false
+  config_file:
+    enabled: true
+    path: "__ENTRYPOINTS__"
+    watch: false
 api:
   enabled: true
   listen_address: "127.0.0.1:19888"
@@ -38,15 +65,23 @@ middleware:
 dashboard:
   enabled: false
 YAML
+sed -i "s|__ENTRYPOINTS__|$JSON_ENTRYPOINTS|" "$JSON_CFG"
 
 # Start it directly in the background. SOZUNE_LOG_FORMAT is left unset so we
 # exercise the YAML `log.format` path specifically. Logs are captured to a
 # file, so we read them after a short sleep without ever `wait`-ing on the
 # process (a blocking wait on the embedded Sōzu workers can hang the suite —
 # the orphan-sozune trap).
-CONFIG_PATH="$JSON_CFG" "$SOZUNE_BIN" >"$JSON_OUT" 2>&1 &
+env -u RUST_LOG CONFIG_PATH="$JSON_CFG" "$SOZUNE_BIN" >"$JSON_OUT" 2>&1 &
 JSON_PID=$!
-sleep 2
+# Wait for the route, then send the request the access log must record. RUST_LOG
+# is left unset: the access log is on by default.
+for _ in $(seq 1 20); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: jsonlog.test' http://127.0.0.1:19080/ || true)
+    [[ "$code" != "404" && "$code" != "000" ]] && break
+    sleep 0.5
+done
+sleep 1
 # SIGKILL the process and any worker children it spawned. No graceful SIGTERM
 # (workers linger), no wait (would block). pkill -P reaps the direct children.
 pkill -9 -P "$JSON_PID" 2>/dev/null || true
@@ -89,4 +124,13 @@ else
     fail "could not find the startup message as JSON in $JSON_OUT"
 fi
 
-rm -f "$JSON_CFG" "$JSON_OUT"
+log "[16] Access log: on by default, one JSON line per request"
+
+# Sōzu's own plain-text lines are not JSON: keep the access lines only.
+if grep -F '"target":"access"' "$JSON_OUT" 2>/dev/null | jq -se 'any(.host == "jsonlog.test")' >/dev/null 2>&1; then
+    pass "the request to jsonlog.test is in the access log"
+else
+    fail "no access log line for jsonlog.test in $JSON_OUT"
+fi
+
+rm -f "$JSON_CFG" "$JSON_OUT" "$JSON_ENTRYPOINTS"
