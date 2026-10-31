@@ -477,15 +477,19 @@ impl KubernetesProvider {
             version.major, version.minor, version.git_version
         );
 
+        // Only a check: the watchers below report what they cannot read, and a
+        // ServiceAccount limited to one namespace may not list them all.
         let ns_api: Api<Namespace> = Api::all(client.clone());
-        let ns_list = ns_api
-            .list(&ListParams::default())
-            .await
-            .context("Failed to list namespaces")?;
-        info!(
-            "Kubernetes auth OK: {} namespace(s) visible to ServiceAccount",
-            ns_list.items.len()
-        );
+        match ns_api.list(&ListParams::default()).await {
+            Ok(ns_list) => info!(
+                "Kubernetes auth OK: {} namespace(s) visible to ServiceAccount",
+                ns_list.items.len()
+            ),
+            Err(e) => warn!(
+                "Could not list namespaces, check the ServiceAccount's RBAC: {}",
+                e
+            ),
+        }
 
         // Fixed addresses are written as Ingresses are applied; a Service's
         // are followed as its load balancer gets them.

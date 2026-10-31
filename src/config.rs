@@ -1763,7 +1763,7 @@ deserialize_string_with_env!(
     default_metrics_listen_address
 );
 
-fn env_bool(var: &str) -> Option<bool> {
+pub(crate) fn env_bool(var: &str) -> Option<bool> {
     std::env::var(var)
         .ok()
         .and_then(|v| match v.to_lowercase().as_str() {
@@ -1851,7 +1851,8 @@ impl ProvidersConfig {
             || std::env::var("SOZUNE_PROVIDER_KUBERNETES_KUBECONFIG").is_ok()
             || std::env::var("SOZUNE_PROVIDER_KUBERNETES_NAMESPACE").is_ok()
             || std::env::var("SOZUNE_PROVIDER_KUBERNETES_INGRESS_CLASS").is_ok()
-            || std::env::var("SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT").is_ok();
+            || std::env::var("SOZUNE_PROVIDER_KUBERNETES_EXPOSE_BY_DEFAULT").is_ok()
+            || std::env::var("SOZUNE_PROVIDER_KUBERNETES_PUBLISH_SERVICE").is_ok();
         if kubernetes_env || self.kubernetes.is_some() {
             self.kubernetes
                 .get_or_insert_with(KubernetesConfig::default)

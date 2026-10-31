@@ -293,6 +293,6 @@ These have no YAML counterpart:
 | Env var | Effect |
 |---|---|
 | `CONFIG_PATH` | Path to the YAML config file (default: `config.yaml`). `--config` wins over it. |
-| `SOZUNE_DEBUG` | When `true` or `1`, routing failures (`502`) include a body listing configured hosts/backends and a did-you-mean suggestion. Off by default to avoid leaking topology. See [Debugging](/documentation/advanced/debugging). (since 0.12) |
+| `SOZUNE_DEBUG` | When on (`true`, `1`, `yes` or `on`), routing failures (`502`) include a body listing configured hosts/backends and a did-you-mean suggestion. Off by default to avoid leaking topology. See [Debugging](/documentation/advanced/debugging). (since 0.12) |
 | `RUST_LOG` | Log verbosity filter. See [Configuring log verbosity](/documentation/advanced/access-logs#configuring-log-verbosity). |
 | `SOZUNE_API_USER` / `SOZUNE_API_PASSWORD` | Credentials `sozune route` uses to call the API. See [Debugging](/documentation/advanced/debugging). (since 0.15) |
