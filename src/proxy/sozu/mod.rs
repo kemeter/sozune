@@ -1292,6 +1292,12 @@ fn handle_reload(
     let (storage_read, _) =
         routes_as_applied(&storage_read, client_certificate_redirect, &unhealthy);
     let mut current_snapshot = snapshot_from_storage(&storage_read);
+    // A live route another one now shadows on its listener comes off it
+    // before that one is installed: left in place, its removal later would
+    // take the listener from the route serving it.
+    for cluster_id in shadowed_on_shared_listener(&storage_read) {
+        current_snapshot.remove(&cluster_id);
+    }
     let wanted_gateway_listeners = gateway_listeners::referenced(&current_snapshot);
 
     // Run the reload under a shared consecutive-timeout counter. A worker that
@@ -1666,6 +1672,72 @@ fn skipped_on_sni_clash(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<Stri
     skipped
 }
 
+/// The routes left out because another takes their listener. Sōzu gives a
+/// TCP listener without SNI routing, and a UDP listener, a single route: each
+/// frontend added replaces the one before, and removing any of them leaves the
+/// listener with none. So only the first of them in routing order, the highest
+/// priority, is sent; the others wait, and the next takes over once it goes.
+/// Logs one line per shared listener.
+fn shadowed_on_shared_listener(storage: &BTreeMap<String, Entrypoint>) -> BTreeSet<String> {
+    // Priority first, then route id: the HTTP specificity routing_order
+    // breaks ties with means nothing here.
+    let mut ordered: Vec<(&String, &Entrypoint)> = storage.iter().collect();
+    ordered.sort_by_key(|(_, ep)| std::cmp::Reverse(ep.config.priority));
+
+    let mut per_listener: BTreeMap<(&str, &str), Vec<(&String, &Entrypoint)>> = BTreeMap::new();
+    for (cluster_id, entrypoint) in ordered {
+        let (protocol, gateway_port): (_, fn(&str) -> Option<u16>) = match entrypoint.protocol {
+            Protocol::Tcp if entrypoint.config.sni.is_none() => {
+                ("TCP", crate::config::gateway_tcp_port)
+            }
+            Protocol::Udp => ("UDP", crate::config::gateway_udp_port),
+            _ => continue,
+        };
+        let Some(listener) = entrypoint.config.entrypoint.as_deref() else {
+            continue;
+        };
+        // Refused on a listener reserved for Gateway routes: it must not
+        // keep one of them off it.
+        if gateway_port(listener).is_some()
+            && !crate::provider::kubernetes::gateway::is_gateway_route(entrypoint)
+        {
+            continue;
+        }
+        per_listener
+            .entry((protocol, listener))
+            .or_default()
+            .push((cluster_id, entrypoint));
+    }
+
+    let mut shadowed = BTreeSet::new();
+    for ((protocol, listener), routes) in per_listener {
+        let Some(((_, served), waiting)) = routes.split_first() else {
+            continue;
+        };
+        if waiting.is_empty() {
+            continue;
+        }
+        warn!(
+            "{} listener `{}` takes one route{}: serving `{}`, the highest priority; {} wait until it goes",
+            protocol,
+            listener,
+            if protocol == "TCP" {
+                " without `sni`"
+            } else {
+                ""
+            },
+            served.name,
+            waiting
+                .iter()
+                .map(|(_, ep)| format!("`{}`", ep.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        shadowed.extend(waiting.iter().map(|(id, _)| (*id).clone()));
+    }
+    shadowed
+}
+
 /// The order Sōzu matches routes in: priority descending, then the more
 /// specific route first, then cluster id. Sōzu checks its Pre rules in
 /// insertion order, first match wins, so this is both the order frontends are
@@ -1802,6 +1874,7 @@ fn configure_sozu_routing(
     );
 
     let mut skipped = skipped_on_sni_clash(storage);
+    skipped.extend(shadowed_on_shared_listener(storage));
     // Every entrypoint the loop gets through, so a mid-loop failure can still
     // tell the caller what actually reached a worker.
     let mut applied: BTreeSet<String> = BTreeSet::new();
@@ -5003,6 +5076,89 @@ mod tests {
             tcp_ep("b", "gateway", Some("b.example.com")),
         ]);
         assert!(skipped_on_sni_clash(&storage).is_empty());
+    }
+
+    fn with_priority(mut ep: Entrypoint, priority: i32) -> Entrypoint {
+        ep.config.priority = priority;
+        ep
+    }
+
+    fn udp_ep(name: &str, listener: &str) -> Entrypoint {
+        let mut ep = tcp_ep(name, listener, None);
+        ep.protocol = Protocol::Udp;
+        ep
+    }
+
+    #[test]
+    fn the_highest_priority_catch_all_takes_its_listener() {
+        let storage = storage_of(vec![
+            with_priority(tcp_ep("low", "db", None), 1),
+            with_priority(tcp_ep("high", "db", None), 10),
+        ]);
+        let shadowed = shadowed_on_shared_listener(&storage);
+        assert_eq!(shadowed, BTreeSet::from(["low".to_string()]));
+    }
+
+    #[test]
+    fn catch_alls_of_equal_priority_go_by_id() {
+        let storage = storage_of(vec![tcp_ep("b", "db", None), tcp_ep("a", "db", None)]);
+        assert_eq!(
+            shadowed_on_shared_listener(&storage),
+            BTreeSet::from(["b".to_string()])
+        );
+    }
+
+    #[test]
+    fn sni_routes_and_other_listeners_share_nothing() {
+        let storage = storage_of(vec![
+            tcp_ep("a", "tls", Some("a.example.com")),
+            tcp_ep("b", "tls", Some("b.example.com")),
+            tcp_ep("pg", "postgres", None),
+            tcp_ep("my", "mysql", None),
+        ]);
+        assert!(shadowed_on_shared_listener(&storage).is_empty());
+    }
+
+    #[test]
+    fn a_route_refused_on_a_gateway_listener_shadows_nothing() {
+        let listener = crate::config::gateway_tcp_listener(9000);
+        let mut gateway = tcp_ep("gw", &listener, None);
+        gateway.source = Some("k8s-gateway-tcp".to_string());
+        assert!(crate::provider::kubernetes::gateway::is_gateway_route(
+            &gateway
+        ));
+        let storage = storage_of(vec![
+            gateway,
+            with_priority(tcp_ep("labels", &listener, None), 10),
+        ]);
+        assert!(shadowed_on_shared_listener(&storage).is_empty());
+    }
+
+    #[test]
+    fn equal_priority_ties_ignore_http_specificity() {
+        let mut a = tcp_ep("a", "db", None);
+        a.config.hostnames = Vec::new();
+        let mut b = tcp_ep("b", "db", None);
+        b.config.hostnames = vec!["db.example.com".to_string()];
+        let storage = storage_of(vec![a, b]);
+        assert_eq!(
+            shadowed_on_shared_listener(&storage),
+            BTreeSet::from(["b".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_udp_listener_takes_one_route() {
+        let storage = storage_of(vec![
+            with_priority(udp_ep("dns-old", "dns"), 0),
+            with_priority(udp_ep("dns-new", "dns"), 5),
+            tcp_ep("tcp-dns", "dns", None),
+        ]);
+        // A TCP listener of the same name is another listener.
+        assert_eq!(
+            shadowed_on_shared_listener(&storage),
+            BTreeSet::from(["dns-old".to_string()])
+        );
     }
 
     /// The production failure this guards, as a state machine over two reloads.

@@ -133,7 +133,7 @@ TCP routing requires a listener declared under `proxy.tcp` in the main config. L
 | `sozune.tcp.<svc>.sni` | `db.example.com` | Route TLS connections by the name in the ClientHello, without terminating TLS. See [Route by SNI](/documentation/routing/tcp#route-by-sni-tls-passthrough). (since 0.15) |
 | `sozune.tcp.<svc>.loadBalancer` | `least_connections` | [Load balancing](/documentation/routing/load-balancing#choosing-the-algorithm) (since 0.14) |
 | `sozune.tcp.<svc>.weight` | `90` | This container's [weight](/documentation/routing/load-balancing#weighted-load-balancing) (since 0.14) |
-| `sozune.tcp.<svc>.priority` | `100` | Not used on TCP routes: a listener without `sni` serves one service, and when several name it, the one applied last takes its connections. See [One route per listener](/documentation/routing/tcp#one-route-per-listener). |
+| `sozune.tcp.<svc>.priority` | `100` | A listener without `sni` serves one service: when several name it, the highest priority. See [One route per listener](/documentation/routing/tcp#one-route-per-listener). (since 0.16) |
 
 ## Routing — UDP
 
@@ -147,7 +147,7 @@ UDP routing requires a listener declared under `proxy.udp` in the main config. S
 | `sozune.udp.<svc>.port` | `53` | Backend port on the container. **Required** — no default for datagram services (`E006`). |
 | `sozune.udp.<svc>.loadBalancer` | `hrw` | [Load balancing](/documentation/routing/udp#load-balancing), including the flow-affine `hrw` and `maglev` |
 | `sozune.udp.<svc>.weight` | `90` | This container's [weight](/documentation/routing/load-balancing#weighted-load-balancing) |
-| `sozune.udp.<svc>.priority` | `100` | Not used on UDP routes: a listener serves one service, and when several name it, the one applied last takes its traffic. |
+| `sozune.udp.<svc>.priority` | `100` | A listener serves one service: when several name it, the highest priority. (since 0.16) |
 
 ## Full example
 

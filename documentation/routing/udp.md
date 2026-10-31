@@ -45,11 +45,11 @@ services:
 |---|---|
 | `sozune.udp.<svc>.entrypoint` | Name of a listener declared under `proxy.udp`. **Required.** Routes are dropped with diagnostic `E005` if missing. |
 | `sozune.udp.<svc>.port` | Backend port on the container. **Required** — datagram protocols have no sensible default, so a missing port drops the route with `E006` rather than binding to a wrong port. |
-| `sozune.udp.<svc>.priority` | Not used on UDP routes: a listener serves one route. See below. |
+| `sozune.udp.<svc>.priority` | Which route serves the listener when several name it: the highest. See below. (since 0.16) |
 
 The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/providers/docker) and `sozune.network` to pick a network when the container is on several.
 
-A listener forwards every datagram to a single route. Several containers of the same service are fine — they are its backends — but declare one service per listener. When several name the same listener, `priority` does not pick between them: the one applied last takes the listener's traffic. Of Kubernetes UDPRoutes sharing a port, only the oldest is served, see [Gateway API](/documentation/providers/kubernetes#gateway-api-udproute). (since 0.16)
+A listener forwards every datagram to a single route. Several containers of the same service are fine — they are its backends — but declare one service per listener. When several name the same listener, the highest `priority` serves it, the lowest route id on a tie; the others wait, logged as such, and the next takes over once it goes. Of Kubernetes UDPRoutes sharing a port, only the oldest is served, see [Gateway API](/documentation/providers/kubernetes#gateway-api-udproute). (since 0.16)
 
 ## Load balancing
 
