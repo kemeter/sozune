@@ -21,7 +21,7 @@ providers:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enables the Swarm provider |
-| `endpoint` | `/var/run/docker.sock` | Docker socket, as a path or a `unix://` URL. Must point to a **Swarm manager** node. Only Unix sockets are supported, as for the [Docker provider](/documentation/providers/docker#configuration). |
+| `endpoint` | `/var/run/docker.sock` | Docker socket, as a path or a `unix://` URL. Must point to a **Swarm manager** node. Takes the same values as for the [Docker provider](/documentation/providers/docker#configuration). |
 | `expose_by_default` | `false` | If `true`, every service is a candidate even without `sozune.enable=true` |
 | `network` | `""` | Optional overlay network name. When set, Sōzune ignores VIPs on other networks. |
 | `refresh_interval` | `15` | Periodic poll interval in seconds (safety net behind the event stream) |

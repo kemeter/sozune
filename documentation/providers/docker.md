@@ -21,7 +21,7 @@ providers:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enables the Docker provider |
-| `endpoint` | `/var/run/docker.sock` | Docker socket, as a path or a `unix://` URL. Only Unix sockets are supported: any other value falls back to `DOCKER_HOST` when it is a `unix://` URL, else to `/var/run/docker.sock`. |
+| `endpoint` | `/var/run/docker.sock` | Docker socket, as a path or a `unix://` URL, or a daemon over plain TCP, as a `tcp://` or `http://` URL (since 0.16). Any other value stops Sōzune at start-up. |
 | `expose_by_default` | `false` | If `true`, every running container is a candidate even without `sozune.enable=true` |
 
 Env var overrides: `SOZUNE_PROVIDER_DOCKER_ENABLED`, `SOZUNE_PROVIDER_DOCKER_ENDPOINT`, `SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT` (since 0.6).

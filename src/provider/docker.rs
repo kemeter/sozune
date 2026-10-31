@@ -17,6 +17,29 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Connects to a Docker API: a Unix socket, as a path or a `unix://` URL, or a
+/// daemon over plain TCP, as a `tcp://` or `http://` URL. Anything else is
+/// refused rather than left to the local defaults, which would silently reach
+/// another daemon.
+pub(crate) fn connect(endpoint: &str) -> Result<Docker, bollard::errors::Error> {
+    const TIMEOUT_SECS: u64 = 120;
+    if endpoint.starts_with("unix://") {
+        Docker::connect_with_socket(endpoint, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
+    } else if endpoint.starts_with('/') {
+        Docker::connect_with_socket(
+            &format!("unix://{endpoint}"),
+            TIMEOUT_SECS,
+            bollard::API_DEFAULT_VERSION,
+        )
+    } else if endpoint.starts_with("tcp://") || endpoint.starts_with("http://") {
+        Docker::connect_with_http(endpoint, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
+    } else {
+        Err(bollard::errors::Error::UnsupportedURISchemeError {
+            uri: endpoint.to_string(),
+        })
+    }
+}
+
 pub struct DockerProvider {
     docker: Docker,
     config: DockerConfig,
@@ -94,17 +117,7 @@ impl DockerProvider {
         config: DockerConfig,
         name: &'static str,
     ) -> Result<Self, bollard::errors::Error> {
-        let docker = if config.endpoint.starts_with("unix://") {
-            Docker::connect_with_socket(&config.endpoint, 120, bollard::API_DEFAULT_VERSION)?
-        } else if config.endpoint.starts_with("/") {
-            Docker::connect_with_socket(
-                &format!("unix://{}", config.endpoint),
-                120,
-                bollard::API_DEFAULT_VERSION,
-            )?
-        } else {
-            Docker::connect_with_local_defaults()?
-        };
+        let docker = connect(&config.endpoint)?;
         Ok(Self {
             docker,
             config,
@@ -903,6 +916,37 @@ fn merge_or_insert_entrypoint_btree(
     entrypoint.id = alt_key.clone();
     entrypoint.source = Some(source_label.to_string());
     dest.insert(alt_key, entrypoint);
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::connect;
+
+    #[tokio::test]
+    async fn endpoints_connect_by_their_scheme() {
+        // Bollard checks that a socket exists before connecting to it.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket = socket.to_str().unwrap();
+        assert!(connect(socket).is_ok());
+        assert!(connect(&format!("unix://{socket}")).is_ok());
+        assert!(connect("tcp://10.0.0.1:2375").is_ok());
+        assert!(connect("http://10.0.0.1:2375").is_ok());
+    }
+
+    #[tokio::test]
+    async fn another_endpoint_is_refused_not_replaced_by_the_local_daemon() {
+        for endpoint in ["", "ssh://host", "https://10.0.0.1:2376", "docker.sock"] {
+            assert!(
+                matches!(
+                    connect(endpoint),
+                    Err(bollard::errors::Error::UnsupportedURISchemeError { .. })
+                ),
+                "{endpoint}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

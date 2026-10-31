@@ -130,7 +130,7 @@ The HTTP provider, the other providers, and the REST API can run together. Each 
 - HTTP provider: `source: "http"`
 - REST API entrypoints: `source: "api"`
 
-A poll only deletes entrypoints with `source: "http"` — the others are untouched. Give the HTTP provider's entrypoints `id`s no other source uses: one with the same `id` as another source's entrypoint replaces it.
+A poll only deletes entrypoints with `source: "http"` — the others are untouched. An entrypoint with the same `id` as another source's is ignored, with a warning (since 0.16).
 
 ## Limitations
 

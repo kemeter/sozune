@@ -25,17 +25,7 @@ pub struct SwarmProvider {
 
 impl SwarmProvider {
     pub fn new(config: SwarmConfig) -> Result<Self, bollard::errors::Error> {
-        let docker = if config.endpoint.starts_with("unix://") {
-            Docker::connect_with_socket(&config.endpoint, 120, bollard::API_DEFAULT_VERSION)?
-        } else if config.endpoint.starts_with('/') {
-            Docker::connect_with_socket(
-                &format!("unix://{}", config.endpoint),
-                120,
-                bollard::API_DEFAULT_VERSION,
-            )?
-        } else {
-            Docker::connect_with_local_defaults()?
-        };
+        let docker = crate::provider::docker::connect(&config.endpoint)?;
         Ok(Self { docker, config })
     }
 
