@@ -7,7 +7,10 @@ use std::collections::HashMap;
 /// - Both absent → returns `None` quietly.
 /// - Only average set → burst defaults to average.
 /// - Only burst set → invalid (no average means no rate limit), emits `W004`.
-/// - Either one non-numeric → emits `W004` and returns `None`.
+/// - `average` non-numeric or `0` → emits `W004` and returns `None`: at `0`, a
+///   client would be blocked for good after its first `burst` requests.
+/// - `burst` non-numeric or `0` → emits `W004` and falls back to average: at
+///   `0`, every request would be refused.
 pub fn parse_rate_limit(
     labels: &HashMap<String, String>,
     prefix: &str,
@@ -35,12 +38,12 @@ pub fn parse_rate_limit(
             return None;
         }
         Some(raw) => match raw.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
+            Ok(n) if n > 0 => n,
+            _ => {
                 diagnostics.push(
                     Diagnostic::new(
                         DiagnosticCode::W004InvalidRateLimit,
-                        "ratelimit.average is not a valid integer, rate limit disabled",
+                        "ratelimit.average is not a positive integer, rate limit disabled",
                     )
                     .with_label(&avg_key)
                     .with_value(raw),
@@ -53,12 +56,12 @@ pub fn parse_rate_limit(
     let burst = match burst_raw {
         None => average,
         Some(raw) => match raw.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
+            Ok(n) if n > 0 => n,
+            _ => {
                 diagnostics.push(
                     Diagnostic::new(
                         DiagnosticCode::W004InvalidRateLimit,
-                        "ratelimit.burst is not a valid integer, falling back to average",
+                        "ratelimit.burst is not a positive integer, falling back to average",
                     )
                     .with_label(&burst_key)
                     .with_value(raw),
@@ -80,6 +83,26 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn zero_average_disables_the_limit_with_w004() {
+        let mut diags = Vec::new();
+        let l = labels(&[("sozune.http.web.ratelimit.average", "0")]);
+        assert!(parse_rate_limit(&l, "sozune.http.web.", &mut diags).is_none());
+        assert_eq!(diags[0].code, DiagnosticCode::W004InvalidRateLimit);
+    }
+
+    #[test]
+    fn zero_burst_falls_back_to_average_with_w004() {
+        let mut diags = Vec::new();
+        let l = labels(&[
+            ("sozune.http.web.ratelimit.average", "10"),
+            ("sozune.http.web.ratelimit.burst", "0"),
+        ]);
+        let config = parse_rate_limit(&l, "sozune.http.web.", &mut diags).unwrap();
+        assert_eq!(config.burst, 10);
+        assert_eq!(diags[0].code, DiagnosticCode::W004InvalidRateLimit);
     }
 
     #[test]

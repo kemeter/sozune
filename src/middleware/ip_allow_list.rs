@@ -29,7 +29,7 @@
 //! - **Trusted proxies configured**: parse `X-Forwarded-For` right-to-left,
 //!   skipping every entry that matches a trusted-proxy CIDR. The first
 //!   non-trusted entry is the client. If every entry is trusted (very long
-//!   chain of internal hops), the leftmost stays as the client. If no entry
+//!   chain of internal hops), the peer stays as the client. If no entry
 //!   parses, fall back to the TCP peer.
 //!
 //! The TCP peer itself is *also* checked against `trusted_proxies` — when an

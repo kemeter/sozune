@@ -17,7 +17,7 @@ labels:
 | `ratelimit.average` | Sustained rate, in requests per second per IP |
 | `ratelimit.burst` | Maximum burst size. Defaults to `average` when omitted. |
 
-If neither label is present, rate limiting is disabled for the service. A value that is not an integer, or `burst` without `average`, raises a `W004` diagnostic and disables the limit, except an invalid `burst`, which falls back to `average` (since 0.11). A `burst` lower than `average` raises `W017` (since 0.13).
+If neither label is present, rate limiting is disabled for the service. A value that is not a positive integer (`0` included, since 0.16), or `burst` without `average`, raises a `W004` diagnostic and disables the limit, except an invalid `burst`, which falls back to `average` (since 0.11). A `burst` lower than `average` raises `W017` (since 0.13).
 
 ## Example
 
