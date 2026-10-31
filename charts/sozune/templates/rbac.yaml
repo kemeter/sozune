@@ -13,7 +13,7 @@ rules:
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "ingressclasses"]
+    resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses/status"]

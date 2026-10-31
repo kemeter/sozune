@@ -85,10 +85,9 @@ pub mod fuzzy {
     }
 }
 
-/// Returns `true` when `SOZUNE_DEBUG=true`. Used to gate verbose runtime
-/// diagnostics that may leak configured hostnames or backend addresses.
+/// Returns `true` when `SOZUNE_DEBUG` is on, read as any boolean variable.
+/// Used to gate verbose runtime diagnostics that may leak configured hostnames
+/// or backend addresses.
 pub fn debug_enabled() -> bool {
-    std::env::var("SOZUNE_DEBUG")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
+    crate::config::env_bool("SOZUNE_DEBUG").unwrap_or(false)
 }

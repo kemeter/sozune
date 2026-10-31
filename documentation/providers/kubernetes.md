@@ -258,7 +258,7 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-`namespaces` is required: Sōzune lists them at start-up to check its access. Without it, that check fails (`Kubernetes service failed: Failed to list namespaces`) and the Service, EndpointSlice and Ingress watchers do not start, so no Service or Ingress is served, and Gateway API routes find no ready pod. With the Gateway API, namespaces are also watched for listeners admitting routes by namespace selector (`allowedRoutes.namespaces.from: Selector`).
+Sōzune lists `namespaces` at start-up to check its access: without the permission it logs a warning and goes on (since 0.16). With the Gateway API, namespaces are also watched for listeners admitting routes by namespace selector (`allowedRoutes.namespaces.from: Selector`).
 
 ### Reaching Sōzune from outside
 

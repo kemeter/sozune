@@ -3938,7 +3938,7 @@ fn apply_route(
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect, requestHeaderModifier, responseHeaderModifier, urlRewrite and requestMirror are supported; extensionRef is not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares filters sōzune cannot represent (requestRedirect, requestHeaderModifier, responseHeaderModifier, urlRewrite, requestMirror and cors are supported; extensionRef is not, and requestRedirect cannot be combined with urlRewrite on the same rule) — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedFilters, Vec::new())
@@ -4047,7 +4047,7 @@ fn apply_route(
                     route.metadata.namespace.as_deref().unwrap_or("default"),
                     route.metadata.name.as_deref().unwrap_or("<no-name>")
                 );
-                (RouteOutcome::UnsupportedFilters, Vec::new())
+                (RouteOutcome::UnroutableRedirect, Vec::new())
             } else {
                 // A mirror with no ready pod copies nothing: its backendRef is
                 // no more resolved than a backend's would be.
@@ -5250,6 +5250,11 @@ pub enum RouteOutcome {
     /// Reflected as `Accepted=False reason=UnsupportedValue`; its
     /// backendRefs are reported on as usual.
     UnsupportedMatches,
+    /// A redirect on a match whose query or header conditions Sōzu cannot
+    /// route on: it answers redirects itself, so they would not be checked.
+    /// Reflected as `Accepted=False reason=UnsupportedValue`; its
+    /// backendRefs are reported on as usual.
+    UnroutableRedirect,
     /// In scope, no filters, but every backendRef resolved to zero
     /// ready endpoints. Surfaces as `ResolvedRefs=False
     /// reason=BackendNotFound` so users can distinguish "I'm waiting
@@ -5400,12 +5405,17 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
         RouteOutcome::UnsupportedFilters => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares HTTPRoute filters sōzune cannot represent (extensionRef is unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect, requestHeaderModifier, responseHeaderModifier, urlRewrite and requestMirror are supported)".to_string(),
+            "Route declares HTTPRoute filters sōzune cannot represent (extensionRef is unsupported, and requestRedirect cannot be combined with urlRewrite on the same rule; requestRedirect, requestHeaderModifier, responseHeaderModifier, urlRewrite, requestMirror and cors are supported)".to_string(),
         ),
         RouteOutcome::UnsupportedMatches => (
             "False",
             REASON_UNSUPPORTED_VALUE,
             "Route declares a match sōzune cannot represent: a RegularExpression path match, or a header or query regular expression that does not compile".to_string(),
+        ),
+        RouteOutcome::UnroutableRedirect => (
+            "False",
+            REASON_UNSUPPORTED_VALUE,
+            "Route redirects on a match whose query or header conditions Sōzu cannot route on: a prefix redirect with query matches, or a header match on Host or Cookie".to_string(),
         ),
         RouteOutcome::NoMatchingListenerHostname => (
             "False",
@@ -8576,7 +8586,7 @@ mod tests {
         }]);
         let route = route_with(vec![r], vec!["app.example.com".into()]);
         let ep = &route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs)[0];
-        assert_eq!(ep.config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(ep.config.redirect, Some(RedirectPolicy::Found));
         assert_eq!(
             ep.config.rewrite,
             Some(UrlRewrite {
@@ -8725,7 +8735,7 @@ mod tests {
         assert_eq!(eps.len(), 1);
         assert!(eps[0].backends.is_empty());
         assert!(eps[0].config.answer.is_none());
-        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Found));
     }
 
     #[test]
@@ -9732,7 +9742,7 @@ mod tests {
         ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
-        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Found));
         assert_eq!(
             eps[0].config.redirect_scheme,
             Some(RedirectScheme::UseHttps)
@@ -9824,7 +9834,7 @@ mod tests {
         ));
         let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
         assert_eq!(eps.len(), 1);
-        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Permanent));
+        assert_eq!(eps[0].config.redirect, Some(RedirectPolicy::Found));
         assert_eq!(eps[0].config.headers.len(), 1);
     }
 

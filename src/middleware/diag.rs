@@ -284,6 +284,8 @@ mod tests {
         assert!(debug_enabled());
         unsafe { std::env::set_var("SOZUNE_DEBUG", "1") };
         assert!(debug_enabled());
+        unsafe { std::env::set_var("SOZUNE_DEBUG", "on") };
+        assert!(debug_enabled());
         unsafe { std::env::set_var("SOZUNE_DEBUG", "false") };
         assert!(!debug_enabled());
         unsafe { std::env::remove_var("SOZUNE_DEBUG") };

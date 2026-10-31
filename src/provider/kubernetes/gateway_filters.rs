@@ -43,14 +43,14 @@ pub struct RedirectMapping {
 ///
 /// Supported filters: a mappable `requestRedirect` (see
 /// [`redirect_from_filter`]), `requestHeaderModifier`,
-/// `responseHeaderModifier`, and `urlRewrite` (see
-/// [`url_rewrite_from_filter`]). Header modifiers freely mix with either a
-/// redirect or a rewrite. `requestRedirect` and `urlRewrite` *conflict*,
-/// though — one redirects the client, the other transparently rewrites the
-/// forwarded request, and both fight over Sōzu's frontend `rewrite_path` —
-/// so a rule carrying both is refused. `requestMirror` and `extensionRef`
-/// remain unsupported; a rule carrying either (alone or mixed) is refused,
-/// since partial execution would misrepresent intent.
+/// `responseHeaderModifier`, `urlRewrite` (see
+/// [`url_rewrite_from_filter`]), `requestMirror` and `cors`. Header modifiers
+/// freely mix with either a redirect or a rewrite. `requestRedirect` and
+/// `urlRewrite` *conflict*, though — one redirects the client, the other
+/// transparently rewrites the forwarded request, and both fight over Sōzu's
+/// frontend `rewrite_path` — so a rule carrying both is refused. `extensionRef`
+/// remains unsupported; a rule carrying it (alone or mixed) is refused, since
+/// partial execution would misrepresent intent.
 pub fn rule_filters_supported(filters: &[HttpRouteRulesFilters]) -> bool {
     let has_redirect = filters.iter().any(|f| f.request_redirect.is_some());
     let has_rewrite = filters.iter().any(|f| f.url_rewrite.is_some());
@@ -431,11 +431,11 @@ fn redirect_from_redirect_filter(
         None => None,
     };
 
-    // Gateway API core status values are 301 and 302; 303, 307 and 308
-    // are extended.
+    // Gateway API core status values are 301 and 302, 302 the default; 303,
+    // 307 and 308 are extended.
     let policy = match rr.status_code {
-        None | Some(301) => RedirectPolicy::Permanent,
-        Some(302) => RedirectPolicy::Found,
+        Some(301) => RedirectPolicy::Permanent,
+        None | Some(302) => RedirectPolicy::Found,
         Some(303) => RedirectPolicy::SeeOther,
         Some(307) => RedirectPolicy::TemporaryRedirect,
         Some(308) => RedirectPolicy::PermanentRedirect,
@@ -498,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn scheme_only_redirect_maps_to_permanent_use_https() {
+    fn scheme_only_redirect_maps_to_found_use_https() {
         let f = vec![redirect_filter(
             Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
             None,
@@ -507,7 +507,7 @@ mod tests {
         )];
         assert!(rule_filters_supported(&f));
         let m = redirect_from_filter(&f).unwrap();
-        assert_eq!(m.policy, RedirectPolicy::Permanent);
+        assert_eq!(m.policy, RedirectPolicy::Found);
         assert_eq!(m.scheme, Some(RedirectScheme::UseHttps));
         assert_eq!(m.host, None);
         assert_eq!(m.path, None);
