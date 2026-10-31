@@ -691,6 +691,63 @@ fn global_lints(state: &AppState) -> Vec<Diagnostic> {
     out
 }
 
+/// Entrypoints per provider, so the dashboard can show "Docker: 5 entrypoints"
+/// next to each provider row. Gateway API routes carry a source of their own
+/// and count under Kubernetes; an unknown source is counted but has no row.
+fn entrypoint_counts<'a>(
+    entrypoints: impl Iterator<Item = &'a crate::model::Entrypoint>,
+) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for ep in entrypoints {
+        let source = if crate::provider::kubernetes::gateway::is_gateway_route(ep) {
+            Some(crate::provider::KUBERNETES)
+        } else {
+            ep.source.as_deref()
+        };
+        if let Some(source) = source {
+            *counts.entry(source.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Whether a provider has a block in the config, and whether it is enabled.
+fn provider_state(p: &crate::config::ProvidersConfig, name: &str) -> (bool, bool) {
+    match name {
+        crate::provider::DOCKER => (
+            p.docker.is_some(),
+            p.docker.as_ref().is_some_and(|c| c.enabled),
+        ),
+        crate::provider::PODMAN => (
+            p.podman.is_some(),
+            p.podman.as_ref().is_some_and(|c| c.enabled),
+        ),
+        crate::provider::SWARM => (
+            p.swarm.is_some(),
+            p.swarm.as_ref().is_some_and(|c| c.enabled),
+        ),
+        crate::provider::KUBERNETES => (
+            p.kubernetes.is_some(),
+            p.kubernetes.as_ref().is_some_and(|c| c.enabled),
+        ),
+        crate::provider::NOMAD => (
+            p.nomad.is_some(),
+            p.nomad.as_ref().is_some_and(|c| c.enabled),
+        ),
+        crate::provider::CONSUL => (
+            p.consul.is_some(),
+            p.consul.as_ref().is_some_and(|c| c.enabled),
+        ),
+        crate::provider::RING => (p.ring.is_some(), p.ring.as_ref().is_some_and(|c| c.enabled)),
+        crate::provider::HTTP => (p.http.is_some(), p.http.as_ref().is_some_and(|c| c.enabled)),
+        crate::provider::CONFIG => (
+            p.config_file.is_some(),
+            p.config_file.as_ref().is_some_and(|c| c.enabled),
+        ),
+        _ => (false, false),
+    }
+}
+
 /// `GET /providers` — snapshot of every provider sōzune knows about, its
 /// configured `enabled` flag, and how many entrypoints it currently owns in
 /// the storage. Lets the dashboard render a "what's wired up?" overview
@@ -710,16 +767,7 @@ async fn list_providers(State(state): State<AppState>) -> (StatusCode, Json<serd
         }
     };
 
-    // Count entrypoints per source so the dashboard can show "Docker: 5
-    // entrypoints" next to each provider row. Sources sōzune emits today
-    // are listed under `documented_sources` below; an unknown source still
-    // gets counted but won't have a matching provider row.
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for ep in storage.values() {
-        if let Some(src) = ep.source.as_deref() {
-            *counts.entry(src.to_string()).or_insert(0) += 1;
-        }
-    }
+    let counts = entrypoint_counts(storage.values());
 
     let p = &state.providers;
     // Iterate `provider::ALL` so the response order, and the set of names,
@@ -729,36 +777,7 @@ async fn list_providers(State(state): State<AppState>) -> (StatusCode, Json<serd
     let items: Vec<serde_json::Value> = crate::provider::ALL
         .iter()
         .map(|&name| {
-            let (configured, enabled) = match name {
-                crate::provider::DOCKER => (
-                    p.docker.is_some(),
-                    p.docker.as_ref().is_some_and(|c| c.enabled),
-                ),
-                crate::provider::PODMAN => (
-                    p.podman.is_some(),
-                    p.podman.as_ref().is_some_and(|c| c.enabled),
-                ),
-                crate::provider::SWARM => (
-                    p.swarm.is_some(),
-                    p.swarm.as_ref().is_some_and(|c| c.enabled),
-                ),
-                crate::provider::KUBERNETES => (
-                    p.kubernetes.is_some(),
-                    p.kubernetes.as_ref().is_some_and(|c| c.enabled),
-                ),
-                crate::provider::NOMAD => (
-                    p.nomad.is_some(),
-                    p.nomad.as_ref().is_some_and(|c| c.enabled),
-                ),
-                crate::provider::HTTP => {
-                    (p.http.is_some(), p.http.as_ref().is_some_and(|c| c.enabled))
-                }
-                crate::provider::CONFIG => (
-                    p.config_file.is_some(),
-                    p.config_file.as_ref().is_some_and(|c| c.enabled),
-                ),
-                _ => (false, false),
-            };
+            let (configured, enabled) = provider_state(p, name);
             serde_json::json!({
                 "name": name,
                 "enabled": enabled,
@@ -1077,6 +1096,47 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use sha2::Digest;
+
+    #[test]
+    fn every_known_provider_reports_its_config_block() {
+        let providers: crate::config::ProvidersConfig = serde_yaml::from_str(
+            r#"
+docker: { enabled: true }
+podman: { enabled: true }
+swarm: { enabled: true }
+kubernetes: { enabled: true }
+nomad: { enabled: true }
+consul: { enabled: true }
+ring: { enabled: true }
+http: { enabled: true }
+config_file: { enabled: true }
+"#,
+        )
+        .unwrap();
+        for name in crate::provider::ALL {
+            assert_eq!(provider_state(&providers, name), (true, true), "{name}");
+        }
+    }
+
+    #[test]
+    fn gateway_routes_count_under_kubernetes() {
+        let entrypoint = |source: &str| -> crate::model::Entrypoint {
+            let mut json = sample_entrypoint_json();
+            json["id"] = serde_json::json!(source);
+            let mut ep: crate::model::Entrypoint = serde_json::from_value(json).unwrap();
+            ep.source = Some(source.to_string());
+            ep
+        };
+        let entrypoints = [
+            entrypoint("kubernetes"),
+            entrypoint("k8s-gateway-default-web-0"),
+            entrypoint("k8s-gateway-tcp/default/db"),
+            entrypoint("docker"),
+        ];
+        let counts = entrypoint_counts(entrypoints.iter());
+        assert_eq!(counts.get("kubernetes"), Some(&3));
+        assert_eq!(counts.get("docker"), Some(&1));
+    }
 
     /// A health check header is often a credential: the API shows its name,
     /// never its value.
