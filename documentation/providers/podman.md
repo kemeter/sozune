@@ -19,10 +19,10 @@ providers:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enables the Podman provider |
-| `endpoint` | `$XDG_RUNTIME_DIR/podman/podman.sock`, or `/run/podman/podman.sock` when `XDG_RUNTIME_DIR` is unset | Podman API socket, as a path or a `unix://` URL. Must speak the Docker API (Podman v3+ does by default). |
+| `endpoint` | `$XDG_RUNTIME_DIR/podman/podman.sock`, or `/run/podman/podman.sock` when `XDG_RUNTIME_DIR` is unset | Podman API socket, as a path or a `unix://` URL, or a remote Podman over plain TCP, as a `tcp://` or `http://` URL (since 0.16). Must speak the Docker API (Podman v3+ does by default). |
 | `expose_by_default` | `false` | If `true`, every running container is a candidate even without `sozune.enable=true` |
 
-Only Unix sockets are supported. Any other value, a `tcp://` URL included, is not used: Sōzune then connects to `DOCKER_HOST` when it is a `unix://` URL, else to `/var/run/docker.sock`. To reach a remote Podman, forward its socket to a local path (e.g. over SSH) and point `endpoint` at it.
+Any other value stops Sōzune at start-up (since 0.16): it used to reach the local Docker daemon instead, without a word.
 
 ## How it works
 

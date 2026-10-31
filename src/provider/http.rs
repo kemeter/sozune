@@ -80,7 +80,7 @@ impl HttpProvider {
             interval.tick().await;
 
             match self.fetch_entrypoints().await {
-                Ok(new_entrypoints) => {
+                Ok(mut new_entrypoints) => {
                     // Compare under a read lock first; the API server also
                     // takes read locks on this storage and would otherwise
                     // contend with our write lock on every poll.
@@ -96,6 +96,7 @@ impl HttpProvider {
                             }
                         };
 
+                        drop_taken_ids(&storage_read, &mut new_entrypoints);
                         http_entrypoints_changed(&storage_read, &new_entrypoints)
                     };
 
@@ -116,6 +117,8 @@ impl HttpProvider {
                         };
                         storage_write
                             .retain(|_, ep| ep.source.as_deref() != Some(crate::provider::HTTP));
+                        // Another provider may have taken one since the read lock.
+                        drop_taken_ids(&storage_write, &mut new_entrypoints);
                         for (id, mut entrypoint) in new_entrypoints {
                             entrypoint.source = Some(crate::provider::HTTP.to_string());
                             debug!("HTTP provider entrypoint: {}", id);
@@ -137,6 +140,25 @@ impl HttpProvider {
             }
         }
     }
+}
+
+/// Leaves out the fetched entrypoints whose id another source already uses:
+/// inserted, they would replace that source's route.
+fn drop_taken_ids(
+    stored: &BTreeMap<String, Entrypoint>,
+    fetched: &mut BTreeMap<String, Entrypoint>,
+) {
+    fetched.retain(|id, _| match stored.get(id) {
+        Some(existing) if existing.source.as_deref() != Some(crate::provider::HTTP) => {
+            warn!(
+                "HTTP provider entrypoint `{}` ignored: this id is already used by {}",
+                id,
+                existing.source.as_deref().unwrap_or("another source")
+            );
+            false
+        }
+        _ => true,
+    });
 }
 
 /// Whether the entrypoints the HTTP provider fetched (`fetched`) differ from
@@ -196,6 +218,25 @@ mod tests {
             regex: true,
         }];
         assert!(http_entrypoints_changed(&stored, &changed));
+    }
+
+    #[test]
+    fn an_id_another_source_uses_is_left_out() {
+        let entrypoint = |source: Option<&str>| Entrypoint {
+            source: source.map(str::to_string),
+            ..serde_json::from_str::<Vec<Entrypoint>>(&sample_entrypoints_json()).unwrap()[0]
+                .clone()
+        };
+        let stored = BTreeMap::from([("docker_web".to_string(), entrypoint(Some("docker")))]);
+        let mut fetched = BTreeMap::from([
+            ("docker_web".to_string(), entrypoint(None)),
+            ("web".to_string(), entrypoint(None)),
+        ]);
+        drop_taken_ids(&stored, &mut fetched);
+        assert_eq!(fetched.keys().collect::<Vec<_>>(), vec!["web"]);
+        // Nothing to do on the next poll for the id left out.
+        fetched.remove("web");
+        assert!(!http_entrypoints_changed(&stored, &fetched));
     }
 
     fn sample_entrypoints_json() -> String {
