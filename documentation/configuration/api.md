@@ -246,7 +246,7 @@ curl -u admin:your-password http://localhost:3035/providers
 - `name`: identifier matching `entrypoint.source` for entrypoints emitted by this provider
 - `configured`: the provider block exists in `config.yaml` (truthy when `providers.<name>` is present, regardless of `enabled`)
 - `enabled`: the provider's `enabled` flag from `config.yaml` — only enabled providers are actually running and contributing entrypoints
-- `entrypoint_count`: live count of entrypoints in storage whose `source` matches this provider name
+- `entrypoint_count`: live count of entrypoints in storage whose `source` matches this provider name; Gateway API routes count under `kubernetes` (since 0.16)
 
 The list always contains every known provider, even when not configured, so the dashboard can render "configure me" rows next to inactive providers.
 
