@@ -48,6 +48,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- TCP listeners at startup: a connection arriving before the listener's route was loaded was refused. It now waits up to 10 seconds for the route. A listener with no route closes its connections and logs one warning, instead of one Sōzu error per connection.
 - A Gateway status write that found its queue full was lost, and the status could stay out of date until the next change to that Gateway. Sōzune now rewrites every status when that happens.
 - A TLS Secret whose certificate was not valid yet, as when its issuer's clock runs ahead, stayed refused until the Secret changed. It is now checked again every minute, and used once valid.
 - Docker rolling updates: a service's route kept the settings of the container that stopped first, until Sōzune restarted. Its route is now rebuilt from the containers still running when one stops. A rollout from a forwarding service to a redirect (`redirect=permanent`, `unauthorized`, `close`) lost the route with the last old container, and one from a redirect to a service kept redirecting: a container that forwards now wins while any runs, and the redirect takes over after it. See [Multiple backends from Docker](documentation/routing/load-balancing.md#multiple-backends-from-docker).
