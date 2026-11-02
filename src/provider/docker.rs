@@ -382,7 +382,7 @@ impl DockerProvider {
                         match action_str {
                             "start" | "health_status: healthy" => {
                                 if let Ok(entrypoints) = self
-                                    .get_container_entrypoints(container_id, &diagnostics)
+                                    .get_container_entrypoints(container_id, diagnostics)
                                     .await
                                     && !entrypoints.is_empty()
                                 {
@@ -460,7 +460,7 @@ impl DockerProvider {
                             }
                             "stop" | "die" | "destroy" => {
                                 // Drop any cached diagnostics for this container — it's gone.
-                                diagnostics::remove(&diagnostics, container_id);
+                                diagnostics::remove(diagnostics, container_id);
                                 // A stopped container no longer reports what it served, so
                                 // we read the endpoints recorded when it started. With no
                                 // entry — the event arrived before we ever saw the container —
@@ -499,7 +499,7 @@ impl DockerProvider {
                             "update" => {
                                 // For updates, remove old and add new
                                 if let Ok(entrypoints) = self
-                                    .get_container_entrypoints(container_id, &diagnostics)
+                                    .get_container_entrypoints(container_id, diagnostics)
                                     .await
                                 {
                                     // What this container contributed before
