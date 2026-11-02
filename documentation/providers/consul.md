@@ -32,7 +32,7 @@ providers:
 
 ## How it works
 
-1. Sōzune issues a **blocking query** against `GET /v1/catalog/services?index=N&wait=<poll_interval>s`. Consul holds the connection open until the catalog changes (or `poll_interval` elapses).
+1. Sōzune holds two **blocking queries**, `GET /v1/catalog/services?index=N&wait=<poll_interval>s` for the services and `GET /v1/health/state/any?index=N&wait=<poll_interval>s` for their health (since 0.16): a check changing state does not move the catalog's index. Consul holds each one until its index moves (or `poll_interval` elapses).
 2. As soon as Consul responds with a new index, Sōzune fetches each service's instances via `GET /v1/health/service/<name>` — the health endpoint, so it sees the instances **and** their checks in one call.
 3. Instances whose aggregate health is not allowed by `strict_checks` are dropped before they ever become a backend.
 4. Service tags are parsed by the same engine that handles Docker / Swarm / Kubernetes / Nomad labels, so `sozune validate` and the runtime stay in sync.

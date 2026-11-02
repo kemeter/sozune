@@ -8,6 +8,7 @@ use crate::provider::Provider;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -16,6 +17,17 @@ use tracing::{debug, error, info, warn};
 
 const PROVIDER_NAME: &str = crate::provider::CONSUL;
 const NETWORK_NAME: &str = "consul";
+/// Moves when a service registers or goes, not when its health changes.
+const CATALOG_PATH: &str = "/v1/catalog/services";
+/// Moves when a check changes state.
+const HEALTH_PATH: &str = "/v1/health/state/any";
+/// How long changes gather before a discovery: each one fetches every service,
+/// and the health index moves for any check of the datacenter.
+const CHANGE_COALESCE: Duration = Duration::from_secs(1);
+/// How long before a discovery that failed is tried again.
+const POLL_RETRY: Duration = Duration::from_secs(2);
+/// How long a request Consul answers at once may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ConsulProvider {
     config: ConsulConfig,
@@ -65,7 +77,7 @@ impl ConsulProvider {
 #[async_trait]
 impl LabelSource for ConsulProvider {
     async fn collect(&self) -> anyhow::Result<Vec<Candidate>> {
-        let (services, _) = self.list_services(None).await?;
+        let services = self.list_services().await?;
         let mut candidates = Vec::new();
         for service_name in services {
             match self.fetch_instances(&service_name).await {
@@ -84,7 +96,6 @@ impl LabelSource for ConsulProvider {
 impl ConsulProvider {
     pub fn new(config: ConsulConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
             .build()
             .context("Failed to build Consul HTTP client")?;
         Ok(Self { config, client })
@@ -115,7 +126,15 @@ impl ConsulProvider {
         &self,
         url: String,
     ) -> anyhow::Result<(T, u64)> {
-        let mut req = self.client.get(&url);
+        self.get_json_within(url, REQUEST_TIMEOUT).await
+    }
+
+    async fn get_json_within<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: String,
+        timeout: Duration,
+    ) -> anyhow::Result<(T, u64)> {
+        let mut req = self.client.get(&url).timeout(timeout);
         if !self.config.token.is_empty() {
             req = req.header("X-Consul-Token", &self.config.token);
         }
@@ -143,19 +162,17 @@ impl ConsulProvider {
 
     /// List registered service names in the configured datacenter (or the
     /// agent default). `GET /v1/catalog/services` returns a map of
-    /// `service name → tags`; we only need the keys here. Uses a Consul
-    /// blocking query when `index` is `Some` so Consul holds the response
-    /// until the catalog changes (or `poll_interval` elapses).
-    async fn list_services(&self, index: Option<u64>) -> anyhow::Result<(Vec<String>, u64)> {
-        let url = self.build_url("/v1/catalog/services", index);
-        let (payload, new_index) = self.get_json::<HashMap<String, Vec<String>>>(url).await?;
+    /// `service name → tags`; we only need the keys here.
+    async fn list_services(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.build_url(CATALOG_PATH, None);
+        let (payload, _) = self.get_json::<HashMap<String, Vec<String>>>(url).await?;
         // Drop Consul's built-in "consul" service — it's the agents
         // themselves, never a routable backend.
         let names = payload
             .into_keys()
             .filter(|name| name != "consul")
             .collect();
-        Ok((names, new_index))
+        Ok(names)
     }
 
     /// Fetch the healthy instances of one service via the health endpoint,
@@ -191,12 +208,12 @@ impl ConsulProvider {
         reload_tx: &mpsc::Sender<()>,
         acme_notify: &Arc<Notify>,
         diagnostics: &DiagnosticsStore,
-    ) {
+    ) -> bool {
         let new_entrypoints = match self.provide_into(diagnostics).await {
             Ok(map) => map,
             Err(e) => {
                 warn!("Consul poll failed: {e}");
-                return;
+                return false;
             }
         };
 
@@ -205,7 +222,7 @@ impl ConsulProvider {
                 Ok(guard) => guard,
                 Err(e) => {
                     error!("internal state corrupted (configuration store), restart required: {e}");
-                    return;
+                    return false;
                 }
             };
 
@@ -223,7 +240,7 @@ impl ConsulProvider {
         };
 
         if !needs_update {
-            return;
+            return true;
         }
 
         {
@@ -231,7 +248,7 @@ impl ConsulProvider {
                 Ok(guard) => guard,
                 Err(e) => {
                     error!("internal state corrupted (configuration store), restart required: {e}");
-                    return;
+                    return false;
                 }
             };
             storage_write.retain(|_, ep| ep.source.as_deref() != Some(PROVIDER_NAME));
@@ -253,6 +270,42 @@ impl ConsulProvider {
         // notification is cheap and keeps the contract identical across
         // providers (Docker, Swarm, Kubernetes, Nomad do the same).
         acme_notify.notify_one();
+        true
+    }
+
+    /// The current `X-Consul-Index` of `path`, 0 when it cannot be read: the
+    /// first blocking query then answers at once, and reports a change.
+    async fn current_index(&self, path: &str) -> u64 {
+        let url = self.build_url(path, None);
+        match self.get_json::<IgnoredAny>(url).await {
+            Ok((_, index)) => index,
+            Err(e) => {
+                warn!("Consul request failed: {e}");
+                0
+            }
+        }
+    }
+
+    /// Hold blocking queries on `path`, and wake `changed` when its index
+    /// moves. Consul holds each one until then, or `poll_interval` elapses.
+    async fn watch_index(&self, path: &str, mut index: u64, changed: &Notify) {
+        // Consul adds up to `wait / 16` of jitter to the wait.
+        let wait = Duration::from_secs(self.config.poll_interval);
+        let timeout = wait + wait / 16 + REQUEST_TIMEOUT;
+        loop {
+            let url = self.build_url(path, Some(index));
+            match self.get_json_within::<IgnoredAny>(url, timeout).await {
+                Ok((_, new_index)) if new_index != index => {
+                    index = new_index;
+                    changed.notify_one();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Consul blocking query failed, backing off 1s: {e}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     pub async fn start_polling(
@@ -275,34 +328,32 @@ impl ConsulProvider {
             self.config.poll_interval,
         );
 
-        // Initial pull (`index = None` → immediate response).
+        // Read before the first pull: a change made during it is then seen.
+        let catalog = self.current_index(CATALOG_PATH).await;
+        let health = self.current_index(HEALTH_PATH).await;
         self.poll_once(&storage, &reload_tx, &acme_notify, &diagnostics)
             .await;
-        let mut last_index = self
-            .list_services(None)
-            .await
-            .map(|(_, idx)| idx)
-            .unwrap_or(0);
 
-        loop {
-            // Blocking query: Consul holds the connection until the catalog
-            // changes or the configured wait elapses.
-            match self.list_services(Some(last_index)).await {
-                Ok((_, new_index)) => {
-                    if new_index != last_index {
-                        last_index = new_index;
-                        self.poll_once(&storage, &reload_tx, &acme_notify, &diagnostics)
-                            .await;
-                    }
-                    // Same index = wait timed out with no change. Loop right
-                    // back into another blocking call — no sleep needed.
-                }
-                Err(e) => {
-                    warn!("Consul blocking query failed, backing off 1s: {e}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+        let changed = Notify::new();
+        let apply = async {
+            loop {
+                changed.notified().await;
+                tokio::time::sleep(CHANGE_COALESCE).await;
+                // The index has moved on: nothing would report this change again.
+                while !self
+                    .poll_once(&storage, &reload_tx, &acme_notify, &diagnostics)
+                    .await
+                {
+                    tokio::time::sleep(POLL_RETRY).await;
                 }
             }
-        }
+        };
+        tokio::join!(
+            self.watch_index(CATALOG_PATH, catalog, &changed),
+            self.watch_index(HEALTH_PATH, health, &changed),
+            apply,
+        );
+        Ok(())
     }
 }
 
@@ -469,6 +520,173 @@ fn parse_tags(tags: &[String]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Consul whose catalog never moves: only `/v1/health/state/any` tells
+    /// that the instance went critical. Answers blocking queries as Consul
+    /// does, holding them until the index moves or the wait elapses.
+    async fn fake_consul(
+        status: Arc<RwLock<&'static str>>,
+        health_index: Arc<Notify>,
+        catalog_down: Arc<std::sync::atomic::AtomicBool>,
+    ) -> u16 {
+        use axum::extract::{Query, State};
+        use axum::http::header::HeaderMap;
+        use axum::routing::get;
+
+        type Params = Query<HashMap<String, String>>;
+        #[derive(Clone)]
+        struct Fake {
+            status: Arc<RwLock<&'static str>>,
+            flipped: Arc<Notify>,
+            index: Arc<std::sync::atomic::AtomicU64>,
+            catalog_down: Arc<std::sync::atomic::AtomicBool>,
+        }
+        fn indexed(index: u64) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Consul-Index", index.to_string().parse().unwrap());
+            headers
+        }
+        async fn catalog(
+            State(fake): State<Fake>,
+            Query(params): Params,
+        ) -> (axum::http::StatusCode, HeaderMap, &'static str) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if params.contains_key("index") {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let status = if fake.catalog_down.load(SeqCst) {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum::http::StatusCode::OK
+            };
+            (status, indexed(7), r#"{"web":[]}"#)
+        }
+        async fn states(
+            State(fake): State<Fake>,
+            Query(params): Params,
+        ) -> (HeaderMap, &'static str) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if params.contains_key("index") {
+                let _ = tokio::time::timeout(Duration::from_secs(1), fake.flipped.notified()).await;
+            }
+            let moved = *fake.status.read().unwrap() == "critical";
+            let index = fake.index.load(SeqCst) + u64::from(moved);
+            (indexed(index), "[]")
+        }
+        async fn instances(State(fake): State<Fake>) -> (HeaderMap, String) {
+            let status = *fake.status.read().unwrap();
+            let body = serde_json::json!([{
+                "Node": {"Address": "10.0.0.1"},
+                "Service": {"ID": "web1", "Service": "web", "Address": "10.0.0.1", "Port": 80,
+                    "Tags": ["sozune.enable=true", "sozune.http.web.host=web.test"]},
+                "Checks": [{"Status": status}],
+            }]);
+            (indexed(7), body.to_string())
+        }
+
+        let app = axum::Router::new()
+            .route("/v1/catalog/services", get(catalog))
+            .route("/v1/health/state/any", get(states))
+            .route("/v1/health/service/web", get(instances))
+            .with_state(Fake {
+                status,
+                flipped: health_index,
+                index: Arc::new(std::sync::atomic::AtomicU64::new(5)),
+                catalog_down,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    /// A check going critical leaves the catalog index alone: the instance
+    /// must still lose its traffic, even when the discovery it triggers fails
+    /// at first.
+    #[tokio::test]
+    async fn a_health_flip_removes_the_instance_without_a_catalog_change() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+        let status = Arc::new(RwLock::new("passing"));
+        let flipped = Arc::new(Notify::new());
+        let catalog_down = Arc::new(AtomicBool::new(false));
+        let port = fake_consul(status.clone(), flipped.clone(), catalog_down.clone()).await;
+
+        let mut config = cfg();
+        config.endpoint = format!("http://127.0.0.1:{port}");
+        config.poll_interval = 1;
+        let provider = ConsulProvider::new(config).unwrap();
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let (reload_tx, mut reload_rx) = mpsc::channel(8);
+        let watcher = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                provider
+                    .start_polling(
+                        storage,
+                        reload_tx,
+                        Arc::new(Notify::new()),
+                        diagnostics::new_store(),
+                    )
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), reload_rx.recv())
+            .await
+            .expect("the first pull finds the instance")
+            .unwrap();
+        assert_eq!(storage.read().unwrap().len(), 1);
+
+        catalog_down.store(true, SeqCst);
+        *status.write().unwrap() = "critical";
+        flipped.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            storage.read().unwrap().len(),
+            1,
+            "the failed pull changes nothing"
+        );
+        catalog_down.store(false, SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(8), reload_rx.recv())
+            .await
+            .expect("the flip is seen with no catalog change, once discovery works again")
+            .unwrap();
+        assert!(storage.read().unwrap().is_empty());
+        watcher.abort();
+    }
+
+    /// A blocking query may be held longer than a plain request may take.
+    #[tokio::test]
+    async fn a_blocking_query_outlasts_the_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                "[]"
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = ConsulProvider::new(cfg()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/slow");
+        assert!(
+            provider
+                .get_json_within::<IgnoredAny>(url.clone(), Duration::from_millis(5))
+                .await
+                .is_err(),
+            "the timeout is the one given"
+        );
+        assert!(
+            provider
+                .get_json_within::<IgnoredAny>(url, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+    }
 
     fn cfg() -> ConsulConfig {
         ConsulConfig {
