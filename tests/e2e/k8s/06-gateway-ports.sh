@@ -123,8 +123,10 @@ kubectl delete tcproute ports-tcp -n sozune-test >/dev/null 2>&1
 
 closed=""
 for _ in $(seq 1 30); do
-    if kubectl logs -n sozune-test pod/sozune 2>/dev/null \
-        | grep -q "Closed Gateway listener \`gateway:tcp:$GATEWAY_TCP_PORT\`"; then
+    # Captured first: under `pipefail`, `grep -q` quitting early would fail
+    # the pipeline when `kubectl logs` is still writing.
+    pod_logs=$(kubectl logs -n sozune-test pod/sozune 2>/dev/null || true)
+    if grep -q "Closed Gateway listener \`gateway:tcp:$GATEWAY_TCP_PORT\`" <<<"$pod_logs"; then
         closed=1
         break
     fi
