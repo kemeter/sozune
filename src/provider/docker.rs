@@ -14,6 +14,7 @@ use bollard::{
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -38,6 +39,26 @@ pub(crate) fn connect(endpoint: &str) -> Result<Docker, bollard::errors::Error> 
             uri: endpoint.to_string(),
         })
     }
+}
+
+const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Why a subscription to the Docker event stream ended.
+enum ListenerEnd {
+    /// The daemon went away or the connection dropped: worth reconnecting.
+    StreamLost,
+    /// The proxy stopped taking updates, which it never does while it runs.
+    ReloadClosed,
+}
+
+/// A running container, as a scan found it.
+struct ScannedContainer {
+    id: String,
+    /// Tracked even while gated, so its routes can be found again later.
+    backends: Vec<Backend>,
+    /// What it serves now: nothing while its healthcheck holds it back.
+    serving: HashMap<String, Entrypoint>,
 }
 
 pub struct DockerProvider {
@@ -205,7 +226,10 @@ impl DockerProvider {
             .await
     }
 
-    /// Start listening for Docker events and update storage directly
+    /// Keep following Docker events for as long as the proxy runs. The stream
+    /// ends whenever the daemon restarts, and everything that happened while it
+    /// was gone is unknown, so each reconnection first rebuilds the routes from
+    /// the containers actually running.
     async fn start_event_listener(
         &self,
         storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -215,6 +239,110 @@ impl DockerProvider {
     ) -> anyhow::Result<()> {
         info!("Starting Docker event listener");
 
+        let mut since = None;
+        let mut delay = RECONNECT_MIN_DELAY;
+        loop {
+            let connected_at = std::time::Instant::now();
+            match self
+                .watch_events(
+                    &storage,
+                    &reload_tx,
+                    &acme_notify,
+                    &diagnostics,
+                    since.take(),
+                )
+                .await
+            {
+                ListenerEnd::ReloadClosed => {
+                    warn!("Docker event listener stopped: the proxy no longer takes updates");
+                    return Ok(());
+                }
+                ListenerEnd::StreamLost => {
+                    warn!("Lost the Docker event stream, reconnecting");
+                }
+            }
+
+            // Only a stream that held for a while resets the delay: one that
+            // connects and drops straight away must not rescan every second.
+            if connected_at.elapsed() >= RECONNECT_MAX_DELAY {
+                delay = RECONNECT_MIN_DELAY;
+            }
+
+            loop {
+                tokio::time::sleep(delay).await;
+                delay = next_reconnect_delay(delay);
+
+                // Taken before the scan, so an event landing between the scan
+                // and the new subscription is replayed rather than lost.
+                let resumed_at = unix_seconds();
+                match self
+                    .resync(&storage, &reload_tx, &acme_notify, &diagnostics)
+                    .await
+                {
+                    Ok(()) => {
+                        since = Some(resumed_at);
+                        break;
+                    }
+                    Err(e) => warn!("Docker is not reachable yet, will retry: {}", e),
+                }
+            }
+        }
+    }
+
+    /// Bring the routes back in line with the running containers, in one write
+    /// so the proxy never sees a route half rebuilt.
+    async fn resync(
+        &self,
+        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+        reload_tx: &mpsc::Sender<()>,
+        acme_notify: &Arc<tokio::sync::Notify>,
+        diagnostics: &DiagnosticsStore,
+    ) -> Result<(), bollard::errors::Error> {
+        let scanned = self.scan_running(diagnostics).await?;
+
+        let changed = {
+            let (Ok(mut storage_write), Ok(mut ips), Ok(mut declared)) = (
+                storage.write(),
+                self.container_ips.lock(),
+                self.declared.lock(),
+            ) else {
+                error!("internal state corrupted (configuration store), restart required");
+                return Ok(());
+            };
+            let before = storage_write.clone();
+            let gone = reconcile(
+                &mut storage_write,
+                &mut ips,
+                &mut declared,
+                scanned,
+                self.name,
+            );
+            for container_id in &gone {
+                diagnostics::remove(diagnostics, container_id);
+            }
+            *storage_write != before
+        };
+
+        if changed {
+            info!("Routes changed while the Docker event stream was down, reloading");
+            if let Err(e) = reload_tx.send(()).await {
+                warn!("could not apply configuration update: {}", e);
+            }
+            acme_notify.notify_one();
+        }
+        info!("Docker event listener resynchronised");
+        Ok(())
+    }
+
+    /// Follow one subscription to the Docker event stream until it ends.
+    async fn watch_events(
+        &self,
+        storage: &Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+        reload_tx: &mpsc::Sender<()>,
+        acme_notify: &Arc<tokio::sync::Notify>,
+        diagnostics: &DiagnosticsStore,
+        since: Option<String>,
+    ) -> ListenerEnd {
         let mut filters = std::collections::HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
         filters.insert(
@@ -234,7 +362,7 @@ impl DockerProvider {
         );
 
         let mut events = self.docker.events(Some(EventsOptions {
-            since: None,
+            since,
             until: None,
             filters: Some(filters),
         }));
@@ -254,7 +382,7 @@ impl DockerProvider {
                         match action_str {
                             "start" | "health_status: healthy" => {
                                 if let Ok(entrypoints) = self
-                                    .get_container_entrypoints(container_id, &diagnostics)
+                                    .get_container_entrypoints(container_id, diagnostics)
                                     .await
                                     && !entrypoints.is_empty()
                                 {
@@ -332,7 +460,7 @@ impl DockerProvider {
                             }
                             "stop" | "die" | "destroy" => {
                                 // Drop any cached diagnostics for this container — it's gone.
-                                diagnostics::remove(&diagnostics, container_id);
+                                diagnostics::remove(diagnostics, container_id);
                                 // A stopped container no longer reports what it served, so
                                 // we read the endpoints recorded when it started. With no
                                 // entry — the event arrived before we ever saw the container —
@@ -371,7 +499,7 @@ impl DockerProvider {
                             "update" => {
                                 // For updates, remove old and add new
                                 if let Ok(entrypoints) = self
-                                    .get_container_entrypoints(container_id, &diagnostics)
+                                    .get_container_entrypoints(container_id, diagnostics)
                                     .await
                                 {
                                     // What this container contributed before
@@ -432,11 +560,8 @@ impl DockerProvider {
                         if storage_changed {
                             info!("Storage updated, triggering reload");
                             if let Err(e) = reload_tx.send(()).await {
-                                error!(
-                                    "could not apply configuration update; will retry on next change: {}",
-                                    e
-                                );
-                                break;
+                                error!("could not apply configuration update: {}", e);
+                                return ListenerEnd::ReloadClosed;
                             }
                             acme_notify.notify_one();
                         }
@@ -444,13 +569,12 @@ impl DockerProvider {
                 }
                 Err(e) => {
                     error!("Docker event error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    return ListenerEnd::StreamLost;
                 }
             }
         }
 
-        warn!("Docker event listener stopped");
-        Ok(())
+        ListenerEnd::StreamLost
     }
 
     /// Get entrypoints for a specific container.
@@ -482,6 +606,59 @@ impl DockerProvider {
         }
 
         Ok(result.entrypoints)
+    }
+
+    /// What each running container serves right now, without touching what is
+    /// tracked. A failed inspect fails the whole scan: it would otherwise read
+    /// as a container with no network, and take a live route down. Only a
+    /// container gone since the listing is skipped.
+    async fn scan_running(
+        &self,
+        diagnostics: &DiagnosticsStore,
+    ) -> Result<Vec<ScannedContainer>, bollard::errors::Error> {
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: false,
+                ..Default::default()
+            }))
+            .await?;
+
+        let mut scanned = Vec::with_capacity(containers.len());
+        for container in containers {
+            let Some(id) = container.id else { continue };
+            let candidate = match self.inspect_to_candidate(&id).await {
+                Ok(Some(candidate)) => candidate,
+                Ok(None) => continue,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => continue,
+                Err(e) => return Err(e),
+            };
+            let result = diagnostics::parse_and_store(diagnostics, &candidate);
+            log_diagnostics(&candidate, &result.diagnostics);
+            if result.entrypoints.is_empty() {
+                continue;
+            }
+            let backends = endpoints_of(result.entrypoints.values());
+            let serving = if is_gated(candidate.health) {
+                HashMap::new()
+            } else {
+                result
+                    .entrypoints
+                    .into_iter()
+                    .filter(|(_, entrypoint)| {
+                        !entrypoint.backends.is_empty() || entrypoint.answers_without_backend()
+                    })
+                    .collect()
+            };
+            scanned.push(ScannedContainer {
+                id,
+                backends,
+                serving,
+            });
+        }
+        Ok(scanned)
     }
 
     async fn get_entrypoints_from_containers(
@@ -847,6 +1024,53 @@ fn take_off(
 ///
 /// `source_id` is the candidate id (container id for Docker) used to build the
 /// disambiguated key.
+/// Rebuild everything the tracked containers contribute from a fresh scan.
+/// Returns the containers no longer running.
+fn reconcile(
+    storage: &mut BTreeMap<String, Entrypoint>,
+    container_ips: &mut HashMap<String, Vec<Backend>>,
+    declared: &mut HashMap<String, HashMap<String, Entrypoint>>,
+    scanned: Vec<ScannedContainer>,
+    provider: &str,
+) -> Vec<String> {
+    let tracked: Vec<String> = container_ips.keys().cloned().collect();
+    let gone = tracked
+        .iter()
+        .filter(|id| !scanned.iter().any(|container| &container.id == *id))
+        .cloned()
+        .collect();
+
+    for id in &tracked {
+        let departing = container_ips.remove(id).unwrap_or_default();
+        declared.remove(id);
+        take_off(storage, id, &departing, provider, declared);
+    }
+
+    for container in scanned {
+        container_ips.insert(container.id.clone(), container.backends);
+        if !container.serving.is_empty() {
+            declared.insert(container.id.clone(), container.serving.clone());
+        }
+        for (key, entrypoint) in container.serving {
+            merge_or_insert_entrypoint_btree(storage, key, entrypoint, &container.id, provider);
+        }
+    }
+
+    gone
+}
+
+fn next_reconnect_delay(delay: Duration) -> Duration {
+    (delay * 2).min(RECONNECT_MAX_DELAY)
+}
+
+fn unix_seconds() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
 fn merge_or_insert_entrypoint(
     dest: &mut HashMap<String, Entrypoint>,
     key: String,
@@ -1561,5 +1785,148 @@ mod rollout_tests {
 
         assert_eq!(storage["web"].config.priority, 2);
         assert_eq!(storage["web"].backends, [Backend::new("10.0.0.2", 80)]);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    fn container(id: &str, ip: &str) -> ScannedContainer {
+        let mut entrypoint = super::merge_tests::ep("app.example.com", None, ip);
+        entrypoint.id = "web".into();
+        entrypoint.source = Some("docker".into());
+        entrypoint.candidates = vec![id.to_string()];
+        ScannedContainer {
+            id: id.to_string(),
+            backends: entrypoint.backends.clone(),
+            serving: HashMap::from([("web".to_string(), entrypoint)]),
+        }
+    }
+
+    fn other(id: &str, host: &str, ip: &str) -> ScannedContainer {
+        let mut scanned = container(id, ip);
+        let mut entrypoint = super::merge_tests::ep(host, None, ip);
+        entrypoint.id = host.to_string();
+        entrypoint.source = Some("docker".into());
+        entrypoint.candidates = vec![id.to_string()];
+        scanned.serving = HashMap::from([(host.to_string(), entrypoint)]);
+        scanned
+    }
+
+    #[derive(Default)]
+    struct State {
+        storage: BTreeMap<String, Entrypoint>,
+        ips: HashMap<String, Vec<Backend>>,
+        declared: HashMap<String, HashMap<String, Entrypoint>>,
+    }
+
+    impl State {
+        fn sync(&mut self, scanned: Vec<ScannedContainer>) -> Vec<String> {
+            reconcile(
+                &mut self.storage,
+                &mut self.ips,
+                &mut self.declared,
+                scanned,
+                "docker",
+            )
+        }
+
+        fn backends(&self, key: &str) -> Vec<String> {
+            let mut addresses: Vec<String> = self.storage[key]
+                .backends
+                .iter()
+                .map(|backend| backend.address.clone())
+                .collect();
+            addresses.sort();
+            addresses
+        }
+    }
+
+    #[test]
+    fn a_container_started_during_the_outage_gets_its_route() {
+        let mut state = State::default();
+
+        let gone = state.sync(vec![container("a", "10.0.0.1")]);
+
+        assert!(gone.is_empty());
+        assert_eq!(state.backends("web"), vec!["10.0.0.1"]);
+        assert!(state.ips.contains_key("a"));
+    }
+
+    #[test]
+    fn a_container_stopped_during_the_outage_loses_its_route() {
+        let mut state = State::default();
+        state.sync(vec![
+            container("a", "10.0.0.1"),
+            other("b", "other.example.com", "10.0.0.2"),
+        ]);
+
+        let gone = state.sync(vec![other("b", "other.example.com", "10.0.0.2")]);
+
+        assert_eq!(gone, vec!["a"]);
+        assert!(!state.storage.contains_key("web"));
+        assert_eq!(state.backends("other.example.com"), vec!["10.0.0.2"]);
+        assert!(!state.ips.contains_key("a"));
+        assert!(!state.declared.contains_key("a"));
+    }
+
+    #[test]
+    fn a_container_replaced_during_the_outage_moves_the_route() {
+        let mut state = State::default();
+        state.sync(vec![container("old", "10.0.0.1")]);
+
+        state.sync(vec![container("new", "10.0.0.2")]);
+
+        assert_eq!(state.backends("web"), vec!["10.0.0.2"]);
+        assert_eq!(state.storage["web"].candidates, vec!["new"]);
+    }
+
+    #[test]
+    fn nothing_changed_leaves_the_routes_identical() {
+        let mut state = State::default();
+        state.sync(vec![container("a", "10.0.0.1"), container("b", "10.0.0.2")]);
+        let before = state.storage.clone();
+
+        state.sync(vec![container("a", "10.0.0.1"), container("b", "10.0.0.2")]);
+
+        assert_eq!(state.backends("web"), vec!["10.0.0.1", "10.0.0.2"]);
+        let mut after = state.storage.clone();
+        let mut expected = before;
+        for routes in [&mut after, &mut expected] {
+            for entrypoint in routes.values_mut() {
+                entrypoint.candidates.sort();
+                entrypoint
+                    .backends
+                    .sort_by(|a, b| a.address.cmp(&b.address));
+            }
+        }
+        assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn a_container_gone_unhealthy_leaves_the_pool_but_stays_tracked() {
+        let mut state = State::default();
+        state.sync(vec![container("a", "10.0.0.1")]);
+        let mut gated = container("a", "10.0.0.1");
+        gated.serving.clear();
+
+        let gone = state.sync(vec![gated]);
+
+        assert!(gone.is_empty());
+        assert!(!state.storage.contains_key("web"));
+        assert!(state.ips.contains_key("a"));
+    }
+
+    #[test]
+    fn the_reconnect_delay_doubles_up_to_its_cap() {
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(20)),
+            RECONNECT_MAX_DELAY
+        );
     }
 }

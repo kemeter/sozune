@@ -48,6 +48,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- Docker daemon restarts — the Docker and Podman providers now reconnect to the event stream and rebuild their routes from the running containers. They used to stop following events for good, so containers started or stopped afterwards were never picked up until Sōzune restarted.
 - TCP listeners at startup: a connection arriving before the listener's route was loaded was refused. It now waits up to 10 seconds for the route. A listener with no route closes its connections and logs one warning, instead of one Sōzu error per connection.
 - A Gateway status write that found its queue full was lost, and the status could stay out of date until the next change to that Gateway. Sōzune now rewrites every status when that happens.
 - A TLS Secret whose certificate was not valid yet, as when its issuer's clock runs ahead, stayed refused until the Secret changed. It is now checked again every minute, and used once valid.
