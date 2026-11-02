@@ -748,6 +748,26 @@ impl GatewayScope {
         });
     }
 
+    /// Record what a Secret refused as not valid yet now holds, unless the
+    /// entry has since changed: another watcher feeding this scope may have
+    /// seen it replaced or deleted.
+    pub(super) fn settle_not_valid_yet(
+        &self,
+        key: (String, String),
+        certificate: Result<Arc<SecretCertificate>, String>,
+    ) {
+        self.update_tls_secrets(|secrets| {
+            let waiting = secrets.get(&key).is_some_and(
+                |current| matches!(current, Err(e) if e == crate::manual_certs::NOT_VALID_YET),
+            );
+            if !waiting {
+                return Vec::new();
+            }
+            secrets.insert(key.clone(), certificate);
+            vec![key]
+        });
+    }
+
     pub fn remove_tls_secret(&self, key: &(String, String)) {
         self.update_tls_secrets(|secrets| {
             secrets
@@ -10772,6 +10792,68 @@ mod tests {
         let fingerprint = certificate.fingerprint.clone();
         scope.upsert_tls_secret((ns.into(), name.into()), Ok(Arc::new(certificate)));
         fingerprint
+    }
+
+    /// A certificate not valid yet is used once it is, with no Secret event
+    /// to announce it.
+    #[tokio::test]
+    async fn a_certificate_is_used_once_it_becomes_valid() {
+        use super::super::gateway_tls::{certificate_from_secret, recheck_not_valid_yet, tests};
+
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut shop = gateway("default", "shop", "sozune");
+        shop.spec.listeners = vec![https_listener("tls", None, "shop-tls")];
+        scope.upsert_gateway(&shop);
+
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["shop.example.com".to_string()]).unwrap();
+        params.not_before = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+        let cert = params.self_signed(&key_pair).unwrap();
+        let secret = tests::tls_secret(
+            "default",
+            "shop-tls",
+            &cert.pem(),
+            &key_pair.serialize_pem(),
+        );
+        let key = ("default".to_string(), "shop-tls".to_string());
+
+        let refused = certificate_from_secret(&secret).unwrap_err();
+        assert_eq!(refused, crate::manual_certs::NOT_VALID_YET);
+        scope.upsert_tls_secret(key.clone(), Err(refused));
+        let mut waiting = HashMap::from([(key, secret)]);
+
+        recheck_not_valid_yet(&scope, &mut waiting);
+        assert_eq!(waiting.len(), 1, "still not valid: it keeps waiting");
+        assert_eq!(resolved_refs(&scope, &shop, "tls").status, "False");
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        recheck_not_valid_yet(&scope, &mut waiting);
+        assert!(waiting.is_empty());
+        assert_eq!(resolved_refs(&scope, &shop, "tls").status, "True");
+    }
+
+    /// A Secret deleted while another watcher waited on it stays deleted.
+    #[test]
+    fn a_waiting_certificate_does_not_bring_a_deleted_secret_back() {
+        use super::super::gateway_tls::{recheck_not_valid_yet, tests};
+
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut shop = gateway("default", "shop", "sozune");
+        shop.spec.listeners = vec![https_listener("tls", None, "shop-tls")];
+        scope.upsert_gateway(&shop);
+
+        let (cert, key_pem) = tests::self_signed(&["shop.example.com"]);
+        let secret = tests::tls_secret("default", "shop-tls", &cert, &key_pem);
+        let key = ("default".to_string(), "shop-tls".to_string());
+        let mut waiting = HashMap::from([(key, secret)]);
+
+        recheck_not_valid_yet(&scope, &mut waiting);
+
+        assert!(waiting.is_empty());
+        assert_eq!(resolved_refs(&scope, &shop, "tls").status, "False");
     }
 
     fn resolved_refs(scope: &GatewayScope, gw: &Gateway, listener: &str) -> Condition {

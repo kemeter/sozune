@@ -76,6 +76,10 @@ fn read(path: &str, field: &str) -> anyhow::Result<String> {
         .with_context(|| format!("could not read {field} `{path}` in proxy.https.tls.certificates"))
 }
 
+/// Why [`check`] refuses a certificate whose validity has not started: the
+/// one refusal that time alone can lift.
+pub(crate) const NOT_VALID_YET: &str = "the certificate is not valid yet";
+
 /// Check that the certificate parses, is not expired, names at least one host
 /// and matches the key. Returns the names it covers.
 pub(crate) fn check(cert_chain_pem: &str, key_pem: &str) -> anyhow::Result<Vec<String>> {
@@ -91,7 +95,7 @@ pub(crate) fn check(cert_chain_pem: &str, key_pem: &str) -> anyhow::Result<Vec<S
         anyhow::bail!("the certificate has expired");
     }
     if life.not_before > now {
-        anyhow::bail!("the certificate is not valid yet");
+        anyhow::bail!(NOT_VALID_YET);
     }
 
     // Lowercased: Sōzu looks names up bytewise, while SNI and hostnames are

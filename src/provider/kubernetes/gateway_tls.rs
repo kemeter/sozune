@@ -9,12 +9,13 @@
 
 use super::gateway::GatewayScope;
 use crate::acme::{CertAction, CertCommand, certificate_fingerprint, split_pem_chain};
+use crate::manual_certs::NOT_VALID_YET;
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::Api;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -81,9 +82,25 @@ pub fn certificate_from_secret(secret: &Secret) -> Result<SecretCertificate, Str
     })
 }
 
-/// How often the TLS Secrets are checked for a certificate that expired
-/// since it was read, which no watch event announces.
-const EXPIRY_CHECK: Duration = Duration::from_secs(60);
+/// How often the TLS Secrets are checked for a certificate that expired or
+/// became valid since it was read, which no watch event announces.
+const VALIDITY_CHECK: Duration = Duration::from_secs(60);
+
+/// Read again the Secrets whose certificate was not valid yet, as with an
+/// issuer whose clock runs ahead: those it has become valid for leave
+/// `waiting`, and the scope gets their certificate.
+pub(super) fn recheck_not_valid_yet(
+    scope: &GatewayScope,
+    waiting: &mut HashMap<(String, String), Secret>,
+) {
+    waiting.retain(|key, secret| match certificate_from_secret(secret) {
+        Err(e) if e == NOT_VALID_YET => true,
+        certificate => {
+            scope.settle_not_valid_yet(key.clone(), certificate.map(Arc::new));
+            false
+        }
+    });
+}
 
 /// Watch the `kubernetes.io/tls` Secrets of `api` and keep the scope in sync
 /// with them. `namespace` is the one `api` is restricted to, `None` for
@@ -105,14 +122,16 @@ pub async fn run_tls_secret_watcher(
     // Reported once until the watch works again: without the RBAC to read
     // Secrets, it fails on every retry.
     let mut failing = false;
-    let mut expiry = tokio::time::interval(EXPIRY_CHECK);
+    let mut validity = tokio::time::interval(VALIDITY_CHECK);
+    let mut not_valid_yet: HashMap<(String, String), Secret> = HashMap::new();
     loop {
         let event = tokio::select! {
             event = stream.next() => match event {
                 Some(event) => event,
                 None => break,
             },
-            _ = expiry.tick() => {
+            _ = validity.tick() => {
+                recheck_not_valid_yet(&scope, &mut not_valid_yet);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -128,22 +147,28 @@ pub async fn run_tls_secret_watcher(
                 };
                 relisted.insert(key.clone());
                 let certificate = certificate_from_secret(&secret);
+                not_valid_yet.remove(&key);
                 if let Err(e) = &certificate {
                     debug!(
                         "Gateway API: TLS Secret {}/{} unusable: {}",
                         key.0, key.1, e
                     );
+                    if e == NOT_VALID_YET {
+                        not_valid_yet.insert(key.clone(), secret);
+                    }
                 }
                 scope.upsert_tls_secret(key, certificate.map(Arc::new));
             }
             Ok(Event::Delete(secret)) => {
                 if let Some(key) = secret_key(&secret) {
+                    not_valid_yet.remove(&key);
                     scope.remove_tls_secret(&key);
                 }
             }
             Ok(Event::Init) => relisted.clear(),
             Ok(Event::InitDone) => {
                 failing = false;
+                not_valid_yet.retain(|key, _| relisted.contains(key));
                 scope.retain_tls_secrets(&relisted, namespace.as_deref());
             }
             Err(e) if failing => debug!("Kubernetes: TLS Secret watcher error: {}", e),
