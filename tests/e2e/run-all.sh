@@ -482,7 +482,7 @@ services:
     command:
       - sh
       - -c
-      - "apk add --no-cache socat >/dev/null 2>&1 &&
+      - "i() { apk add --no-cache socat >/dev/null 2>&1; }; { i || { sleep 2; i; } || { sleep 5; i; }; } &&
          exec socat TCP-LISTEN:8080,fork,reuseaddr
            SYSTEM:'head -1 >&2; printf \"HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n\"'"
     labels:
@@ -741,7 +741,7 @@ services:
     command:
       - sh
       - -c
-      - "apk add --no-cache socat openssl >/dev/null 2>&1 &&
+      - "i() { apk add --no-cache socat openssl >/dev/null 2>&1; }; { i || { sleep 2; i; } || { sleep 5; i; }; } &&
          openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem
            -days 1 -nodes -subj /CN=alpha.sni.test >/dev/null 2>&1 &&
          exec socat OPENSSL-LISTEN:9000,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr
@@ -758,7 +758,7 @@ services:
     command:
       - sh
       - -c
-      - "apk add --no-cache socat openssl >/dev/null 2>&1 &&
+      - "i() { apk add --no-cache socat openssl >/dev/null 2>&1; }; { i || { sleep 2; i; } || { sleep 5; i; }; } &&
          openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem
            -days 1 -nodes -subj /CN=beta.sni.test >/dev/null 2>&1 &&
          exec socat OPENSSL-LISTEN:9000,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr
@@ -775,7 +775,7 @@ services:
     command:
       - sh
       - -c
-      - "apk add --no-cache socat openssl >/dev/null 2>&1 &&
+      - "i() { apk add --no-cache socat openssl >/dev/null 2>&1; }; { i || { sleep 2; i; } || { sleep 5; i; }; } &&
          openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem
            -days 1 -nodes -subj /CN=https.sni.test >/dev/null 2>&1 &&
          exec socat OPENSSL-LISTEN:9000,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr

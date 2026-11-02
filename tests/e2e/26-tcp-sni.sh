@@ -42,7 +42,14 @@ pass "alpha.sni.test routes to its own backend"
 
 log "[26] TCP SNI: a different name on the same port reaches a different backend"
 
-beta=$(tls_sni_probe "127.0.0.1" "$TCP_SNI_PORT" "beta.sni.test")
+# Its own backend, which boots on its own time: alpha answering says nothing
+# about it.
+beta=""
+for _ in $(seq 1 30); do
+    beta=$(tls_sni_probe "127.0.0.1" "$TCP_SNI_PORT" "beta.sni.test")
+    [[ "$beta" == *"sni-backend-beta"* ]] && break
+    sleep 1
+done
 if [[ "$beta" == *"sni-backend-beta"* ]]; then
     pass "beta.sni.test routes to its own backend on the same port"
 else
@@ -65,9 +72,7 @@ log "[26] TCP SNI: passthrough leaves TLS termination to the backend"
 
 # The cert must be the backend's own. If Sōzune were terminating, the subject
 # would be whatever the proxy serves instead.
-subject=$(timeout 5 openssl s_client -connect "127.0.0.1:$TCP_SNI_PORT" \
-    -servername "alpha.sni.test" -verify_quiet </dev/null 2>/dev/null |
-    grep -m1 "subject=" || true)
+subject=$(tls_subject_until "127.0.0.1" "$TCP_SNI_PORT" "alpha.sni.test" "alpha.sni.test")
 
 if [[ "$subject" == *"alpha.sni.test"* ]]; then
     pass "client negotiates TLS with the backend's own certificate"
