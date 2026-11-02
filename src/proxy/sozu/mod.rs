@@ -44,6 +44,7 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 /// Map Sōzune's [`LoadBalancer`](crate::model::LoadBalancer) to the Sōzu
@@ -182,6 +183,8 @@ struct Channels {
     http: Channel<WorkerRequest, WorkerResponse>,
     https: Channel<WorkerRequest, WorkerResponse>,
     tcp: L4Channels,
+    /// Whether a route serves each static TCP listener, for its forwarder.
+    tcp_routed: HashMap<String, watch::Sender<bool>>,
     udp: L4Channels,
     http_port: u16,
     https_port: u16,
@@ -235,6 +238,38 @@ struct TcpForwarderSpec {
     loopback_port: u16,
     allow_list: Vec<String>,
     rate_limit: Option<TcpRateLimit>,
+    /// Whether a route serves this listener: without one, its worker can only
+    /// refuse the connection.
+    routed: watch::Receiver<bool>,
+    /// How long connections wait in the backlog for a first route.
+    startup_hold: Duration,
+}
+
+/// How long a static TCP listener holds its first connections while the
+/// providers discover its route, rather than refuse them.
+const TCP_STARTUP_HOLD: Duration = Duration::from_secs(10);
+
+/// A forwarder's route state when its route precedes it, as on a Gateway port.
+fn always_routed() -> watch::Receiver<bool> {
+    watch::channel(true).1
+}
+
+/// Tell the static TCP listeners no route of `wanted` asks for that they have
+/// none, once the departing routes are off them. Only `wanted` can say so: the
+/// snapshot a failed reload hands back leaves out routes Sōzu still serves, and
+/// a listener wrongly marked would close the connections they should get.
+fn retire_unrouted_listeners(
+    routed: &HashMap<String, watch::Sender<bool>>,
+    wanted: &RoutingSnapshot,
+) {
+    for (name, sender) in routed {
+        let served = wanted.values().any(|ep| {
+            ep.protocol == Protocol::Tcp && ep.config.entrypoint.as_deref() == Some(name)
+        });
+        if !served {
+            sender.send_if_modified(|current| std::mem::replace(current, false));
+        }
+    }
 }
 
 /// Grab a free loopback port by binding `127.0.0.1:0` and reading the assigned
@@ -282,6 +317,11 @@ async fn serve_tcp_forwarder(spec: TcpForwarderSpec, listener: &TcpListener) {
     );
     let loopback = (Ipv4Addr::LOCALHOST, spec.loopback_port);
 
+    // The port is bound, so clients connect and wait in the backlog.
+    let mut routed = spec.routed;
+    let _ = tokio::time::timeout(spec.startup_hold, routed.wait_for(|served| *served)).await;
+    let mut warned_unrouted = false;
+
     loop {
         let (inbound, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -312,6 +352,22 @@ async fn serve_tcp_forwarder(spec: TcpForwarderSpec, listener: &TcpListener) {
                 spec.name,
                 peer.ip()
             );
+            continue;
+        }
+        // Closed here rather than by the worker, which logs an error per
+        // connection for a listener with no route. Warned once per time it
+        // loses its route.
+        if routed.has_changed().unwrap_or(false) {
+            warned_unrouted = false;
+        }
+        if !*routed.borrow_and_update() {
+            if !warned_unrouted {
+                warn!(
+                    "TCP listener `{}` has no route: closing its connections until it gets one",
+                    spec.name
+                );
+                warned_unrouted = true;
+            }
             continue;
         }
         let name = spec.name.clone();
@@ -465,6 +521,8 @@ fn spawn_tcp_worker(
             loopback_port,
             allow_list: tcp_cfg.ip_allow_list.clone(),
             rate_limit: tcp_cfg.rate_limit.clone(),
+            routed: always_routed(),
+            startup_hold: Duration::ZERO,
         },
     ))
 }
@@ -725,7 +783,14 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     wait_for_worker_ready(&mut command_channel_https, "HTTPS", timeout)?;
 
     // Spawn one Sōzu TCP worker per declared listener.
-    let (mut tcp_channels, mut tcp_worker_handles, tcp_forwarders) = spawn_tcp_workers(config)?;
+    let (mut tcp_channels, mut tcp_worker_handles, mut tcp_forwarders) = spawn_tcp_workers(config)?;
+    let mut tcp_routed = HashMap::new();
+    for spec in &mut tcp_forwarders {
+        let (sender, receiver) = watch::channel(false);
+        spec.routed = receiver;
+        spec.startup_hold = TCP_STARTUP_HOLD;
+        tcp_routed.insert(spec.name.clone(), sender);
+    }
     // The passthrough routes of the HTTPS port: a TCP listener the gate
     // splices to, with no public port of its own.
     let passthrough = if config.https.passthrough {
@@ -830,6 +895,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         http: command_channel,
         https: command_channel_https,
         tcp: tcp_channels,
+        tcp_routed,
         udp: udp_channels,
         http_port,
         https_port,
@@ -1307,6 +1373,7 @@ fn handle_reload(
     // only a genuinely unresponsive worker trips the short-circuit.
     with_reload_budget(|| {
         let departed = apply_routing_diff(previous_snapshot, &current_snapshot, channels);
+        retire_unrouted_listeners(&channels.tcp_routed, &current_snapshot);
         // Once the departed routes are off them, and before any route is
         // installed: the listeners no route wants let their ports go, so one
         // of another protocol can take them.
@@ -1993,6 +2060,17 @@ fn configure_sozu_routing(
             }
             Protocol::Tcp => {
                 let outcome = configure_tcp_entrypoint(&mut channels.tcp, cluster_id, entrypoint);
+                // Usable now: a long reload must not keep its first connections
+                // waiting past the listener's hold.
+                if outcome == FrontendOutcome::Installed
+                    && let Some(routed) = entrypoint
+                        .config
+                        .entrypoint
+                        .as_deref()
+                        .and_then(|name| channels.tcp_routed.get(name))
+                {
+                    routed.send_if_modified(|served| !std::mem::replace(served, true));
+                }
                 note_frontend_outcome(cluster_id, outcome, &mut skipped);
             }
             Protocol::Udp => {
@@ -6164,12 +6242,88 @@ mod tests {
         Some(buf)
     }
 
+    fn unrouted_spec(
+        public_port: u16,
+        backend_port: u16,
+        startup_hold: Duration,
+    ) -> (TcpForwarderSpec, watch::Sender<bool>) {
+        let (sender, routed) = watch::channel(false);
+        let spec = TcpForwarderSpec {
+            name: "test".into(),
+            public_port,
+            loopback_port: backend_port,
+            allow_list: Vec::new(),
+            rate_limit: None,
+            routed,
+            startup_hold,
+        };
+        (spec, sender)
+    }
+
+    /// A listener loses its route only once none of the wanted routes asks
+    /// for it, whatever a failed reload left out of its snapshot.
+    #[test]
+    fn a_listener_is_retired_only_when_no_route_wants_it() {
+        let (sender, routed) = watch::channel(true);
+        let listeners = HashMap::from([("pg".to_string(), sender)]);
+
+        let wanted =
+            RoutingSnapshot::from([("db".to_string(), super::tests::tcp_ep("db", "pg", None))]);
+        retire_unrouted_listeners(&listeners, &wanted);
+        assert!(*routed.borrow(), "still wanted: it keeps its route");
+
+        let other = RoutingSnapshot::from([(
+            "other".to_string(),
+            super::tests::tcp_ep("other", "redis", None),
+        )]);
+        retire_unrouted_listeners(&listeners, &other);
+        assert!(!*routed.borrow());
+    }
+
+    /// A connection made while the route is being discovered waits for it,
+    /// and gets through.
+    #[tokio::test]
+    async fn forwarder_holds_connections_until_a_route_arrives() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        let (spec, routed) = unrouted_spec(public_port, backend_port, Duration::from_secs(30));
+        tokio::spawn(run_tcp_forwarder(spec));
+        sleep(Duration::from_millis(100)).await;
+
+        let client = tokio::spawn(try_connect_and_echo(public_port, b"held"));
+        sleep(Duration::from_millis(200)).await;
+        assert!(!client.is_finished(), "held until the route arrives");
+
+        routed.send_replace(true);
+        let echoed = client.await.unwrap();
+        assert_eq!(echoed.as_deref(), Some(&b"held"[..]));
+    }
+
+    /// After the hold, a listener with no route closes its connections, until
+    /// it gets one.
+    #[tokio::test]
+    async fn forwarder_closes_connections_without_a_route() {
+        let backend_port = spawn_echo_backend().await;
+        let public_port = pick_loopback_port().unwrap();
+        let (spec, routed) = unrouted_spec(public_port, backend_port, Duration::ZERO);
+        tokio::spawn(run_tcp_forwarder(spec));
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(try_connect_and_echo(public_port, b"refused").await, None);
+
+        routed.send_replace(true);
+        let echoed = try_connect_and_echo(public_port, b"served").await;
+        assert_eq!(echoed.as_deref(), Some(&b"served"[..]));
+    }
+
     #[tokio::test]
     async fn forwarder_passes_allowed_peer_through_to_backend() {
         let backend_port = spawn_echo_backend().await;
         let public_port = pick_loopback_port().unwrap();
         tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
             name: "test".into(),
+            routed: always_routed(),
+            startup_hold: Duration::ZERO,
             public_port,
             loopback_port: backend_port,
             // 127.0.0.1 is allowed (the test client connects from loopback).
@@ -6189,6 +6343,8 @@ mod tests {
         let public_port = pick_loopback_port().unwrap();
         tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
             name: "test".into(),
+            routed: always_routed(),
+            startup_hold: Duration::ZERO,
             public_port,
             loopback_port: backend_port,
             // Only a foreign IP is allowed, so the loopback test client is denied.
@@ -6209,6 +6365,8 @@ mod tests {
         let public_port = pick_loopback_port().unwrap();
         tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
             name: "test".into(),
+            routed: always_routed(),
+            startup_hold: Duration::ZERO,
             public_port,
             loopback_port: backend_port,
             allow_list: Vec::new(), // empty = allow all
@@ -6227,6 +6385,8 @@ mod tests {
         // Burst of 2, slow refill: the 3rd rapid connection is dropped.
         tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
             name: "test".into(),
+            routed: always_routed(),
+            startup_hold: Duration::ZERO,
             public_port,
             loopback_port: backend_port,
             allow_list: Vec::new(),
@@ -6255,6 +6415,8 @@ mod tests {
         // Same tight limit, but loopback is exempt → never throttled.
         tokio::spawn(run_tcp_forwarder(TcpForwarderSpec {
             name: "test".into(),
+            routed: always_routed(),
+            startup_hold: Duration::ZERO,
             public_port,
             loopback_port: backend_port,
             allow_list: Vec::new(),

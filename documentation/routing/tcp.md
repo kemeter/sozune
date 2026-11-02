@@ -54,6 +54,8 @@ services:
 | `sozune.tcp.<svc>.priority` | On a listener without SNI routes, which catch-all route serves it: the highest. See [One route per listener](#one-route-per-listener). (since 0.16) |
 | `sozune.tcp.<svc>.sni` | Route TLS connections to this backend by the name in the ClientHello, without terminating TLS. Absent (default) = the listener forwards everything to one backend. See [Route by SNI](#route-by-sni-tls-passthrough). (since 0.15) |
 
+A listener's port opens at startup, and its first connections wait up to 10 seconds for the providers to discover a route. After that, a listener with no route closes its connections, and logs one warning until it gets a route (since 0.16).
+
 The container's IP is resolved through the same network rules as HTTP — see [Docker labels](/documentation/providers/docker) and `sozune.network` to pick a network when the container is on several.
 
 ### One route per listener
