@@ -76,7 +76,7 @@ services:
 
 The files in `live/` are symlinks into `../../archive/`. Mounting `live/` alone leaves them dangling, and Sōzune refuses to start because it cannot read them.
 
-The image reads `config.yaml` from its working directory unless `CONFIG_PATH` names another path: without it, the file mounted at `/etc/sozune/config.yaml` is ignored.
+Images before 0.16 read `config.yaml` from their working directory unless `CONFIG_PATH` names another path: without it, the file mounted at `/etc/sozune/config.yaml` is ignored.
 
 Certbot creates `privkey.pem` readable by root only, while the image runs as the unprivileged `nonroot` user (UID `65532`). `user: "0:0"` runs it as root so it can read the key (and the Docker socket). To keep `nonroot`, give UID `65532` read access to the key instead, and restore it after each renewal from the hook below, since certbot writes a new key every time; it then also needs the host's `docker` group (`group_add`, see [Installation](/documentation/getting-started/installation)) to read the Docker socket.
 

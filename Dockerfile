@@ -36,6 +36,7 @@ LABEL org.opencontainers.image.source="https://github.com/kemeter/sozune" \
       org.opencontainers.image.description="Reverse proxy built on Sōzu" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=builder /sozune /sozune
+ENV CONFIG_PATH=/etc/sozune/config.yaml
 
 EXPOSE 80 443
 ENTRYPOINT ["/sozune"]
