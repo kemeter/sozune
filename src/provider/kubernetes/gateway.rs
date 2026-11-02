@@ -529,6 +529,9 @@ pub struct GatewayScope {
     /// Woken when the certificates the accepted Gateways reference may have
     /// changed, for the task handing them to the HTTPS worker.
     certificates: Arc<Notify>,
+    /// Woken when a status write found its queue full and was lost: the
+    /// writer then rewrites every status.
+    status_overflow: Arc<Notify>,
 }
 
 impl GatewayScope {
@@ -605,13 +608,13 @@ impl GatewayScope {
                 }
             }
         }
-        Self::store_attachments(&mut g, (kind, uid.to_string()), attached);
+        self.store_attachments(&mut g, (kind, uid.to_string()), attached);
     }
 
     /// Forget the listeners a deleted route was attached to.
     pub fn forget_attachments(&self, kind: &'static str, uid: &str) {
         match self.state.write() {
-            Ok(mut g) => Self::store_attachments(&mut g, (kind, uid.to_string()), Vec::new()),
+            Ok(mut g) => self.store_attachments(&mut g, (kind, uid.to_string()), Vec::new()),
             Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
         }
     }
@@ -633,11 +636,12 @@ impl GatewayScope {
             .map(|(_, uid)| uid.clone())
             .collect();
         for uid in stale {
-            Self::store_attachments(&mut g, (kind, uid), Vec::new());
+            self.store_attachments(&mut g, (kind, uid), Vec::new());
         }
     }
 
     fn store_attachments(
+        &self,
         g: &mut ScopeState,
         route: (&'static str, String),
         attached: Vec<ListenerKey>,
@@ -663,6 +667,7 @@ impl GatewayScope {
             {
                 queue_status_write(
                     g.status_tx.as_ref(),
+                    &self.status_overflow,
                     StatusWrite::Gateway(Box::new(gateway.clone())),
                 );
             }
@@ -837,6 +842,7 @@ impl GatewayScope {
             {
                 queue_status_write(
                     g.status_tx.as_ref(),
+                    &self.status_overflow,
                     StatusWrite::Gateway(Box::new(gateway.clone())),
                 );
             }
@@ -1926,6 +1932,7 @@ impl GatewayScope {
             if g.gateways.contains_key(key) && references_secret_in(gateway, &ns) {
                 queue_status_write(
                     g.status_tx.as_ref(),
+                    &self.status_overflow,
                     StatusWrite::Gateway(Box::new(gateway.clone())),
                 );
             }
@@ -1966,6 +1973,24 @@ impl GatewayScope {
                 return;
             }
         }
+    }
+
+    /// The Gateways and the GatewayClasses Sōzune writes the status of.
+    fn owned_for_status(&self) -> (Vec<Gateway>, Vec<String>) {
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return (Vec::new(), Vec::new());
+            }
+        };
+        let gateways = g
+            .gateway_objects
+            .iter()
+            .filter(|(key, _)| g.gateways.contains_key(*key))
+            .map(|(_, gateway)| gateway.clone())
+            .collect();
+        (gateways, g.gateway_classes.iter().cloned().collect())
     }
 
     /// Write the status of Gateway `ns/name` again after a while, as it is
@@ -2095,6 +2120,7 @@ impl GatewayScope {
         for gateway in selecting {
             queue_status_write(
                 g.status_tx.as_ref(),
+                &self.status_overflow,
                 StatusWrite::Gateway(Box::new(gateway)),
             );
         }
@@ -2142,6 +2168,7 @@ impl GatewayScope {
             for gateway in g.gateway_objects.values() {
                 queue_status_write(
                     g.status_tx.as_ref(),
+                    &self.status_overflow,
                     StatusWrite::Gateway(Box::new(gateway.clone())),
                 );
             }
@@ -2704,6 +2731,7 @@ pub async fn run_gatewayclass_watcher(
                 if accepted {
                     queue_status_write(
                         Some(&status_tx),
+                        &scope.status_overflow,
                         StatusWrite::GatewayClass(Box::new(class.clone())),
                     );
                 }
@@ -2753,7 +2781,11 @@ async fn reconcile_gateways_for_class(
             );
         }
         if scope.owns_gateway_class(&gw.spec.gateway_class_name) {
-            queue_status_write(Some(status_tx), StatusWrite::Gateway(Box::new(gw)));
+            queue_status_write(
+                Some(status_tx),
+                &scope.status_overflow,
+                StatusWrite::Gateway(Box::new(gw)),
+            );
         }
     }
 }
@@ -2922,7 +2954,11 @@ pub async fn run_gateway_watcher(
                 // is left untouched. The status reflects the current
                 // ownership decision, not whether the set changed here.
                 if scope.owns_gateway_class(&class) {
-                    queue_status_write(Some(&status_tx), StatusWrite::Gateway(Box::new(gw)));
+                    queue_status_write(
+                        Some(&status_tx),
+                        &scope.status_overflow,
+                        StatusWrite::Gateway(Box::new(gw)),
+                    );
                 }
             }
             Ok(Event::Delete(gw)) => {
@@ -3790,25 +3826,52 @@ pub async fn run_gateway_status_writer(
     mut rx: mpsc::Receiver<StatusWrite>,
 ) {
     info!("Gateway API: Gateway/GatewayClass status writer started");
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            StatusWrite::Gateway(gw) => patch_gateway_status(&client, &scope, &gw).await,
-            StatusWrite::GatewayClass(class) => {
-                patch_gatewayclass_status(&client, &scope, &class).await
-            }
+    let overflow = scope.status_overflow.clone();
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(StatusWrite::Gateway(gw)) => {
+                    patch_gateway_status(&client, &scope, &gw).await
+                }
+                Some(StatusWrite::GatewayClass(class)) => {
+                    patch_gatewayclass_status(&client, &scope, &class).await
+                }
+                None => break,
+            },
+            () = overflow.notified() => rewrite_all_statuses(&client, &scope).await,
         }
     }
     info!("Gateway API: Gateway/GatewayClass status writer stopped");
 }
 
-/// Best-effort hand-off of a status write to the writer task. Never blocks
-/// the caller: a full or closed channel just drops the write (status is
-/// observability, not routing), and the next event re-attempts it.
-fn queue_status_write(tx: Option<&mpsc::Sender<StatusWrite>>, msg: StatusWrite) {
-    if let Some(tx) = tx
-        && let Err(e) = tx.try_send(msg)
-    {
-        debug!("Gateway API: status channel full or closed: {}", e);
+/// Hand a status write to the writer task. Never blocks the caller, which may
+/// hold the scope lock. A full queue loses the write, but `overflow` has the
+/// writer rewrite every status: no later event may bring this one back.
+fn queue_status_write(tx: Option<&mpsc::Sender<StatusWrite>>, overflow: &Notify, msg: StatusWrite) {
+    let Some(tx) = tx else {
+        return;
+    };
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!("Gateway API: status queue full, rewriting every status");
+            overflow.notify_one();
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!("Gateway API: status queue closed");
+        }
+    }
+}
+
+/// Rewrite the status of everything Sōzune owns, as it is now: unchanged ones
+/// cost no write. What a full queue lost is then back.
+async fn rewrite_all_statuses(client: &Client, scope: &GatewayScope) {
+    let (gateways, classes) = scope.owned_for_status();
+    for gateway in gateways {
+        patch_gateway_status(client, scope, &gateway).await;
+    }
+    for class in classes {
+        scope.retry_gatewayclass_status(client.clone(), class);
     }
 }
 
@@ -10792,6 +10855,51 @@ mod tests {
         let fingerprint = certificate.fingerprint.clone();
         scope.upsert_tls_secret((ns.into(), name.into()), Ok(Arc::new(certificate)));
         fingerprint
+    }
+
+    /// A status write lost to a full queue is written all the same.
+    #[tokio::test]
+    async fn a_status_lost_to_a_full_queue_is_still_written() {
+        let patched = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = patched.clone();
+        let service = tower::service_fn(move |req: hyper::Request<kube::client::Body>| {
+            seen.lock().unwrap().push(req.uri().path().to_string());
+            // Answered "gone": the writer has nothing more to do about it.
+            let status = br#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"gone","reason":"NotFound","code":404}"#;
+            std::future::ready(Ok::<_, std::convert::Infallible>(
+                hyper::Response::builder()
+                    .status(404)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(status.to_vec()))
+                    .unwrap(),
+            ))
+        });
+        let client = Client::new(service, "default");
+
+        let scope = GatewayScope::new();
+        let (tx, rx) = mpsc::channel(1);
+        scope.configure_status(served(), tx.clone());
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        for name in ["shop", "blog"] {
+            let gw = gateway("default", name, "sozune");
+            scope.upsert_gateway(&gw);
+            queue_status_write(
+                Some(&tx),
+                &scope.status_overflow,
+                StatusWrite::Gateway(Box::new(gw)),
+            );
+        }
+
+        let writer = tokio::spawn(run_gateway_status_writer(client, scope.clone(), rx));
+        let blog = "/apis/gateway.networking.k8s.io/v1/namespaces/default/gateways/blog/status";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !patched.lock().unwrap().iter().any(|path| path == blog) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the status lost to the full queue is written");
+        writer.abort();
     }
 
     /// A certificate not valid yet is used once it is, with no Secret event
