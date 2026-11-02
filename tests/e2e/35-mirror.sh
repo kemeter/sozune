@@ -17,8 +17,10 @@ fi
 
 copied=""
 for _ in $(seq 1 "$MAX_RETRIES"); do
-    if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" logs svc-mirror-shadow 2>/dev/null \
-        | grep -q "GET /$marker"; then
+    # Captured first: under `pipefail`, `grep -q` quitting early would fail
+    # the pipeline when `docker compose logs` is still writing.
+    shadow_logs=$(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" logs svc-mirror-shadow 2>/dev/null || true)
+    if grep -q "GET /$marker" <<<"$shadow_logs"; then
         copied="yes"
         break
     fi
