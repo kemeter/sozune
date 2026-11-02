@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Upgrade notes
 
+- The Docker image now sets `CONFIG_PATH=/etc/sozune/config.yaml`, so a file mounted there is read without any further setting. A file mounted at `/home/nonroot/config.yaml` is no longer read: move it, or set `CONFIG_PATH` to its path.
 - A Gateway listener's `allowedRoutes` is now enforced. By default a listener only admits routes from the Gateway's own namespace, so a route in another namespace that names the Gateway is no longer served: set `allowedRoutes.namespaces.from: All` on the listeners it should attach to, or `from: Selector` with a selector its namespace's labels match. See [Which routes a listener admits](documentation/providers/kubernetes.md#which-routes-a-listener-admits-allowedroutes).
 
 ### Routing

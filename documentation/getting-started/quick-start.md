@@ -26,7 +26,7 @@ services:
       - "sozune.http.whoami.host=whoami.localhost"
 ```
 
-The image runs as a non-root user: `group_add` lets it open the Docker socket, and `CONFIG_PATH` points it at the mounted file, which it would otherwise not read. See [Running as non-root](/documentation/getting-started/installation#running-as-non-root).
+The image runs as a non-root user: `group_add` lets it open the Docker socket, and `CONFIG_PATH` points it at the mounted file, which images before 0.16 would otherwise not read. See [Running as non-root](/documentation/getting-started/installation#running-as-non-root).
 
 ## 2. Sōzune config
 

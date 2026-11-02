@@ -13,7 +13,7 @@ docker run -d \
   ghcr.io/kemeter/sozune:latest
 ```
 
-The image does not set `CONFIG_PATH`: without it, Sōzune looks for `config.yaml` in its working directory (`/home/nonroot`), ignores the mounted file and starts with the default configuration. `--group-add` gives it the host's `docker` group, needed to open the Docker socket (see [Running as non-root](#running-as-non-root)).
+Images since 0.16 set `CONFIG_PATH` to this path. Earlier ones need the variable: without it, Sōzune looks for `config.yaml` in its working directory (`/home/nonroot`), ignores the mounted file and starts with the default configuration. `--group-add` gives it the host's `docker` group, needed to open the Docker socket (see [Running as non-root](#running-as-non-root)).
 
 ### Image tags
 

@@ -1,6 +1,6 @@
 # Configuration overview
 
-Sōzune reads its main configuration from a YAML file. Path: `config.yaml` in the working directory by default, overridable through the `CONFIG_PATH` environment variable or the `--config` flag (since 0.12), which wins over it.
+Sōzune reads its main configuration from a YAML file. Path: `config.yaml` in the working directory by default, `/etc/sozune/config.yaml` in the Docker image (since 0.16), overridable through the `CONFIG_PATH` environment variable or the `--config` flag (since 0.12), which wins over it.
 
 If the file is missing, Sōzune falls back to a built-in default configuration (everything disabled, both listeners on default ports).
 
@@ -292,7 +292,7 @@ These have no YAML counterpart:
 
 | Env var | Effect |
 |---|---|
-| `CONFIG_PATH` | Path to the YAML config file (default: `config.yaml`). `--config` wins over it. |
+| `CONFIG_PATH` | Path to the YAML config file (default: `config.yaml`, `/etc/sozune/config.yaml` in the Docker image). `--config` wins over it. |
 | `SOZUNE_DEBUG` | When on (`true`, `1`, `yes` or `on`), routing failures (`502`) include a body listing configured hosts/backends and a did-you-mean suggestion. Off by default to avoid leaking topology. See [Debugging](/documentation/advanced/debugging). (since 0.12) |
 | `RUST_LOG` | Log verbosity filter. See [Configuring log verbosity](/documentation/advanced/access-logs#configuring-log-verbosity). |
 | `SOZUNE_API_USER` / `SOZUNE_API_PASSWORD` | Credentials `sozune route` uses to call the API. See [Debugging](/documentation/advanced/debugging). (since 0.15) |
