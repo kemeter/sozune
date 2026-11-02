@@ -13,7 +13,7 @@ const CAPABILITIES: Capability[] = [
     tag: 'follow',
     title: 'Live route updates',
     description:
-      'Sōzune follows each platform, through its events or by polling, and applies every change to the running Sōzu workers. A deploy, a scale or a stopped container reroutes traffic without restarting the proxy.',
+      'Sōzune follows each platform, through its events or by polling, and applies every change while it runs. A deploy, a scale or a stopped container reroutes traffic without restarting the proxy.',
   },
   {
     tag: 'secure',

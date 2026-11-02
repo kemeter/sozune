@@ -4,7 +4,7 @@ import PlatformShowcase from '@/components/PlatformShowcase';
 import FeatureSection from '@/components/FeatureSection';
 
 const description =
-  'A reverse proxy built on Sōzu. Declare routes alongside your services on Docker, Podman, Swarm, Kubernetes, Nomad, Consul or Ring: Sōzune discovers their backends, updates routing as they change, and can manage HTTPS certificates with ACME.';
+  'Declare routes alongside your services on Docker, Podman, Swarm, Kubernetes, Nomad, Consul or Ring: Sōzune discovers their backends, updates routing as they change, and can manage HTTPS certificates with ACME.';
 
 export const meta = {
   title: 'Sōzune — Routes that follow your services',
