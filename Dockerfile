@@ -3,6 +3,7 @@
 FROM oven/bun:1-debian AS dashboard
 WORKDIR /dashboard
 COPY dashboard/package.json dashboard/bun.lock ./
+COPY dashboard/patches ./patches
 RUN bun install --frozen-lockfile
 COPY dashboard/ ./
 RUN bun run build
