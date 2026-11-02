@@ -57,9 +57,14 @@ fi
 log "[03] TLSRoute: the backend owns the certificate (no termination)"
 
 # If Sōzune were terminating, the subject would be whatever it serves instead.
-subject=$(timeout 5 openssl s_client -connect "127.0.0.1:$TLS_PASSTHROUGH_PORT" \
-    -servername "$TLS_HOST" -verify_quiet </dev/null 2>/dev/null |
-    grep -m1 "subject=" || true)
+subject=""
+for _ in $(seq 1 15); do
+    subject=$(timeout 5 openssl s_client -connect "127.0.0.1:$TLS_PASSTHROUGH_PORT" \
+        -servername "$TLS_HOST" -verify_quiet </dev/null 2>/dev/null |
+        grep -m1 "subject=" || true)
+    [[ "$subject" == *"$TLS_HOST"* ]] && break
+    sleep 2
+done
 
 if [[ "$subject" == *"$TLS_HOST"* ]]; then
     pass "client negotiates TLS with the backend's own certificate"

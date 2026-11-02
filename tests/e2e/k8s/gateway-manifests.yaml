@@ -202,7 +202,8 @@ data:
   run.sh: |
     #!/bin/sh
     set -e
-    apk add --no-cache socat openssl >/dev/null 2>&1
+    i() { apk add --no-cache socat openssl >/dev/null 2>&1; }
+    i || { sleep 2; i; } || { sleep 5; i; }
     openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem \
       -days 1 -nodes -subj "/CN=passthrough.k8s-test.localhost" >/dev/null 2>&1
     exec socat OPENSSL-LISTEN:8443,cert=/tmp/c.pem,key=/tmp/k.pem,verify=0,fork,reuseaddr \

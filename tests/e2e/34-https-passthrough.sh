@@ -24,9 +24,7 @@ else
     fail "https.sni.test did not reach its backend on the HTTPS port (got: '$reply')"
 fi
 
-subject=$(timeout 5 openssl s_client -connect "127.0.0.1:$HTTPS_PORT" \
-    -servername "https.sni.test" -verify_quiet </dev/null 2>/dev/null |
-    grep -m1 "subject=" || true)
+subject=$(tls_subject_until "127.0.0.1" "$HTTPS_PORT" "https.sni.test" "https.sni.test")
 if [[ "$subject" == *"https.sni.test"* ]]; then
     pass "the backend presents its own certificate"
 else

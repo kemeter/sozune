@@ -141,6 +141,21 @@ tls_sni_probe() {
         -quiet -verify_quiet </dev/null 2>/dev/null || true
 }
 
+# The certificate subject the server at host:port presents for servername,
+# tried until it names `expected` or the attempts run out: the backend may
+# still be starting.
+tls_subject_until() {
+    local host="$1" port="$2" servername="$3" expected="$4" subject=""
+    for _ in $(seq 1 30); do
+        subject=$(timeout 5 openssl s_client -connect "$host:$port" \
+            -servername "$servername" -verify_quiet </dev/null 2>/dev/null |
+            grep -m1 "subject=" || true)
+        [[ "$subject" == *"$expected"* ]] && break
+        sleep 1
+    done
+    printf '%s' "$subject"
+}
+
 # Send a UDP datagram and capture the reply. `nc -u -w 2` waits up to 2s for the
 # backend's echo to come back through Sōzune's UDP flow before closing.
 udp_send() {
