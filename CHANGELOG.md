@@ -48,6 +48,7 @@ All notable changes to this project will be documented in this file.
 
 - HTTPRoute host rewrite — a `urlRewrite` `hostname` is now applied by Sōzu, so such a rule no longer goes through the middleware. The backend still gets a single `Host` header, the client's going in `X-Forwarded-Host`. See [urlRewrite](documentation/providers/kubernetes.md#urlrewrite).
 - HTTPRoute path regular expressions — a `RegularExpression` path match is now served: the regex must match the whole path, the query left out, as Gateway API asks. Such a route used to be dropped. One that does not compile still drops the route. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
+- Cleartext HTTP/2 — `proxy.http.h2c: true` also serves HTTP/2 on the HTTP port to clients that open with its preface (prior knowledge), such as gRPC clients, next to HTTP/1.x. Off by default. `GET /config` shows it. See [Configuration](documentation/configuration/overview.md).
 
 ### Reliability
 

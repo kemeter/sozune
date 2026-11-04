@@ -97,6 +97,8 @@ api:
 proxy:
   http:
     listen_address: $HTTP_PORT
+    # Cleartext HTTP/2 with prior knowledge next to HTTP/1.x (38-h2c.sh).
+    h2c: true
     error_pages:
       "404": "<html><body><h1>sozune custom 404</h1></body></html>"
   https:

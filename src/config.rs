@@ -709,7 +709,16 @@ pub struct HttpConfig {
         deserialize_with = "crate::error_pages::deserialize_error_pages"
     )]
     pub error_pages: BTreeMap<String, String>,
+    /// Serve HTTP/2 in cleartext to clients that open with its preface
+    /// (prior knowledge), such as gRPC clients, alongside HTTP/1.x. Off by
+    /// default. Needs `buffer_size` of at least [`H2_MIN_BUFFER_SIZE`].
+    #[serde(default)]
+    pub h2c: bool,
 }
+
+/// The least buffer HTTP/2 needs: a frame of up to 16 384 bytes and its
+/// 9-byte header.
+pub const H2_MIN_BUFFER_SIZE: usize = 16_393;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct HttpsConfig {
@@ -1247,6 +1256,7 @@ impl Default for HttpConfig {
         Self {
             listen_address: default_http_port(),
             error_pages: BTreeMap::new(),
+            h2c: false,
         }
     }
 }
@@ -2802,6 +2812,21 @@ enabled: true
         assert!(!config.expose_by_default);
         assert!(config.network.is_empty());
         assert_eq!(config.refresh_interval, 15);
+    }
+
+    #[test]
+    fn h2c_is_off_unless_asked_for() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config: ProxyConfig =
+            serde_yaml::from_str("http:\n  listen_address: 9080\nhttps:\n  listen_address: 9443\n")
+                .unwrap();
+        assert!(!config.http.h2c);
+        let config: ProxyConfig = serde_yaml::from_str(
+            "http:\n  listen_address: 9080\n  h2c: true\nhttps:\n  listen_address: 9443\n",
+        )
+        .unwrap();
+        assert!(config.http.h2c);
+        assert!(config.buffer_size >= H2_MIN_BUFFER_SIZE);
     }
 
     #[test]
