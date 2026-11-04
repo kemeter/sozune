@@ -345,6 +345,9 @@ pub struct ScopeState {
     /// The listeners each route attaches to, keyed by route kind and uid:
     /// what `attachedRoutes` counts on a listener's status.
     attachments: HashMap<(&'static str, String), Vec<ListenerKey>>,
+    /// The age and hostnames of each HTTPRoute and GRPCRoute, keyed like
+    /// `attachments`: what decides between the two kinds on a listener.
+    claims: HashMap<(&'static str, String), RouteClaim>,
     /// The ports Sōzune listens on, from `config.yaml`.
     served: ServedPorts,
     /// Where Gateway status rewrites go when attachments change.
@@ -419,6 +422,16 @@ impl SecretGrant {
 /// A Gateway listener: `(namespace, gateway name, listener name)`.
 type ListenerKey = (String, String, String);
 
+/// What decides between an HTTPRoute and a GRPCRoute attached to one
+/// listener with a hostname in common (see
+/// [`GatewayScope::loses_kind_conflict`]).
+#[derive(Clone, Debug)]
+struct RouteClaim {
+    /// Creation time, then namespace and name: the lowest is served.
+    age: (Option<k8s_openapi::jiff::Timestamp>, String, String),
+    hostnames: Vec<String>,
+}
+
 /// The ports Sōzune can serve a Gateway listener on, from `config.yaml`: the
 /// ones it binds at startup, and those a Gateway may open (`gateway_ports`).
 #[derive(Clone, Debug, Default)]
@@ -430,6 +443,9 @@ pub struct ServedPorts {
     /// Whether a `TLS` listener on the HTTPS port is served, by its
     /// passthrough listener (`proxy.https.passthrough`).
     pub https_passthrough: bool,
+    /// Whether the HTTP listeners serve HTTP/2 in cleartext
+    /// (`proxy.http.h2c`), which a GRPCRoute needs on a plain `HTTP` listener.
+    pub h2c: bool,
     pub gateway: crate::config::GatewayPortsConfig,
     /// The ports of `gateway` Sōzune could not open, as the proxy reported.
     pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
@@ -443,6 +459,7 @@ impl ServedPorts {
             tcp: proxy.tcp.iter().map(|l| l.listen).collect(),
             udp: proxy.udp.iter().map(|l| l.listen).collect(),
             https_passthrough: proxy.https.passthrough,
+            h2c: proxy.http.h2c,
             gateway: proxy.gateway_ports.clone(),
             unopened: Default::default(),
         }
@@ -613,6 +630,59 @@ impl GatewayScope {
         self.store_attachments(&mut g, (kind, uid.to_string()), attached);
     }
 
+    /// Record what decides between an HTTPRoute and a GRPCRoute (see
+    /// [`Self::loses_kind_conflict`]), after its attachments.
+    fn record_claim(&self, kind: &'static str, uid: &str, age: RouteClaim) {
+        match self.state.write() {
+            Ok(mut g) => {
+                if g.attachments.contains_key(&(kind, uid.to_string())) {
+                    g.claims.insert((kind, uid.to_string()), age);
+                } else {
+                    g.claims.remove(&(kind, uid.to_string()));
+                }
+            }
+            Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
+        }
+    }
+
+    /// Whether a route of the other kind (an HTTPRoute for a GRPCRoute, and
+    /// the reverse), older or as old and first by namespace and name, is
+    /// attached to a listener the route is attached to, with a hostname in
+    /// common: Gateway API serves only one of them.
+    fn loses_kind_conflict(&self, kind: &'static str, uid: &str) -> bool {
+        let other_kind = match kind {
+            "HTTPRoute" => "GRPCRoute",
+            "GRPCRoute" => "HTTPRoute",
+            _ => return false,
+        };
+        let g = match self.state.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                return false;
+            }
+        };
+        let key = (kind, uid.to_string());
+        let (Some(mine), Some(listeners)) = (g.claims.get(&key), g.attachments.get(&key)) else {
+            return false;
+        };
+        let share_a_hostname = |a: &[String], b: &[String]| {
+            a.is_empty()
+                || b.is_empty()
+                || a.iter()
+                    .any(|x| b.iter().any(|y| hostnames_compatible(x, y)))
+        };
+        g.claims
+            .iter()
+            .filter(|((k, _), other)| *k == other_kind && other.age < mine.age)
+            .any(|((k, other_uid), other)| {
+                g.attachments
+                    .get(&(*k, other_uid.clone()))
+                    .is_some_and(|theirs| theirs.iter().any(|l| listeners.contains(l)))
+                    && share_a_hostname(&mine.hostnames, &other.hostnames)
+            })
+    }
+
     /// Forget the listeners a deleted route was attached to.
     pub fn forget_attachments(&self, kind: &'static str, uid: &str) {
         match self.state.write() {
@@ -649,6 +719,7 @@ impl GatewayScope {
         attached: Vec<ListenerKey>,
     ) {
         let previous = if attached.is_empty() {
+            g.claims.remove(&route);
             g.attachments.remove(&route).unwrap_or_default()
         } else {
             g.attachments
@@ -996,8 +1067,26 @@ impl GatewayScope {
             route_namespace,
             parent_ref,
             route_kind,
-            Some(Self::listener_serves_http),
+            Some(self.listener_ok_for(route_kind)),
         )
+    }
+
+    /// The listeners a route of `route_kind` (HTTPRoute or GRPCRoute) can
+    /// attach to: `HTTP` and `HTTPS` ones, a GRPCRoute through a plain `HTTP`
+    /// listener only when it serves HTTP/2 in cleartext (`proxy.http.h2c`).
+    pub(crate) fn listener_ok_for(&self, route_kind: &str) -> fn(&ListenerInfo) -> bool {
+        let h2c = match self.state.read() {
+            Ok(g) => g.served.h2c,
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                false
+            }
+        };
+        if route_kind == "GRPCRoute" && !h2c {
+            Self::listener_serves_https
+        } else {
+            Self::listener_serves_http
+        }
     }
 
     /// Why a Gateway we own refuses `parent_ref`, for the route's status:
@@ -1678,6 +1767,7 @@ impl GatewayScope {
                 let ns = p.namespace.as_deref().unwrap_or(route_ns);
                 let mut listeners =
                     self.gateway_listeners(ns, &p.name, route_ns, route_kind(route))?;
+                listeners.retain(self.listener_ok_for(route_kind(route)));
                 listeners.retain(listener_ok);
                 listeners.retain(|l| {
                     !need_certificate
@@ -3687,8 +3777,9 @@ fn build_listener_status(
         // An HTTP listener on a port of `gateway_ports.http` is served there,
         // once opened. Any other is served on Sōzune's HTTP port, which a
         // Service commonly maps the listener's port to: served whatever its
-        // port, its status says where.
-        "HTTP" => (HTTP_KINDS, served.http_problem(listener.port)),
+        // port, its status says where. gRPC needs HTTP/2 in cleartext there.
+        "HTTP" if served.h2c => (HTTP_KINDS, served.http_problem(listener.port)),
+        "HTTP" => (&["HTTPRoute"], served.http_problem(listener.port)),
         // Likewise on Sōzune's HTTPS port or one of `gateway_ports.https`,
         // when the listener terminates TLS.
         "HTTPS" if GatewayScope::listener_serves_https(listener) => {
@@ -4177,7 +4268,21 @@ fn apply_route(
         route.metadata.namespace.as_deref().unwrap_or("default"),
         route.spec.hostnames.as_deref().unwrap_or_default(),
         route.spec.parent_refs.as_deref().unwrap_or_default(),
-        GatewayScope::listener_serves_http,
+        scope.listener_ok_for(route_kind(route)),
+    );
+    scope.record_claim(
+        route_kind(route),
+        &uid,
+        RouteClaim {
+            age: (
+                route.metadata.creation_timestamp.as_ref().map(|t| t.0),
+                route.metadata.namespace.clone().unwrap_or_default(),
+                gateway_grpc::source_name(route)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            hostnames: route.spec.hostnames.clone().unwrap_or_default(),
+        },
     );
 
     // Out-of-scope routes are tracked but produce zero entrypoints, so
@@ -4194,6 +4299,14 @@ fn apply_route(
     // urlRewrite and requestMirror are honoured.)
     let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
         (RouteOutcome::NotMine, Vec::new())
+    } else if scope.loses_kind_conflict(route_kind(route), &uid) {
+        warn!(
+            "Gateway API: {} {}/{} shares a listener and a hostname with an older route of the other kind (HTTPRoute or GRPCRoute) — not serving it",
+            route_kind(route),
+            route.metadata.namespace.as_deref().unwrap_or("default"),
+            gateway_grpc::source_name(route).unwrap_or("<no-name>")
+        );
+        (RouteOutcome::KindConflict, Vec::new())
     } else if route_has_unsupported_filters(route, resolver, scope) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
@@ -5552,6 +5665,10 @@ pub enum RouteOutcome {
     /// No listener the route binds to admits any of its hostnames.
     /// Surfaces as `Accepted=False reason=NoMatchingListenerHostname`.
     NoMatchingListenerHostname,
+    /// An HTTPRoute and a GRPCRoute share a listener and a hostname, and the
+    /// other one is older (see [`GatewayScope::loses_kind_conflict`]).
+    /// Reflected as `Accepted=False reason=NotAllowedByListeners`.
+    KindConflict,
     /// A GRPCRoute that would need the middleware, which cannot carry gRPC
     /// (see [`grpc_entrypoints`]). Reflected as `Accepted=False
     /// reason=UnsupportedValue`.
@@ -5588,7 +5705,7 @@ fn build_route_status(
         route.spec.parent_refs.as_deref().unwrap_or_default(),
         route_kind(route),
         &|p| scope.accepts_parent_ref(route_ns, p, route_kind(route)),
-        GatewayScope::listener_serves_http,
+        scope.listener_ok_for(route_kind(route)),
         &|_| outcome,
         invalid_ref,
     )
@@ -5709,6 +5826,11 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
             "False",
             REASON_UNSUPPORTED_VALUE,
             "Route redirects on a match whose query or header conditions Sōzu cannot route on: a prefix redirect with query matches, or a header match on Host or Cookie".to_string(),
+        ),
+        RouteOutcome::KindConflict => (
+            "False",
+            REASON_NOT_ALLOWED_BY_LISTENERS,
+            "An older route of the other kind (HTTPRoute or GRPCRoute) is attached to the same listener with a hostname in common: only one of them is served".to_string(),
         ),
         RouteOutcome::UnservableGrpc => (
             "False",
@@ -11051,6 +11173,7 @@ mod tests {
             tcp: HashSet::from([5432]),
             udp: HashSet::from([53]),
             https_passthrough: false,
+            h2c: true,
             gateway: crate::config::GatewayPortsConfig {
                 tcp: vec!["9000-9099".parse().unwrap()],
                 udp: vec!["5353".parse().unwrap()],
@@ -12393,6 +12516,8 @@ mod tests {
     #[test]
     fn a_listener_admits_only_the_route_kinds_it_allows() {
         let scope = GatewayScope::new();
+        let (tx, _rx) = mpsc::channel(8);
+        scope.configure_status(served(), tx);
         scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
         let mut gw = gateway("default", "gw", "sozune");
         gw.spec.listeners[0].allowed_routes = Some(allowed_kind(None, "HTTPRoute"));
@@ -12413,11 +12538,48 @@ mod tests {
         assert!(scope.accepts_route(&grpc));
     }
 
+    /// gRPC in cleartext needs `proxy.http.h2c`: without it, a plain HTTP
+    /// listener neither carries nor lists GRPCRoutes.
+    #[test]
+    fn a_plain_http_listener_carries_grpc_routes_only_with_h2c() {
+        let scope = GatewayScope::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ports = served();
+        ports.h2c = false;
+        scope.configure_status(ports.clone(), tx);
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let gw = gateway("default", "gw", "sozune");
+        scope.upsert_gateway(&gw);
+        let http = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        let mut grpc = http.clone();
+        grpc.metadata.name = Some(format!("{}web", gateway_grpc::GRPC_NAME_PREFIX));
+        assert!(scope.accepts_route(&http));
+        assert!(!scope.accepts_route(&grpc));
+
+        let kinds: Vec<String> = build_listener_status(&gw, &li("l", 80, None), &ports, 0, None)
+            .supported_kinds
+            .unwrap_or_default()
+            .into_iter()
+            .map(|k| k.kind)
+            .collect();
+        assert_eq!(kinds, ["HTTPRoute"]);
+
+        let (tx, _rx) = mpsc::channel(8);
+        scope.configure_status(served(), tx);
+        assert!(scope.accepts_route(&grpc));
+    }
+
     /// A translated GRPCRoute is served over h2c, under ids no HTTPRoute
     /// of the same name can take.
     #[test]
     fn a_grpc_route_reaches_its_backends_over_h2c() {
         let scope = default_scope();
+        let (tx, _rx) = mpsc::channel(8);
+        scope.configure_status(served(), tx);
         let grpc: GrpcRoute = serde_json::from_value(serde_json::json!({
             "apiVersion": "gateway.networking.k8s.io/v1",
             "kind": "GRPCRoute",
@@ -12456,6 +12618,63 @@ mod tests {
         let all = storage.read().unwrap();
         assert!(all.values().any(|ep| !ep.config.h2c_backends));
         assert!(eps.iter().all(|ep| all.contains_key(&ep.id)));
+    }
+
+    /// An HTTPRoute and a GRPCRoute on one listener with a hostname in common:
+    /// the older is served, the other refused until it goes.
+    #[test]
+    fn the_older_of_an_httproute_and_a_grpcroute_sharing_a_hostname_is_served() {
+        let scope = default_scope();
+        let (tx, _rx) = mpsc::channel(8);
+        scope.configure_status(served(), tx);
+        let at = |seconds: i64| {
+            Some(Time(
+                k8s_openapi::jiff::Timestamp::from_second(seconds).unwrap(),
+            ))
+        };
+        let mut http = route_with_uid_parents(
+            "h1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["shared.example.com".into()],
+            vec![parent("gw")],
+        );
+        http.metadata.creation_timestamp = at(100);
+        let mut grpc = http.clone();
+        grpc.metadata.uid = Some("g1".into());
+        grpc.metadata.name = Some(format!("{}web", gateway_grpc::GRPC_NAME_PREFIX));
+        grpc.metadata.creation_timestamp = at(200);
+
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        let (status_tx, mut status_rx) = mpsc::channel(16);
+        let mut outcome_of = |route: &HttpRoute| {
+            apply_route(route, &storage, &index, &r1(), &scope, Some(&status_tx));
+            status_rx.try_recv().unwrap().1
+        };
+        assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
+        assert_eq!(outcome_of(&http), RouteOutcome::Accepted);
+        // The GRPCRoute, younger, gives way once the HTTPRoute is known.
+        assert_eq!(outcome_of(&grpc), RouteOutcome::KindConflict);
+        assert_eq!(outcome_of(&http), RouteOutcome::Accepted);
+
+        // No hostname in common: both served.
+        let mut elsewhere = grpc.clone();
+        elsewhere.spec.hostnames = Some(vec!["grpc.example.com".into()]);
+        assert_eq!(outcome_of(&elsewhere), RouteOutcome::Accepted);
+        assert_eq!(outcome_of(&grpc), RouteOutcome::KindConflict);
+
+        // As old: the first by namespace and name wins, `grpc/web` being read
+        // as `web`, which an HTTPRoute `api` comes before.
+        let mut older_name = http.clone();
+        older_name.metadata.creation_timestamp = at(200);
+        older_name.metadata.name = Some("api".into());
+        assert_eq!(outcome_of(&older_name), RouteOutcome::Accepted);
+        assert_eq!(outcome_of(&grpc), RouteOutcome::KindConflict);
+
+        // Once the HTTPRoute goes, the GRPCRoute is served.
+        scope.forget_attachments("HTTPRoute", "h1");
+        delete_route(&http, &storage, &index);
+        assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
     }
 
     /// The middleware cannot carry gRPC: a GRPCRoute that would need it is

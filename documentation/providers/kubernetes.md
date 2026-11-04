@@ -739,7 +739,7 @@ When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready 
 
 > Since 0.16
 
-A `GRPCRoute` routes gRPC calls through the same `HTTP` and `HTTPS` listeners as an HTTPRoute, with the same hostnames, `parentRefs`, `allowedRoutes`, backendRefs, `ReferenceGrant`s and status. Sōzune reaches its backends over HTTP/2 in cleartext (h2c), as gRPC servers expect. A client in cleartext needs [`proxy.http.h2c: true`](/documentation/configuration/overview) on the HTTP port; over TLS, HTTP/2 is negotiated as usual.
+A `GRPCRoute` routes gRPC calls through the same `HTTP` and `HTTPS` listeners as an HTTPRoute, with the same hostnames, `parentRefs`, `allowedRoutes`, backendRefs, `ReferenceGrant`s and status. Sōzune reaches its backends over HTTP/2 in cleartext (h2c), as gRPC servers expect. Over TLS, an `HTTPS` listener negotiates HTTP/2 as usual. A plain `HTTP` listener carries GRPCRoutes only with [`proxy.http.h2c: true`](/documentation/configuration/overview), which lets clients speak HTTP/2 in cleartext there: without it, its status does not list `GRPCRoute` among its `supportedKinds`, and a GRPCRoute attached only to it is refused with `NotAllowedByListeners`.
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -770,7 +770,9 @@ A gRPC call is a request to `/<service>/<method>`, which is what a `method` matc
 | `method` alone | that method of any service |
 | `type: RegularExpression` | `service` and `method` matched as regular expressions, a missing one matching any name |
 
-`headers` matches (`Exact` or `RegularExpression`), and the `requestHeaderModifier` and `responseHeaderModifier` filters, work as on an HTTPRoute. A call no rule matches gets `UNIMPLEMENTED`.
+`headers` matches (`Exact` or `RegularExpression`), and the `requestHeaderModifier` and `responseHeaderModifier` filters, work as on an HTTPRoute. Only gRPC calls are routed, those whose `content-type` is `application/grpc`: a rule without matches takes every call, not every request. A call no rule matches gets `UNIMPLEMENTED`.
+
+An HTTPRoute and a GRPCRoute attached to the same listener with a hostname in common are not both served: the older one is, or the first by namespace and name when they are as old, and the other is refused with `Accepted=False reason=NotAllowedByListeners` until it is the only one left.
 
 Not supported: a `requestMirror` filter, and a backendRef that cannot take traffic (a Service that does not exist, another namespace without a `ReferenceGrant`), whose share of the calls an HTTPRoute answers with an error. Sōzune serves both through its middleware, which cannot carry gRPC: such a route is refused with `Accepted=False reason=UnsupportedValue`. The `extensionRef` filter is not supported either.
 
