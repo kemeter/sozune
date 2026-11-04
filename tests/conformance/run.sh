@@ -19,6 +19,8 @@
 #                      features to test, which Sōzune does not publish on its
 #                      GatewayClass yet: pass them in CONFORMANCE_ARGS, e.g.
 #                      "--supported-features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,TLSRoute"
+#   KIND_NODE_IMAGE    kind node image, i.e. the Kubernetes version (default:
+#                      kind's own)
 #   CONFORMANCE_TIMEOUT  `go test` timeout (default 60m)
 #   CONFORMANCE_GO_FLAGS  extra `go test` flags, e.g. "-v"
 #   KEEP_CLUSTER=1     leave the cluster up afterwards
@@ -48,7 +50,7 @@ trap cleanup EXIT
 
 if ! kind get clusters 2>/dev/null | grep -q "^$CLUSTER_NAME$"; then
     log "Creating kind cluster $CLUSTER_NAME..."
-    kind create cluster --name "$CLUSTER_NAME" >/dev/null
+    kind create cluster --name "$CLUSTER_NAME" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} >/dev/null
 fi
 kind get kubeconfig --name "$CLUSTER_NAME" > "$KUBECONFIG_FILE"
 kubectl wait --for=condition=Ready nodes --all --timeout=120s >/dev/null

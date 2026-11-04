@@ -63,9 +63,12 @@ ensure_cluster() {
         log "Creating kind cluster '$CLUSTER_NAME'..."
         # The cluster config maps Sozune's HTTP/HTTPS/API ports from the
         # node container back to the developer's host so curl can hit them.
+        # KIND_NODE_IMAGE picks the Kubernetes version, e.g.
+        # kindest/node:v1.36.4; kind's default otherwise.
         kind create cluster \
             --name "$CLUSTER_NAME" \
             --config "$KIND_CLUSTER_CONFIG" \
+            ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} \
             --kubeconfig "$KUBECONFIG_FILE" >/dev/null
         CLUSTER_CREATED_BY_US=1
     fi
