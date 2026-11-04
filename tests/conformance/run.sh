@@ -11,14 +11,15 @@
 #                      "--supported-features=HTTPRouteMethodMatching"
 #   CONFORMANCE_PROFILES  profiles to run, comma-separated (default
 #                      GATEWAY-HTTP), e.g. GATEWAY-HTTP,GATEWAY-GRPC;
-#                      GATEWAY-TLS needs GATEWAY_API_CHANNEL=experimental
+#                      GATEWAY-TLS needs TLSRoute: the experimental channel
+#                      before v1.5
 #   GATEWAY_API_CHANNEL  CRD channel to install: standard (default), or
 #                      experimental for TLSRoute
 #   GATEWAY_API_VERSION  Gateway API release whose suite and CRDs to use
-#                      (default v1.2.0). The v1.6 suite needs the
-#                      features to test, which Sōzune does not publish on its
-#                      GatewayClass yet: pass them in CONFORMANCE_ARGS, e.g.
-#                      "--supported-features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,TLSRoute"
+#                      (default v1.2.0). The v1.6 suite tests the features
+#                      Sōzune publishes on its GatewayClass's
+#                      `status.supportedFeatures`, unless CONFORMANCE_ARGS
+#                      names others
 #   KIND_NODE_IMAGE    kind node image, i.e. the Kubernetes version (default:
 #                      kind's own)
 #   CONFORMANCE_TIMEOUT  `go test` timeout (default 60m)
