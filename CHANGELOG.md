@@ -48,7 +48,8 @@ All notable changes to this project will be documented in this file.
 
 - HTTPRoute host rewrite — a `urlRewrite` `hostname` is now applied by Sōzu, so such a rule no longer goes through the middleware. The backend still gets a single `Host` header, the client's going in `X-Forwarded-Host`. See [urlRewrite](documentation/providers/kubernetes.md#urlrewrite).
 - HTTPRoute path regular expressions — a `RegularExpression` path match is now served: the regex must match the whole path, the query left out, as Gateway API asks. Such a route used to be dropped. One that does not compile still drops the route. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
-- Cleartext HTTP/2 — `proxy.http.h2c: true` also serves HTTP/2 on the HTTP port to clients that open with its preface (prior knowledge), next to HTTP/1.x. Backends are still reached over HTTP/1.1. Off by default. `GET /config` shows it. See [Configuration](documentation/configuration/overview.md).
+- Cleartext HTTP/2 — `proxy.http.h2c: true` also serves HTTP/2 on the HTTP port to clients that open with its preface (prior knowledge), next to HTTP/1.x. Backends are reached over HTTP/1.1, except those of a GRPCRoute. Off by default. `GET /config` shows it. See [Configuration](documentation/configuration/overview.md).
+- GRPCRoute — a Kubernetes `GRPCRoute` now routes gRPC calls through the Gateway's `HTTP` and `HTTPS` listeners, on `method` and `headers` matches, its backends reached over h2c. A cleartext client needs `proxy.http.h2c: true`. A `requestMirror` filter, or a backendRef that cannot take traffic, is refused with `Accepted=False`. Sōzune needs the `grpcroutes` and `grpcroutes/status` RBAC, which the Helm chart grants. See [Gateway API (GRPCRoute)](documentation/providers/kubernetes.md#gateway-api-grpcroute).
 
 ### Reliability
 

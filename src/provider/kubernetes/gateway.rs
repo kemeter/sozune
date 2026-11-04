@@ -29,6 +29,7 @@
 
 use super::gateway_compat::ReferenceGrant;
 use super::gateway_filters;
+use super::gateway_grpc::{self, route_kind};
 use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
 use crate::model::{
@@ -53,6 +54,7 @@ use gateway_api::apis::standard::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
 };
+use gateway_api::apis::standard::grpcroutes::GrpcRoute;
 use gateway_api::apis::standard::httproutes::{
     HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
     HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteRulesMatchesPathType, HttpRouteStatus,
@@ -108,11 +110,11 @@ pub fn is_gateway_route(entrypoint: &Entrypoint) -> bool {
         .is_some_and(|rest| rest.starts_with('-'))
 }
 
-/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute, TLSRoute,
-/// TCPRoute and UDPRoute. Each scope mutation posts one permit per watcher so
+/// Route watchers that consume `GatewayScope::changed()`: HTTPRoute,
+/// GRPCRoute, TLSRoute, TCPRoute and UDPRoute. Each scope mutation posts one permit per watcher so
 /// all re-resolve immediately instead of one waiting out its periodic tick.
 /// Bump this when adding another route watcher.
-const SCOPE_SUBSCRIBERS: usize = 4;
+const SCOPE_SUBSCRIBERS: usize = 5;
 
 /// How long a Gateway status write that failed waits before it is tried
 /// again.
@@ -980,15 +982,20 @@ impl GatewayScope {
     /// have a listener that matches, otherwise the ref is refused. Per
     /// spec, an unset `sectionName`/`port` binds to the whole Gateway (any
     /// listener), which is the existing behaviour.
-    fn accepts_parent_ref<P: ParentRef>(&self, route_namespace: &str, parent_ref: &P) -> bool {
-        // An HTTPRoute is served on the configured HTTP listener whatever port
-        // the Gateway declares, but only through an HTTP listener
-        // whose `allowedRoutes` admits it: another protocol's listener would
-        // let it past the restrictions of the HTTP ones.
+    fn accepts_parent_ref<P: ParentRef>(
+        &self,
+        route_namespace: &str,
+        parent_ref: &P,
+        route_kind: &str,
+    ) -> bool {
+        // An HTTPRoute or a GRPCRoute is served on the configured HTTP
+        // listener whatever port the Gateway declares, but only through an
+        // HTTP listener whose `allowedRoutes` admits it: another protocol's
+        // listener would let it past the restrictions of the HTTP ones.
         self.accepts_parent_ref_where(
             route_namespace,
             parent_ref,
-            "HTTPRoute",
+            route_kind,
             Some(Self::listener_serves_http),
         )
     }
@@ -1454,7 +1461,7 @@ impl GatewayScope {
         };
         let accepted: Vec<&HttpRouteParentRefs> = refs
             .iter()
-            .filter(|p| self.accepts_parent_ref(route_ns, *p))
+            .filter(|p| self.accepts_parent_ref(route_ns, *p, route_kind(route)))
             .collect();
         let g = match self.state.read() {
             Ok(g) => g,
@@ -1484,7 +1491,7 @@ impl GatewayScope {
                     listeners
                         .iter()
                         .filter(|l| kind(l))
-                        .filter(|l| l.admits(&ns, route_ns, "HTTPRoute", &g.namespace_labels))
+                        .filter(|l| l.admits(&ns, route_ns, route_kind(route), &g.namespace_labels))
                         .filter(|l| {
                             p.section_name.as_deref().is_none_or(|s| s == l.name)
                                 && p.port.is_none_or(|port| port == l.port)
@@ -1666,10 +1673,11 @@ impl GatewayScope {
             return Vec::new();
         };
         refs.iter()
-            .filter(|p| self.accepts_parent_ref(route_ns, *p))
+            .filter(|p| self.accepts_parent_ref(route_ns, *p, route_kind(route)))
             .filter_map(|p| {
                 let ns = p.namespace.as_deref().unwrap_or(route_ns);
-                let mut listeners = self.gateway_listeners(ns, &p.name, route_ns, "HTTPRoute")?;
+                let mut listeners =
+                    self.gateway_listeners(ns, &p.name, route_ns, route_kind(route))?;
                 listeners.retain(listener_ok);
                 listeners.retain(|l| {
                     !need_certificate
@@ -1697,7 +1705,8 @@ impl GatewayScope {
         let Some(refs) = route.spec.parent_refs.as_ref() else {
             return false;
         };
-        refs.iter().any(|p| self.accepts_parent_ref(route_ns, p))
+        refs.iter()
+            .any(|p| self.accepts_parent_ref(route_ns, p, route_kind(route)))
     }
 
     /// Notifies subscribers iff `changed` is true; returns the same bool
@@ -2321,7 +2330,7 @@ fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
             f.group == GATEWAY_API_GROUP
                 && matches!(
                     f.kind.as_str(),
-                    "HTTPRoute" | "TLSRoute" | "TCPRoute" | "UDPRoute"
+                    "HTTPRoute" | "GRPCRoute" | "TLSRoute" | "TCPRoute" | "UDPRoute"
                 )
         })
         .map(|f| f.namespace.clone())
@@ -2685,6 +2694,175 @@ pub async fn run_httproute_watcher(
 
     warn!("Gateway API: HTTPRoute watcher stream ended unexpectedly");
     Ok(())
+}
+
+/// Watch GRPCRoutes, translated into the HTTPRoutes they route like (see
+/// [`gateway_grpc`]), the way [`run_httproute_watcher`] does HTTPRoutes.
+/// Stops at once when the cluster serves no GRPCRoute, or Sōzune may not
+/// list them.
+pub async fn run_grpcroute_watcher(
+    client: Client,
+    storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
+    reload_tx: mpsc::Sender<()>,
+    resolver: Arc<dyn ServiceResolver>,
+    scope: GatewayScope,
+) -> anyhow::Result<()> {
+    let api: Api<GrpcRoute> = Api::all(client.clone());
+    if let Err(e) = api.list(&Default::default()).await {
+        match &e {
+            kube::Error::Api(resp) if resp.code == 404 => {
+                info!("Gateway API: GRPCRoute CRD not installed, skipping watcher");
+            }
+            kube::Error::Api(resp) if resp.code == 403 => {
+                warn!(
+                    "Gateway API: not allowed to list GRPCRoutes, skipping watcher — grant `grpcroutes` (get/list/watch) in the gateway.networking.k8s.io group: {}",
+                    resp.message
+                );
+            }
+            other => {
+                warn!(
+                    "Gateway API: could not probe for GRPCRoutes, skipping watcher: {}",
+                    other
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let (status_tx, status_rx) =
+        mpsc::channel::<(HttpRoute, RouteOutcome, Option<InvalidRef>)>(256);
+    {
+        let client = client.clone();
+        let scope = scope.clone();
+        tokio::spawn(async move {
+            run_grpc_status_writer(client, status_rx, scope).await;
+        });
+    }
+
+    let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+    let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    resolve_ticker.tick().await;
+
+    info!("Gateway API: GRPCRoute watcher started");
+    let mut relisted: Option<HashSet<String>> = None;
+
+    loop {
+        let changed = tokio::select! {
+            event = stream.next() => match event {
+                Some(Ok(Event::Apply(route))) | Some(Ok(Event::InitApply(route))) => {
+                    if let (Some(uids), Some(uid)) = (relisted.as_mut(), route.metadata.uid.as_deref()) {
+                        uids.insert(uid.to_string());
+                    }
+                    match gateway_grpc::to_http_route(&route) {
+                        Some(route) => {
+                            log_route("apply", &route);
+                            apply_route(&route, &storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
+                        }
+                        None => {
+                            warn!(
+                                "Gateway API: GRPCRoute {}/{} could not be read, skipping",
+                                route.metadata.namespace.as_deref().unwrap_or("default"),
+                                route.metadata.name.as_deref().unwrap_or("<no-name>")
+                            );
+                            false
+                        }
+                    }
+                }
+                Some(Ok(Event::Delete(route))) => {
+                    if let Some(uid) = route.metadata.uid.as_deref() {
+                        scope.forget_attachments("GRPCRoute", uid);
+                    }
+                    match gateway_grpc::to_http_route(&route) {
+                        Some(route) => {
+                            log_route("delete", &route);
+                            delete_route(&route, &storage, &index)
+                        }
+                        None => false,
+                    }
+                }
+                Some(Ok(Event::Init)) => {
+                    debug!("Gateway API: GRPCRoute init");
+                    relisted = Some(HashSet::new());
+                    false
+                }
+                Some(Ok(Event::InitDone)) => {
+                    debug!("Gateway API: GRPCRoute init done");
+                    match relisted.take() {
+                        Some(uids) => drop_routes_not_relisted(
+                            "GRPCRoute",
+                            &uids,
+                            &index,
+                            |t: &TrackedRoute| t.entrypoint_ids.as_slice(),
+                            &storage,
+                            &scope,
+                        ),
+                        None => false,
+                    }
+                }
+                Some(Err(e)) => {
+                    error!("Gateway API: GRPCRoute watcher error: {}", e);
+                    false
+                }
+                None => break,
+            },
+            _ = resolve_ticker.tick() => {
+                re_resolve_all(&storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
+            }
+            _ = scope.changed() => {
+                debug!("Gateway API: scope changed, re-resolving GRPCRoutes");
+                re_resolve_all(&storage, &index, resolver.as_ref(), &scope, Some(&status_tx))
+            }
+        };
+        if changed && let Err(e) = reload_tx.send(()).await {
+            error!("Gateway API: failed to send reload signal: {}", e);
+        }
+    }
+
+    warn!("Gateway API: GRPCRoute watcher stream ended unexpectedly");
+    Ok(())
+}
+
+/// The status writer of [`run_grpcroute_watcher`]: the status of the
+/// translated route, written on the GRPCRoute it comes from, whose
+/// `status.parents[]` has the same shape.
+async fn run_grpc_status_writer(
+    client: Client,
+    mut rx: mpsc::Receiver<(HttpRoute, RouteOutcome, Option<InvalidRef>)>,
+    scope: GatewayScope,
+) {
+    info!("Gateway API: GRPCRoute status writer started");
+    while let Some((route, outcome, invalid_ref)) = rx.recv().await {
+        let Some(name) = gateway_grpc::source_name(&route) else {
+            continue;
+        };
+        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let our_status = build_route_status(&route, &scope, outcome, invalid_ref);
+        let (_, changed) = merge_route_status(route.status.as_ref(), our_status.clone());
+        if !changed {
+            continue;
+        }
+        let api: Api<GrpcRoute> = Api::namespaced(client.clone(), ns);
+        let parents = |r: &GrpcRoute| -> Vec<HttpRouteStatusParents> {
+            r.status
+                .as_ref()
+                .and_then(|s| serde_json::to_value(&s.parents).ok())
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default()
+        };
+        match bounded_status_write(patch_route_parents(&api, name, our_status, parents)).await {
+            Ok(true) => debug!(
+                "Gateway API: status patched on GRPCRoute {}/{} (outcome={:?})",
+                ns, name, outcome
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(
+                "Gateway API: failed to patch status on GRPCRoute {}/{}: {}",
+                ns, name, e
+            ),
+        }
+    }
+    info!("Gateway API: GRPCRoute status writer stopped");
 }
 
 /// Watch GatewayClasses cluster-wide and keep [`GatewayScope`] in sync.
@@ -3504,31 +3682,26 @@ fn build_listener_status(
     };
     let port = u16::try_from(listener.port).ok();
     let protocol = listener.protocol.to_ascii_uppercase();
-    let (kind, problem) = match protocol.as_str() {
+    const HTTP_KINDS: &[&str] = &["HTTPRoute", "GRPCRoute"];
+    let (protocol_kinds, problem): (&[&str], _) = match protocol.as_str() {
         // An HTTP listener on a port of `gateway_ports.http` is served there,
         // once opened. Any other is served on Sōzune's HTTP port, which a
         // Service commonly maps the listener's port to: served whatever its
         // port, its status says where.
-        "HTTP" => (Some("HTTPRoute"), served.http_problem(listener.port)),
+        "HTTP" => (HTTP_KINDS, served.http_problem(listener.port)),
         // Likewise on Sōzune's HTTPS port or one of `gateway_ports.https`,
         // when the listener terminates TLS.
         "HTTPS" if GatewayScope::listener_serves_https(listener) => {
-            (Some("HTTPRoute"), served.https_problem(listener.port))
+            (HTTP_KINDS, served.https_problem(listener.port))
         }
         // A TLS listener carries TLSRoutes in Passthrough mode only.
-        "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (None, None),
+        "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (&[], None),
         // On the HTTPS port, by its passthrough listener when it has one.
-        "TLS" if served.https_passthrough && port == Some(served.https) => (Some("TLSRoute"), None),
-        "TLS" | "TCP" => (
-            Some(if protocol == "TLS" {
-                "TLSRoute"
-            } else {
-                "TCPRoute"
-            }),
-            served.tcp_problem(listener.port),
-        ),
-        "UDP" => (Some("UDPRoute"), served.udp_problem(listener.port)),
-        _ => (None, None),
+        "TLS" if served.https_passthrough && port == Some(served.https) => (&["TLSRoute"], None),
+        "TLS" => (&["TLSRoute"], served.tcp_problem(listener.port)),
+        "TCP" => (&["TCPRoute"], served.tcp_problem(listener.port)),
+        "UDP" => (&["UDPRoute"], served.udp_problem(listener.port)),
+        _ => (&[], None),
     };
 
     let now = Time(k8s_openapi::jiff::Timestamp::now());
@@ -3541,7 +3714,7 @@ fn build_listener_status(
         last_transition_time: now.clone(),
         observed_generation: generation,
     };
-    let mut conditions = match (kind, problem) {
+    let mut conditions = match (protocol_kinds.first(), problem) {
         (None, _) => {
             let message = if protocol == "TLS" {
                 "TLS listeners are served in Passthrough mode only".to_string()
@@ -3606,24 +3779,27 @@ fn build_listener_status(
     // `allowedRoutes.kinds` can only narrow what the protocol carries. A kind
     // it lists that the listener cannot carry is reported, and a listener
     // left with no kind is not programmed: no route would attach.
-    let protocol_kind = kind;
-    let kind = protocol_kind.filter(|kind| {
-        listener
-            .allowed_kinds
-            .as_ref()
-            .is_none_or(|kinds| kinds.iter().any(|k| k == kind))
-    });
+    let kinds: Vec<&str> = protocol_kinds
+        .iter()
+        .copied()
+        .filter(|kind| {
+            listener
+                .allowed_kinds
+                .as_ref()
+                .is_none_or(|kinds| kinds.iter().any(|k| k == kind))
+        })
+        .collect();
     let kinds_problem = listener
         .allowed_kinds
         .as_ref()
-        .filter(|_| protocol_kind.is_some())
+        .filter(|_| !protocol_kinds.is_empty())
         .and_then(|listed| {
             let invalid: Vec<&str> = listed
                 .iter()
                 .map(String::as_str)
-                .filter(|k| Some(*k) != kind)
+                .filter(|k| !protocol_kinds.contains(k))
                 .collect();
-            if kind.is_some() && invalid.is_empty() {
+            if !kinds.is_empty() && invalid.is_empty() {
                 None
             } else if invalid.is_empty() {
                 Some(
@@ -3638,7 +3814,7 @@ fn build_listener_status(
                 ))
             }
         });
-    if kind.is_none()
+    if kinds.is_empty()
         && let Some(message) = &kinds_problem
     {
         for c in conditions
@@ -3688,12 +3864,13 @@ fn build_listener_status(
         conditions,
         name: listener.name.clone(),
         supported_kinds: Some(
-            kind.map(|kind| GatewayStatusListenersSupportedKinds {
-                group: Some(GATEWAY_API_GROUP.to_string()),
-                kind: kind.to_string(),
-            })
-            .into_iter()
-            .collect(),
+            kinds
+                .iter()
+                .map(|kind| GatewayStatusListenersSupportedKinds {
+                    group: Some(GATEWAY_API_GROUP.to_string()),
+                    kind: kind.to_string(),
+                })
+                .collect(),
         ),
     }
 }
@@ -3995,7 +4172,7 @@ fn apply_route(
     // Attachment depends on the parentRefs alone, whether or not the route
     // is accepted: it is what a listener's `attachedRoutes` counts.
     scope.record_attachments(
-        "HTTPRoute",
+        route_kind(route),
         &uid,
         route.metadata.namespace.as_deref().unwrap_or("default"),
         route.spec.hostnames.as_deref().unwrap_or_default(),
@@ -4142,7 +4319,11 @@ fn apply_route(
                 } else {
                     RouteOutcome::Accepted
                 };
-                (outcome, eps)
+                if route_kind(route) == "GRPCRoute" {
+                    grpc_entrypoints(route, outcome, eps)
+                } else {
+                    (outcome, eps)
+                }
             }
         }
     };
@@ -4198,6 +4379,30 @@ fn apply_route(
     );
 
     changed
+}
+
+/// The entrypoints of a translated GRPCRoute, which reach their backends over
+/// h2c. One that would go through the middleware cannot carry gRPC: Sōzu
+/// reaches it over HTTP/1.1, and its client speaks HTTP/1.1 only. Such a
+/// route is refused whole rather than served without what made it need the
+/// middleware (a request mirror, or a backendRef answered with an error).
+fn grpc_entrypoints(
+    route: &HttpRoute,
+    outcome: RouteOutcome,
+    mut eps: Vec<Entrypoint>,
+) -> (RouteOutcome, Vec<Entrypoint>) {
+    if eps.iter().any(crate::middleware::needs_middleware) {
+        warn!(
+            "Gateway API: GRPCRoute {}/{} needs a request mirror or answers a backendRef that cannot take traffic, which sōzune cannot do over gRPC — dropping the route",
+            route.metadata.namespace.as_deref().unwrap_or("default"),
+            gateway_grpc::source_name(route).unwrap_or("<no-name>")
+        );
+        return (RouteOutcome::UnservableGrpc, Vec::new());
+    }
+    for ep in &mut eps {
+        ep.config.h2c_backends = true;
+    }
+    (outcome, eps)
 }
 
 /// Forget the routes of `kind` a watcher's relist did not return: deleted
@@ -5347,6 +5552,10 @@ pub enum RouteOutcome {
     /// No listener the route binds to admits any of its hostnames.
     /// Surfaces as `Accepted=False reason=NoMatchingListenerHostname`.
     NoMatchingListenerHostname,
+    /// A GRPCRoute that would need the middleware, which cannot carry gRPC
+    /// (see [`grpc_entrypoints`]). Reflected as `Accepted=False
+    /// reason=UnsupportedValue`.
+    UnservableGrpc,
     /// None of the route's parentRefs matched a sōzune-owned Gateway
     /// (or the route declares no parentRefs at all). Gateway API says
     /// implementations only populate `parents[]` for parents they own, so
@@ -5377,8 +5586,8 @@ fn build_route_status(
         route_ns,
         route.metadata.generation,
         route.spec.parent_refs.as_deref().unwrap_or_default(),
-        "HTTPRoute",
-        &|p| scope.accepts_parent_ref(route_ns, p),
+        route_kind(route),
+        &|p| scope.accepts_parent_ref(route_ns, p, route_kind(route)),
         GatewayScope::listener_serves_http,
         &|_| outcome,
         invalid_ref,
@@ -5500,6 +5709,11 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
             "False",
             REASON_UNSUPPORTED_VALUE,
             "Route redirects on a match whose query or header conditions Sōzu cannot route on: a prefix redirect with query matches, or a header match on Host or Cookie".to_string(),
+        ),
+        RouteOutcome::UnservableGrpc => (
+            "False",
+            REASON_UNSUPPORTED_VALUE,
+            "GRPCRoute needs a requestMirror, or answers a backendRef that cannot take traffic, which sōzune does not support over gRPC".to_string(),
         ),
         RouteOutcome::NoMatchingListenerHostname => (
             "False",
@@ -5859,6 +6073,7 @@ fn rule_to_entrypoints(
                     in_flight_req: None,
                     sticky_session: false,
                     compress: false,
+                    h2c_backends: false,
                     entrypoint: None,
                     sni: None,
                     methods,
@@ -6073,7 +6288,6 @@ fn delete_tls_route(
     let mut index_guard = match index.write() {
         Ok(g) => g,
         Err(e) => {
-                    h2c_backends: false,
             error!("Gateway API: index lock poisoned: {}", e);
             return false;
         }
@@ -7303,6 +7517,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         load_balancer: LoadBalancer::default(),
         sticky_session: false,
         compress: false,
+        h2c_backends: false,
         entrypoint: None,
         sni: None,
         methods: Vec::new(),
@@ -7337,8 +7552,13 @@ fn log_route(action: &str, route: &HttpRoute) {
         .unwrap_or_default();
     let rules = route.spec.rules.as_ref().map(|v| v.len()).unwrap_or(0);
     info!(
-        "Gateway API: HTTPRoute {} {}/{} hosts=[{}] rules={}",
-        action, ns, name, hosts, rules
+        "Gateway API: {} {} {}/{} hosts=[{}] rules={}",
+        route_kind(route),
+        action,
+        ns,
+        gateway_grpc::source_name(route).unwrap_or(name),
+        hosts,
+        rules
     );
 }
 
@@ -7517,7 +7737,6 @@ mod tests {
         assert!(snis.contains(&"a.example.com".to_string()));
         assert!(snis.contains(&"b.example.com".to_string()));
         for ep in &eps {
-        h2c_backends: false,
             assert!(matches!(ep.protocol, Protocol::Tcp));
             assert_eq!(ep.config.entrypoint.as_deref(), Some("tlsgw"));
             // The routing name lives in `sni`; a Host match would never run.
@@ -12131,34 +12350,139 @@ mod tests {
             "True"
         );
 
-        let mixed = status(&["HTTPRoute", "GRPCRoute"]);
-        assert_eq!(
-            mixed.supported_kinds.as_deref().unwrap_or_default().len(),
-            1
-        );
-        assert_eq!(
-            condition_of(&mixed, CONDITION_TYPE_PROGRAMMED).status,
-            "True"
-        );
-        let resolved = condition_of(&mixed, CONDITION_TYPE_RESOLVED_REFS);
-        assert_eq!(resolved.status, "False");
-        assert_eq!(resolved.reason, REASON_INVALID_ROUTE_KINDS);
-
-        let grpc_only = status(&["GRPCRoute"]);
-        assert!(
-            grpc_only
+        let kinds = |status: &gateway_api::apis::standard::gateways::GatewayStatusListeners| -> Vec<String> {
+            status
                 .supported_kinds
                 .as_deref()
                 .unwrap_or_default()
-                .is_empty()
+                .iter()
+                .map(|k| k.kind.clone())
+                .collect()
+        };
+        let mixed = status(&["HTTPRoute", "GRPCRoute"]);
+        assert_eq!(kinds(&mixed), ["HTTPRoute", "GRPCRoute"]);
+        assert_eq!(
+            condition_of(&mixed, CONDITION_TYPE_RESOLVED_REFS).status,
+            "True"
         );
+
+        let grpc_only = status(&["GRPCRoute"]);
+        assert_eq!(kinds(&grpc_only), ["GRPCRoute"]);
         assert_eq!(
             condition_of(&grpc_only, CONDITION_TYPE_PROGRAMMED).status,
-            "False"
+            "True"
         );
+
+        // A kind no HTTP listener carries.
+        let tcp = status(&["HTTPRoute", "TCPRoute"]);
+        assert_eq!(kinds(&tcp), ["HTTPRoute"]);
+        assert_eq!(condition_of(&tcp, CONDITION_TYPE_PROGRAMMED).status, "True");
+        let resolved = condition_of(&tcp, CONDITION_TYPE_RESOLVED_REFS);
+        assert_eq!(resolved.status, "False");
+        assert_eq!(resolved.reason, REASON_INVALID_ROUTE_KINDS);
+
+        // With no kind given, both.
+        let mut listener = li("l", 80, None);
+        listener.allowed_kinds = None;
+        let any = build_listener_status(&gw, &listener, &served(), 0, None);
+        assert_eq!(kinds(&any), ["HTTPRoute", "GRPCRoute"]);
+    }
+
+    /// A GRPCRoute is told apart from an HTTPRoute by its translated name:
+    /// a listener restricted to one kind refuses the other.
+    #[test]
+    fn a_listener_admits_only_the_route_kinds_it_allows() {
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        gw.spec.listeners[0].allowed_routes = Some(allowed_kind(None, "HTTPRoute"));
+        scope.upsert_gateway(&gw);
+        let http = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["a.example.com".into()],
+            vec![parent("gw")],
+        );
+        let mut grpc = http.clone();
+        grpc.metadata.name = Some(format!("{}web", gateway_grpc::GRPC_NAME_PREFIX));
+        assert!(scope.accepts_route(&http));
+        assert!(!scope.accepts_route(&grpc));
+
+        gw.spec.listeners[0].allowed_routes = Some(allowed_kind(None, "GRPCRoute"));
+        scope.upsert_gateway(&gw);
+        assert!(!scope.accepts_route(&http));
+        assert!(scope.accepts_route(&grpc));
+    }
+
+    /// A translated GRPCRoute is served over h2c, under ids no HTTPRoute
+    /// of the same name can take.
+    #[test]
+    fn a_grpc_route_reaches_its_backends_over_h2c() {
+        let scope = default_scope();
+        let grpc: GrpcRoute = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "GRPCRoute",
+            "metadata": { "name": "web", "namespace": "default", "uid": "g1" },
+            "spec": {
+                "parentRefs": [{ "name": "gw" }],
+                "hostnames": ["grpc.example.com"],
+                "rules": [{
+                    "matches": [{ "method": { "service": "pkg.Echo", "method": "Ping" } }],
+                    "backendRefs": [{ "name": "api", "port": 80 }]
+                }]
+            }
+        }))
+        .unwrap();
+        let route = gateway_grpc::to_http_route(&grpc).unwrap();
+        let storage = Arc::new(RwLock::new(BTreeMap::new()));
+        let index: RouteIndex = Arc::new(RwLock::new(HashMap::new()));
+        assert!(apply_route(&route, &storage, &index, &r1(), &scope, None));
+        let eps: Vec<Entrypoint> = storage.read().unwrap().values().cloned().collect();
+        assert!(!eps.is_empty());
+        for ep in &eps {
+            assert!(ep.config.h2c_backends, "{}", ep.id);
+            assert!(ep.id.contains("-grpc/web-"), "{}", ep.id);
+            let path = ep.config.path.as_ref().unwrap();
+            assert_eq!(path.value, "/pkg.Echo/Ping");
+        }
+
+        // An HTTPRoute of the same name keeps its own entrypoints.
+        let http = route_with_uid_parents(
+            "h1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["grpc.example.com".into()],
+            vec![parent("gw")],
+        );
+        apply_route(&http, &storage, &index, &r1(), &scope, None);
+        let all = storage.read().unwrap();
+        assert!(all.values().any(|ep| !ep.config.h2c_backends));
+        assert!(eps.iter().all(|ep| all.contains_key(&ep.id)));
+    }
+
+    /// The middleware cannot carry gRPC: a GRPCRoute that would need it is
+    /// refused whole.
+    #[test]
+    fn a_grpc_route_needing_the_middleware_is_refused() {
+        let mut route = route_with_uid_parents(
+            "g1",
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["grpc.example.com".into()],
+            vec![parent("gw")],
+        );
+        route.metadata.name = Some(format!("{}web", gateway_grpc::GRPC_NAME_PREFIX));
+        let eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
+        let (outcome, kept) = grpc_entrypoints(&route, RouteOutcome::Accepted, eps.clone());
+        assert_eq!(outcome, RouteOutcome::Accepted);
+        assert!(kept.iter().all(|ep| ep.config.h2c_backends));
+
+        let mut eps = eps;
+        eps[0].config.compress = true;
+        let (outcome, kept) = grpc_entrypoints(&route, RouteOutcome::Accepted, eps);
+        assert_eq!(outcome, RouteOutcome::UnservableGrpc);
+        assert!(kept.is_empty());
+        let (accepted, _) = outcome_verdicts(outcome, None);
         assert_eq!(
-            condition_of(&grpc_only, CONDITION_TYPE_RESOLVED_REFS).reason,
-            REASON_INVALID_ROUTE_KINDS
+            (accepted.0, accepted.1),
+            ("False", REASON_UNSUPPORTED_VALUE)
         );
     }
 

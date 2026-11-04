@@ -27,6 +27,7 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       - httproutes
+      - grpcroutes
       - tlsroutes
       - tcproutes
       - udproutes
@@ -37,6 +38,7 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       - httproutes/status
+      - grpcroutes/status
       - tlsroutes/status
       - tcproutes/status
       - udproutes/status

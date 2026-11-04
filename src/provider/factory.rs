@@ -438,6 +438,26 @@ pub async fn start_services(
                 }
             });
 
+            // GRPCRoute: translated into the HTTPRoutes it routes like.
+            let grpc_client = client.clone();
+            let grpc_storage = Arc::clone(&storage_for_gateway);
+            let grpc_reload_tx = reload_tx_for_gateway.clone();
+            let grpc_resolver = Arc::clone(&resolver);
+            let grpc_scope = scope.clone();
+            tokio::spawn(async move {
+                if let Err(e) = gateway::run_grpcroute_watcher(
+                    grpc_client,
+                    grpc_storage,
+                    grpc_reload_tx,
+                    grpc_resolver,
+                    grpc_scope,
+                )
+                .await
+                {
+                    error!("Gateway API: GRPCRoute watcher failed: {}", e);
+                }
+            });
+
             if let Err(e) = gateway::run_httproute_watcher(
                 client,
                 storage_for_gateway,
