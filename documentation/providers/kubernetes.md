@@ -691,7 +691,7 @@ rules:
 
 | `urlRewrite` field | Mapped to | Notes |
 |---|---|---|
-| `hostname` | `rewrite_host` | rewrites the forwarded request's `Host` header to a fixed authority, the client's going in `X-Forwarded-Host` (since 0.16: such a rule no longer goes through the middleware) |
+| `hostname` | `rewrite_host` | rewrites the forwarded request's `Host` header to a fixed authority, the client's going in `X-Forwarded-Host` (since 0.16: such a rule no longer goes through the middleware, unless a `requestHeaderModifier` also edits `X-Forwarded-Host`) |
 | `path.replaceFullPath` | `rewrite_path` | replaces the whole request path with a fixed value, regardless of trailing segments (`/api/users` with `ReplaceFullPath: /new` → `/new`) |
 | `path.replacePrefixMatch` | `rewrite_path` | swaps the matched prefix and **keeps** the trailing segments (`/api/users` with prefix `/api`, `ReplacePrefixMatch: /v2` → `/v2/users`; `/api` exactly → `/v2`). Allowed with a `PathPrefix` match only: on another, the route is dropped |
 

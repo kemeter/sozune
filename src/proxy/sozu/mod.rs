@@ -5756,6 +5756,30 @@ mod tests {
         assert!(fronts.iter().all(|(_, f)| f.rewrite_host.is_none()));
     }
 
+    /// Sōzu adds its own `X-Forwarded-Host` when it rewrites the host: next to
+    /// an edit of that header, the middleware rewrites it, leaving one.
+    #[test]
+    fn a_host_rewrite_next_to_a_forwarded_host_edit_goes_through_the_middleware() {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        ep.config.rewrite = Some(crate::model::UrlRewrite {
+            path: None,
+            hostname: Some("backend.internal".into()),
+        });
+        ep.config.headers = vec![HeaderConfig {
+            name: "X-Forwarded-Host".into(),
+            value: "public.example.com".into(),
+            direction: HeaderDirection::Request,
+            append: false,
+        }];
+        assert!(middleware::needs_middleware(&ep));
+        let fronts =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        assert!(fronts.iter().all(|(_, f)| f.rewrite_host.is_none()));
+
+        ep.config.headers[0].direction = HeaderDirection::Response;
+        assert!(!middleware::needs_middleware(&ep));
+    }
+
     #[test]
     fn a_middleware_route_names_itself_to_the_middleware() {
         let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
