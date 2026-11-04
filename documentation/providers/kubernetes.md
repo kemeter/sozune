@@ -277,19 +277,15 @@ Useful for local development. Sōzune uses the current context from `$KUBECONFIG
 
 > Since 0.14
 
-Sōzune watches `gateway.networking.k8s.io` resources alongside Ingress. Its watchers run side by side: `GatewayClass`, `Gateway`, `Namespace` (for [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)), `ReferenceGrant`, `HTTPRoute`, `TLSRoute`, `TCPRoute` and `UDPRoute` (see [TLSRoute](#gateway-api-tlsroute), [TCPRoute](#gateway-api-tcproute), [UDPRoute](#gateway-api-udproute)), and the TLS Secrets `HTTPS` listeners name. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required. The `TLSRoute`, `TCPRoute` and `UDPRoute` watchers exit quietly when their CRD is absent: TLSRoute is in the standard channel since Gateway API v1.5, TCPRoute and UDPRoute only in the experimental one.
+Sōzune watches `gateway.networking.k8s.io` resources alongside Ingress. Its watchers run side by side: `GatewayClass`, `Gateway`, `Namespace` (for [`allowedRoutes`](#which-routes-a-listener-admits-allowedroutes)), `ReferenceGrant`, `HTTPRoute`, `TLSRoute`, `TCPRoute` and `UDPRoute` (see [TLSRoute](#gateway-api-tlsroute), [TCPRoute](#gateway-api-tcproute), [UDPRoute](#gateway-api-udproute)), and the TLS Secrets `HTTPS` listeners name. They are started automatically when the Kubernetes provider is enabled and the CRDs are installed; no extra configuration is required. The `TLSRoute`, `TCPRoute` and `UDPRoute` watchers exit quietly when their CRD is absent: TLSRoute is in the standard channel since Gateway API v1.5, TCPRoute and UDPRoute since v1.6, and only in the experimental one before.
 
 ### Prerequisites
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
 ```
 
-The standard channel of v1.2.0 does not have every field Sōzune serves, and the API server refuses a route using one: a `requestRedirect` `statusCode` of `303`, `307` or `308` and a `requestMirror` `percent` or `fraction` need the experimental channel, and the `cors` filter the experimental channel of v1.3.0 or later. For those, for TCPRoute and UDPRoute, and for TLSRoute before v1.5, install the experimental bundle instead:
-
-```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install.yaml
-```
+The standard channel of v1.6.3 has every resource and field Sōzune serves. Sōzune also reads the CRDs of releases from v1.2.0 on, whose standard channel lacks some: there, a `requestRedirect` `statusCode` of `303`, `307` or `308` and a `requestMirror` `percent` or `fraction` need the experimental channel, as do the `cors` filter (v1.3.0 or later), TLSRoute before v1.5, and TCPRoute and UDPRoute before v1.6. The API server refuses a route using a field its CRDs lack.
 
 If the CRDs are missing, Sōzune logs `HTTPRoute CRD not installed` once and skips the Gateway watchers — Ingress alone keeps working.
 
@@ -861,7 +857,7 @@ A `TLSRoute` on a port in neither is tracked but not served: Sōzune logs which 
 
 `TCPRoute` forwards a whole listener port to its backends — plain TCP, no SNI, no TLS, no matching. It is the raw-TCP counterpart to TLSRoute: where TLSRoute routes by the name in the ClientHello, TCPRoute routes nothing and hands the entire connection to its backend. A port takes one route: when several TCPRoutes bind the same listener port, the oldest is served, and the others, still `Accepted`, take over in turn when it goes.
 
-`TCPRoute` is `v1alpha2` and ships only in the Gateway API **experimental** channel; the watcher probes for the CRD and skips quietly when it is absent.
+`TCPRoute` is `v1` in the Gateway API **standard** channel since v1.6, and `v1alpha2` in the **experimental** channel of earlier releases. Sōzune reads `v1` when the CRD serves it, `v1alpha2` otherwise (since 0.16). The watcher probes for the CRD and skips quietly when it is absent.
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -875,7 +871,7 @@ spec:
       protocol: TCP
       port: 5432
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1  # v1alpha2 before Gateway API v1.6
 kind: TCPRoute
 metadata:
   name: my-db
@@ -916,7 +912,7 @@ proxy:
 
 `UDPRoute` is the datagram counterpart to TCPRoute: it forwards a whole UDP listener port to its backends. Same shape, same constraints — the only difference is the listener protocol (`UDP`) and that it resolves against `proxy.udp` listeners rather than `proxy.tcp`. Likewise, when several UDPRoutes bind the same listener port, the oldest is served.
 
-`UDPRoute` is `v1alpha2`/experimental; the watcher probes for the CRD and skips quietly when it is absent.
+`UDPRoute`, like TCPRoute, is `v1` in the standard channel since v1.6 and `v1alpha2` in the experimental channel before; Sōzune reads either (since 0.16). The watcher probes for the CRD and skips quietly when it is absent.
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -930,7 +926,7 @@ spec:
       protocol: UDP
       port: 53
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1  # v1alpha2 before Gateway API v1.6
 kind: UDPRoute
 metadata:
   name: my-dns

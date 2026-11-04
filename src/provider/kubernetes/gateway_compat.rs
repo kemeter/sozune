@@ -5,9 +5,9 @@
 //! TLSRoute, TCPRoute and UDPRoute require fields older CRDs leave optional —
 //! a route without `hostnames` or `backendRefs`, or a status entry without
 //! `conditions`, would fail to deserialize and stall its whole watcher. These
-//! types read ReferenceGrant as `v1beta1`, TCPRoute and UDPRoute as
-//! `v1alpha2`, and TLSRoute as `v1` or `v1alpha2`, whichever the cluster
-//! serves, all with those fields optional.
+//! types read ReferenceGrant as `v1beta1`, and TLSRoute, TCPRoute and
+//! UDPRoute as `v1` or `v1alpha2`, whichever the cluster serves (see
+//! [`ServedVersion`]), all with those fields optional.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,26 +49,79 @@ pub struct ReferenceGrantTo {
     pub name: Option<String>,
 }
 
+/// An L4 route kind whose version is chosen at runtime.
+///
+/// Gateway API v1.5 promoted TLSRoute to `v1`, and v1.6 TCPRoute and UDPRoute:
+/// the standard bundle of those releases serves `v1` only, older bundles
+/// `v1alpha2` only. Each watcher probes for `v1` first and falls back to
+/// `v1alpha2` before it lists, so these kinds are not `CustomResource`s: both
+/// versions share their shape, `v1` only making required what `v1alpha2`
+/// leaves optional.
+pub trait ServedVersion {
+    /// Read and write this kind as `v1alpha2` (`true`) or `v1` (`false`).
+    /// An `Api` keeps the URL of the version current when it is built.
+    fn use_v1alpha2(v1alpha2: bool);
+}
+
 /// The types of one route kind, named as the `gateway-api` crate names them.
 macro_rules! l4_route {
     (
-        $kind:literal, $plural:literal, $route:literal, $spec:ident, $status_name:literal, $status:ident,
+        $kind:literal, $plural:literal, $route:ident, $flag:ident, $spec:ident, $status:ident,
         $parent_ref:ident, $rule:ident, $backend_ref:ident, $status_parent:ident,
         $status_parent_ref:ident, { $($spec_field:tt)* }
     ) => {
-        #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-        #[kube(
-            group = "gateway.networking.k8s.io",
-            version = "v1alpha2",
-            kind = $kind,
-            plural = $plural,
-            root = $route,
-            namespaced,
-            status = $status_name,
-            schema = "disabled",
-            derive = "Default",
-            derive = "PartialEq"
-        )]
+        /// Whether the cluster serves this kind at `v1alpha2` rather than `v1`.
+        static $flag: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+        pub struct $route {
+            #[serde(default)]
+            pub metadata: ObjectMeta,
+            pub spec: $spec,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub status: Option<$status>,
+        }
+
+        impl ServedVersion for $route {
+            fn use_v1alpha2(v1alpha2: bool) {
+                $flag.store(v1alpha2, Ordering::Relaxed);
+            }
+        }
+
+        impl Resource for $route {
+            type DynamicType = ();
+            type Scope = NamespaceResourceScope;
+
+            fn kind(_: &()) -> Cow<'_, str> {
+                $kind.into()
+            }
+
+            fn group(_: &()) -> Cow<'_, str> {
+                "gateway.networking.k8s.io".into()
+            }
+
+            fn version(_: &()) -> Cow<'_, str> {
+                if $flag.load(Ordering::Relaxed) {
+                    "v1alpha2".into()
+                } else {
+                    "v1".into()
+                }
+            }
+
+            fn plural(_: &()) -> Cow<'_, str> {
+                $plural.into()
+            }
+
+            fn meta(&self) -> &ObjectMeta {
+                &self.metadata
+            }
+
+            fn meta_mut(&mut self) -> &mut ObjectMeta {
+                &mut self.metadata
+            }
+        }
+
+        #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
         pub struct $spec {
             $($spec_field)*
             #[serde(default, skip_serializing_if = "Option::is_none", rename = "parentRefs")]
@@ -171,94 +224,21 @@ macro_rules! l4_route_parts {
     };
 }
 
-/// The TLSRoute version the cluster serves: `v1` unless [`use_tls_route_v1alpha2`]
-/// says otherwise.
-static TLS_ROUTE_V1ALPHA2: AtomicBool = AtomicBool::new(false);
-
-/// Read and write TLSRoutes as `v1alpha2` (`true`) or `v1` (`false`).
-///
-/// Gateway API v1.5 promoted TLSRoute to `v1`, and its standard bundle serves
-/// no other version; older bundles serve `v1alpha2` only. The TLSRoute watcher
-/// probes for `v1` first and falls back to `v1alpha2` before it lists.
-pub fn use_tls_route_v1alpha2(v1alpha2: bool) {
-    TLS_ROUTE_V1ALPHA2.store(v1alpha2, Ordering::Relaxed);
-}
-
-/// Routes TLS connections to backends by SNI, without terminating them.
-///
-/// Its version is chosen at runtime ([`use_tls_route_v1alpha2`]), so it is
-/// not a `CustomResource`: both versions share this shape, `v1` only making
-/// required what `v1alpha2` leaves optional.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct TlsRoute {
-    #[serde(default)]
-    pub metadata: ObjectMeta,
-    pub spec: TlsRouteSpec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<TlsRouteStatus>,
-}
-
-impl Resource for TlsRoute {
-    type DynamicType = ();
-    type Scope = NamespaceResourceScope;
-
-    fn kind(_: &()) -> Cow<'_, str> {
-        "TLSRoute".into()
+l4_route!(
+    "TLSRoute", "tlsroutes", TlsRoute, TLS_ROUTE_V1ALPHA2, TlsRouteSpec, TlsRouteStatus,
+    TlsRouteParentRefs, TlsRouteRules, TlsRouteRulesBackendRefs, TlsRouteStatusParents,
+    TlsRouteStatusParentsParentRef, {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hostnames: Option<Vec<String>>,
     }
-
-    fn group(_: &()) -> Cow<'_, str> {
-        "gateway.networking.k8s.io".into()
-    }
-
-    fn version(_: &()) -> Cow<'_, str> {
-        if TLS_ROUTE_V1ALPHA2.load(Ordering::Relaxed) {
-            "v1alpha2".into()
-        } else {
-            "v1".into()
-        }
-    }
-
-    fn plural(_: &()) -> Cow<'_, str> {
-        "tlsroutes".into()
-    }
-
-    fn meta(&self) -> &ObjectMeta {
-        &self.metadata
-    }
-
-    fn meta_mut(&mut self) -> &mut ObjectMeta {
-        &mut self.metadata
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct TlsRouteSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostnames: Option<Vec<String>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "parentRefs"
-    )]
-    pub parent_refs: Option<Vec<TlsRouteParentRefs>>,
-    pub rules: Vec<TlsRouteRules>,
-}
-
-l4_route_parts!(
-    TlsRouteStatus,
-    TlsRouteParentRefs,
-    TlsRouteRules,
-    TlsRouteRulesBackendRefs,
-    TlsRouteStatusParents,
-    TlsRouteStatusParentsParentRef
 );
 
 l4_route!(
     "TCPRoute",
     "tcproutes",
-    "TcpRoute",
+    TcpRoute,
+    TCP_ROUTE_V1ALPHA2,
     TcpRouteSpec,
-    "TcpRouteStatus",
     TcpRouteStatus,
     TcpRouteParentRefs,
     TcpRouteRules,
@@ -271,9 +251,9 @@ l4_route!(
 l4_route!(
     "UDPRoute",
     "udproutes",
-    "UdpRoute",
+    UdpRoute,
+    UDP_ROUTE_V1ALPHA2,
     UdpRouteSpec,
-    "UdpRouteStatus",
     UdpRouteStatus,
     UdpRouteParentRefs,
     UdpRouteRules,
@@ -288,14 +268,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tcp_routes_use_the_version_the_cluster_serves() {
+        assert_eq!(
+            TcpRoute::url_path(&(), Some("ns")),
+            "/apis/gateway.networking.k8s.io/v1/namespaces/ns/tcproutes"
+        );
+        TcpRoute::use_v1alpha2(true);
+        let v1alpha2 = TcpRoute::url_path(&(), Some("ns"));
+        TcpRoute::use_v1alpha2(false);
+        assert_eq!(
+            v1alpha2,
+            "/apis/gateway.networking.k8s.io/v1alpha2/namespaces/ns/tcproutes"
+        );
+    }
+
+    #[test]
     fn tls_routes_use_the_version_the_cluster_serves() {
         assert_eq!(
             TlsRoute::url_path(&(), Some("ns")),
             "/apis/gateway.networking.k8s.io/v1/namespaces/ns/tlsroutes"
         );
-        use_tls_route_v1alpha2(true);
+        TlsRoute::use_v1alpha2(true);
         let v1alpha2 = TlsRoute::url_path(&(), Some("ns"));
-        use_tls_route_v1alpha2(false);
+        TlsRoute::use_v1alpha2(false);
         assert_eq!(
             v1alpha2,
             "/apis/gateway.networking.k8s.io/v1alpha2/namespaces/ns/tlsroutes"
