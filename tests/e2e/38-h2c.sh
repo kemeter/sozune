@@ -4,6 +4,11 @@
 
 log "[38] h2c prior knowledge on the HTTP port"
 
+if ! curl --version 2>/dev/null | grep -qi "HTTP2"; then
+    skip "h2c: local curl built without HTTP/2 support"
+    return 0
+fi
+
 h2c_result=$(curl -s -o /dev/null -w '%{http_version} %{http_code}' --http2-prior-knowledge \
     --max-time 5 -H "Host: $HOST_A" "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || true)
 if [[ "$h2c_result" == "2 200" ]]; then
