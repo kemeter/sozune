@@ -15,7 +15,10 @@
 #   GATEWAY_API_CHANNEL  CRD channel to install: standard (default), or
 #                      experimental for TLSRoute
 #   GATEWAY_API_VERSION  Gateway API release whose suite and CRDs to use
-#                      (default v1.2.0)
+#                      (default v1.2.0). The v1.6 suite needs the
+#                      features to test, which Sōzune does not publish on its
+#                      GatewayClass yet: pass them in CONFORMANCE_ARGS, e.g.
+#                      "--supported-features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,TLSRoute"
 #   CONFORMANCE_TIMEOUT  `go test` timeout (default 60m)
 #   CONFORMANCE_GO_FLAGS  extra `go test` flags, e.g. "-v"
 #   KEEP_CLUSTER=1     leave the cluster up afterwards
