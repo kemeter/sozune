@@ -51,6 +51,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- Default buffer size — `proxy.buffer_size` now defaults to `16393` bytes, Sōzu's own default and the least HTTP/2 needs to hold a full-size frame with its header. It was `16384`.
 - Docker daemon restarts — the Docker and Podman providers now reconnect to the event stream and rebuild their routes from the running containers. They used to stop following events for good, so containers started or stopped afterwards were never picked up until Sōzune restarted.
 - TCP listeners at startup: a connection arriving before the listener's route was loaded was refused. It now waits up to 10 seconds for the route. A listener with no route closes its connections and logs one warning, instead of one Sōzu error per connection.
 - Consul: a check changing state does not move the catalog's index, so an instance going critical kept its traffic until the next service registered or left. Sōzune now watches check states too. See [Consul](documentation/providers/consul.md#how-it-works).

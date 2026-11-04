@@ -1288,8 +1288,10 @@ fn default_max_buffers() -> usize {
     500
 }
 
+/// Sōzu's own default: an HTTP/2 frame of the largest size the protocol
+/// starts with (16 384 bytes) and its 9-byte header fit in one buffer.
 fn default_buffer_size() -> usize {
-    16384
+    16393
 }
 
 fn default_startup_delay_ms() -> u64 {
@@ -2437,7 +2439,7 @@ proxy:
         assert_eq!(default_http_port(), 80);
         assert_eq!(default_https_port(), 443);
         assert_eq!(default_max_buffers(), 500);
-        assert_eq!(default_buffer_size(), 16384);
+        assert_eq!(default_buffer_size(), 16393);
         assert_eq!(default_startup_delay_ms(), 1000);
         assert_eq!(default_cluster_setup_delay_ms(), 500);
         assert_eq!(default_reload_debounce_ms(), 500);
@@ -2818,7 +2820,7 @@ https:
         assert_eq!(config.https.listen_address, 9443);
         // Vérifier que les valeurs par défaut sont utilisées
         assert_eq!(config.max_buffers, 500);
-        assert_eq!(config.buffer_size, 16384);
+        assert_eq!(config.buffer_size, 16393);
         assert_eq!(config.startup_delay_ms, 1000);
         assert_eq!(config.cluster_setup_delay_ms, 500);
         assert_eq!(config.reload_debounce_ms, 500);

@@ -135,7 +135,7 @@ proxy:
     - name: udpecho
       listen: $UDP_ECHO_PORT
   max_buffers: 500
-  buffer_size: 16384
+  buffer_size: 16393
   startup_delay_ms: 1000
   cluster_setup_delay_ms: 200
 
