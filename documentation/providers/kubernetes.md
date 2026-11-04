@@ -6,6 +6,12 @@ The Kubernetes provider discovers entrypoints from two sources — `Service` ann
 
 This is the right provider when your workloads run on a Kubernetes cluster (kind, k3s, EKS, GKE, AKS, on-prem…) and you want a Sōzu-powered ingress for them.
 
+## Supported versions
+
+Sōzune supports the latest three minor versions of Kubernetes: 1.35, 1.36 and 1.37 for this release. Its end-to-end tests and the Gateway API conformance suite run on each of them.
+
+For [Gateway API](#gateway-api-httproute), it targets v1.6.3, standard channel. It passes that release's `GATEWAY-HTTP`, `GATEWAY-GRPC` and `GATEWAY-TLS` conformance profiles except one test, `HTTPRouteMultipleGateways`: Sōzune serves every Gateway on the same addresses, so two Gateways with a listener on the same port and no hostname share their requests. It also reads the CRDs of every release from v1.2.0 on (see [Prerequisites](#prerequisites)).
+
 ## Configuration
 
 The minimal block — Sōzune auto-discovers the cluster (in-cluster `ServiceAccount` if it runs in a Pod, otherwise `$KUBECONFIG` / `~/.kube/config`) and watches every namespace it can read.
