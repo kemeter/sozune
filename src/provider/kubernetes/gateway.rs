@@ -430,6 +430,9 @@ struct RouteClaim {
     /// Creation time, then namespace and name: the lowest is served.
     age: (Option<k8s_openapi::jiff::Timestamp>, String, String),
     hostnames: Vec<String>,
+    /// Whether the route was served when last applied: one refused for its
+    /// own reasons leaves the hostname to the other kind.
+    served: bool,
 }
 
 /// The ports Sōzune can serve a Gateway listener on, from `config.yaml`: the
@@ -446,6 +449,10 @@ pub struct ServedPorts {
     /// Whether the HTTP listeners serve HTTP/2 in cleartext
     /// (`proxy.http.h2c`), which a GRPCRoute needs on a plain `HTTP` listener.
     pub h2c: bool,
+    /// Whether the HTTPS listeners offer HTTP/2 through ALPN
+    /// (`proxy.https.http2.alpn_protocols`), which a GRPCRoute needs on an
+    /// `HTTPS` listener.
+    pub https_h2: bool,
     pub gateway: crate::config::GatewayPortsConfig,
     /// The ports of `gateway` Sōzune could not open, as the proxy reported.
     pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
@@ -460,6 +467,12 @@ impl ServedPorts {
             udp: proxy.udp.iter().map(|l| l.listen).collect(),
             https_passthrough: proxy.https.passthrough,
             h2c: proxy.http.h2c,
+            https_h2: proxy
+                .https
+                .http2
+                .alpn_protocols
+                .as_ref()
+                .is_none_or(|protocols| protocols.iter().any(|p| p == "h2")),
             gateway: proxy.gateway_ports.clone(),
             unopened: Default::default(),
         }
@@ -632,13 +645,29 @@ impl GatewayScope {
 
     /// Record what decides between an HTTPRoute and a GRPCRoute (see
     /// [`Self::loses_kind_conflict`]), after its attachments.
-    fn record_claim(&self, kind: &'static str, uid: &str, age: RouteClaim) {
+    fn record_claim(&self, kind: &'static str, uid: &str, mut claim: RouteClaim) {
         match self.state.write() {
             Ok(mut g) => {
-                if g.attachments.contains_key(&(kind, uid.to_string())) {
-                    g.claims.insert((kind, uid.to_string()), age);
+                let key = (kind, uid.to_string());
+                if g.attachments.contains_key(&key) {
+                    // Served until its outcome says otherwise.
+                    claim.served = g.claims.get(&key).is_none_or(|c| c.served);
+                    g.claims.insert(key, claim);
                 } else {
-                    g.claims.remove(&(kind, uid.to_string()));
+                    g.claims.remove(&key);
+                }
+            }
+            Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
+        }
+    }
+
+    /// Record whether the route of `kind` and `uid` is served, once its
+    /// outcome is known.
+    fn record_claim_served(&self, kind: &'static str, uid: &str, served: bool) {
+        match self.state.write() {
+            Ok(mut g) => {
+                if let Some(claim) = g.claims.get_mut(&(kind, uid.to_string())) {
+                    claim.served = served;
                 }
             }
             Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
@@ -674,7 +703,7 @@ impl GatewayScope {
         };
         g.claims
             .iter()
-            .filter(|((k, _), other)| *k == other_kind && other.age < mine.age)
+            .filter(|((k, _), other)| *k == other_kind && other.served && other.age < mine.age)
             .any(|((k, other_uid), other)| {
                 g.attachments
                     .get(&(*k, other_uid.clone()))
@@ -1072,20 +1101,25 @@ impl GatewayScope {
     }
 
     /// The listeners a route of `route_kind` (HTTPRoute or GRPCRoute) can
-    /// attach to: `HTTP` and `HTTPS` ones, a GRPCRoute through a plain `HTTP`
-    /// listener only when it serves HTTP/2 in cleartext (`proxy.http.h2c`).
+    /// attach to: `HTTP` and `HTTPS` ones, a GRPCRoute only where clients can
+    /// speak HTTP/2: on a plain `HTTP` listener with `proxy.http.h2c`, on an
+    /// `HTTPS` one when its ALPN offers `h2`.
     pub(crate) fn listener_ok_for(&self, route_kind: &str) -> fn(&ListenerInfo) -> bool {
-        let h2c = match self.state.read() {
-            Ok(g) => g.served.h2c,
+        if route_kind != "GRPCRoute" {
+            return Self::listener_serves_http;
+        }
+        let (h2c, https_h2) = match self.state.read() {
+            Ok(g) => (g.served.h2c, g.served.https_h2),
             Err(e) => {
                 error!("Gateway API: scope lock poisoned: {}", e);
-                false
+                (false, false)
             }
         };
-        if route_kind == "GRPCRoute" && !h2c {
-            Self::listener_serves_https
-        } else {
-            Self::listener_serves_http
+        match (h2c, https_h2) {
+            (true, true) => Self::listener_serves_http,
+            (true, false) => Self::listener_is_plain_http,
+            (false, true) => Self::listener_serves_https,
+            (false, false) => |_| false,
         }
     }
 
@@ -3782,8 +3816,11 @@ fn build_listener_status(
         "HTTP" => (&["HTTPRoute"], served.http_problem(listener.port)),
         // Likewise on Sōzune's HTTPS port or one of `gateway_ports.https`,
         // when the listener terminates TLS.
-        "HTTPS" if GatewayScope::listener_serves_https(listener) => {
+        "HTTPS" if GatewayScope::listener_serves_https(listener) && served.https_h2 => {
             (HTTP_KINDS, served.https_problem(listener.port))
+        }
+        "HTTPS" if GatewayScope::listener_serves_https(listener) => {
+            (&["HTTPRoute"], served.https_problem(listener.port))
         }
         // A TLS listener carries TLSRoutes in Passthrough mode only.
         "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (&[], None),
@@ -4282,6 +4319,7 @@ fn apply_route(
                     .to_string(),
             ),
             hostnames: route.spec.hostnames.clone().unwrap_or_default(),
+            served: true,
         },
     );
 
@@ -4440,6 +4478,18 @@ fn apply_route(
             }
         }
     };
+
+    // A route of one kind refused, for its own reasons or the other kind's,
+    // leaves its hostnames to the other. One waiting on its backends is
+    // accepted, and keeps them.
+    scope.record_claim_served(
+        route_kind(route),
+        &uid,
+        matches!(
+            outcome,
+            RouteOutcome::Accepted | RouteOutcome::NoResolvableBackends
+        ),
+    );
 
     // Best-effort status notification. We send the route (cloned —
     // tiny payload relative to the network round-trip) to the status
@@ -11174,6 +11224,7 @@ mod tests {
             udp: HashSet::from([53]),
             https_passthrough: false,
             h2c: true,
+            https_h2: true,
             gateway: crate::config::GatewayPortsConfig {
                 tcp: vec!["9000-9099".parse().unwrap()],
                 udp: vec!["5353".parse().unwrap()],
@@ -12573,6 +12624,45 @@ mod tests {
         assert!(scope.accepts_route(&grpc));
     }
 
+    /// Over TLS, gRPC needs `h2` among the HTTPS listeners' ALPN protocols.
+    #[test]
+    fn an_https_listener_carries_grpc_routes_only_when_it_offers_h2() {
+        let gw = gateway("default", "gw", "sozune");
+        let mut listener = li("l", 443, None);
+        listener.protocol = "HTTPS".into();
+        let kinds = |ports: &ServedPorts| -> Vec<String> {
+            build_listener_status(&gw, &listener, ports, 0, None)
+                .supported_kinds
+                .unwrap_or_default()
+                .into_iter()
+                .map(|k| k.kind)
+                .collect()
+        };
+        let mut ports = served();
+        assert_eq!(kinds(&ports), ["HTTPRoute", "GRPCRoute"]);
+        ports.https_h2 = false;
+        assert_eq!(kinds(&ports), ["HTTPRoute"]);
+
+        let scope = GatewayScope::new();
+        let (tx, _rx) = mpsc::channel(8);
+        scope.configure_status(ports.clone(), tx);
+        let ok = scope.listener_ok_for("GRPCRoute");
+        assert!(ok(&li("plain", 80, None)));
+        assert!(!ok(&listener));
+        ports.h2c = false;
+        let (tx, _rx) = mpsc::channel(8);
+        scope.configure_status(ports, tx);
+        let ok = scope.listener_ok_for("GRPCRoute");
+        assert!(!ok(&li("plain", 80, None)));
+        assert!(!ok(&listener));
+        assert!(scope.listener_ok_for("HTTPRoute")(&listener));
+
+        let mut config = crate::config::ProxyConfig::default();
+        assert!(ServedPorts::from_config(&config).https_h2);
+        config.https.http2.alpn_protocols = Some(vec!["http/1.1".into()]);
+        assert!(!ServedPorts::from_config(&config).https_h2);
+    }
+
     /// A translated GRPCRoute is served over h2c, under ids no HTTPRoute
     /// of the same name can take.
     #[test]
@@ -12671,9 +12761,26 @@ mod tests {
         assert_eq!(outcome_of(&older_name), RouteOutcome::Accepted);
         assert_eq!(outcome_of(&grpc), RouteOutcome::KindConflict);
 
-        // Once the HTTPRoute goes, the GRPCRoute is served.
+        // Once the HTTPRoutes go, the GRPCRoute is served.
         scope.forget_attachments("HTTPRoute", "h1");
         delete_route(&http, &storage, &index);
+        assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
+
+        // An older HTTPRoute refused for its own reasons takes nothing.
+        let mut broken = route_with_uid_parents(
+            "h2",
+            vec![rule(
+                Some(vec![path_match(
+                    "/api/v(",
+                    HttpRouteRulesMatchesPathType::RegularExpression,
+                )]),
+                vec![backend("api", 80)],
+            )],
+            vec!["shared.example.com".into()],
+            vec![parent("gw")],
+        );
+        broken.metadata.creation_timestamp = at(50);
+        assert_eq!(outcome_of(&broken), RouteOutcome::UnsupportedMatches);
         assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
     }
 
