@@ -105,6 +105,15 @@ fn translate_match(m: &mut Value) {
         *headers = json!([]);
     }
     if let Some(headers) = headers.as_array_mut() {
+        // A name listed again, whatever its case, is ignored: only the first
+        // value counts.
+        let mut seen = std::collections::HashSet::new();
+        headers.retain(|header| {
+            header
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| seen.insert(name.to_ascii_lowercase()))
+        });
         for header in headers.iter_mut() {
             if let Some(header) = header.as_object_mut()
                 && !header.contains_key("type")
@@ -283,6 +292,37 @@ mod tests {
         assert_eq!(
             route.spec.hostnames.as_deref(),
             Some(&["grpc.example.com".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_header_listed_again_is_ignored() {
+        let route = to_http_route(&grpc_route(json!([{
+            "headers": [
+                { "name": "version", "value": "one" },
+                { "name": "Version", "value": "two" },
+                { "name": "color", "value": "blue" }
+            ]
+        }])))
+        .unwrap();
+        let m = &route.spec.rules.as_ref().unwrap()[0]
+            .matches
+            .as_ref()
+            .unwrap()[0];
+        let headers: Vec<(&str, &str)> = m
+            .headers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|h| (h.name.as_str(), h.value.as_str()))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                ("version", "one"),
+                ("color", "blue"),
+                ("content-type", GRPC_CONTENT_TYPE)
+            ]
         );
     }
 

@@ -2375,6 +2375,9 @@ impl GatewayScope {
 struct ServiceGrant {
     /// The namespaces of the routes it trusts.
     from: HashSet<String>,
+    /// The namespaces of the GRPCRoutes it trusts, which only a `from` naming
+    /// `GRPCRoute` opens.
+    grpc_from: HashSet<String>,
     /// The Services it opens, `None` for all of them.
     names: Option<HashSet<String>>,
 }
@@ -2382,7 +2385,11 @@ struct ServiceGrant {
 impl ServiceGrant {
     /// `None` when the grant opens no Service to any route.
     fn of(grant: &ReferenceGrant) -> Option<Self> {
-        let from = trusted_route_from_namespaces(grant);
+        let from = trusted_route_from_namespaces(
+            grant,
+            &["HTTPRoute", "TLSRoute", "TCPRoute", "UDPRoute"],
+        );
+        let grpc_from = trusted_route_from_namespaces(grant, &["GRPCRoute"]);
         let mut names = Some(HashSet::new());
         for to in grant
             .spec
@@ -2399,11 +2406,19 @@ impl ServiceGrant {
             }
         }
         let opens_any = names.as_ref().is_none_or(|n| !n.is_empty());
-        (!from.is_empty() && opens_any).then_some(Self { from, names })
+        ((!from.is_empty() || !grpc_from.is_empty()) && opens_any).then_some(Self {
+            from,
+            grpc_from,
+            names,
+        })
     }
 
     fn allows(&self, from_ns: &str, service: &str) -> bool {
         self.from.contains(from_ns) && self.names.as_ref().is_none_or(|n| n.contains(service))
+    }
+
+    fn allows_grpc(&self, from_ns: &str, service: &str) -> bool {
+        self.grpc_from.contains(from_ns) && self.names.as_ref().is_none_or(|n| n.contains(service))
     }
 }
 
@@ -2423,6 +2438,28 @@ impl BackendRefAuthorizer for GatewayScope {
     }
 }
 
+/// The [`BackendRefAuthorizer`] of a GRPCRoute: a cross-namespace backendRef
+/// needs a `ReferenceGrant` whose `from` names `GRPCRoute`.
+struct GrpcBackendRefs<'a>(&'a GatewayScope);
+
+impl BackendRefAuthorizer for GrpcBackendRefs<'_> {
+    fn allows(&self, from_ns: &str, to_ns: &str, service: &str) -> bool {
+        if from_ns == to_ns {
+            return true;
+        }
+        match self.0.state.read() {
+            Ok(g) => g
+                .reference_grants
+                .iter()
+                .any(|((ns, _), grant)| ns == to_ns && grant.allows_grpc(from_ns, service)),
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                false
+            }
+        }
+    }
+}
+
 /// A [`BackendRefAuthorizer`] that permits every cross-namespace reference.
 /// Same-namespace refs never consult an authorizer, so this only matters
 /// for the cross-namespace paths in tests that predate grant enforcement.
@@ -2436,7 +2473,9 @@ impl BackendRefAuthorizer for AllowAllBackendRefs {
     }
 }
 
-fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
+/// The namespaces whose routes of one of `kinds` the grant trusts, when it
+/// opens Services.
+fn trusted_route_from_namespaces(grant: &ReferenceGrant, kinds: &[&str]) -> HashSet<String> {
     let grants_to_service = grant.spec.to.iter().any(|t| {
         let group_ok = t.group.is_empty();
         let kind_ok = t.kind == "Service";
@@ -2445,21 +2484,12 @@ fn trusted_route_from_namespaces(grant: &ReferenceGrant) -> HashSet<String> {
     if !grants_to_service {
         return HashSet::new();
     }
-    // A ReferenceGrant's `from` names the route kind it authorises. Recognise
-    // every route kind Sōzune serves, not just HTTPRoute — otherwise a
-    // TLSRoute or TCPRoute could never reach a cross-namespace backend even
-    // with a valid grant in place.
+    // A ReferenceGrant's `from` names the route kind it authorises.
     grant
         .spec
         .from
         .iter()
-        .filter(|f| {
-            f.group == GATEWAY_API_GROUP
-                && matches!(
-                    f.kind.as_str(),
-                    "HTTPRoute" | "GRPCRoute" | "TLSRoute" | "TCPRoute" | "UDPRoute"
-                )
-        })
+        .filter(|f| f.group == GATEWAY_API_GROUP && kinds.contains(&f.kind.as_str()))
         .map(|f| f.namespace.clone())
         .collect()
 }
@@ -4338,6 +4368,12 @@ fn apply_route(
     // user knows to fall back to Ingress annotations until filter support
     // lands. (requestRedirect, requestHeaderModifier, responseHeaderModifier,
     // urlRewrite and requestMirror are honoured.)
+    let grpc_grants = GrpcBackendRefs(scope);
+    let grants: &dyn BackendRefAuthorizer = if route_kind(route) == "GRPCRoute" {
+        &grpc_grants
+    } else {
+        scope
+    };
     let (outcome, new_entrypoints) = if !scope.accepts_route(route) {
         (RouteOutcome::NotMine, Vec::new())
     } else if scope.loses_kind_conflict(route_kind(route), &uid) {
@@ -4348,7 +4384,7 @@ fn apply_route(
             gateway_grpc::source_name(route).unwrap_or("<no-name>")
         );
         (RouteOutcome::KindConflict, Vec::new())
-    } else if route_has_unsupported_filters(route, resolver, scope) {
+    } else if route_has_unsupported_filters(route, resolver, grants) {
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
@@ -4432,7 +4468,7 @@ fn apply_route(
                 route_entrypoints_by_scheme(
                     route,
                     resolver,
-                    scope,
+                    grants,
                     plain,
                     secure,
                     scope.https_redirect_port(route),
@@ -4441,12 +4477,12 @@ fn apply_route(
             };
             for (port, hostnames) in own_ports {
                 eps.extend(own_port_entrypoints(
-                    route, resolver, scope, port, hostnames, false,
+                    route, resolver, grants, port, hostnames, false,
                 ));
             }
             for (port, hostnames) in own_secure_ports {
                 eps.extend(own_port_entrypoints(
-                    route, resolver, scope, port, hostnames, true,
+                    route, resolver, grants, port, hostnames, true,
                 ));
             }
             let isolated = scope.isolated_hostnames(route);
@@ -4499,7 +4535,7 @@ fn apply_route(
     // writer; it computes the desired status, deduplicates against the
     // current object, and PATCHes only when something changed. Send
     // failures are non-fatal: status is observability, not routing.
-    let invalid_ref = route_invalid_ref(route, resolver, scope);
+    let invalid_ref = route_invalid_ref(route, resolver, grants);
     if let Some(tx) = status_tx
         && let Err(e) = tx.try_send((route.clone(), outcome, invalid_ref))
     {
@@ -9386,6 +9422,24 @@ mod tests {
                 }],
             },
         }
+    }
+
+    /// A grant names the route kind it trusts: one for HTTPRoutes does not
+    /// open a Service to GRPCRoutes, nor the reverse.
+    #[test]
+    fn a_grant_opens_services_to_the_route_kind_it_names() {
+        let scope = GatewayScope::new();
+        let grpc = GrpcBackendRefs(&scope);
+        scope.upsert_reference_grant(&reference_grant("other", "default"));
+        assert!(scope.allows("default", "other", "api"));
+        assert!(!grpc.allows("default", "other", "api"));
+
+        let mut for_grpc = reference_grant("other", "default");
+        for_grpc.spec.from[0].kind = "GRPCRoute".into();
+        scope.upsert_reference_grant(&for_grpc);
+        assert!(!scope.allows("default", "other", "api"));
+        assert!(grpc.allows("default", "other", "api"));
+        assert!(grpc.allows("default", "default", "api"));
     }
 
     #[test]
