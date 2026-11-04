@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Routing
 
+- TLSRoute `v1` — Sōzune now reads TLSRoutes at `v1`, the version the standard channel serves since Gateway API v1.5, and falls back to `v1alpha2` on earlier releases. It used to read `v1alpha2` only, so on a v1.5 or later standard install it served no TLSRoute. See [TLSRoute](documentation/providers/kubernetes.md#gateway-api-tlsroute).
 - HTTPRoute backendRefs that cannot take traffic — a kind Sōzune does not serve, another namespace without a `ReferenceGrant`, a Service that does not exist — keep their share of the rule's requests, by weight, answered `500`, and those whose Service has no ready pod theirs answered `503`, as Gateway API requires. Their share used to go to the other backendRefs. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
 - HTTPRoute timeouts — a rule's `timeouts.request` now caps the whole request, the client's body and every attempt included, and `timeouts.backendRequest` each attempt on a backend, as `backendTimeout` does: past either, the client gets `504`. `0s` disables either. They used to be ignored. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
 - HTTPRoute backendRef filters — header modifiers set on a rule's backendRefs (`backendRefs[].filters`) now apply to the requests sent to that backendRef's pods and the responses they give, each backendRef with its own. They used to be ignored. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).

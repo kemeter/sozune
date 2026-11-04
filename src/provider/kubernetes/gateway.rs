@@ -42,7 +42,7 @@ use crate::provider::kubernetes::gateway_compat::{
 };
 use crate::provider::kubernetes::gateway_compat::{
     TlsRoute, TlsRouteParentRefs, TlsRouteRules, TlsRouteStatusParents,
-    TlsRouteStatusParentsParentRef,
+    TlsRouteStatusParentsParentRef, use_tls_route_v1alpha2,
 };
 use crate::provider::kubernetes::gateway_compat::{
     UdpRoute, UdpRouteParentRefs, UdpRouteRules, UdpRouteStatusParents,
@@ -6569,9 +6569,11 @@ fn re_resolve_all_tls(
 
 /// Watch TLSRoutes and keep their entrypoints in sync.
 ///
-/// TLSRoute is `v1alpha2` and ships in the Gateway API *experimental* bundle,
-/// so the CRD is often absent. The watcher probes for it first and exits
-/// quietly when missing rather than logging an error on every retry.
+/// TLSRoute is `v1` in the standard bundle since Gateway API v1.5, and
+/// `v1alpha2` in the experimental bundle of older releases, so the CRD may be
+/// absent or serve either version. The watcher probes for `v1`, then
+/// `v1alpha2`, and exits quietly when neither is served rather than logging
+/// an error on every retry.
 pub async fn run_tlsroute_watcher(
     client: Client,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -6581,14 +6583,20 @@ pub async fn run_tlsroute_watcher(
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
     let api: Api<TlsRoute> = Api::all(client.clone());
+    use_tls_route_v1alpha2(false);
+    let mut probe = api.list(&Default::default()).await;
+    if matches!(&probe, Err(kube::Error::Api(resp)) if resp.code == 404) {
+        use_tls_route_v1alpha2(true);
+        probe = api.list(&Default::default()).await;
+    }
     // Distinguish "CRD absent" from "not allowed to list it": both stop the
     // watcher, but only the first is routine. Reporting a 403 as a missing CRD
     // would send an operator hunting for the wrong thing.
-    if let Err(e) = api.list(&Default::default()).await {
+    if let Err(e) = probe {
         match &e {
             kube::Error::Api(resp) if resp.code == 404 => {
                 info!(
-                    "Gateway API: TLSRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
+                    "Gateway API: TLSRoute CRD not installed (neither v1 nor v1alpha2 is served), skipping watcher"
                 );
             }
             kube::Error::Api(resp) if resp.code == 403 => {
@@ -6614,7 +6622,10 @@ pub async fn run_tlsroute_watcher(
     let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     resolve_ticker.tick().await;
 
-    info!("Gateway API: TLSRoute watcher started");
+    info!(
+        "Gateway API: TLSRoute watcher started ({})",
+        <TlsRoute as kube::Resource>::api_version(&())
+    );
     // The routes the current relist returned; the others were deleted while
     // the watcher was away.
     let mut relisted: Option<HashSet<String>> = None;
