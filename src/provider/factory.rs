@@ -255,9 +255,9 @@ pub async fn start_services(
         //                               authorisations
         //   - HTTPRoute watcher       — accepts routes whose parentRefs
         //                               point to an accepted Gateway
-        //   - TLSRoute watcher        — same, for TLS passthrough; exits
-        //                               quietly when the (experimental) CRD
-        //                               is absent
+        //   - TLSRoute watcher        — same, for TLS passthrough, at v1
+        //                               or v1alpha2; exits quietly when the
+        //                               CRD is absent
         //   - TCPRoute watcher        — same, for raw TCP forwarding
         //   - UDPRoute watcher        — same, for datagram forwarding
         // Mutations to the scope notify the route watchers, which
