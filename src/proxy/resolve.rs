@@ -15,10 +15,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
-use sozu_command_lib::proto::command::{RedirectPolicy, RequestHttpFrontend, SocketAddress};
+use sozu_command_lib::proto::command::{
+    HeaderMatchKind, RedirectPolicy, RequestHttpFrontend, SocketAddress,
+};
 use sozu_lib::protocol::kawa_h1::parser::Method;
 use sozu_lib::router::{
-    DomainRule, MethodRule, MethodRuleResult, PathRule, PathRuleResult, RequestHeaders, Router,
+    DomainRule, HeaderRules, MethodRule, MethodRuleResult, PathRule, PathRuleResult,
+    RequestHeaders, Router,
 };
 
 use crate::middleware::chain::{Flow, Middleware, RequestCtx};
@@ -731,19 +734,28 @@ fn explain_candidates(
 
 /// Why the request fails a frontend's header predicates, or `None` when it
 /// satisfies them all.
+/// Each predicate is checked by Sōzu's own matcher, so a regex is matched
+/// as the router matches it, anchored, not compared as text.
 fn failed_header_predicate(front: &RequestHttpFrontend, target: &Target) -> Option<String> {
     front.header_predicates.iter().find_map(|predicate| {
+        let holds = HeaderRules::from_config(std::slice::from_ref(predicate))
+            .is_ok_and(|rules| rules.matches(target));
+        if holds {
+            return None;
+        }
         let name = predicate.name.as_str();
-        match (target.header(name.as_bytes()), predicate.value.as_deref()) {
-            (None, Some(value)) => {
-                Some(format!("header: {name} must be `{value}`, and is missing"))
-            }
-            (None, None) => Some(format!("header: {name} must be present, and is missing")),
-            (Some(sent), Some(value)) if sent != value.as_bytes() => Some(format!(
-                "header: {name} must be `{value}`, not `{}`",
+        let regex = predicate.kind == HeaderMatchKind::Regex as i32;
+        let expected = match predicate.value.as_deref() {
+            Some(value) if regex => format!("match `{value}`"),
+            Some(value) => format!("be `{value}`"),
+            None => "be present".to_string(),
+        };
+        match target.header(name.as_bytes()) {
+            None => Some(format!("header: {name} must {expected}, and is missing")),
+            Some(sent) => Some(format!(
+                "header: {name} must {expected}, not `{}`",
                 String::from_utf8_lossy(sent)
             )),
-            _ => None,
         }
     })
 }
@@ -1532,6 +1544,51 @@ mod tests {
         assert_eq!(
             other_value.candidates[0].reason,
             "header: X-Tenant must be `acme`, not `globex`"
+        );
+    }
+
+    /// A regex header condition is matched as Sōzu matches it, anchored, not
+    /// compared to the request's value as text.
+    #[tokio::test]
+    async fn a_regex_header_condition_is_matched_as_a_regex() {
+        let routes = || {
+            vec![
+                route("web", &["app.example.com"], serde_json::json!({})),
+                route(
+                    "versioned",
+                    &["app.example.com"],
+                    serde_json::json!({
+                        "priority": 10,
+                        "match_headers": [{ "key": "X-Version", "value": "v[0-9]+", "regex": true }]
+                    }),
+                ),
+            ]
+        };
+
+        let matching = resolve_in(
+            routes(),
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Version": "v2" } }),
+        )
+        .await;
+        let partial = resolve_in(
+            routes(),
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Version": "v2-beta" } }),
+        )
+        .await;
+
+        assert_eq!(served_by(&matching), Some("versioned"));
+        assert!(
+            matching
+                .candidates
+                .iter()
+                .all(|c| c.verdict != Verdict::Rejected || !c.reason.starts_with("header:")),
+            "{:?}",
+            matching.candidates
+        );
+        assert_eq!(served_by(&partial), Some("web"));
+        assert_eq!(
+            partial.candidates[0].reason,
+            "header: X-Version must match `v[0-9]+`, not `v2-beta`"
         );
     }
 
