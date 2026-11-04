@@ -22,7 +22,7 @@
     const host = exact ?? (wildcard ? `www.${wildcard.slice(2)}` : undefined);
     if (!host) return '/resolve';
     const rule = entrypoint.config.path as { value?: string; rule_type?: string } | null | undefined;
-    const regexPath = rule?.rule_type === 'Regex';
+    const regexPath = rule?.rule_type === 'Regex' || rule?.rule_type === 'RegexPath';
     const path = rule?.value && !regexPath ? rule.value : '/';
     const scheme = entrypoint.config.tls ? 'https' : 'http';
     // Query conditions go into the URL; header ones cannot (the tester never

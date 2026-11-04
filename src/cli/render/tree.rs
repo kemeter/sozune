@@ -141,7 +141,7 @@ fn format_route(ep: &Entrypoint) -> String {
 fn format_path(p: &PathConfig) -> String {
     match p.rule_type {
         PathRuleType::Prefix | PathRuleType::Exact => p.value.clone(),
-        PathRuleType::Regex => format!(" (regex: {})", p.value),
+        PathRuleType::Regex | PathRuleType::RegexPath => format!(" (regex: {})", p.value),
     }
 }
 

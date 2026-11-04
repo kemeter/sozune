@@ -1903,10 +1903,13 @@ fn path_specificity(path: Option<&crate::model::PathConfig>) -> Rank {
         Some(p) if p.rule_type == PathRuleType::Exact => (0, std::cmp::Reverse(p.value.len())),
         // An alternative can match far wider than its first branch: such a
         // regex counts as `/`.
-        Some(p) if p.rule_type == PathRuleType::Regex && p.value.contains('|') => {
+        Some(p)
+            if matches!(p.rule_type, PathRuleType::Regex | PathRuleType::RegexPath)
+                && p.value.contains('|') =>
+        {
             (1, std::cmp::Reverse(1))
         }
-        Some(p) if p.rule_type == PathRuleType::Regex => (
+        Some(p) if matches!(p.rule_type, PathRuleType::Regex | PathRuleType::RegexPath) => (
             1,
             std::cmp::Reverse(regex_literal_prefix(&p.value).len().max(1)),
         ),

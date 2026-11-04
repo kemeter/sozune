@@ -4029,7 +4029,7 @@ fn apply_route(
         let ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
         warn!(
-            "Gateway API: HTTPRoute {}/{} declares a RegularExpression path match, or a header or query one that does not compile — dropping the route",
+            "Gateway API: HTTPRoute {}/{} declares a RegularExpression path, header or query match that does not compile — dropping the route",
             ns, name
         );
         (RouteOutcome::UnsupportedMatches, Vec::new())
@@ -4963,7 +4963,8 @@ fn specificity_groups(hostnames: Vec<String>) -> Vec<Vec<String>> {
 /// Other silent skips:
 /// - rules with backends that resolve to zero pod IPs
 /// - matches that aren't `Path` (header/query/method-only matches)
-/// - a `RegularExpression` path match (the route is rejected upstream)
+/// - a `RegularExpression` match that does not compile (the route is
+///   rejected upstream)
 pub fn route_to_entrypoints_with_hostnames(
     route: &HttpRoute,
     resolver: &dyn ServiceResolver,
@@ -5057,8 +5058,8 @@ fn redirect_skips_conditions(ep: &Entrypoint) -> bool {
 }
 
 /// True iff any match in the route declares a condition sōzune can't
-/// represent — a `type: RegularExpression` path match, or a header or query
-/// one that does not compile. Treated like an unsupported filter: the route is
+/// represent — a `type: RegularExpression` path, header or query match that
+/// does not compile. Treated like an unsupported filter: the route is
 /// rejected (logged, and reflected as `ResolvedRefs=False
 /// reason=UnsupportedValue`) rather than served with the condition dropped,
 /// which would route more traffic than the author asked for.
@@ -5328,8 +5329,8 @@ pub enum RouteOutcome {
     /// the entire route. Reflected as `ResolvedRefs=False
     /// reason=UnsupportedValue`.
     UnsupportedFilters,
-    /// A match sōzune cannot represent (a `RegularExpression` path, or a
-    /// header or query regex that does not compile) dropped the route.
+    /// A match sōzune cannot represent (a `RegularExpression` path, header
+    /// or query match that does not compile) dropped the route.
     /// Reflected as `Accepted=False reason=UnsupportedValue`; its
     /// backendRefs are reported on as usual.
     UnsupportedMatches,
@@ -5493,7 +5494,7 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
         RouteOutcome::UnsupportedMatches => (
             "False",
             REASON_UNSUPPORTED_VALUE,
-            "Route declares a match sōzune cannot represent: a RegularExpression path match, or a header or query regular expression that does not compile".to_string(),
+            "Route declares a match sōzune cannot represent: a RegularExpression path, header or query match that does not compile".to_string(),
         ),
         RouteOutcome::UnroutableRedirect => (
             "False",
@@ -5778,8 +5779,9 @@ fn rule_to_entrypoints(
                 let rule_type = match p.r#type {
                     Some(HttpRouteRulesMatchesPathType::Exact) => PathRuleType::Exact,
                     Some(HttpRouteRulesMatchesPathType::PathPrefix) | None => PathRuleType::Prefix,
-                    // Refused upstream (see `route_has_unsupported_matches`).
-                    Some(HttpRouteRulesMatchesPathType::RegularExpression) => return None,
+                    Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
+                        PathRuleType::RegexPath
+                    }
                 };
                 Some(PathConfig { rule_type, value })
             });
@@ -9180,7 +9182,7 @@ mod tests {
     }
 
     #[test]
-    fn regex_path_match_is_reported_unsupported() {
+    fn a_regex_path_match_becomes_a_path_regex() {
         let r = route_with(
             vec![rule(
                 Some(vec![path_match(
@@ -9191,7 +9193,28 @@ mod tests {
             )],
             vec!["app.example.com".into()],
         );
-        assert!(route_has_unsupported_matches(&r));
+        assert!(!route_has_unsupported_matches(&r));
+        let eps = route_to_entrypoints(&r, &r1(), &AllowAllBackendRefs);
+        let p = eps[0].config.path.as_ref().unwrap();
+        assert_eq!(p.rule_type, PathRuleType::RegexPath);
+        assert_eq!(p.value, "/api/v[0-9]+");
+    }
+
+    #[test]
+    fn a_regex_path_that_does_not_compile_is_reported_unsupported() {
+        for pattern in ["/api/v(", "(?x)/api # comment"] {
+            let r = route_with(
+                vec![rule(
+                    Some(vec![path_match(
+                        pattern,
+                        HttpRouteRulesMatchesPathType::RegularExpression,
+                    )]),
+                    vec![backend("api", 80)],
+                )],
+                vec!["app.example.com".into()],
+            );
+            assert!(route_has_unsupported_matches(&r), "{pattern}");
+        }
     }
 
     #[test]

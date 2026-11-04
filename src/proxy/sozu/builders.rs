@@ -188,6 +188,7 @@ pub(super) fn build_path_and_rewrite(
             PathRuleType::Prefix => segment_prefix_rule(&path_config.value),
             PathRuleType::Regex => user_regex_rule(&path_config.value),
             PathRuleType::Exact => exact_rule(&path_config.value),
+            PathRuleType::RegexPath => regex_path_rule(&path_config.value),
         };
         return (rule, None);
     }
@@ -201,6 +202,13 @@ pub(super) fn build_path_and_rewrite(
             exact_rule_capturing_query(&path_config.value),
             Some("/$PATH[1]".to_string()),
         ),
+        PathRuleType::RegexPath => {
+            debug!(
+                "strip_prefix on a path regex is not supported natively for {}",
+                cluster_id
+            );
+            (regex_path_rule(&path_config.value), None)
+        }
         PathRuleType::Regex => {
             debug!(
                 "strip_prefix on Regex path is not supported natively for {}; configure rewrite via Sozu directly if needed",
@@ -235,7 +243,7 @@ pub(crate) fn routes_on_query(config: &EntrypointConfig) -> bool {
         && config
             .path
             .as_ref()
-            .is_none_or(|p| p.rule_type != PathRuleType::Regex)
+            .is_none_or(|p| !matches!(p.rule_type, PathRuleType::Regex | PathRuleType::RegexPath))
 }
 
 /// The path rule of a route whose query conditions Sōzu routes on (see
@@ -398,6 +406,14 @@ fn segment_prefix_rule(prefix: &str) -> PathRule {
 /// keeps the first occurrence (the one a `$PATH[n]` rewrite captures), and
 /// `.*`. `^` and `$` written by the user keep their meaning, and its groups
 /// their numbers.
+/// A regex Sōzu matches against the whole path, the query left out.
+fn regex_path_rule(value: &str) -> PathRule {
+    PathRule {
+        value: value.to_string(),
+        kind: sozu_command_lib::proto::command::PathRuleKind::RegexPath as i32,
+    }
+}
+
 fn user_regex_rule(value: &str) -> PathRule {
     // A pattern that does not compile on its own goes as written, for Sōzu
     // to refuse: the wrapping could otherwise balance it into a valid one.
@@ -464,6 +480,11 @@ fn build_add_prefix_rewrite(
                 user_regex_rule(&pc.value),
                 Some(format!("{normalized}$PATH[1]")),
             ),
+            // The whole path as $PATH[0]; Sōzu appends the query.
+            PathRuleType::RegexPath => (
+                regex_path_rule(&pc.value),
+                Some(format!("{normalized}$PATH[0]")),
+            ),
         },
     }
 }
@@ -520,6 +541,8 @@ fn build_replace_full_path(
             ),
             PathRuleType::Exact => (exact_rule_capturing_query(&pc.value), keep_query),
             PathRuleType::Regex => (user_regex_rule(&pc.value), Some(new.to_string())),
+            // Sōzu appends the query to the new path.
+            PathRuleType::RegexPath => (regex_path_rule(&pc.value), Some(new.to_string())),
         },
     }
 }
@@ -595,6 +618,14 @@ fn build_replace_prefix_match(
                 cluster_id
             );
             (user_regex_rule(&pc.value), None)
+        }
+        // Refused upstream: a prefix replacement needs a PathPrefix match.
+        PathRuleType::RegexPath => {
+            warn!(
+                "urlRewrite ReplacePrefixMatch on a path regex is not supported for {}; leaving the request path unchanged",
+                cluster_id
+            );
+            (regex_path_rule(&pc.value), None)
         }
     }
 }
@@ -1086,6 +1117,49 @@ mod tests {
         assert!(!matches("^/users/[0-9]+", "/v1/users/42"));
         assert!(!matches("^/users/[0-9]+", "/health?next=/users/42"));
         assert!(!matches("^/users/[0-9]+$", "/users/42?page=2"));
+    }
+
+    /// A Gateway path regex is matched by Sōzu against the whole path, the
+    /// query left out.
+    #[test]
+    fn a_regex_path_matches_the_whole_path_without_its_query_in_sozu() {
+        use sozu_lib::router::{PathRule as SozuPathRule, PathRuleResult};
+        let matches = |regex: &str, path: &str| {
+            let path_config = PathConfig {
+                rule_type: PathRuleType::RegexPath,
+                value: regex.to_string(),
+            };
+            let (rule, _) = build_path_and_rewrite(Some(&path_config), false, None, None, "test");
+            SozuPathRule::from_config(rule)
+                .is_some_and(|r| r.matches(path.as_bytes()) != PathRuleResult::None)
+        };
+
+        assert!(matches("/api/v[0-9]+", "/api/v2"));
+        assert!(matches("/api/v[0-9]+", "/api/v2?x=1"));
+        assert!(!matches("/api/v[0-9]+", "/api/v2/users"));
+        assert!(!matches("/api/v[0-9]+", "/v1/api/v2"));
+        assert!(!matches("/api/.+", "/api/?x=1"));
+        assert!(matches("/api/.+", "/api/a?x=1"));
+    }
+
+    /// A full-path rewrite on a path regex keeps the query: Sōzu appends it.
+    #[test]
+    fn a_full_path_rewrite_on_a_regex_path_keeps_the_query() {
+        let path_config = PathConfig {
+            rule_type: PathRuleType::RegexPath,
+            value: "/api/v[0-9]+".to_string(),
+        };
+        let rewrite = UrlRewrite {
+            path: Some(PathRewrite::ReplaceFullPath("/new".to_string())),
+            hostname: None,
+        };
+        let (rule, template) =
+            build_path_and_rewrite(Some(&path_config), false, None, Some(&rewrite), "test");
+        assert_eq!(
+            rule.kind,
+            sozu_command_lib::proto::command::PathRuleKind::RegexPath as i32
+        );
+        assert_eq!(template.as_deref(), Some("/new"));
     }
 
     /// A rewrite captures the first occurrence, as an unanchored search does.

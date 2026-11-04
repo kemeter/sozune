@@ -601,6 +601,9 @@ pub enum PathRuleType {
     Prefix,
     Regex,
     Exact,
+    /// A regular expression matched against the whole path, without the
+    /// query: a Gateway API `RegularExpression` path match.
+    RegexPath,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
