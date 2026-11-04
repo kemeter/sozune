@@ -40,7 +40,7 @@ pub struct ConfigView {
 
 #[derive(Debug, Serialize)]
 pub struct ListenersView {
-    pub http: PortView,
+    pub http: HttpPortView,
     pub https: HttpsPortView,
     /// Timeouts of the HTTP and HTTPS listeners, in seconds, Sōzu's defaults
     /// filled in for the fields `proxy.timeouts` leaves out.
@@ -111,8 +111,9 @@ pub struct ClientAuthView {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PortView {
+pub struct HttpPortView {
     pub port: u16,
+    pub h2c: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,8 +226,9 @@ impl ConfigView {
 
 fn listeners_view(proxy: &ProxyConfig) -> ListenersView {
     ListenersView {
-        http: PortView {
+        http: HttpPortView {
             port: proxy.http.listen_address,
+            h2c: proxy.http.h2c,
         },
         https: HttpsPortView {
             port: proxy.https.listen_address,

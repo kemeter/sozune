@@ -97,6 +97,8 @@ api:
 proxy:
   http:
     listen_address: $HTTP_PORT
+    # Cleartext HTTP/2 with prior knowledge next to HTTP/1.x (38-h2c.sh).
+    h2c: true
     error_pages:
       "404": "<html><body><h1>sozune custom 404</h1></body></html>"
   https:
@@ -135,7 +137,7 @@ proxy:
     - name: udpecho
       listen: $UDP_ECHO_PORT
   max_buffers: 500
-  buffer_size: 16384
+  buffer_size: 16393
   startup_delay_ms: 1000
   cluster_setup_delay_ms: 200
 

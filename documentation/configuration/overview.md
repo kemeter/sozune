@@ -39,7 +39,7 @@ proxy:
     - name: postgres
       listen: 5432
   max_buffers: 500
-  buffer_size: 16384
+  buffer_size: 16393
   startup_delay_ms: 1000
   cluster_setup_delay_ms: 500
 
@@ -145,6 +145,7 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 |---|---|---|
 | `proxy.http.listen_address` | `80` | Port for the HTTP listener |
 | `proxy.https.listen_address` | `443` | Port for the HTTPS listener |
+| `proxy.http.h2c` | `false` | Also serves HTTP/2 in cleartext on the HTTP port, to clients that open with its preface (prior knowledge). HTTP/1.x is still served there, and requests reach the backends over HTTP/1.1, so gRPC is not supported yet. Needs `proxy.buffer_size` of at least `16393`. `Upgrade: h2c` is not supported. (since 0.16) |
 | `proxy.http.error_pages` / `proxy.https.error_pages` | `{}` | Pages for the errors Sōzune answers itself, by status. See [Error pages](/documentation/middleware/error-pages). (since 0.14) |
 | `proxy.https.http2` | — | ALPN protocols offered on the HTTPS listener. See [HTTP/2](/documentation/tls/overview#http2). (since 0.14) |
 | `proxy.https.tls` | — | TLS versions, ciphers, certificates from files and client certificates. See [TLS](/documentation/tls/overview). (since 0.15) |
@@ -156,7 +157,7 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 | `proxy.gateway_ports.http` | `[]` | Ports a Kubernetes Gateway `HTTP` listener is served on, instead of `proxy.http.listen_address`. Opened while a route is served on them. See [Kubernetes](/documentation/providers/kubernetes#http-listeners-on-their-own-port). (since 0.16) |
 | `proxy.gateway_ports.https` | `[]` | The same, for `HTTPS` listeners and `proxy.https.listen_address`. See [Kubernetes](/documentation/providers/kubernetes#https-listeners-on-their-own-port). (since 0.16) |
 | `proxy.max_buffers` | `500` | Max number of buffers in the Sōzu pool |
-| `proxy.buffer_size` | `16384` | Buffer size, in bytes |
+| `proxy.buffer_size` | `16393` | Buffer size, in bytes. HTTP/2 needs at least `16393`: a frame of up to 16 384 bytes and its 9-byte header (since 0.16; `16384` before) |
 | `proxy.startup_delay_ms` | `1000` | Delay before applying the initial config (gives Sōzu workers time to boot) |
 | `proxy.cluster_setup_delay_ms` | `500` | Delay between cluster setup commands |
 | `proxy.reload_debounce_ms` | `500` | Debounce window, in ms, applied to reload signals. A reload runs only after this many ms of silence, coalescing bursts of container start/stop events into one reload (since 0.12) |

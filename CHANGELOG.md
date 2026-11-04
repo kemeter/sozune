@@ -48,9 +48,11 @@ All notable changes to this project will be documented in this file.
 
 - HTTPRoute host rewrite — a `urlRewrite` `hostname` is now applied by Sōzu, so such a rule no longer goes through the middleware. The backend still gets a single `Host` header, the client's going in `X-Forwarded-Host`. See [urlRewrite](documentation/providers/kubernetes.md#urlrewrite).
 - HTTPRoute path regular expressions — a `RegularExpression` path match is now served: the regex must match the whole path, the query left out, as Gateway API asks. Such a route used to be dropped. One that does not compile still drops the route. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
+- Cleartext HTTP/2 — `proxy.http.h2c: true` also serves HTTP/2 on the HTTP port to clients that open with its preface (prior knowledge), next to HTTP/1.x. Backends are still reached over HTTP/1.1. Off by default. `GET /config` shows it. See [Configuration](documentation/configuration/overview.md).
 
 ### Reliability
 
+- Default buffer size — `proxy.buffer_size` now defaults to `16393` bytes, Sōzu's own default and the least HTTP/2 needs to hold a full-size frame with its header. It was `16384`.
 - Docker daemon restarts — the Docker and Podman providers now reconnect to the event stream and rebuild their routes from the running containers. They used to stop following events for good, so containers started or stopped afterwards were never picked up until Sōzune restarted.
 - TCP listeners at startup: a connection arriving before the listener's route was loaded was refused. It now waits up to 10 seconds for the route. A listener with no route closes its connections and logs one warning, instead of one Sōzu error per connection.
 - Consul: a check changing state does not move the catalog's index, so an instance going critical kept its traffic until the next service registered or left. Sōzune now watches check states too. See [Consul](documentation/providers/consul.md#how-it-works).

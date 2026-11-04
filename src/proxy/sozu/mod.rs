@@ -702,9 +702,19 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
     ));
     apply_listener_error_pages(&mut http_builder, &config.http.error_pages, "HTTP");
     apply_listener_timeouts(&mut http_builder, &config.timeouts)?;
-    let http_listener = http_builder
+    let mut http_listener = http_builder
         .to_http(None)
         .map_err(|e| anyhow::anyhow!("Could not create HTTP listener: {}", e))?;
+    if config.http.h2c {
+        if config.buffer_size < crate::config::H2_MIN_BUFFER_SIZE {
+            anyhow::bail!(
+                "proxy.http.h2c needs proxy.buffer_size of at least {} bytes, got {}",
+                crate::config::H2_MIN_BUFFER_SIZE,
+                config.buffer_size
+            );
+        }
+        http_listener.h2c_prior_knowledge = Some(true);
+    }
     // What a Gateway HTTP listener on a port of its own is built from.
     let http_listener_template = http_listener.clone();
 

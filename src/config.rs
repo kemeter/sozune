@@ -709,7 +709,16 @@ pub struct HttpConfig {
         deserialize_with = "crate::error_pages::deserialize_error_pages"
     )]
     pub error_pages: BTreeMap<String, String>,
+    /// Serve HTTP/2 in cleartext to clients that open with its preface
+    /// (prior knowledge), alongside HTTP/1.x. Backends are still reached over
+    /// HTTP/1.1. Off by default. Needs `buffer_size` of at least [`H2_MIN_BUFFER_SIZE`].
+    #[serde(default)]
+    pub h2c: bool,
 }
+
+/// The least buffer HTTP/2 needs: a frame of up to 16 384 bytes and its
+/// 9-byte header.
+pub const H2_MIN_BUFFER_SIZE: usize = 16_393;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct HttpsConfig {
@@ -1247,6 +1256,7 @@ impl Default for HttpConfig {
         Self {
             listen_address: default_http_port(),
             error_pages: BTreeMap::new(),
+            h2c: false,
         }
     }
 }
@@ -1288,8 +1298,10 @@ fn default_max_buffers() -> usize {
     500
 }
 
+/// Sōzu's own default: an HTTP/2 frame of the largest size the protocol
+/// starts with (16 384 bytes) and its 9-byte header fit in one buffer.
 fn default_buffer_size() -> usize {
-    16384
+    16393
 }
 
 fn default_startup_delay_ms() -> u64 {
@@ -2437,7 +2449,7 @@ proxy:
         assert_eq!(default_http_port(), 80);
         assert_eq!(default_https_port(), 443);
         assert_eq!(default_max_buffers(), 500);
-        assert_eq!(default_buffer_size(), 16384);
+        assert_eq!(default_buffer_size(), 16393);
         assert_eq!(default_startup_delay_ms(), 1000);
         assert_eq!(default_cluster_setup_delay_ms(), 500);
         assert_eq!(default_reload_debounce_ms(), 500);
@@ -2803,6 +2815,21 @@ enabled: true
     }
 
     #[test]
+    fn h2c_is_off_unless_asked_for() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config: ProxyConfig =
+            serde_yaml::from_str("http:\n  listen_address: 9080\nhttps:\n  listen_address: 9443\n")
+                .unwrap();
+        assert!(!config.http.h2c);
+        let config: ProxyConfig = serde_yaml::from_str(
+            "http:\n  listen_address: 9080\n  h2c: true\nhttps:\n  listen_address: 9443\n",
+        )
+        .unwrap();
+        assert!(config.http.h2c);
+        assert!(config.buffer_size >= H2_MIN_BUFFER_SIZE);
+    }
+
+    #[test]
     fn test_proxy_config_with_defaults() {
         // ProxyConfig deserializers read SOZUNE_* env vars; hold the shared
         // lock so a sibling test setting those vars can't bleed in here.
@@ -2818,7 +2845,7 @@ https:
         assert_eq!(config.https.listen_address, 9443);
         // Vérifier que les valeurs par défaut sont utilisées
         assert_eq!(config.max_buffers, 500);
-        assert_eq!(config.buffer_size, 16384);
+        assert_eq!(config.buffer_size, 16393);
         assert_eq!(config.startup_delay_ms, 1000);
         assert_eq!(config.cluster_setup_delay_ms, 500);
         assert_eq!(config.reload_debounce_ms, 500);
