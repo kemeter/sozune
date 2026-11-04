@@ -456,6 +456,9 @@ pub struct ServedPorts {
     /// `HTTPS` listener.
     pub https_h2: bool,
     pub gateway: crate::config::GatewayPortsConfig,
+    /// Whether Sōzune writes its addresses in the status of its Gateways
+    /// (`publish_service` or `publish_addresses`).
+    pub publishes_addresses: bool,
     /// The ports of `gateway` Sōzune could not open, as the proxy reported.
     pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
 }
@@ -476,6 +479,7 @@ impl ServedPorts {
                 .as_ref()
                 .is_none_or(|protocols| protocols.iter().any(|p| p == "h2")),
             gateway: proxy.gateway_ports.clone(),
+            publishes_addresses: false,
             unopened: Default::default(),
         }
     }
@@ -4170,15 +4174,20 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "TLSRoute",
 ];
 
-/// The features of [`SUPPORTED_FEATURES`] and the route kinds this Sōzune
-/// serves, sorted by name as Gateway API requires. GRPCRoute needs HTTP/2 on
-/// a listener: `proxy.http.h2c`, or `h2` in the HTTPS listener's ALPN.
+/// The features of [`SUPPORTED_FEATURES`] this Sōzune serves as configured,
+/// sorted by name as Gateway API requires. GRPCRoute needs HTTP/2 on a
+/// listener: `proxy.http.h2c`, or `h2` in the HTTPS listener's ALPN. A
+/// Gateway gets an address only where Sōzune publishes its own, and a
+/// listener on port 8080 is served there only on an HTTP port of Sōzune's.
 fn supported_features(served: &ServedPorts) -> Vec<GatewayClassStatusSupportedFeatures> {
     let grpc = served.h2c || served.https_h2;
+    let port_8080 = served.http == 8080 || served.gateway.allows_http(8080);
     let mut names: Vec<&str> = SUPPORTED_FEATURES
         .iter()
         .copied()
         .filter(|name| grpc || !name.starts_with("GRPCRoute"))
+        .filter(|name| served.publishes_addresses || *name != "GatewayAddressEmpty")
+        .filter(|name| port_8080 || *name != "GatewayPort8080")
         .collect();
     names.sort_unstable();
     names
@@ -11087,6 +11096,24 @@ mod tests {
         assert!(!without.iter().any(|n| n.starts_with("GRPCRoute")));
         assert!(without.contains(&"HTTPRoute".to_string()));
     }
+
+    #[test]
+    fn deployment_dependent_features_follow_the_config() {
+        let has = |served: &ServedPorts, name: &str| {
+            supported_features(served).iter().any(|f| f.name == name)
+        };
+        let mut ports = served();
+        ports.publishes_addresses = false;
+        assert!(!has(&ports, "GatewayAddressEmpty"));
+        ports.publishes_addresses = true;
+        assert!(has(&ports, "GatewayAddressEmpty"));
+
+        ports.http = 80;
+        ports.gateway = Default::default();
+        assert!(!has(&ports, "GatewayPort8080"));
+        ports.http = 8080;
+        assert!(has(&ports, "GatewayPort8080"));
+    }
     //
     // Same contract as the route status tests: the pure builders and the
     // condition merge encode which conditions sōzune owns and how they
@@ -11417,6 +11444,7 @@ mod tests {
                 udp: vec!["5353".parse().unwrap()],
                 ..Default::default()
             },
+            publishes_addresses: false,
             unopened: Default::default(),
         }
     }
