@@ -6,7 +6,7 @@
 //! match is a path match:
 //!
 //! - `service` and `method` → the exact path `/<service>/<method>`;
-//! - `service` alone → the prefix `/<service>/`;
+//! - `service` alone → the path regex `/<service>/[^/]+`;
 //! - `method` alone → the path regex `/[^/]+/<method>`;
 //! - `type: RegularExpression` → the path regex built from both, a missing
 //!   one standing for any name.
@@ -160,7 +160,10 @@ fn method_path(method: &Value) -> Option<Value> {
             ),
         )),
         (Some(service), Some(name), false) => Some(path("Exact", format!("/{service}/{name}"))),
-        (Some(service), None, false) => Some(path("PathPrefix", format!("/{service}/"))),
+        (Some(service), None, false) => Some(path(
+            "RegularExpression",
+            format!("/{}/[^/]+", regex::escape(service)),
+        )),
         (None, Some(name), false) => Some(path(
             "RegularExpression",
             format!("/[^/]+/{}", regex::escape(name)),
@@ -219,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn a_service_alone_becomes_a_prefix() {
+    fn a_service_alone_needs_a_method() {
         let route = to_http_route(&grpc_route(
             json!([{ "method": { "service": "pkg.Echo" } }]),
         ))
@@ -227,8 +230,8 @@ mod tests {
         assert_eq!(
             path_of(&route),
             (
-                Some(HttpRouteRulesMatchesPathType::PathPrefix),
-                Some("/pkg.Echo/".into())
+                Some(HttpRouteRulesMatchesPathType::RegularExpression),
+                Some(r"/pkg\.Echo/[^/]+".into())
             )
         );
     }

@@ -4588,12 +4588,19 @@ fn apply_route(
 /// reaches it over HTTP/1.1, and its client speaks HTTP/1.1 only. Such a
 /// route is refused whole rather than served without what made it need the
 /// middleware (a request mirror, or a backendRef answered with an error).
+/// The shadows that keep a more specific listener's hostnames from the route
+/// answer `404` from the middleware and forward nothing: they stay.
 fn grpc_entrypoints(
     route: &HttpRoute,
     outcome: RouteOutcome,
     mut eps: Vec<Entrypoint>,
 ) -> (RouteOutcome, Vec<Entrypoint>) {
-    if eps.iter().any(crate::middleware::needs_middleware) {
+    let shadow =
+        |ep: &Entrypoint| ep.config.answer == Some(crate::model::FixedAnswer::OtherListener);
+    if eps
+        .iter()
+        .any(|ep| !shadow(ep) && crate::middleware::needs_middleware(ep))
+    {
         warn!(
             "Gateway API: GRPCRoute {}/{} needs a request mirror or answers a backendRef that cannot take traffic, which sōzune cannot do over gRPC — dropping the route",
             route.metadata.namespace.as_deref().unwrap_or("default"),
@@ -4601,7 +4608,7 @@ fn grpc_entrypoints(
         );
         return (RouteOutcome::UnservableGrpc, Vec::new());
     }
-    for ep in &mut eps {
+    for ep in eps.iter_mut().filter(|ep| !shadow(ep)) {
         ep.config.h2c_backends = true;
     }
     (outcome, eps)
@@ -12877,6 +12884,19 @@ mod tests {
             (accepted.0, accepted.1),
             ("False", REASON_UNSUPPORTED_VALUE)
         );
+
+        // A listener-isolation shadow answers 404 itself: the route stays.
+        let mut eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
+        let mut shadow = eps[0].clone();
+        shadow.id.push_str("-iso0");
+        shadow.backends.clear();
+        shadow.config.answer = Some(crate::model::FixedAnswer::OtherListener);
+        eps.push(shadow);
+        let (outcome, kept) = grpc_entrypoints(&route, RouteOutcome::Accepted, eps);
+        assert_eq!(outcome, RouteOutcome::Accepted);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].config.h2c_backends);
+        assert!(!kept[1].config.h2c_backends);
     }
 
     #[test]
