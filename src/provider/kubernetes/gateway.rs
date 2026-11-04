@@ -6582,11 +6582,14 @@ pub async fn run_tlsroute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<TlsRoute> = Api::all(client.clone());
+    // An `Api` keeps the URL of the version current when it is built: build
+    // it again after switching.
     use_tls_route_v1alpha2(false);
+    let mut api: Api<TlsRoute> = Api::all(client.clone());
     let mut probe = api.list(&Default::default()).await;
     if matches!(&probe, Err(kube::Error::Api(resp)) if resp.code == 404) {
         use_tls_route_v1alpha2(true);
+        api = Api::all(client.clone());
         probe = api.list(&Default::default()).await;
     }
     // Distinguish "CRD absent" from "not allowed to list it": both stop the
