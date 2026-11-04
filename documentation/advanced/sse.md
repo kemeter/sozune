@@ -58,5 +58,5 @@ This setup is exercised by the e2e suite: a publish through Sōzune to the hub r
 ## Limitations
 
 - **Compression** disabled by hand, as noted above.
-- **HTTP/2 and HTTP/3 SSE** work as long as the client speaks them — Sōzu serves both and forwards chunks. Polling intervals (e.g. browser auto-reconnect on `EventSource` close) are entirely client-side.
+- **HTTP/2 SSE** works as long as the client speaks it, over HTTPS or, with `proxy.http.h2c`, over plain HTTP: Sōzu forwards the chunks as they come. HTTP/3 is not supported. Polling intervals (e.g. browser auto-reconnect on `EventSource` close) are entirely client-side.
 - **No SSE-specific framing.** Sōzune does not inspect `data:` / `event:` / `id:` lines; it only shuffles bytes. Subscriber lifecycle, retry policies and topic filtering are the backend's responsibility.
