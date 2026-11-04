@@ -2278,6 +2278,12 @@ pub(crate) enum FrontListener {
     Https,
 }
 
+/// Whether Sōzu speaks h2c to the route's backends. It reaches the
+/// middleware over HTTP/1.1, so only a route that does not go through it.
+fn backend_http2(entrypoint: &Entrypoint) -> Option<bool> {
+    (entrypoint.config.h2c_backends && !middleware::needs_middleware(entrypoint)).then_some(true)
+}
+
 /// The frontends of an HTTP `entrypoint`, in the order they are sent: one per
 /// hostname and method on the HTTP listener, plus its HTTPS twin when TLS is
 /// on. Built once here so what reaches the workers and anything reproducing
@@ -2530,7 +2536,7 @@ fn configure_http_entrypoint(
         load_balancing: lb_algorithm(entrypoint.config.load_balancer) as i32,
         load_metric: None,
         answer_503: None,
-        http2: None,
+        http2: backend_http2(entrypoint),
         authorized_hashes,
         https_redirect_port: entrypoint.config.https_redirect_port.map(|p| p as u32),
         www_authenticate: entrypoint.config.www_authenticate.clone(),
@@ -5552,6 +5558,7 @@ mod tests {
                 load_balancer: Default::default(),
                 sticky_session: false,
                 compress: false,
+                h2c_backends: false,
                 entrypoint: None,
                 sni: None,
                 methods: Vec::new(),
@@ -5791,6 +5798,16 @@ mod tests {
 
         ep.config.headers[0].direction = HeaderDirection::Response;
         assert!(!middleware::needs_middleware(&ep));
+    }
+
+    #[test]
+    fn h2c_backends_are_reached_over_http2_unless_through_the_middleware() {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        assert_eq!(backend_http2(&ep), None);
+        ep.config.h2c_backends = true;
+        assert_eq!(backend_http2(&ep), Some(true));
+        ep.config.compress = true;
+        assert_eq!(backend_http2(&ep), None);
     }
 
     #[test]

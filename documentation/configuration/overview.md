@@ -145,7 +145,7 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 |---|---|---|
 | `proxy.http.listen_address` | `80` | Port for the HTTP listener |
 | `proxy.https.listen_address` | `443` | Port for the HTTPS listener |
-| `proxy.http.h2c` | `false` | Also serves HTTP/2 in cleartext on the HTTP port, to clients that open with its preface (prior knowledge). HTTP/1.x is still served there, and requests reach the backends over HTTP/1.1, so gRPC is not supported yet. Needs `proxy.buffer_size` of at least `16393`. `Upgrade: h2c` is not supported. (since 0.16) |
+| `proxy.http.h2c` | `false` | Also serves HTTP/2 in cleartext on the HTTP port, to clients that open with its preface (prior knowledge). HTTP/1.x is still served there. Requests reach the backends over HTTP/1.1, except those of a Kubernetes [GRPCRoute](/documentation/providers/kubernetes#gateway-api-grpcroute), sent over h2c. Needs `proxy.buffer_size` of at least `16393`. `Upgrade: h2c` is not supported. (since 0.16) |
 | `proxy.http.error_pages` / `proxy.https.error_pages` | `{}` | Pages for the errors Sōzune answers itself, by status. See [Error pages](/documentation/middleware/error-pages). (since 0.14) |
 | `proxy.https.http2` | — | ALPN protocols offered on the HTTPS listener. See [HTTP/2](/documentation/tls/overview#http2). (since 0.14) |
 | `proxy.https.tls` | — | TLS versions, ciphers, certificates from files and client certificates. See [TLS](/documentation/tls/overview). (since 0.15) |

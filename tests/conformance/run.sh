@@ -9,8 +9,9 @@
 #                      into kind
 #   CONFORMANCE_ARGS   extra flags for the suite, e.g.
 #                      "--supported-features=HTTPRouteMethodMatching"
-#   CONFORMANCE_PROFILES  profiles to run (default GATEWAY-HTTP); GATEWAY-TLS
-#                      needs GATEWAY_API_CHANNEL=experimental
+#   CONFORMANCE_PROFILES  profiles to run, comma-separated (default
+#                      GATEWAY-HTTP), e.g. GATEWAY-HTTP,GATEWAY-GRPC;
+#                      GATEWAY-TLS needs GATEWAY_API_CHANNEL=experimental
 #   GATEWAY_API_CHANNEL  CRD channel to install: standard (default), or
 #                      experimental for TLSRoute
 #   GATEWAY_API_VERSION  Gateway API release whose suite and CRDs to use

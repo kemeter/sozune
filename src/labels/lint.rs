@@ -404,6 +404,7 @@ mod tests {
                 in_flight_req: None,
                 sticky_session: false,
                 compress: false,
+                h2c_backends: false,
                 entrypoint: None,
                 sni: None,
                 methods: Vec::new(),

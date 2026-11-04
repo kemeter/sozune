@@ -32,6 +32,7 @@ rules:
     resources:
       [
         "httproutes",
+        "grpcroutes",
         "tlsroutes",
         "tcproutes",
         "udproutes",
@@ -41,7 +42,8 @@ rules:
       ]
     verbs: ["get", "list", "watch"]
   # Status sub-resources — sōzune patches conditions on the resources it
-  # owns: `status.parents[]` on HTTPRoutes, TLSRoutes, TCPRoutes and UDPRoutes
+  # owns: `status.parents[]` on HTTPRoutes, GRPCRoutes, TLSRoutes, TCPRoutes and
+  # UDPRoutes
   # (Accepted/ResolvedRefs) and
   # `status.conditions[]` on Gateways (Accepted/Programmed) and
   # GatewayClasses (Accepted).
@@ -49,6 +51,7 @@ rules:
     resources:
       [
         "httproutes/status",
+        "grpcroutes/status",
         "tlsroutes/status",
         "tcproutes/status",
         "udproutes/status",
@@ -91,6 +94,8 @@ data:
     proxy:
       http:
         listen_address: 18180
+        # Cleartext HTTP/2 for the GRPCRoute suite (10-grpcroute.sh).
+        h2c: true
       https:
         listen_address: 18443
         # TLS passthrough on the HTTPS port too, for a Gateway TLS listener

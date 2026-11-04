@@ -218,14 +218,15 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses/status"]
     verbs: ["update", "patch"]
-  # Optional: only needed if you want Gateway API support. `tlsroutes`,
-  # `tcproutes` and `udproutes` are only consulted when their (experimental)
+  # Optional: only needed if you want Gateway API support. `grpcroutes`,
+  # `tlsroutes`, `tcproutes` and `udproutes` are only consulted when their
   # CRDs are installed; without the permission Sōzune logs a warning and skips
   # that watcher.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       [
         "httproutes",
+        "grpcroutes",
         "tlsroutes",
         "tcproutes",
         "udproutes",
@@ -236,12 +237,14 @@ rules:
     verbs: ["get", "list", "watch"]
   # Optional: only needed for Gateway API status reporting (kubectl
   # describe will show sōzune's conditions: Accepted/ResolvedRefs on
-  # HTTPRoutes, TLSRoutes, TCPRoutes and UDPRoutes, Accepted/Programmed on
-  # Gateways and their listeners, Accepted on GatewayClasses).
+  # HTTPRoutes, GRPCRoutes, TLSRoutes, TCPRoutes and UDPRoutes,
+  # Accepted/Programmed on Gateways and their listeners, Accepted on
+  # GatewayClasses).
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       [
         "httproutes/status",
+        "grpcroutes/status",
         "tlsroutes/status",
         "tcproutes/status",
         "udproutes/status",
@@ -523,7 +526,7 @@ Gateways and GatewayClasses that belong to another controller receive **no statu
 
 > Since 0.16
 
-A listener only takes the routes its `allowedRoutes` admits, for every route kind (HTTPRoute, TLSRoute, TCPRoute, UDPRoute). An HTTPRoute only attaches through `HTTP` and `HTTPS` listeners, a TLSRoute through `TLS` ones in `Passthrough` mode, a TCPRoute through `TCP` ones and a UDPRoute through `UDP` ones:
+A listener only takes the routes its `allowedRoutes` admits, for every route kind (HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute). An HTTPRoute or a GRPCRoute only attaches through `HTTP` and `HTTPS` listeners, a TLSRoute through `TLS` ones in `Passthrough` mode, a TCPRoute through `TCP` ones and a UDPRoute through `UDP` ones:
 
 | Field | Behaviour |
 |---|---|
@@ -575,7 +578,6 @@ With this applied, an `HTTPRoute` in `frontend` may target a `Service` in `backe
 ### What's not supported (yet)
 
 - HTTPRoute filter `extensionRef`. Declaring it (or a `requestRedirect` we can't represent, or `requestRedirect` combined with `urlRewrite` on the same rule, see below) causes Sōzune to drop the entire route with a `WARN` log line and surface `Accepted=False reason=UnsupportedValue` in the route status. Routing it as if the filter weren't there would silently rewrite user intent. (`requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite`, `requestMirror` and `cors` **are** supported — see [HTTPRoute filters](#httproute-filters).)
-- `GRPCRoute`.
 
 ### HTTPRoute filters
 
@@ -732,6 +734,49 @@ A `set` or `add` with an empty value cannot be represented — Sōzu reads an em
 ### How resolution works
 
 When an `HTTPRoute` is applied, Sōzune resolves each `backendRef` to the ready pod IPs from the matching Service's `EndpointSlice`s. Sōzu requires `IpAddr` backends and refuses cluster-DNS hostnames, so a rule none of whose backendRefs has a ready endpoint (and none of which is invalid) registers no entrypoint and is retried every 2 seconds until the endpoints appear. Once at least one ready endpoint exists the rule becomes live without any user intervention. In a rule whose other backendRefs have ready pods, a Service with none keeps its share of the requests, answered `503` (since 0.16).
+
+## Gateway API (GRPCRoute)
+
+> Since 0.16
+
+A `GRPCRoute` routes gRPC calls through the same `HTTP` and `HTTPS` listeners as an HTTPRoute, with the same hostnames, `parentRefs`, `allowedRoutes`, backendRefs and status. A backendRef in another namespace needs a `ReferenceGrant` whose `from` names `GRPCRoute`: one naming `HTTPRoute` does not open the Service to GRPCRoutes. Sōzune reaches its backends over HTTP/2 in cleartext (h2c), as gRPC servers expect. An `HTTPS` listener carries GRPCRoutes when its ALPN offers `h2`, as it does by default (see [`proxy.https.http2`](/documentation/tls/overview#http2)). A plain `HTTP` listener carries GRPCRoutes only with [`proxy.http.h2c: true`](/documentation/configuration/overview), which lets clients speak HTTP/2 in cleartext there: without it, its status does not list `GRPCRoute` among its `supportedKinds`, and a GRPCRoute attached only to it is refused with `NotAllowedByListeners`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: echo
+spec:
+  parentRefs:
+    - name: my-gateway
+  hostnames:
+    - grpc.example.com
+  rules:
+    - matches:
+        - method:
+            service: echo.v1.Echo
+            method: Ping
+      backendRefs:
+        - name: echo
+          port: 8080
+```
+
+A gRPC call is a request to `/<service>/<method>`, which is what a `method` match routes on:
+
+| `method` match | Routes |
+|---|---|
+| `service` and `method` | that method of that service |
+| `service` alone | every method of the service |
+| `method` alone | that method of any service |
+| `type: RegularExpression` | `service` and `method` matched as regular expressions, a missing one matching any name |
+
+`headers` matches (`Exact` or `RegularExpression`), and the `requestHeaderModifier` and `responseHeaderModifier` filters, work as on an HTTPRoute. Only gRPC calls are routed, `POST` requests whose `content-type` is `application/grpc`: a rule without matches takes every call, not every request. A call no rule matches gets `UNIMPLEMENTED`.
+
+An HTTPRoute and a GRPCRoute attached to the same listener with a hostname in common are not both served: the older one is, or the first by namespace and name when they are as old, and the other is refused with `Accepted=False reason=NotAllowedByListeners` until it is the only one left. A route refused for its own reasons takes no hostname from the other.
+
+Not supported: a `requestMirror` filter, and a backendRef that cannot take traffic (a Service that does not exist, another namespace without a `ReferenceGrant`), whose share of the calls an HTTPRoute answers with an error. Sōzune serves both through its middleware, which cannot carry gRPC: such a route is refused with `Accepted=False reason=UnsupportedValue`. The `extensionRef` filter is not supported either.
+
+Writing its status needs the `grpcroutes/status` RBAC (see [Minimum RBAC](#minimum-rbac)). Without the `grpcroutes` CRD, or the permission to list them, Sōzune skips the GRPCRoute watcher.
 
 ## Gateway API (TLSRoute)
 
@@ -923,7 +968,7 @@ Refer to [ACME / Let's Encrypt](/documentation/tls/acme) for the full setup.
 - **Multi-cluster.** A single Sōzune instance watches a single API server. Run one Sōzune per cluster.
 - **EndpointSlice required.** Kubernetes ≥ 1.21 only — the deprecated `Endpoints` API is not consumed.
 - **Cross-namespace backends not supported on Ingress.** Backends must live in the same namespace as the Ingress, per the Kubernetes spec. (HTTPRoute supports cross-namespace `backendRefs` when authorised by a [`ReferenceGrant`](#cross-namespace-backends-referencegrant).)
-- **Gateway API: `GRPCRoute` and the `extensionRef` HTTPRoute filter are not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite`, `requestMirror` and `cors` filters. See the Gateway API section above for details.
+- **Gateway API: the `extensionRef` filter is not yet implemented.** `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` and `ReferenceGrant` are supported, as are the `requestRedirect`, `requestHeaderModifier`, `responseHeaderModifier`, `urlRewrite`, `requestMirror` and `cors` filters. See the Gateway API section above for details.
 - **TLSRoute, TCPRoute and UDPRoute serve on a port you allow.** The listener's port must be bound by a `proxy.tcp` / `proxy.udp` entry, or listed in `proxy.gateway_ports`, or, for a `TLS` listener, be the HTTPS port with `proxy.https.passthrough` — Sōzune opens no other port from a Gateway. TLSRoute is `Passthrough` only (`tls.mode: Terminate` is out of scope, that is what [`HTTPS` listeners](#https-listeners) are for). See [Gateway API (TLSRoute)](#gateway-api-tlsroute) and [Gateway API (TCPRoute)](#gateway-api-tcproute).
 
 ## Environment variables

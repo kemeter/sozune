@@ -171,6 +171,11 @@ pub struct EntrypointConfig {
     pub sticky_session: bool,
     #[serde(default)]
     pub compress: bool,
+    /// Speak HTTP/2 in cleartext with prior knowledge (h2c) to the backends,
+    /// as gRPC servers expect. A route that goes through the middleware is
+    /// still forwarded to them over HTTP/1.1.
+    #[serde(default)]
+    pub h2c_backends: bool,
     #[serde(default)]
     pub entrypoint: Option<String>,
     /// SNI hostname this TCP entrypoint matches, for TLS passthrough routing.

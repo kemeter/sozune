@@ -1,6 +1,7 @@
 pub mod gateway;
 mod gateway_compat;
 pub mod gateway_filters;
+pub mod gateway_grpc;
 pub mod gateway_matches;
 pub mod gateway_tls;
 mod ingress_annotations;
@@ -1379,6 +1380,7 @@ impl IngressParseCtx<'_> {
                 in_flight_req: None,
                 sticky_session: false,
                 compress: false,
+                h2c_backends: false,
                 entrypoint: None,
                 sni: None,
                 methods: Vec::new(),

@@ -32,6 +32,7 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       - httproutes/status
+      - grpcroutes/status
       - tlsroutes/status
       - tcproutes/status
       - udproutes/status
@@ -74,6 +75,8 @@ data:
         udp: ["5300-5312"]
       http:
         listen_address: 80
+        # GATEWAY-GRPC's client speaks h2c on the HTTP port.
+        h2c: true
       https:
         listen_address: 443
         # GATEWAY-TLS puts a TLS listener on the HTTPS port.
