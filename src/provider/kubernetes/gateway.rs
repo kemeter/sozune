@@ -49,7 +49,9 @@ use crate::provider::kubernetes::gateway_compat::{
     UdpRouteStatusParentsParentRef,
 };
 use futures_util::StreamExt;
-use gateway_api::apis::standard::gatewayclasses::GatewayClass;
+use gateway_api::apis::standard::gatewayclasses::{
+    GatewayClass, GatewayClassStatusSupportedFeatures,
+};
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
@@ -454,6 +456,9 @@ pub struct ServedPorts {
     /// `HTTPS` listener.
     pub https_h2: bool,
     pub gateway: crate::config::GatewayPortsConfig,
+    /// Whether Sōzune writes its addresses in the status of its Gateways
+    /// (`publish_service` or `publish_addresses`).
+    pub publishes_addresses: bool,
     /// The ports of `gateway` Sōzune could not open, as the proxy reported.
     pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
 }
@@ -474,6 +479,7 @@ impl ServedPorts {
                 .as_ref()
                 .is_none_or(|protocols| protocols.iter().any(|p| p == "h2")),
             gateway: proxy.gateway_ports.clone(),
+            publishes_addresses: false,
             unopened: Default::default(),
         }
     }
@@ -580,6 +586,17 @@ impl GatewayScope {
                 g.status_tx = Some(status_tx);
             }
             Err(e) => error!("Gateway API: scope lock poisoned: {}", e),
+        }
+    }
+
+    /// The ports Sōzune listens on, as [`configure_status`](Self::configure_status) recorded them.
+    fn served(&self) -> ServedPorts {
+        match self.state.read() {
+            Ok(g) => g.served.clone(),
+            Err(e) => {
+                error!("Gateway API: scope lock poisoned: {}", e);
+                ServedPorts::default()
+            }
         }
     }
 
@@ -4121,6 +4138,66 @@ fn merge_listener_statuses(
     (merged, changed)
 }
 
+/// The Gateway API features a GatewayClass of Sōzune serves, by their
+/// conformance names: the kinds whose core conformance tests pass, and the
+/// extended features whose tests all pass. Published on the class's `status.supportedFeatures`, where the
+/// conformance suite reads what to test.
+const SUPPORTED_FEATURES: &[&str] = &[
+    "Gateway",
+    "GatewayAddressEmpty",
+    "GatewayHTTPListenerIsolation",
+    "GatewayPort8080",
+    "GRPCRoute",
+    "HTTPRoute",
+    "HTTPRoute303RedirectStatusCode",
+    "HTTPRoute307RedirectStatusCode",
+    "HTTPRoute308RedirectStatusCode",
+    "HTTPRouteBackendProtocolWebSocket",
+    "HTTPRouteBackendRequestHeaderModification",
+    "HTTPRouteBackendTimeout",
+    "HTTPRouteCORS",
+    "HTTPRouteDestinationPortMatching",
+    "HTTPRouteHostRewrite",
+    "HTTPRouteNamedRouteRule",
+    "HTTPRouteParentRefPort",
+    "HTTPRoutePathRedirect",
+    "HTTPRoutePathRewrite",
+    "HTTPRoutePortRedirect",
+    "HTTPRouteQueryParamMatching",
+    "HTTPRouteRequestMirror",
+    "HTTPRouteRequestMultipleMirrors",
+    "HTTPRouteRequestPercentageMirror",
+    "HTTPRouteRequestTimeout",
+    "HTTPRouteResponseHeaderModification",
+    "HTTPRouteSchemeRedirect",
+    "ReferenceGrant",
+    "TLSRoute",
+];
+
+/// The features of [`SUPPORTED_FEATURES`] this Sōzune serves as configured,
+/// sorted by name as Gateway API requires. GRPCRoute needs HTTP/2 on a
+/// listener: `proxy.http.h2c`, or `h2` in the HTTPS listener's ALPN. A
+/// Gateway gets an address only where Sōzune publishes its own, and a
+/// listener on port 8080 is served there only on an HTTP port of Sōzune's.
+fn supported_features(served: &ServedPorts) -> Vec<GatewayClassStatusSupportedFeatures> {
+    let grpc = served.h2c || served.https_h2;
+    let port_8080 = served.http == 8080 || served.gateway.allows_http(8080);
+    let mut names: Vec<&str> = SUPPORTED_FEATURES
+        .iter()
+        .copied()
+        .filter(|name| grpc || !name.starts_with("GRPCRoute"))
+        .filter(|name| served.publishes_addresses || *name != "GatewayAddressEmpty")
+        .filter(|name| port_8080 || *name != "GatewayPort8080")
+        .collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .map(|name| GatewayClassStatusSupportedFeatures {
+            name: name.to_string(),
+        })
+        .collect()
+}
+
 /// Build the single `Accepted` condition sōzune owns on a GatewayClass's
 /// status. Only ever called for a class sōzune owns (controllerName
 /// matches), so the condition is always `Accepted=True`.
@@ -4332,12 +4409,20 @@ async fn patch_gatewayclass_status(client: &Client, scope: &GatewayScope, class:
     };
     let ours = build_gatewayclass_conditions(class);
     let existing = class.status.as_ref().and_then(|s| s.conditions.as_deref());
-    let (merged, changed) = merge_conditions(existing, ours);
-    if !changed {
+    let (merged, conditions_changed) = merge_conditions(existing, ours);
+    let features = supported_features(&scope.served());
+    // CRDs older than the field prune it: the write is then a no-op the API
+    // server does not record, so no event comes back to repeat it.
+    let features_changed = class
+        .status
+        .as_ref()
+        .and_then(|s| s.supported_features.as_ref())
+        != Some(&features);
+    if !conditions_changed && !features_changed {
         return;
     }
     let patch = serde_json::json!({
-        "status": { "conditions": merged }
+        "status": { "conditions": merged, "supportedFeatures": features }
     });
     let api: Api<GatewayClass> = Api::all(client.clone());
     let pp = PatchParams::default();
@@ -10987,6 +11072,48 @@ mod tests {
     }
 
     // ---------- Gateway / GatewayClass status tests ----------
+
+    #[test]
+    fn supported_features_are_sorted_and_need_http2_for_grpc() {
+        let names = |served: &ServedPorts| -> Vec<String> {
+            supported_features(served)
+                .into_iter()
+                .map(|f| f.name)
+                .collect()
+        };
+        let mut ports = served();
+        ports.h2c = false;
+        ports.https_h2 = true;
+        let with_grpc = names(&ports);
+        let mut sorted = with_grpc.clone();
+        sorted.sort();
+        assert_eq!(with_grpc, sorted);
+        assert!(with_grpc.contains(&"GRPCRoute".to_string()));
+        assert!(with_grpc.contains(&"HTTPRoute".to_string()));
+
+        ports.https_h2 = false;
+        let without = names(&ports);
+        assert!(!without.iter().any(|n| n.starts_with("GRPCRoute")));
+        assert!(without.contains(&"HTTPRoute".to_string()));
+    }
+
+    #[test]
+    fn deployment_dependent_features_follow_the_config() {
+        let has = |served: &ServedPorts, name: &str| {
+            supported_features(served).iter().any(|f| f.name == name)
+        };
+        let mut ports = served();
+        ports.publishes_addresses = false;
+        assert!(!has(&ports, "GatewayAddressEmpty"));
+        ports.publishes_addresses = true;
+        assert!(has(&ports, "GatewayAddressEmpty"));
+
+        ports.http = 80;
+        ports.gateway = Default::default();
+        assert!(!has(&ports, "GatewayPort8080"));
+        ports.http = 8080;
+        assert!(has(&ports, "GatewayPort8080"));
+    }
     //
     // Same contract as the route status tests: the pure builders and the
     // condition merge encode which conditions sōzune owns and how they
@@ -11317,6 +11444,7 @@ mod tests {
                 udp: vec!["5353".parse().unwrap()],
                 ..Default::default()
             },
+            publishes_addresses: false,
             unopened: Default::default(),
         }
     }

@@ -271,7 +271,10 @@ pub async fn start_services(
             .https
             .passthrough
             .then_some(config.proxy.https.listen_address);
-        let served_ports_for_gateway = gateway::ServedPorts::from_config(&config.proxy);
+        let mut served_ports_for_gateway = gateway::ServedPorts::from_config(&config.proxy);
+        served_ports_for_gateway.publishes_addresses =
+            !kubernetes_config.publish_service.is_empty()
+                || !kubernetes_config.publish_addresses.is_empty();
         tokio::spawn(async move {
             let client = match kubernetes_provider_for_gateway.build_client().await {
                 Ok(c) => c,

@@ -310,6 +310,8 @@ spec:
   controllerName: kemeter.io/sozune
 ```
 
+Sōzune marks the class `Accepted` and lists on its `status.supportedFeatures` the Gateway API features it serves, by their conformance names: the route kinds, and the extended features whose conformance tests pass (since 0.16). Those that depend on the deployment are listed only when it provides them: GRPCRoute when a listener speaks HTTP/2 (`proxy.http.h2c`, or `h2` in the HTTPS ALPN), `GatewayAddressEmpty` when Sōzune publishes its addresses (`publish_service` or `publish_addresses`), `GatewayPort8080` when it serves HTTP on port 8080 (`proxy.http.listen_address` or `proxy.gateway_ports.http`).
+
 Then a `Gateway` that references it:
 
 ```yaml
