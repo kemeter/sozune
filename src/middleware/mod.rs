@@ -85,6 +85,16 @@ impl PathMatch {
         match path.rule_type {
             crate::model::PathRuleType::Prefix => PathMatch::Prefix(path.value.clone()),
             crate::model::PathRuleType::Exact => PathMatch::Exact(path.value.clone()),
+            crate::model::PathRuleType::RegexPath => {
+                let compiled = crate::model::anchored_regex(&path.value);
+                if compiled.is_none() {
+                    warn!(
+                        "path regex `{}` does not compile; the route will match nothing",
+                        path.value
+                    );
+                }
+                PathMatch::Regex(compiled, path.value.clone())
+            }
             crate::model::PathRuleType::Regex => {
                 let compiled = regex::Regex::new(&path.value).ok();
                 if compiled.is_none() {

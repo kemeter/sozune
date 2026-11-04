@@ -617,6 +617,57 @@ else
     fail "urlRewrite hostname: got $host_code, body: $(head -c 300 <<<"$host_body")"
 fi
 
+# RegularExpression path: the regex must match the whole path, the query
+# left out.
+log "[02] Gateway: RegularExpression path matches the whole path, not its query"
+
+kubectl apply -n sozune-test -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: regex-path-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-regex-path.k8s-test.localhost
+  rules:
+    - matches:
+        - path:
+            type: RegularExpression
+            value: /api/v[0-9]+
+        - path:
+            type: RegularExpression
+            value: /files/.+
+      backendRefs:
+        - name: svcb
+          port: 80
+YAML
+sleep 4
+
+regex_reason=$(kubectl get httproute regex-path-route -n sozune-test \
+    -o jsonpath="{.status.parents[?(@.controllerName=='kemeter.io/sozune')].conditions[?(@.type=='Accepted')].reason}" 2>/dev/null)
+if [[ "$regex_reason" == "Accepted" ]]; then
+    pass "RegularExpression path route has Accepted=True"
+else
+    fail "RegularExpression path route status wrong (reason='$regex_reason', expected Accepted)"
+fi
+
+for case in "/api/v2 200" "/api/v2?page=2 200" "/api/v2/users 404" "/api/vx 404" \
+    "/files/a 200" "/files/?name=a 404"; do
+    regex_path=${case% *}
+    regex_want=${case##* }
+    regex_got=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+        -H "Host: gw-regex-path.k8s-test.localhost" \
+        "http://127.0.0.1:$HTTP_PORT$regex_path" 2>/dev/null)
+    if [[ "$regex_got" == "$regex_want" ]]; then
+        pass "RegularExpression path: $regex_path -> $regex_got"
+    else
+        fail "RegularExpression path: $regex_path -> $regex_got (expected $regex_want)"
+    fi
+done
+
 # ----------------------------------------------------------------------
 # Cross-namespace backendRef + ReferenceGrant. An HTTPRoute in one
 # namespace targeting a Service in another must be REFUSED until a

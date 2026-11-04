@@ -789,6 +789,7 @@ fn describe_path(entrypoint: &Entrypoint) -> String {
             PathRuleType::Prefix => format!("prefix `{}`", path.value),
             PathRuleType::Exact => format!("exactly `{}`", path.value),
             PathRuleType::Regex => format!("regex `{}`", path.value),
+            PathRuleType::RegexPath => format!("path regex `{}`", path.value),
         },
     }
 }

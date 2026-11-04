@@ -47,6 +47,7 @@ All notable changes to this project will be documented in this file.
 - Route order — among routes of the same priority, the more specific one is tried first: exact hostname, regex, wildcard (longer first), then any host; exact path before prefix, longer prefix first; a route on `methods` before one on any method; more `matchHeaders` conditions first. They used to be tried by id, so a `/` route could capture `/api` requests from an `/api` route depending on their names. `sozune route` and `POST /routes/resolve` say when specificity decided. See [Priority](documentation/routing/hostnames.md#priority).
 
 - HTTPRoute host rewrite — a `urlRewrite` `hostname` is now applied by Sōzu, so such a rule no longer goes through the middleware. The backend still gets a single `Host` header, the client's going in `X-Forwarded-Host`. See [urlRewrite](documentation/providers/kubernetes.md#urlrewrite).
+- HTTPRoute path regular expressions — a `RegularExpression` path match is now served: the regex must match the whole path, the query left out, as Gateway API asks. Such a route used to be dropped. One that does not compile still drops the route. See [Gateway API](documentation/providers/kubernetes.md#gateway-api-httproute).
 
 ### Reliability
 

@@ -93,9 +93,8 @@ fn method_verb(method: &HttpRouteRulesMatchesMethod) -> &'static str {
 }
 
 /// True iff a single match declares a condition sōzune cannot represent: a
-/// `RegularExpression` header or query match that does not compile, or a
-/// `RegularExpression` path match, which Sōzu would match against the path
-/// with its query. The caller aggregates this across a route's matches to
+/// `RegularExpression` path, header or query match that does not compile.
+/// The caller aggregates this across a route's matches to
 /// reject the route with a clear status rather than serve it with the
 /// condition dropped.
 pub fn match_has_unsupported_conditions(m: &HttpRouteRulesMatches) -> bool {
@@ -122,7 +121,7 @@ pub fn match_has_unsupported_conditions(m: &HttpRouteRulesMatches) -> bool {
         matches!(
             p.r#type,
             Some(HttpRouteRulesMatchesPathType::RegularExpression)
-        )
+        ) && p.value.as_deref().is_none_or(invalid)
     });
     header_regex || query_regex || path_regex
 }

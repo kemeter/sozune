@@ -36,6 +36,9 @@ enum PathCaptures {
     Whole,
     Prefix(String),
     Regex(Regex),
+    /// A regex on the path without its query, which Sōzu appends to the
+    /// rewritten path unless that path carries a query of its own.
+    RegexPath(Regex),
 }
 
 impl RedirectMiddleware {
@@ -52,6 +55,10 @@ impl RedirectMiddleware {
             1 => match Regex::new(&format!("^(?:{})$", path_rule.value)) {
                 Ok(regex) => PathCaptures::Regex(regex),
                 Err(_) => PathCaptures::Whole,
+            },
+            3 => match crate::model::anchored_regex(&path_rule.value) {
+                Some(regex) => PathCaptures::RegexPath(regex),
+                None => PathCaptures::Whole,
             },
             _ => PathCaptures::Whole,
         };
@@ -105,6 +112,14 @@ impl RedirectMiddleware {
         };
         let query = path.find('?').map_or("", |start| &path[start..]);
         let path = match &self.path {
+            Some(template) if matches!(self.path_rule, PathCaptures::RegexPath(_)) => {
+                let rewritten = expand(template);
+                if rewritten.contains('?') {
+                    rewritten
+                } else {
+                    format!("{rewritten}{query}")
+                }
+            }
             Some(template) if self.keeps_query => format!("{}{query}", expand(template)),
             Some(template) => expand(template),
             None => path.to_string(),
@@ -195,6 +210,17 @@ impl RedirectMiddleware {
             PathCaptures::Prefix(prefix) => captures.push(&path[prefix.len().min(path.len())..]),
             PathCaptures::Regex(regex) => {
                 if let Some(caps) = regex.captures(path) {
+                    captures.extend(
+                        caps.iter()
+                            .skip(1)
+                            .map(|c| c.map(|m| m.as_str()).unwrap_or("")),
+                    );
+                }
+            }
+            PathCaptures::RegexPath(regex) => {
+                let path_only = path.split_once('?').map_or(path, |(p, _)| p);
+                captures[0] = path_only;
+                if let Some(caps) = regex.captures(path_only) {
                     captures.extend(
                         caps.iter()
                             .skip(1)
@@ -462,6 +488,30 @@ mod tests {
         assert_eq!(
             m.location(false, "app.example.com:8080", "/"),
             "http://app.example.org/"
+        );
+    }
+
+    /// A path regex captures from the path alone, and the query follows the
+    /// rewritten path unless it has one of its own, as Sōzu does.
+    #[test]
+    fn a_path_regex_captures_from_the_path_and_keeps_the_query() {
+        let rule = PathRule {
+            value: "/api/(v[0-9]+)".to_string(),
+            kind: 3,
+        };
+        let m = middleware(&see_other(), rule.clone(), Some("/new/$PATH[1]"));
+        assert_eq!(
+            m.location(false, "example.com", "/api/v2?x=1"),
+            "http://example.com/new/v2?x=1"
+        );
+        assert_eq!(
+            m.location(false, "example.com", "/api/v2"),
+            "http://example.com/new/v2"
+        );
+        let m = middleware(&see_other(), rule, Some("/new/$PATH[1]?y=2"));
+        assert_eq!(
+            m.location(false, "example.com", "/api/v2?x=1"),
+            "http://example.com/new/v2?y=2"
         );
     }
 
