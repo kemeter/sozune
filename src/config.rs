@@ -710,8 +710,8 @@ pub struct HttpConfig {
     )]
     pub error_pages: BTreeMap<String, String>,
     /// Serve HTTP/2 in cleartext to clients that open with its preface
-    /// (prior knowledge), such as gRPC clients, alongside HTTP/1.x. Off by
-    /// default. Needs `buffer_size` of at least [`H2_MIN_BUFFER_SIZE`].
+    /// (prior knowledge), alongside HTTP/1.x. Backends are still reached over
+    /// HTTP/1.1. Off by default. Needs `buffer_size` of at least [`H2_MIN_BUFFER_SIZE`].
     #[serde(default)]
     pub h2c: bool,
 }
