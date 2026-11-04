@@ -42,7 +42,7 @@ spec:
       protocol: UDP
       port: $GATEWAY_UDP_PORT
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/$TCPROUTE_API_VERSION
 kind: TCPRoute
 metadata:
   name: ports-tcp
@@ -56,7 +56,7 @@ spec:
         - name: svc-tcp
           port: 9000
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/$UDPROUTE_API_VERSION
 kind: UDPRoute
 metadata:
   name: ports-udp

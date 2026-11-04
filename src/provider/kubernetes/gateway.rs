@@ -27,7 +27,7 @@
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gatewayclass/>
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gateway/>
 
-use super::gateway_compat::ReferenceGrant;
+use super::gateway_compat::{ReferenceGrant, ServedVersion};
 use super::gateway_filters;
 use super::gateway_grpc::{self, route_kind};
 use super::gateway_matches;
@@ -42,7 +42,7 @@ use crate::provider::kubernetes::gateway_compat::{
 };
 use crate::provider::kubernetes::gateway_compat::{
     TlsRoute, TlsRouteParentRefs, TlsRouteRules, TlsRouteStatusParents,
-    TlsRouteStatusParentsParentRef, use_tls_route_v1alpha2,
+    TlsRouteStatusParentsParentRef,
 };
 use crate::provider::kubernetes::gateway_compat::{
     UdpRoute, UdpRouteParentRefs, UdpRouteRules, UdpRouteStatusParents,
@@ -61,7 +61,7 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-use kube::api::{Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -3635,6 +3635,45 @@ impl L4Route for UdpRoute {
     }
 }
 
+/// An `Api` on the version of `R` the cluster serves: `v1`, else `v1alpha2`
+/// (see [`ServedVersion`]). `None`, logged, when it serves neither or Sōzune
+/// may not list it: the watcher of `R` then stops.
+async fn served_l4_api<R: L4Route + ServedVersion>(client: &Client) -> Option<Api<R>> {
+    let plural = R::plural(&());
+    let mut last = None;
+    for v1alpha2 in [false, true] {
+        // An `Api` keeps the URL of the version current when it is built.
+        R::use_v1alpha2(v1alpha2);
+        let api: Api<R> = Api::all(client.clone());
+        match api.list(&ListParams::default().limit(1)).await {
+            Ok(_) => return Some(api),
+            Err(kube::Error::Api(resp)) if resp.code == 404 => last = None,
+            Err(e) => {
+                last = Some(e);
+                break;
+            }
+        }
+    }
+    // Distinguish "CRD absent" from "not allowed to list it": both stop the
+    // watcher, but only the first is routine. Reporting a 403 as a missing CRD
+    // would send an operator hunting for the wrong thing.
+    match last {
+        None => info!(
+            "Gateway API: {} CRD not installed (neither v1 nor v1alpha2 is served), skipping watcher",
+            R::KIND
+        ),
+        Some(kube::Error::Api(resp)) if resp.code == 403 => warn!(
+            "Gateway API: not allowed to list {}, skipping watcher — grant `{}` (get/list/watch) in the gateway.networking.k8s.io group: {}",
+            plural, plural, resp.message
+        ),
+        Some(e) => warn!(
+            "Gateway API: could not probe for {}, skipping watcher: {}",
+            plural, e
+        ),
+    }
+    None
+}
+
 /// What an [`L4Route`] watcher hands its status writer.
 type L4StatusTx<R> = mpsc::Sender<(R, RouteOutcome, Option<InvalidRef>)>;
 
@@ -6576,11 +6615,9 @@ fn re_resolve_all_tls(
 
 /// Watch TLSRoutes and keep their entrypoints in sync.
 ///
-/// TLSRoute is `v1` in the standard bundle since Gateway API v1.5, and
-/// `v1alpha2` in the experimental bundle of older releases, so the CRD may be
-/// absent or serve either version. The watcher probes for `v1`, then
-/// `v1alpha2`, and exits quietly when neither is served rather than logging
-/// an error on every retry.
+/// The CRD may be absent or serve either version (see [`served_l4_api`]):
+/// the watcher exits quietly when neither is served rather than logging an
+/// error on every retry.
 pub async fn run_tlsroute_watcher(
     client: Client,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -6589,42 +6626,9 @@ pub async fn run_tlsroute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    // An `Api` keeps the URL of the version current when it is built: build
-    // it again after switching.
-    use_tls_route_v1alpha2(false);
-    let mut api: Api<TlsRoute> = Api::all(client.clone());
-    let mut probe = api.list(&Default::default()).await;
-    if matches!(&probe, Err(kube::Error::Api(resp)) if resp.code == 404) {
-        use_tls_route_v1alpha2(true);
-        api = Api::all(client.clone());
-        probe = api.list(&Default::default()).await;
-    }
-    // Distinguish "CRD absent" from "not allowed to list it": both stop the
-    // watcher, but only the first is routine. Reporting a 403 as a missing CRD
-    // would send an operator hunting for the wrong thing.
-    if let Err(e) = probe {
-        match &e {
-            kube::Error::Api(resp) if resp.code == 404 => {
-                info!(
-                    "Gateway API: TLSRoute CRD not installed (neither v1 nor v1alpha2 is served), skipping watcher"
-                );
-            }
-            kube::Error::Api(resp) if resp.code == 403 => {
-                warn!(
-                    "Gateway API: not allowed to list TLSRoutes, skipping watcher — grant `tlsroutes` (get/list/watch) in the gateway.networking.k8s.io group: {}",
-                    resp.message
-                );
-            }
-            other => {
-                warn!(
-                    "Gateway API: could not probe for TLSRoutes, skipping watcher: {}",
-                    other
-                );
-            }
-        }
+    let Some(api) = served_l4_api::<TlsRoute>(&client).await else {
         return Ok(());
-    }
-
+    };
     let status_tx = spawn_l4_status_writer::<TlsRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
@@ -7013,8 +7017,8 @@ fn re_resolve_all_tcp(
     changed
 }
 
-/// Watch TCPRoutes and keep their entrypoints in sync. `v1alpha2`/experimental
-/// like TLSRoute, so the CRD is probed and the watcher exits quietly if absent.
+/// Watch TCPRoutes and keep their entrypoints in sync. The CRD is probed, as
+/// TLSRoute's is, and the watcher exits quietly if absent.
 pub async fn run_tcproute_watcher(
     client: Client,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -7023,13 +7027,9 @@ pub async fn run_tcproute_watcher(
     scope: GatewayScope,
     listener_ports: TcpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<TcpRoute> = Api::all(client.clone());
-    if api.list(&Default::default()).await.is_err() {
-        info!(
-            "Gateway API: TCPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
-        );
+    let Some(api) = served_l4_api::<TcpRoute>(&client).await else {
         return Ok(());
-    }
+    };
     let status_tx = spawn_l4_status_writer::<TcpRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
@@ -7037,7 +7037,10 @@ pub async fn run_tcproute_watcher(
     let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     resolve_ticker.tick().await;
 
-    info!("Gateway API: TCPRoute watcher started");
+    info!(
+        "Gateway API: TCPRoute watcher started ({})",
+        <TcpRoute as kube::Resource>::api_version(&())
+    );
     // The routes the current relist returned; the others were deleted while
     // the watcher was away.
     let mut relisted: Option<HashSet<String>> = None;
@@ -7399,8 +7402,8 @@ fn re_resolve_all_udp(
     changed
 }
 
-/// Watch UDPRoutes and keep their entrypoints in sync. `v1alpha2`/experimental
-/// like TCPRoute, so the CRD is probed and the watcher exits quietly if absent.
+/// Watch UDPRoutes and keep their entrypoints in sync. The CRD is probed, as
+/// TLSRoute's is, and the watcher exits quietly if absent.
 pub async fn run_udproute_watcher(
     client: Client,
     storage: Arc<RwLock<BTreeMap<String, Entrypoint>>>,
@@ -7409,13 +7412,9 @@ pub async fn run_udproute_watcher(
     scope: GatewayScope,
     listener_ports: UdpListenerPorts,
 ) -> anyhow::Result<()> {
-    let api: Api<UdpRoute> = Api::all(client.clone());
-    if api.list(&Default::default()).await.is_err() {
-        info!(
-            "Gateway API: UDPRoute CRD not installed, skipping watcher (it ships in the experimental bundle)"
-        );
+    let Some(api) = served_l4_api::<UdpRoute>(&client).await else {
         return Ok(());
-    }
+    };
     let status_tx = spawn_l4_status_writer::<UdpRoute>(client, scope.clone());
 
     let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
@@ -7423,7 +7422,10 @@ pub async fn run_udproute_watcher(
     let mut resolve_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     resolve_ticker.tick().await;
 
-    info!("Gateway API: UDPRoute watcher started");
+    info!(
+        "Gateway API: UDPRoute watcher started ({})",
+        <UdpRoute as kube::Resource>::api_version(&())
+    );
     // The routes the current relist returned; the others were deleted while
     // the watcher was away.
     let mut relisted: Option<HashSet<String>> = None;
