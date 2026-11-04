@@ -12,7 +12,9 @@
 //!   one standing for any name.
 //!
 //! Header matches, filters and backendRefs have the same shape in both
-//! kinds and are carried over as they are.
+//! kinds and are carried over as they are. Every match, a rule without any
+//! included, also requires a gRPC `content-type` ([`GRPC_CONTENT_TYPE`]): a
+//! GRPCRoute routes gRPC calls, not every request on its hostnames.
 //!
 //! The translated route keeps the GRPCRoute's namespace and uid, and takes
 //! its name behind [`GRPC_NAME_PREFIX`]: Kubernetes names cannot hold a `/`,
@@ -25,6 +27,10 @@ use serde_json::{Map, Value, json};
 
 /// Put before the name of the HTTPRoute a GRPCRoute is translated into.
 pub const GRPC_NAME_PREFIX: &str = "grpc/";
+
+/// The `content-type` of a gRPC call: `application/grpc`, maybe with a
+/// `+<format>` suffix or parameters.
+pub const GRPC_CONTENT_TYPE: &str = "application/grpc([+;].*)?";
 
 /// The Gateway API kind of a route handled by the HTTPRoute pipeline:
 /// `GRPCRoute` for one translated by [`to_http_route`], `HTTPRoute`
@@ -63,10 +69,21 @@ pub fn to_http_route(route: &GrpcRoute) -> Option<HttpRoute> {
         .and_then(Value::as_array_mut)
     {
         for rule in rules {
-            if let Some(matches) = rule.get_mut("matches").and_then(Value::as_array_mut) {
-                for m in matches {
-                    translate_match(m);
-                }
+            let Some(rule) = rule.as_object_mut() else {
+                continue;
+            };
+            let matches = rule.entry("matches").or_insert_with(|| json!([]));
+            if !matches.is_array() {
+                *matches = json!([]);
+            }
+            let Some(matches) = matches.as_array_mut() else {
+                continue;
+            };
+            if matches.is_empty() {
+                matches.push(json!({}));
+            }
+            for m in matches {
+                translate_match(m);
             }
         }
     }
@@ -82,14 +99,23 @@ fn translate_match(m: &mut Value) {
     if let Some(path) = method.as_ref().and_then(method_path) {
         object.insert("path".into(), path);
     }
-    if let Some(headers) = object.get_mut("headers").and_then(Value::as_array_mut) {
-        for header in headers {
+    let headers = object.entry("headers").or_insert_with(|| json!([]));
+    if !headers.is_array() {
+        *headers = json!([]);
+    }
+    if let Some(headers) = headers.as_array_mut() {
+        for header in headers.iter_mut() {
             if let Some(header) = header.as_object_mut()
                 && !header.contains_key("type")
             {
                 header.insert("type".into(), json!("Exact"));
             }
         }
+        headers.push(json!({
+            "name": "content-type",
+            "type": "RegularExpression",
+            "value": GRPC_CONTENT_TYPE,
+        }));
     }
 }
 
@@ -134,7 +160,9 @@ fn method_path(method: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_api::apis::standard::httproutes::HttpRouteRulesMatchesPathType;
+    use gateway_api::apis::standard::httproutes::{
+        HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesPathType,
+    };
 
     fn grpc_route(matches: Value) -> GrpcRoute {
         serde_json::from_value(json!({
@@ -236,8 +264,13 @@ mod tests {
         let m = &rule.matches.as_ref().unwrap()[0];
         assert!(m.path.is_none());
         let headers = m.headers.as_ref().unwrap();
+        assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].name, "version");
         assert_eq!(headers[0].value, "two");
+        assert_eq!(
+            headers[0].r#type,
+            Some(HttpRouteRulesMatchesHeadersType::Exact)
+        );
         assert_eq!(rule.filters.as_ref().unwrap().len(), 1);
         let backend = &rule.backend_refs.as_ref().unwrap()[0];
         assert_eq!(
@@ -248,6 +281,50 @@ mod tests {
             route.spec.hostnames.as_deref(),
             Some(&["grpc.example.com".to_string()][..])
         );
+    }
+
+    /// Only gRPC calls are routed, a rule without matches included.
+    #[test]
+    fn every_match_requires_a_grpc_content_type() {
+        let content_type = |m: &HttpRouteRulesMatches| {
+            m.headers.as_deref().unwrap_or_default().iter().any(|h| {
+                h.name == "content-type"
+                    && h.value == GRPC_CONTENT_TYPE
+                    && h.r#type == Some(HttpRouteRulesMatchesHeadersType::RegularExpression)
+            })
+        };
+        let route = to_http_route(&grpc_route(json!([
+            { "method": { "service": "pkg.Echo" } },
+            { "headers": [{ "name": "version", "value": "two" }] }
+        ])))
+        .unwrap();
+        let matches = route.spec.rules.as_ref().unwrap()[0]
+            .matches
+            .clone()
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(content_type));
+
+        let route = to_http_route(&grpc_route(Value::Null)).unwrap();
+        let matches = route.spec.rules.as_ref().unwrap()[0]
+            .matches
+            .clone()
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].path.is_none());
+        assert!(content_type(&matches[0]));
+
+        let regex = regex::Regex::new(&format!("^(?:{GRPC_CONTENT_TYPE})$")).unwrap();
+        for ok in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc;charset=utf-8",
+        ] {
+            assert!(regex.is_match(ok), "{ok}");
+        }
+        for no in ["application/json", "application/grpc-web", "text/html"] {
+            assert!(!regex.is_match(no), "{no}");
+        }
     }
 
     #[test]
