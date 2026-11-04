@@ -916,7 +916,6 @@ pub(crate) fn edit_headers(
 pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
     let config = &entrypoint.config;
     config.answer.is_some()
-        || url_rewrite_host(config).is_some()
         || config.backend_timeout.is_some()
         || config.request_timeout.is_some()
         || config.rate_limit.is_some()
@@ -1133,9 +1132,9 @@ pub fn build_middleware_route(
     })
 }
 
-/// The host a route's URL rewrite gives the request. The middleware applies
-/// it: Sōzu's own host rewrite sends the backend two `Host` headers, which
-/// many servers refuse.
+/// The host a route's URL rewrite gives the request. Sōzu applies it to a
+/// route that reaches its backends directly, the middleware to one that goes
+/// through it, so that its own steps still see the host the client asked for.
 pub fn url_rewrite_host(config: &EntrypointConfig) -> Option<&str> {
     config.rewrite.as_ref()?.hostname.as_deref()
 }
