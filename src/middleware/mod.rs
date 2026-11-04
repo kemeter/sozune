@@ -916,7 +916,7 @@ pub(crate) fn edit_headers(
 pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
     let config = &entrypoint.config;
     config.answer.is_some()
-        || url_rewrite_host(config).is_some()
+        || rewrites_host_next_to_a_forwarded_host_edit(config)
         || config.backend_timeout.is_some()
         || config.request_timeout.is_some()
         || config.rate_limit.is_some()
@@ -1133,11 +1133,22 @@ pub fn build_middleware_route(
     })
 }
 
-/// The host a route's URL rewrite gives the request. The middleware applies
-/// it: Sōzu's own host rewrite sends the backend two `Host` headers, which
-/// many servers refuse.
+/// The host a route's URL rewrite gives the request. Sōzu applies it to a
+/// route that reaches its backends directly, the middleware to one that goes
+/// through it, so that its own steps still see the host the client asked for.
 pub fn url_rewrite_host(config: &EntrypointConfig) -> Option<&str> {
     config.rewrite.as_ref()?.hostname.as_deref()
+}
+
+/// A host rewrite on a route that also edits the request's
+/// `X-Forwarded-Host`: Sōzu would send the backend its own and the edit's,
+/// so the middleware rewrites the host instead and one header is left.
+fn rewrites_host_next_to_a_forwarded_host_edit(config: &EntrypointConfig) -> bool {
+    url_rewrite_host(config).is_some()
+        && config.headers.iter().any(|h| {
+            h.direction != HeaderDirection::Response
+                && h.name.eq_ignore_ascii_case("x-forwarded-host")
+        })
 }
 
 /// Start the middleware reverse proxy server

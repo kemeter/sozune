@@ -579,6 +579,44 @@ else
     fail "urlRewrite route status wrong (reason='$rewrite_reason', expected Accepted)"
 fi
 
+# urlRewrite hostname: Sōzu rewrites the Host. whoami is a Go server, which
+# answers 400 to a request carrying two Host headers.
+log "[02] Gateway: urlRewrite hostname reaches the backend as a single Host"
+
+kubectl apply -n sozune-test -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rewrite-host-route
+  namespace: sozune-test
+spec:
+  parentRefs:
+    - name: gw
+  hostnames:
+    - gw-rewrite-host.k8s-test.localhost
+  rules:
+    - filters:
+        - type: URLRewrite
+          urlRewrite:
+            hostname: rewritten.k8s-test.localhost
+      backendRefs:
+        - name: svcb
+          port: 80
+YAML
+sleep 4
+
+host_body=$(curl -s --max-time 2 -w '\n%{http_code}' \
+    -H "Host: gw-rewrite-host.k8s-test.localhost" \
+    "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null || true)
+host_code=$(tail -n1 <<<"$host_body")
+if [[ "$host_code" == "200" ]] \
+    && grep -qi '^Host: rewritten.k8s-test.localhost' <<<"$host_body" \
+    && grep -qi '^X-Forwarded-Host: gw-rewrite-host.k8s-test.localhost' <<<"$host_body"; then
+    pass "urlRewrite hostname: backend saw Host rewritten.k8s-test.localhost, the client's in X-Forwarded-Host"
+else
+    fail "urlRewrite hostname: got $host_code, body: $(head -c 300 <<<"$host_body")"
+fi
+
 # ----------------------------------------------------------------------
 # Cross-namespace backendRef + ReferenceGrant. An HTTPRoute in one
 # namespace targeting a Service in another must be REFUSED until a
