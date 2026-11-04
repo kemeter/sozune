@@ -68,24 +68,33 @@ else
     log "Installing Gateway API CRDs (standard $GATEWAY_API_VERSION)..."
     kubectl apply --server-side -f "$crd_cache/standard-install.yaml" >/dev/null
 
-    # TCPRoute and UDPRoute are experimental: take only their CRDs from the
-    # experimental bundle, so every other kind stays at its standard version.
-    log "Installing TCPRoute and UDPRoute CRDs (experimental $GATEWAY_API_VERSION)..."
-    awk -v RS='\n---\n' -v ORS='\n---\n' \
-        '/name: (tcproutes|udproutes)\.gateway\.networking\.k8s\.io/' \
-        "$crd_cache/experimental-install.yaml" | kubectl apply --server-side -f - >/dev/null
+    # TCPRoute and UDPRoute joined the standard channel in v1.6. Before, take
+    # only their CRDs from the experimental bundle, so every other kind stays
+    # at its standard version.
+    if ! kubectl get crd tcproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+        log "Installing TCPRoute and UDPRoute CRDs (experimental $GATEWAY_API_VERSION)..."
+        awk -v RS='\n---\n' -v ORS='\n---\n' \
+            '/name: (tcproutes|udproutes)\.gateway\.networking\.k8s\.io/' \
+            "$crd_cache/experimental-install.yaml" | kubectl apply --server-side -f - >/dev/null
+    fi
 fi
 
-# The TLSRoute version the manifests use: `v1` where the CRD serves it (the
-# standard channel since v1.5), `v1alpha2` before.
-if kubectl get crd tlsroutes.gateway.networking.k8s.io \
-    -o jsonpath='{.spec.versions[?(@.served==true)].name}' 2>/dev/null | tr ' ' '\n' | grep -qx v1; then
-    TLSROUTE_API_VERSION=v1
-else
-    TLSROUTE_API_VERSION=v1alpha2
-fi
-export TLSROUTE_API_VERSION
-log "TLSRoute manifests use $TLSROUTE_API_VERSION"
+# The version the manifests use for each L4 route kind: `v1` where its CRD
+# serves it (the standard channel, since v1.5 for TLSRoute and v1.6 for
+# TCPRoute and UDPRoute), `v1alpha2` before.
+served_route_version() {
+    if kubectl get crd "$1.gateway.networking.k8s.io" \
+        -o jsonpath='{.spec.versions[?(@.served==true)].name}' 2>/dev/null | tr ' ' '\n' | grep -qx v1; then
+        echo v1
+    else
+        echo v1alpha2
+    fi
+}
+TLSROUTE_API_VERSION=$(served_route_version tlsroutes)
+TCPROUTE_API_VERSION=$(served_route_version tcproutes)
+UDPROUTE_API_VERSION=$(served_route_version udproutes)
+export TLSROUTE_API_VERSION TCPROUTE_API_VERSION UDPROUTE_API_VERSION
+log "L4 route manifests use TLSRoute $TLSROUTE_API_VERSION, TCPRoute $TCPROUTE_API_VERSION, UDPRoute $UDPROUTE_API_VERSION"
 
 # -- Workload manifests (must come before the sozune Pod so the namespace
 # and ingresses already exist when sozune starts watching).
@@ -93,7 +102,7 @@ log "Applying workload manifests..."
 kubectl apply -f "$MANIFESTS_FILE"
 
 log "Applying Gateway API workloads..."
-sed "/^apiVersion: gateway.networking.k8s.io\/v1alpha2$/{N;s|v1alpha2\(\nkind: TLSRoute\)|$TLSROUTE_API_VERSION\1|}" \
+sed -e "/^apiVersion: gateway.networking.k8s.io\/v1alpha2$/{N;s|v1alpha2\(\nkind: TLSRoute\)|$TLSROUTE_API_VERSION\1|;s|v1alpha2\(\nkind: TCPRoute\)|$TCPROUTE_API_VERSION\1|;s|v1alpha2\(\nkind: UDPRoute\)|$UDPROUTE_API_VERSION\1|}" \
     "$K8S_DIR/gateway-manifests.yaml" | kubectl apply -f -
 
 log "Applying sozune deployment..."
