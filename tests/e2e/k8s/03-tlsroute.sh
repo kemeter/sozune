@@ -106,7 +106,7 @@ spec:
         kinds:
           - kind: TLSRoute
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/$TLSROUTE_API_VERSION
 kind: TLSRoute
 metadata:
   name: tls-https-passthrough
