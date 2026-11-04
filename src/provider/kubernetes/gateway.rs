@@ -3877,23 +3877,30 @@ fn build_listener_status(
     };
     let mut conditions = match (protocol_kinds.first(), problem) {
         (None, _) => {
-            let message = if protocol == "TLS" {
-                "TLS listeners are served in Passthrough mode only".to_string()
+            // A TLS or HTTPS listener is refused for its `tls.mode`, a value
+            // of a field Sōzune does not support; any other for its protocol.
+            let (reason, message) = if protocol == "TLS" {
+                (
+                    REASON_UNSUPPORTED_VALUE,
+                    "TLS listeners are served in Passthrough mode only".to_string(),
+                )
             } else if protocol == "HTTPS" {
-                "HTTPS listeners terminate TLS: Passthrough belongs on a TLS listener".to_string()
+                (
+                    REASON_UNSUPPORTED_VALUE,
+                    "HTTPS listeners terminate TLS: Passthrough belongs on a TLS listener"
+                        .to_string(),
+                )
             } else {
-                format!(
-                    "protocol {} is not supported: use HTTP, HTTPS, TLS, TCP or UDP",
-                    listener.protocol
+                (
+                    REASON_UNSUPPORTED_PROTOCOL,
+                    format!(
+                        "protocol {} is not supported: use HTTP, HTTPS, TLS, TCP or UDP",
+                        listener.protocol
+                    ),
                 )
             };
             vec![
-                condition(
-                    CONDITION_TYPE_ACCEPTED,
-                    false,
-                    REASON_UNSUPPORTED_PROTOCOL,
-                    message.clone(),
-                ),
+                condition(CONDITION_TYPE_ACCEPTED, false, reason, message.clone()),
                 condition(CONDITION_TYPE_PROGRAMMED, false, REASON_INVALID, message),
             ]
         }
@@ -12966,7 +12973,7 @@ mod tests {
         let passthrough = build_listener_status(&gw, &passthrough, &served(), 0, None);
         assert_eq!(
             condition_of(&passthrough, CONDITION_TYPE_ACCEPTED).reason,
-            REASON_UNSUPPORTED_PROTOCOL
+            REASON_UNSUPPORTED_VALUE
         );
         assert!(
             passthrough
@@ -13189,7 +13196,7 @@ mod tests {
         let status = build_listener_status(&gw, &terminate, &served(), 0, None);
         let accepted = condition_of(&status, CONDITION_TYPE_ACCEPTED);
         assert_eq!(accepted.status, "False");
-        assert_eq!(accepted.reason, REASON_UNSUPPORTED_PROTOCOL);
+        assert_eq!(accepted.reason, REASON_UNSUPPORTED_VALUE);
         assert!(accepted.message.contains("Passthrough"));
         assert!(
             status

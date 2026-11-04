@@ -512,7 +512,8 @@ With `publish_service` or `publish_addresses` set, `status.addresses` carries SÅ
 | `ResolvedRefs` | `True` (`ResolvedRefs`) | The listener's `allowedRoutes.kinds` is unset, or only lists the kind it carries, and an `HTTPS` listener's certificateRefs all resolve |
 | `ResolvedRefs` | `False` (`InvalidRouteKinds`) | `allowedRoutes.kinds` lists a kind the listener's protocol cannot carry. If it leaves out the one it can, `Programmed` is `False` (`Invalid`) too: no route attaches |
 | `ResolvedRefs` | `False` (`InvalidCertificateRef`, `RefNotPermitted`) | An `HTTPS` listener's certificateRef cannot be used (see [HTTPS listeners](#https-listeners)); `Programmed` is `False` (`Invalid`) too |
-| `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | An `HTTPS` listener in `Passthrough` mode (that belongs on a `TLS` listener), a `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`), or any other protocol |
+| `Accepted`, `Programmed` | `False` (`UnsupportedValue`, `Invalid`) | An `HTTPS` listener in `Passthrough` mode (that belongs on a `TLS` listener), or a `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`) (since 0.16; `UnsupportedProtocol` before) |
+| `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | Any other protocol |
 
 **GatewayClass** (`status.conditions[]`) (since 0.15):
 
