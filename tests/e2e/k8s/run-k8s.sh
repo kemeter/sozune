@@ -71,7 +71,7 @@ else
     # TCPRoute and UDPRoute joined the standard channel in v1.6. Before, take
     # only their CRDs from the experimental bundle, so every other kind stays
     # at its standard version.
-    if ! kubectl get crd tcproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+    if ! grep -q "name: tcproutes.gateway.networking.k8s.io" "$crd_cache/standard-install.yaml"; then
         log "Installing TCPRoute and UDPRoute CRDs (experimental $GATEWAY_API_VERSION)..."
         awk -v RS='\n---\n' -v ORS='\n---\n' \
             '/name: (tcproutes|udproutes)\.gateway\.networking\.k8s\.io/' \
