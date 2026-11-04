@@ -2427,9 +2427,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libm"
@@ -3615,9 +3615,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4007,9 +4007,9 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "2.3.2"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a8c78529d6fc5283dbbf56752ab00bb540cd69ab4d1f740e9684aa3bd1f8d7c"
+checksum = "3950202dd49862e01164451a00d870e492efa38c3a8d7e772140f67f5e5730b3"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -4039,9 +4039,9 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "2.3.2"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "327c77fb9455d677f7a69bb6266c6c9de117067fe99ff27e838fc78247cecfd0"
+checksum = "e4bffdd81850a34c7f705a5f5c8ebce4cc2405405c29483f4269bb10096013a8"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

@@ -21,8 +21,8 @@ regex-syntax = "0.8"
 # Already in the tree through url; declared directly to decode the query of a
 # request before comparing it to a route's query conditions.
 percent-encoding = "2"
-sozu-command-lib = "2.3.2"
-sozu-lib = "2.3.2"
+sozu-command-lib = "2.3.4"
+sozu-lib = "2.3.4"
 anyhow = "1.0.99"
 bollard = "0.20"
 async-trait = "0.1.89"

@@ -77,5 +77,5 @@ One exception: a route whose [header conditions](/documentation/routing/header-q
 
 ## Notes
 
-- **Wildcard quirk**: wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)). The Sōzu release Sōzune uses (2.3.2) is not affected.
+- **Wildcard quirk**: wildcards combined with shorter hostnames on the same listener could panic the HTTP worker on early Sōzu builds ([sozu-proxy/sozu#1223](https://github.com/sozu-proxy/sozu/issues/1223)). The Sōzu release Sōzune uses (2.3.4) is not affected.
 - Hostnames are passed as-is to Sōzu, which is responsible for the actual matching at request time.
