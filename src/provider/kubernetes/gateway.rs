@@ -6073,6 +6073,7 @@ fn delete_tls_route(
     let mut index_guard = match index.write() {
         Ok(g) => g,
         Err(e) => {
+                    h2c_backends: false,
             error!("Gateway API: index lock poisoned: {}", e);
             return false;
         }
@@ -7516,6 +7517,7 @@ mod tests {
         assert!(snis.contains(&"a.example.com".to_string()));
         assert!(snis.contains(&"b.example.com".to_string()));
         for ep in &eps {
+        h2c_backends: false,
             assert!(matches!(ep.protocol, Protocol::Tcp));
             assert_eq!(ep.config.entrypoint.as_deref(), Some("tlsgw"));
             // The routing name lives in `sni`; a Host match would never run.

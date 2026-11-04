@@ -1380,6 +1380,7 @@ impl IngressParseCtx<'_> {
                 sticky_session: false,
                 compress: false,
                 entrypoint: None,
+                h2c_backends: false,
                 sni: None,
                 methods: Vec::new(),
                 acme: None,
