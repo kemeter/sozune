@@ -13,8 +13,9 @@
 //!
 //! Header matches, filters and backendRefs have the same shape in both
 //! kinds and are carried over as they are. Every match, a rule without any
-//! included, also requires a gRPC `content-type` ([`GRPC_CONTENT_TYPE`]): a
-//! GRPCRoute routes gRPC calls, not every request on its hostnames.
+//! included, also requires a `POST` with a gRPC `content-type`
+//! ([`GRPC_CONTENT_TYPE`]): a GRPCRoute routes gRPC calls, not every request
+//! on its hostnames.
 //!
 //! The translated route keeps the GRPCRoute's namespace and uid, and takes
 //! its name behind [`GRPC_NAME_PREFIX`]: Kubernetes names cannot hold a `/`,
@@ -117,6 +118,7 @@ fn translate_match(m: &mut Value) {
             "value": GRPC_CONTENT_TYPE,
         }));
     }
+    object.insert("method".into(), json!("POST"));
 }
 
 /// The HTTPRoute path match of a GRPCRoute method match, `None` when it
@@ -161,7 +163,8 @@ fn method_path(method: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use gateway_api::apis::standard::httproutes::{
-        HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesPathType,
+        HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
+        HttpRouteRulesMatchesPathType,
     };
 
     fn grpc_route(matches: Value) -> GrpcRoute {
@@ -304,6 +307,11 @@ mod tests {
             .unwrap();
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().all(content_type));
+        assert!(
+            matches
+                .iter()
+                .all(|m| m.method == Some(HttpRouteRulesMatchesMethod::Post))
+        );
 
         let route = to_http_route(&grpc_route(Value::Null)).unwrap();
         let matches = route.spec.rules.as_ref().unwrap()[0]

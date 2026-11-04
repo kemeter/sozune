@@ -677,7 +677,8 @@ impl GatewayScope {
     /// Whether a route of the other kind (an HTTPRoute for a GRPCRoute, and
     /// the reverse), older or as old and first by namespace and name, is
     /// attached to a listener the route is attached to, with a hostname in
-    /// common: Gateway API serves only one of them.
+    /// common: Gateway API serves only one of them. Between two of the same
+    /// age, namespace and name, the GRPCRoute is served.
     fn loses_kind_conflict(&self, kind: &'static str, uid: &str) -> bool {
         let other_kind = match kind {
             "HTTPRoute" => "GRPCRoute",
@@ -703,7 +704,9 @@ impl GatewayScope {
         };
         g.claims
             .iter()
-            .filter(|((k, _), other)| *k == other_kind && other.served && other.age < mine.age)
+            .filter(|((k, _), other)| {
+                *k == other_kind && other.served && (&other.age, other_kind) < (&mine.age, kind)
+            })
             .any(|((k, other_uid), other)| {
                 g.attachments
                     .get(&(*k, other_uid.clone()))
@@ -12697,11 +12700,12 @@ mod tests {
             assert_eq!(path.value, "/pkg.Echo/Ping");
         }
 
-        // An HTTPRoute of the same name keeps its own entrypoints.
+        // An HTTPRoute of the same name, on another hostname, keeps its own
+        // entrypoints.
         let http = route_with_uid_parents(
             "h1",
             vec![rule(None, vec![backend("api", 80)])],
-            vec!["grpc.example.com".into()],
+            vec!["web.example.com".into()],
             vec![parent("gw")],
         );
         apply_route(&http, &storage, &index, &r1(), &scope, None);
@@ -12761,10 +12765,19 @@ mod tests {
         assert_eq!(outcome_of(&older_name), RouteOutcome::Accepted);
         assert_eq!(outcome_of(&grpc), RouteOutcome::KindConflict);
 
-        // Once the HTTPRoutes go, the GRPCRoute is served.
+        // Once the HTTPRoute goes, the GRPCRoute is served.
         scope.forget_attachments("HTTPRoute", "h1");
         delete_route(&http, &storage, &index);
         assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
+
+        // Same age, namespace and name: the GRPCRoute keeps it.
+        let mut twin = http.clone();
+        twin.metadata.uid = Some("h3".into());
+        twin.metadata.creation_timestamp = at(200);
+        assert_eq!(outcome_of(&twin), RouteOutcome::KindConflict);
+        assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
+        scope.forget_attachments("HTTPRoute", "h3");
+        delete_route(&twin, &storage, &index);
 
         // An older HTTPRoute refused for its own reasons takes nothing.
         let mut broken = route_with_uid_parents(

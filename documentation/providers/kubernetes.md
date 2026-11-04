@@ -770,7 +770,7 @@ A gRPC call is a request to `/<service>/<method>`, which is what a `method` matc
 | `method` alone | that method of any service |
 | `type: RegularExpression` | `service` and `method` matched as regular expressions, a missing one matching any name |
 
-`headers` matches (`Exact` or `RegularExpression`), and the `requestHeaderModifier` and `responseHeaderModifier` filters, work as on an HTTPRoute. Only gRPC calls are routed, those whose `content-type` is `application/grpc`: a rule without matches takes every call, not every request. A call no rule matches gets `UNIMPLEMENTED`.
+`headers` matches (`Exact` or `RegularExpression`), and the `requestHeaderModifier` and `responseHeaderModifier` filters, work as on an HTTPRoute. Only gRPC calls are routed, `POST` requests whose `content-type` is `application/grpc`: a rule without matches takes every call, not every request. A call no rule matches gets `UNIMPLEMENTED`.
 
 An HTTPRoute and a GRPCRoute attached to the same listener with a hostname in common are not both served: the older one is, or the first by namespace and name when they are as old, and the other is refused with `Accepted=False reason=NotAllowedByListeners` until it is the only one left. A route refused for its own reasons takes no hostname from the other.
 
