@@ -469,6 +469,7 @@ mod tests {
                 .collect(),
             protocol: Protocol::Http,
             config: EntrypointConfig {
+                terminate_tls: false,
                 hostnames: vec![host.to_string()],
                 path: None,
                 tls,

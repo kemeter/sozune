@@ -70,7 +70,7 @@ data:
       gateway_ports:
         http: ["8080-8099"]
         # The TCPRoute and TLSRoute tests' listeners.
-        tcp: ["8883", "9300-9321"]
+        tcp: ["8443", "8883", "9300-9321"]
         # The UDPRoute tests' listeners.
         udp: ["5300-5312"]
       http:

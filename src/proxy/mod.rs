@@ -5,3 +5,4 @@ pub mod request_metrics;
 pub mod resolve;
 pub mod sozu;
 pub mod tls_gate;
+pub mod tls_terminator;

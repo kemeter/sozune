@@ -1351,6 +1351,7 @@ impl IngressParseCtx<'_> {
             name: key.clone(),
             protocol: Protocol::Http,
             config: EntrypointConfig {
+                terminate_tls: false,
                 hostnames,
                 path,
                 tls,

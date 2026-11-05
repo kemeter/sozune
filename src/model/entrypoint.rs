@@ -186,6 +186,11 @@ pub struct EntrypointConfig {
     /// `None` keeps the listener's legacy catch-all behaviour.
     #[serde(default)]
     pub sni: Option<String>,
+    /// Terminate TLS on this TCP entrypoint, routed by its `sni`: the
+    /// handshake completes on Sōzune, with the certificate the HTTPS worker
+    /// holds for the name, and the backends get the plaintext.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminate_tls: bool,
     /// HTTP methods this entrypoint matches. Empty means any method.
     /// Methods are uppercased and validated against the standard verbs
     /// (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE).

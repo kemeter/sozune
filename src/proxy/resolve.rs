@@ -273,6 +273,14 @@ pub async fn resolve(
                     route.name
                 ),
             )
+        } else if route.config.terminate_tls {
+            (
+                Outcome::Proxied,
+                format!(
+                    "TLS terminated by route `{}`, its backends getting the plaintext: no HTTP route sees it",
+                    route.name
+                ),
+            )
         } else {
             (
                 Outcome::Proxied,
@@ -1282,6 +1290,23 @@ mod tests {
             resolve_with_tls(vec![empty], get("https://app.example.com/"), true, true).await;
         assert_eq!(closed.outcome, Outcome::Rejected);
         assert_eq!(closed.status, None);
+
+        // A route terminating TLS says so.
+        let mut terminating = passthrough("app", "app.example.com");
+        terminating.config.terminate_tls = true;
+        let decrypted = resolve_with_tls(
+            vec![terminating],
+            get("https://app.example.com/"),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(decrypted.outcome, Outcome::Proxied);
+        assert!(
+            decrypted.summary.contains("TLS terminated"),
+            "{}",
+            decrypted.summary
+        );
 
         // Without passthrough on the port, the HTTPS listener has it.
         let terminated =
