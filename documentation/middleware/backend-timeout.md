@@ -39,7 +39,7 @@ labels:
 
 ## Behaviour
 
-- A `backendTimeout` you set covers each attempt: connecting to the backend, sending the request, and reading the whole response, its body included. A body still streaming past it is cut short. The default 30 seconds only bound the wait for the response's headers.
+- A `backendTimeout` you set covers each attempt: connecting to the backend, sending the request, and reading the whole response, its body included. The time the client takes to send the request body is not counted: a slow upload is the client's time, which a [request timeout](/documentation/providers/kubernetes#gateway-api-httproute) bounds; a backend that stops reading the body is (since 0.16). A body still streaming past it is cut short. The default 30 seconds only bound the wait for the response's headers.
 - On timeout, the client receives `504 Gateway Timeout`, or the connection is cut if the response had already started. With [`retry.attempts`](/documentation/middleware/retry), a timeout before the response is retried.
 - Setting `backendTimeout` sends the route's requests through the Sōzune middleware layer, where the timeout is enforced, like any other middleware.
 - On a WebSocket upgrade, the timeout covers only the handshake (connecting and getting the backend's first answer); the tunnel that follows is not bounded by it — see [WebSocket](/documentation/advanced/websocket).

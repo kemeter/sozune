@@ -121,6 +121,10 @@ labels:
   - "sozune.http.events.backendTimeout=0"
 ```
 
+### Large request bodies are no longer retried or mirrored
+
+A route with a retry or a mirror keeps the request body, up to 1 MiB, to send it again. A larger body is streamed to a single attempt: such a request is not retried, and not copied to the mirrors, where it used to be read whole into memory first. Nothing to change unless a retry of large uploads is relied on: let the client retry them. See [Retry](documentation/middleware/retry.md).
+
 ## Upgrade to 0.15
 
 ### `backendTimeout` is in milliseconds

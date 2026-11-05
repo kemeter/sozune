@@ -59,6 +59,7 @@ See [UPGRADE.md](UPGRADE.md#upgrade-to-016) for what to change.
 
 ### Reliability
 
+- Request bodies through the middleware — a route going through the Sōzune middleware now streams the request body to the backend instead of reading it whole first, so a large upload no longer sits in memory. A route with a retry or a mirror keeps the body, up to 1 MiB, to send it again; a larger one is streamed to a single attempt, neither retried nor copied. The time the client takes to send the body still does not count toward the backend timeout. See [Retry](documentation/middleware/retry.md).
 - Default buffer size — `proxy.buffer_size` now defaults to `16393` bytes, Sōzu's own default and the least HTTP/2 needs to hold a full-size frame with its header. It was `16384`.
 - Docker daemon restarts — the Docker and Podman providers now reconnect to the event stream and rebuild their routes from the running containers. They used to stop following events for good, so containers started or stopped afterwards were never picked up until Sōzune restarted.
 - TCP listeners at startup: a connection arriving before the listener's route was loaded was refused. It now waits up to 10 seconds for the route. A listener with no route closes its connections and logs one warning, instead of one Sōzu error per connection.
