@@ -95,6 +95,8 @@ pub struct Attempt {
     health: std::sync::Arc<PassiveHealth>,
     backend: BackendKey,
     settled: bool,
+    /// Whether an attempt cut short is not the backend's doing.
+    excused: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Attempt {
@@ -103,13 +105,26 @@ impl Attempt {
             health,
             backend,
             settled: false,
+            excused: None,
         }
+    }
+
+    /// Not a failure when cut short while `excused` says so: the client
+    /// was the one keeping it waiting.
+    pub fn excused_by(mut self, excused: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.excused = Some(Box::new(excused));
+        self
     }
 
     /// The backend answered.
     pub fn succeeded(mut self) {
         self.settled = true;
         self.health.succeeded(&self.backend);
+    }
+
+    /// Ended by something else than the backend: no outcome.
+    pub fn excused(mut self) {
+        self.settled = true;
     }
 
     /// The backend gave no response.
@@ -121,7 +136,7 @@ impl Attempt {
 
 impl Drop for Attempt {
     fn drop(&mut self) {
-        if !self.settled {
+        if !self.settled && !self.excused.as_ref().is_some_and(|excused| excused()) {
             self.health.failed(&self.backend);
         }
     }
@@ -133,6 +148,20 @@ mod tests {
 
     fn key(host: &str) -> BackendKey {
         (host.to_string(), 80)
+    }
+
+    /// An attempt cut short while excused is no failure; otherwise it is.
+    #[test]
+    fn an_excused_attempt_is_no_failure() {
+        let health = std::sync::Arc::new(PassiveHealth::default());
+        for _ in 0..MAX_FAILURES {
+            drop(Attempt::new(health.clone(), key("a")).excused_by(|| true));
+        }
+        assert!(!health.is_down_at(&key("a"), Instant::now()));
+        for _ in 0..MAX_FAILURES {
+            drop(Attempt::new(health.clone(), key("a")).excused_by(|| false));
+        }
+        assert!(health.is_down_at(&key("a"), Instant::now()));
     }
 
     #[test]

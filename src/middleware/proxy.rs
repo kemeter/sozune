@@ -30,6 +30,11 @@ fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
 /// timeout.
 const MIRROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How much of a request body is kept to send it again: to a mirror, or on
+/// a retry. A larger body is streamed to a single attempt instead, neither
+/// retried nor copied, rather than held in memory.
+const REPLAY_BODY_LIMIT: usize = 1024 * 1024;
+
 /// Monotonic milliseconds since the process started, for circuit-breaker
 /// cooldown timing. Monotonic (not wall-clock) so clock changes don't confuse
 /// the breaker.
@@ -187,6 +192,9 @@ pub async fn handle_proxy(
         // waits on its outcome.
         let admitted = std::sync::atomic::AtomicBool::new(false);
         let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The streamed body of the attempt under way: its client's turn
+        // is not the backend's time.
+        let current_upload: std::sync::Mutex<Option<BodySent>> = std::sync::Mutex::new(None);
 
         // Everything up to the response bounded by the request's deadline.
         let handled = async {
@@ -385,14 +393,23 @@ pub async fn handle_proxy(
 
             let timeout = backend_timeout(route.backend_timeout);
 
-            // Buffer the request body up front so each retry can replay it. The
-            // body has to be owned bytes — a streaming body can only be sent once.
-            // With no retry (`attempts <= 1`) this is still a single send.
-            let collected = body.collect().await;
-            let body_bytes = match collected {
-                Ok(collected) => collected.to_bytes(),
+            // The body is streamed to the backend. It is kept to be sent again
+            // only when a mirror or a retry may need it, and up to
+            // `REPLAY_BODY_LIMIT`: a larger one is streamed all the same, to a
+            // single attempt.
+            // Backups take over a failed attempt even without retries.
+            let replays = attempts > 1 || !route.mirrors.is_empty() || !route.backups.is_empty();
+            let request_body = if replays || hyper::body::Body::is_end_stream(&body) {
+                // An empty body costs nothing to keep: any backend the plan
+                // holds can be tried.
+                replayable(body, &parts.headers, REPLAY_BODY_LIMIT).await
+            } else {
+                Ok(RequestBody::Streamed(Some(body)))
+            };
+            let mut request_body = match request_body {
+                Ok(body) => body,
                 Err(e) => {
-                    error!("Failed to buffer request body for {}: {}", target_uri, e);
+                    error!("Failed to read request body for {}: {}", target_uri, e);
                     let resp =
                         diag::forwarding_failed("request-body", &e.to_string()).into_response();
                     state
@@ -413,10 +430,17 @@ pub async fn handle_proxy(
 
             // A copy to each mirror, its answer ignored: the client's response
             // waits for none of them, and a mirror failing changes nothing.
-            for mirror in &route.mirrors {
+            let replayed = request_body.bytes().cloned();
+            if replayed.is_none() && !route.mirrors.is_empty() {
+                debug!("Request body past {REPLAY_BODY_LIMIT} bytes: not copied to the mirrors");
+            }
+            for mirror in route.mirrors.iter().filter(|_| replayed.is_some()) {
                 if !mirror.copies_next() {
                     continue;
                 }
+                let Some(body_bytes) = replayed.clone() else {
+                    continue;
+                };
                 // Too many copies under way already: this one is dropped.
                 let Ok(permit) = super::mirror_permits().try_acquire_owned() else {
                     debug!("Mirror busy, request not copied");
@@ -434,7 +458,7 @@ pub async fn handle_proxy(
                 };
                 let mut copy = parts.clone();
                 copy.uri = mirror_uri;
-                let copy = Request::from_parts(copy, Body::from(body_bytes.clone()));
+                let copy = Request::from_parts(copy, Body::from(body_bytes));
                 let client = state.http_client.clone();
                 let limit = timeout.unwrap_or(MIRROR_TIMEOUT);
                 tokio::spawn(async move {
@@ -467,6 +491,8 @@ pub async fn handle_proxy(
             let mut backend_response = None;
             let mut target_uri = target_uri;
             let mut tries = 0u32;
+            // Whether the client's body, not a backend, failed the request.
+            let mut client_fault = false;
             let mut picked = plan.last_index();
             let mut uri = Some(((backend_host.clone(), backend_port), primary_uri));
             while let Some((backend, current)) = uri.take() {
@@ -486,8 +512,10 @@ pub async fn handle_proxy(
                     route.edits_for(picked),
                     HeaderDirection::Request,
                 );
-                let forwarded_req =
-                    Request::from_parts(attempt_parts, Body::from(body_bytes.clone()));
+                let Some((attempt_body, body_sent)) = request_body.take() else {
+                    break;
+                };
+                let forwarded_req = Request::from_parts(attempt_parts, attempt_body);
                 let attempt_start = tokio::time::Instant::now();
                 // Counted for the balancers that pick by load, until the
                 // backend answers or the attempt ends.
@@ -496,19 +524,26 @@ pub async fn handle_proxy(
                 let attempt = super::passive_health::Attempt::new(
                     state.passive_health.clone(),
                     backend.clone(),
-                );
+                )
+                .excused_by(client_turn(body_sent.clone()));
+                // Read when the request's deadline cancels the attempt.
+                if let Ok(mut upload) = current_upload.lock() {
+                    upload.clone_from(&body_sent);
+                }
                 forwarded.store(true, std::sync::atomic::Ordering::Relaxed);
                 let response_future = state.http_client.request(forwarded_req);
 
                 // The attempt ends at the backend timeout or the request's
-                // deadline, whichever comes first.
-                let attempt_deadline = timeout.map(|limit| attempt_start + limit);
+                // deadline, whichever comes first. The backend timeout counts
+                // from the end of the request body: a long upload is the
+                // client's time, which the request's deadline bounds.
 
                 // `Ok(resp)` on success, `Err((msg, is_timeout))` otherwise.
-                let result = if let Some(deadline) = attempt_deadline {
-                    match tokio::time::timeout_at(deadline, response_future).await {
-                        Ok(result) => result.map_err(|e| (e.to_string(), false)),
-                        Err(_) => Err(("timed out".to_string(), true)),
+                let result = if let Some(limit) = timeout {
+                    let expiry = attempt_expiry(body_sent.clone(), attempt_start, limit);
+                    tokio::select! {
+                        result = response_future => result.map_err(|e| (e.to_string(), false)),
+                        () = expiry => Err(("timed out".to_string(), true)),
                     }
                 } else {
                     response_future.await.map_err(|e| (e.to_string(), false))
@@ -519,8 +554,9 @@ pub async fn handle_proxy(
                     Ok(resp) => {
                         // An answer, whatever its status: the backend is up.
                         attempt.succeeded();
-                        let retried =
-                            tries < attempts && route.retry_codes.contains(&resp.status().as_u16());
+                        let retried = tries < attempts
+                            && request_body.replays()
+                            && route.retry_codes.contains(&resp.status().as_u16());
                         let next = if retried {
                             plan.by_ref()
                                 .find_map(|b| uri_of(b).map(|u| (b.clone(), u)))
@@ -542,24 +578,35 @@ pub async fn handle_proxy(
                         let body = body.map_err(|e| axum::Error::new(std::io::Error::other(e)));
                         // A backend timeout the route sets caps the whole response,
                         // its body included; the default one only the wait for it.
-                        let body = match (route.backend_timeout, timeout) {
-                            (Some(ms), Some(limit)) if ms > 0 => body_before(
+                        // The rest of the attempt's time, as of the answer: an
+                        // upload still on its way no longer counts.
+                        let limit =
+                            timeout.filter(|_| route.backend_timeout.is_some_and(|ms| ms > 0));
+                        let body = match limit {
+                            Some(limit) => body_before(
                                 Body::new(body),
-                                attempt_start + limit,
+                                attempt_deadline(body_sent.as_ref(), attempt_start, limit),
                                 timed_out.clone(),
                             ),
-                            _ => Body::new(body),
+                            None => Body::new(body),
                         };
                         backend_response = Some(Response::from_parts(parts, body));
                     }
                     Err((msg, is_timeout)) => {
-                        attempt.failed();
+                        if client_failed(body_sent.as_ref()) {
+                            // The client's body broke the attempt.
+                            client_fault = true;
+                            attempt.excused();
+                        } else {
+                            attempt.failed();
+                        }
                         last_err = msg;
                         last_was_timeout = is_timeout;
-                        // Past the request's deadline, no other attempt.
+                        // Past the request's deadline, or with a body that
+                        // cannot be sent again, no other attempt.
                         let expired = request_deadline
                             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
-                        uri = if expired {
+                        uri = if expired || !request_body.replays() {
                             None
                         } else {
                             plan.by_ref()
@@ -584,12 +631,14 @@ pub async fn handle_proxy(
                         target_uri, tries, last_err
                     );
                     // All attempts failed: count it as a backend failure for the
-                    // circuit breaker.
+                    // circuit breaker, unless the client's body did.
                     if let Some(cb) = route.circuit_breaker.as_ref() {
-                        cb.record(true, monotonic_ms());
+                        cb.record(!client_fault, monotonic_ms());
                     }
                     // Preserve the distinct 504 for a timeout; 502 otherwise.
-                    let resp = if last_was_timeout {
+                    let resp = if client_fault {
+                        diag::forwarding_failed("request-body", &last_err).into_response()
+                    } else if last_was_timeout {
                         diag::backend_timeout(&target_uri, timeout).into_response()
                     } else {
                         diag::backend_unreachable(&format!("backend at {target_uri}: {last_err}"))
@@ -668,8 +717,13 @@ pub async fn handle_proxy(
                 if let Some(cb) = route.circuit_breaker.as_ref()
                     && admitted.load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    let waiting_on_client = current_upload
+                        .lock()
+                        .ok()
+                        .and_then(|upload| upload.clone())
+                        .is_some_and(|sent| matches!(*sent.borrow(), Upload::Client { .. }));
                     cb.record(
-                        forwarded.load(std::sync::atomic::Ordering::Relaxed),
+                        forwarded.load(std::sync::atomic::Ordering::Relaxed) && !waiting_on_client,
                         monotonic_ms(),
                     );
                 }
@@ -961,6 +1015,354 @@ async fn handle_websocket(
 /// `body`, cut short with an error once `deadline` passes: the client then
 /// sees the response end early rather than wait past the route's timeout.
 /// `timed_out` is set when it does, before the body it wraps is dropped.
+/// A request body on its way to the backends: kept to be sent to each
+/// attempt, or streamed to the first one alone.
+enum RequestBody {
+    Replayable(axum::body::Bytes),
+    /// `None` once sent.
+    Streamed(Option<Body>),
+}
+
+impl RequestBody {
+    /// The body for the next attempt, with what tells when it has been sent
+    /// for a streamed one; `None` when it was streamed already.
+    fn take(&mut self) -> Option<(Body, Option<BodySent>)> {
+        match self {
+            Self::Replayable(bytes) => Some((Body::from(bytes.clone()), None)),
+            Self::Streamed(body) => {
+                let (body, sent) = watch_end(body.take()?);
+                Some((body, Some(sent)))
+            }
+        }
+    }
+
+    /// Whether another attempt can be sent the body.
+    fn replays(&self) -> bool {
+        matches!(self, Self::Replayable(_))
+    }
+
+    /// The whole body, when it is kept.
+    fn bytes(&self) -> Option<&axum::body::Bytes> {
+        match self {
+            Self::Replayable(bytes) => Some(bytes),
+            Self::Streamed(_) => None,
+        }
+    }
+}
+
+/// `body` kept to be sent again when it holds at most `limit` bytes,
+/// streamed otherwise: its `Content-Length` says so before anything is
+/// read, or else the bytes read so far are sent ahead of the rest. A body
+/// with trailers is streamed, as only a stream carries them.
+async fn replayable(
+    mut body: Body,
+    headers: &axum::http::HeaderMap,
+    limit: usize,
+) -> Result<RequestBody, axum::Error> {
+    use futures_util::StreamExt;
+    use http_body_util::{BodyStream, StreamBody};
+
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit as u64) {
+        return Ok(RequestBody::Streamed(Some(body)));
+    }
+    let mut read: Vec<u8> = Vec::new();
+    loop {
+        let Some(frame) = body.frame().await else {
+            return Ok(RequestBody::Replayable(read.into()));
+        };
+        let frame = frame?;
+        // A part that would take the body past the limit is not copied:
+        // it goes on with the stream.
+        let past = match frame.into_data() {
+            Ok(data) if read.len() + data.len() <= limit => {
+                read.extend_from_slice(&data);
+                continue;
+            }
+            Ok(data) => hyper::body::Frame::data(data),
+            Err(other) => other,
+        };
+        let head = std::iter::once(Ok(hyper::body::Frame::data(axum::body::Bytes::from(read))))
+            .chain(std::iter::once(Ok(past)));
+        let frames = futures_util::stream::iter(head).chain(BodyStream::new(body));
+        return Ok(RequestBody::Streamed(Some(Body::new(StreamBody::new(
+            frames,
+        )))));
+    }
+}
+
+/// Where a streamed request body is in being sent, and how much of the
+/// attempt's time the backend has taken so far (`spent`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Upload {
+    /// Up to the backend since `since`: to connect and ask for the body, or
+    /// for the next part of it.
+    Backend {
+        since: tokio::time::Instant,
+        spent: std::time::Duration,
+    },
+    /// Waiting for the client to send the next part: not the backend's time.
+    Client { spent: std::time::Duration },
+    /// Sent whole, failed, or dropped, at `at`; `failed` when reading it
+    /// from the client failed.
+    Sent {
+        at: tokio::time::Instant,
+        spent: std::time::Duration,
+        failed: bool,
+    },
+}
+
+impl Upload {
+    /// When an attempt of `limit` runs out, if the backend keeps the turn:
+    /// `None` while the client has it.
+    fn deadline(self, limit: std::time::Duration) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Backend { since, spent }
+            | Self::Sent {
+                at: since, spent, ..
+            } => Some(since + limit.saturating_sub(spent)),
+            Self::Client { .. } => None,
+        }
+    }
+
+    /// The backend's time so far, up to `now`.
+    fn spent(self, now: tokio::time::Instant) -> std::time::Duration {
+        match self {
+            Self::Backend { since, spent } => spent + now.saturating_duration_since(since),
+            Self::Client { spent } | Self::Sent { spent, .. } => spent,
+        }
+    }
+}
+
+/// Where a streamed request body is in being sent.
+type BodySent = tokio::sync::watch::Receiver<Upload>;
+
+/// Moves [`BodySent`] along, and to `Sent` when dropped, which the body is
+/// once sent whole, failed or left unsent.
+struct SentGuard(tokio::sync::watch::Sender<Upload>);
+
+impl SentGuard {
+    /// The client has the turn.
+    fn to_client(&self) {
+        let now = tokio::time::Instant::now();
+        self.0.send_if_modified(|upload| {
+            !matches!(upload, Upload::Client { .. }) && {
+                *upload = Upload::Client {
+                    spent: upload.spent(now),
+                };
+                true
+            }
+        });
+    }
+
+    /// The backend has the turn.
+    fn to_backend(&self) {
+        let now = tokio::time::Instant::now();
+        self.0.send_modify(|upload| {
+            *upload = Upload::Backend {
+                since: now,
+                spent: upload.spent(now),
+            }
+        });
+    }
+}
+
+impl SentGuard {
+    /// Sent whole.
+    fn finished(self) {
+        let now = tokio::time::Instant::now();
+        self.0.send_modify(|upload| {
+            *upload = Upload::Sent {
+                at: now,
+                spent: upload.spent(now),
+                failed: false,
+            }
+        });
+    }
+
+    /// Reading the body from the client failed.
+    fn client_failed(self) {
+        let now = tokio::time::Instant::now();
+        self.0.send_modify(|upload| {
+            *upload = Upload::Sent {
+                at: now,
+                spent: upload.spent(now),
+                failed: true,
+            }
+        });
+    }
+}
+
+impl Drop for SentGuard {
+    /// Sent, unless dropped on the client's turn: the client kept it
+    /// waiting, which is what cancelled it.
+    fn drop(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.0.send_if_modified(|upload| {
+            !matches!(upload, Upload::Sent { .. } | Upload::Client { .. }) && {
+                *upload = Upload::Sent {
+                    at: now,
+                    spent: upload.spent(now),
+                    failed: false,
+                };
+                true
+            }
+        });
+    }
+}
+
+/// A streamed request body telling where it is in being sent. Its length
+/// and end are those of the body it wraps, so the request keeps its framing.
+struct Watched {
+    inner: Body,
+    /// `None` once the body is sent whole or failed.
+    guard: Option<SentGuard>,
+}
+
+impl hyper::body::Body for Watched {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        // Asked for the next part: the client's turn until it comes.
+        if let Some(guard) = &this.guard {
+            guard.to_client();
+        }
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(_))) => {
+                if let Some(guard) = &this.guard {
+                    guard.to_backend();
+                }
+            }
+            Poll::Ready(Some(Err(_))) => {
+                if let Some(guard) = this.guard.take() {
+                    guard.client_failed();
+                }
+            }
+            Poll::Ready(None) => {
+                if let Some(guard) = this.guard.take() {
+                    guard.finished();
+                }
+            }
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// `body`, and what tells where it is in being sent.
+fn watch_end(body: Body) -> (Body, BodySent) {
+    let (tx, rx) = tokio::sync::watch::channel(Upload::Backend {
+        since: tokio::time::Instant::now(),
+        spent: std::time::Duration::ZERO,
+    });
+    let watched = Watched {
+        inner: body,
+        guard: Some(SentGuard(tx)),
+    };
+    (Body::new(watched), rx)
+}
+
+/// When an attempt of `limit` runs out for its response body, as of its
+/// answer: what the backend took of it so far is spent, whatever the
+/// request body still to come.
+fn attempt_deadline(
+    sent: Option<&BodySent>,
+    start: tokio::time::Instant,
+    limit: std::time::Duration,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    match sent.map(|sent| *sent.borrow()) {
+        None => start + limit,
+        Some(upload @ Upload::Sent { .. }) => upload.deadline(limit).unwrap_or(now),
+        Some(upload) => now + limit.saturating_sub(upload.spent(now)),
+    }
+}
+
+/// Whether reading the body behind `sent` from the client failed: the
+/// attempt it broke is not the backend's failure.
+fn client_failed(sent: Option<&BodySent>) -> bool {
+    sent.is_some_and(|sent| matches!(*sent.borrow(), Upload::Sent { failed: true, .. }))
+}
+
+/// Whether the client has the turn on the body behind `sent`: an attempt
+/// cut then is not the backend's failure.
+fn client_turn(sent: Option<BodySent>) -> impl Fn() -> bool + Send + Sync + 'static {
+    move || {
+        client_failed(sent.as_ref())
+            || sent
+                .as_ref()
+                .is_some_and(|sent| matches!(*sent.borrow(), Upload::Client { .. }))
+    }
+}
+
+/// Resolves once an attempt started at `start` has taken `limit` of the
+/// backend's time: to connect, to ask for each part of the body, and to
+/// answer once the body is sent. The time the client takes to send the body
+/// is not the backend's.
+async fn attempt_expiry(
+    sent: Option<BodySent>,
+    start: tokio::time::Instant,
+    limit: std::time::Duration,
+) {
+    let Some(mut sent) = sent else {
+        tokio::time::sleep_until(start + limit).await;
+        return;
+    };
+    loop {
+        let upload = *sent.borrow_and_update();
+        match upload.deadline(limit) {
+            Some(deadline) if matches!(upload, Upload::Sent { .. }) => {
+                tokio::time::sleep_until(deadline).await;
+                return;
+            }
+            Some(deadline) => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => {
+                        // The turn may have passed to the client meanwhile.
+                        let now = tokio::time::Instant::now();
+                        if (*sent.borrow()).deadline(limit).is_some_and(|d| d <= now) {
+                            return;
+                        }
+                    }
+                    changed = sent.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            None => {
+                if sent.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // The body is gone without being sent whole, its client's turn cut
+    // short: the rest of the time is the backend's, from now.
+    let upload = *sent.borrow();
+    let now = tokio::time::Instant::now();
+    tokio::time::sleep_until(now + limit.saturating_sub(upload.spent(now))).await;
+}
+
 fn body_before(
     body: Body,
     deadline: tokio::time::Instant,
@@ -1279,6 +1681,12 @@ mod retry_tests {
             retry: Some(retry),
             ..Default::default()
         };
+        send_through(config, port, Body::empty()).await
+    }
+
+    /// The status a request of `body` to a route of `config` gets from
+    /// `port`.
+    async fn send_through(config: EntrypointConfig, port: u16, body: Body) -> u16 {
         let backends = [Backend {
             address: "127.0.0.1".into(),
             port,
@@ -1304,10 +1712,13 @@ mod retry_tests {
             request_metrics: Default::default(),
             passive_health: Arc::default(),
         };
+        // A body of unknown length comes chunked, as Sōzu forwards it.
         let request = Request::builder()
+            .method("POST")
             .uri("/")
             .header("host", "retry.test")
-            .body(Body::empty())
+            .header("transfer-encoding", "chunked")
+            .body(body)
             .unwrap();
         handle_proxy(State(state), request)
             .await
@@ -1361,5 +1772,269 @@ mod retry_tests {
         assert_eq!(status_through(retry, port).await, 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    }
+
+    /// A backend reading the whole body, answering `status` to its first
+    /// `failures` requests and then `200`, and the body sizes it read.
+    async fn reading_backend(
+        failures: usize,
+        status: u16,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<usize>>>) {
+        let read = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = read.clone();
+        let app = axum::Router::new()
+            .fallback(move |body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(body.len());
+                    if seen.len() <= failures {
+                        StatusCode::from_u16(status).unwrap()
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (port, read)
+    }
+
+    fn retrying(codes: &[u16], attempts: u32) -> EntrypointConfig {
+        EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            retry: Some(on(codes, attempts)),
+            ..Default::default()
+        }
+    }
+
+    /// A body small enough is kept, and sent again on a retry.
+    #[tokio::test]
+    async fn a_small_body_is_sent_again_on_a_retry() {
+        let (port, read) = reading_backend(1, 503).await;
+        let body = Body::from(vec![b'a'; 1000]);
+        assert_eq!(send_through(retrying(&[503], 2), port, body).await, 200);
+        assert_eq!(*read.lock().unwrap(), [1000, 1000]);
+    }
+
+    /// A body past the limit is streamed to one attempt, whole, and not
+    /// retried: there is nothing left to send again.
+    #[tokio::test]
+    async fn a_large_body_is_streamed_and_not_retried() {
+        let size = REPLAY_BODY_LIMIT + 10;
+        let (port, read) = reading_backend(1, 503).await;
+        // Without a length, in chunks: read past the limit, then streamed.
+        let chunks = futures_util::stream::iter(
+            vec![vec![b'a'; 64 * 1024]; size / (64 * 1024)]
+                .into_iter()
+                .chain(std::iter::once(vec![b'a'; size % (64 * 1024)]))
+                .map(|c| Ok::<_, std::io::Error>(axum::body::Bytes::from(c))),
+        );
+        let body = Body::from_stream(chunks);
+        assert_eq!(send_through(retrying(&[503], 3), port, body).await, 503);
+        assert_eq!(*read.lock().unwrap(), [size]);
+    }
+
+    /// A slow upload is the client's time: the backend timeout counts from
+    /// the end of the body.
+    #[tokio::test]
+    async fn the_backend_timeout_starts_once_the_body_is_sent() {
+        let (port, read) = reading_backend(0, 200).await;
+        let chunks = futures_util::stream::unfold(0, |n| async move {
+            if n == 5 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Some((
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"chunk")),
+                n + 1,
+            ))
+        });
+        let config = EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            backend_timeout: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(
+            send_through(config, port, Body::from_stream(chunks)).await,
+            200
+        );
+        assert_eq!(*read.lock().unwrap(), [25]);
+    }
+
+    /// Before the backend asks for the body, the attempt is timed from its
+    /// start: a connection that never comes up still times out.
+    #[tokio::test]
+    async fn an_attempt_times_out_before_the_body_is_asked_for() {
+        let ms = std::time::Duration::from_millis;
+        let (_body, sent) = watch_end(Body::from("x"));
+        let start = tokio::time::Instant::now();
+        attempt_expiry(Some(sent.clone()), start, ms(100)).await;
+        assert!(start.elapsed() >= ms(100) && start.elapsed() < ms(300));
+
+        // Asked for and sent at once: the rest of the time is for the
+        // answer.
+        let (body, sent) = watch_end(Body::from("x"));
+        let start = tokio::time::Instant::now();
+        drop(body.collect().await);
+        attempt_expiry(Some(sent), start, ms(100)).await;
+        assert!(start.elapsed() >= ms(95), "{:?}", start.elapsed());
+    }
+
+    /// A backend that stops asking for the body runs out its time; a client
+    /// slow to send it does not.
+    #[tokio::test]
+    async fn only_the_backend_stalling_the_upload_runs_out_the_time() {
+        use futures_util::StreamExt;
+        let ms = std::time::Duration::from_millis;
+        let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+        let client = tokio_stream_from(rx);
+        let (body, sent) = watch_end(Body::from_stream(client));
+        let mut frames = http_body_util::BodyStream::new(body);
+        let start = tokio::time::Instant::now();
+        let expiry = tokio::spawn(attempt_expiry(Some(sent), start, ms(100)));
+        // The backend asks; the client takes 300 ms to send a part.
+        let reader = tokio::spawn(async move {
+            let first = frames.next().await;
+            (first.is_some(), frames)
+        });
+        tokio::time::sleep(ms(300)).await;
+        assert!(!expiry.is_finished());
+        tx.send(axum::body::Bytes::from_static(b"part"))
+            .await
+            .unwrap();
+        let (got, _frames) = reader.await.unwrap();
+        assert!(got);
+        // Then the backend stops asking: out of time 100 ms later.
+        let stalled = tokio::time::Instant::now();
+        expiry.await.unwrap();
+        assert!(stalled.elapsed() >= ms(90), "{:?}", stalled.elapsed());
+    }
+
+    /// A body the client fails to send is the client's fault.
+    #[tokio::test]
+    async fn a_failed_upload_is_the_clients_fault() {
+        let failing = futures_util::stream::iter([
+            Ok(axum::body::Bytes::from_static(b"part")),
+            Err(std::io::Error::other("client gone")),
+        ]);
+        let (body, sent) = watch_end(Body::from_stream(failing));
+        assert!(body.collect().await.is_err());
+        assert!(client_failed(Some(&sent)));
+
+        let (body, sent) = watch_end(Body::from("whole"));
+        drop(body.collect().await);
+        assert!(!client_failed(Some(&sent)));
+    }
+
+    /// Cancelled on the client's turn, an upload stays the client's.
+    #[tokio::test]
+    async fn an_upload_cut_on_the_clients_turn_stays_the_clients() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+        let (body, sent) = watch_end(Body::from_stream(tokio_stream_from(rx)));
+        let mut frames = http_body_util::BodyStream::new(body);
+        // Asked for a part the client does not send.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), {
+            use futures_util::StreamExt;
+            frames.next()
+        })
+        .await;
+        drop(frames);
+        drop(tx);
+        assert!(client_turn(Some(sent))());
+    }
+
+    /// A body dropped on its client's turn leaves the backend the rest of
+    /// the time, not none of it.
+    #[tokio::test]
+    async fn a_dropped_upload_is_no_timeout() {
+        let ms = std::time::Duration::from_millis;
+        let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+        let (body, sent) = watch_end(Body::from_stream(tokio_stream_from(rx)));
+        let mut frames = http_body_util::BodyStream::new(body);
+        let _ = tokio::time::timeout(ms(20), {
+            use futures_util::StreamExt;
+            frames.next()
+        })
+        .await;
+        drop(frames);
+        drop(tx);
+        let start = tokio::time::Instant::now();
+        attempt_expiry(Some(sent), start, ms(100)).await;
+        assert!(start.elapsed() >= ms(50), "{:?}", start.elapsed());
+    }
+
+    /// A watched body keeps the length of the one it wraps.
+    #[test]
+    fn a_watched_body_keeps_its_length() {
+        use hyper::body::Body as _;
+        let (body, _sent) = watch_end(Body::from("hello"));
+        assert_eq!(body.size_hint().exact(), Some(5));
+    }
+
+    /// A part past the limit is streamed on, not copied.
+    #[tokio::test]
+    async fn a_part_past_the_limit_is_not_copied() {
+        let headers = axum::http::HeaderMap::new();
+        let mut streamed = replayable(Body::from("0123456789"), &headers, 5)
+            .await
+            .unwrap();
+        assert!(!streamed.replays());
+        let (body, _) = streamed.take().unwrap();
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "0123456789");
+    }
+
+    /// The backend's turns add up: no single one runs out the time, all
+    /// of them do.
+    #[test]
+    fn the_backend_time_adds_up() {
+        let now = tokio::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let backend = Upload::Backend {
+            since: now,
+            spent: ms(80),
+        };
+        assert_eq!(backend.deadline(ms(100)), Some(now + ms(20)));
+        assert_eq!(backend.spent(now + ms(10)), ms(90));
+        let client = Upload::Client { spent: ms(90) };
+        assert_eq!(client.deadline(ms(100)), None);
+        let sent = Upload::Sent {
+            at: now,
+            spent: ms(150),
+            failed: false,
+        };
+        assert_eq!(sent.deadline(ms(100)), Some(now));
+    }
+
+    fn tokio_stream_from(
+        mut rx: tokio::sync::mpsc::Receiver<axum::body::Bytes>,
+    ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> {
+        futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|b| b.map(Ok)))
+    }
+
+    #[tokio::test]
+    async fn a_body_is_kept_up_to_the_limit() {
+        let headers = axum::http::HeaderMap::new();
+        let kept = replayable(Body::from("hello"), &headers, 5).await.unwrap();
+        assert_eq!(kept.bytes().map(|b| b.as_ref()), Some(&b"hello"[..]));
+
+        // Past it, streamed, all of it.
+        let mut streamed = replayable(Body::from("hello!"), &headers, 5).await.unwrap();
+        assert!(!streamed.replays());
+        let (body, _) = streamed.take().unwrap();
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "hello!");
+        assert!(streamed.take().is_none());
+
+        // A length past it: streamed unread.
+        let mut long = axum::http::HeaderMap::new();
+        long.insert(axum::http::header::CONTENT_LENGTH, "6".parse().unwrap());
+        assert!(
+            !replayable(Body::from("hello!"), &long, 5)
+                .await
+                .unwrap()
+                .replays()
+        );
     }
 }
