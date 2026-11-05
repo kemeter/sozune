@@ -6,9 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Upgrade notes
 
-- The Docker image now sets `CONFIG_PATH=/etc/sozune/config.yaml`, so a file mounted there is read without any further setting. A file mounted at `/home/nonroot/config.yaml` is no longer read: move it, or set `CONFIG_PATH` to its path.
-- A Gateway `HTTPS` listener on a port where the Gateway asks for client certificates to be checked (`spec.tls.frontend` with a `validation` in mode `AllowValidOnly`) is now refused and serves no route over HTTPS, where it used to be served without checking them. Remove the `validation`, or set `proxy.https.tls.client_auth` to check client certificates on every HTTPS connection. See [HTTPS listeners](documentation/providers/kubernetes.md#https-listeners).
-- A Gateway listener's `allowedRoutes` is now enforced. By default a listener only admits routes from the Gateway's own namespace, so a route in another namespace that names the Gateway is no longer served: set `allowedRoutes.namespaces.from: All` on the listeners it should attach to, or `from: Selector` with a selector its namespace's labels match. See [Which routes a listener admits](documentation/providers/kubernetes.md#which-routes-a-listener-admits-allowedroutes).
+See [UPGRADE.md](UPGRADE.md#upgrade-to-016) for what to change.
 
 ### Routing
 
@@ -133,11 +131,7 @@ All notable changes to this project will be documented in this file.
 
 ### Upgrade notes
 
-- `backendTimeout` is now read in milliseconds, as the API and the label diagnostics describe it. It used to be applied as seconds, so a route that set `backendTimeout=30` meaning 30 seconds now times out after 30ms: multiply such values by 1000. Values written in milliseconds (e.g. `30000`) now behave as intended instead of lasting 1000 times longer. The default (30s) and `0` (no timeout) are unchanged.
-- A path prefix now matches on segment boundaries, as documented: a route on `/api` serves `/api`, `/api/users` and `/api?page=2`, but no longer `/apidocs`, which Sōzu used to hand it by comparing bytes. A route relying on that has to declare the longer prefix (or `/`) itself.
-- A bare `*` hostname, and a regex hostname that does not stay inside a literal domain, are now refused, from labels (`E002`), the HTTP provider and the API (`400`): they could match the hosts of every other route. Exact names, `*.` wildcards and regexes such as `/cdn[0-9]+/.example.com` are still accepted. See [Regex hostnames](documentation/routing/hostnames.md#regex).
-- A custom header (`headers.<name>`, `headers.response.<name>`, the HTTP provider, the API, Gateway API `set` / `add`) now replaces a header of the same name sent by the client or the backend, as documented, instead of being sent next to it.
-- A `backendTimeout` longer than 30 seconds never took effect: the HTTP and HTTPS listeners cut a request left waiting 30 seconds for its response first. Such routes now get diagnostic `W030`; to let them wait longer, raise `proxy.timeouts.backend_idle` (and `client_idle` past 60 seconds) in `config.yaml`. See [Proxy](documentation/configuration/overview.md#proxy).
+See [UPGRADE.md](UPGRADE.md#upgrade-to-015) for what to change.
 
 ### TLS / ACME
 
