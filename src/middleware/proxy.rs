@@ -449,9 +449,10 @@ pub async fn handle_proxy(
             }
 
             // Send to the backend, retrying connection-level failures and timeouts
-            // (the backend produced no response). A response that arrives — even a
-            // 5xx — is returned as-is and never retried, so a side effect is not
-            // replayed.
+            // (the backend produced no response). A response that arrives is
+            // returned as-is, so a side effect is not replayed — unless the route
+            // retries its status: then the next attempt takes over, and the last
+            // one's response is returned whatever its status.
             //
             // The backends come from `plan`, one per failed attempt: retries go to
             // the backends this request has not tried, and a backup (weight 0)
@@ -469,6 +470,12 @@ pub async fn handle_proxy(
             let mut picked = plan.last_index();
             let mut uri = Some(((backend_host.clone(), backend_port), primary_uri));
             while let Some((backend, current)) = uri.take() {
+                if tries > 0
+                    && let Some(backoff) = route.retry_backoff
+                {
+                    // The request's deadline cuts the wait short.
+                    tokio::time::sleep(backoff).await;
+                }
                 tries += 1;
                 target_uri = current.to_string();
                 parts.uri = current;
@@ -512,6 +519,25 @@ pub async fn handle_proxy(
                     Ok(resp) => {
                         // An answer, whatever its status: the backend is up.
                         attempt.succeeded();
+                        let retried =
+                            tries < attempts && route.retry_codes.contains(&resp.status().as_u16());
+                        let next = if retried {
+                            plan.by_ref()
+                                .find_map(|b| uri_of(b).map(|u| (b.clone(), u)))
+                        } else {
+                            None
+                        };
+                        if next.is_some() {
+                            debug!(
+                                "Backend {} attempt {} answered {}; retrying",
+                                target_uri,
+                                tries,
+                                resp.status().as_u16()
+                            );
+                            picked = plan.last_index();
+                            uri = next;
+                            continue;
+                        }
                         let (parts, body) = resp.into_parts();
                         let body = body.map_err(|e| axum::Error::new(std::io::Error::other(e)));
                         // A backend timeout the route sets caps the whole response,
@@ -1215,5 +1241,125 @@ mod forwarding_tests {
         let hosts: Vec<_> = headers.get_all(axum::http::header::HOST).iter().collect();
         assert_eq!(hosts, ["one.example.org"]);
         assert_eq!(headers["x-forwarded-host"], "rewrite.example");
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::model::{Backend, EntrypointConfig, RetryConfig};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A backend answering `status` to its first `failures` requests, then
+    /// `200`, and the number of requests it got.
+    async fn backend(failures: usize, status: u16) -> (u16, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let counted = counted.clone();
+            async move {
+                if counted.fetch_add(1, Ordering::SeqCst) < failures {
+                    StatusCode::from_u16(status).unwrap()
+                } else {
+                    StatusCode::OK
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (port, hits)
+    }
+
+    /// The status a request to a route of `retry` gets from `port`.
+    async fn status_through(retry: RetryConfig, port: u16) -> u16 {
+        let config = EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            retry: Some(retry),
+            ..Default::default()
+        };
+        let backends = [Backend {
+            address: "127.0.0.1".into(),
+            port,
+            weight: 100,
+            headers: Vec::new(),
+        }];
+        let route = super::super::build_middleware_route(
+            "retry",
+            &config,
+            &backends,
+            &super::super::build_forward_auth_client(),
+            &super::super::PluginRegistry::new(),
+            &crate::middleware::ip_allow_list::TrustedProxies::default(),
+        );
+        let mut table = super::super::MiddlewareRouteTable::default();
+        table.update_routes_for_entrypoint(&config.hostnames, None, route);
+        let state = MiddlewareAppState {
+            route_table: Arc::new(std::sync::RwLock::new(table)),
+            http_client: hyper_util::client::legacy::Client::builder(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .build_http(),
+            request_metrics: Default::default(),
+            passive_health: Arc::default(),
+        };
+        let request = Request::builder()
+            .uri("/")
+            .header("host", "retry.test")
+            .body(Body::empty())
+            .unwrap();
+        handle_proxy(State(state), request)
+            .await
+            .into_response()
+            .status()
+            .as_u16()
+    }
+
+    fn on(codes: &[u16], attempts: u32) -> RetryConfig {
+        RetryConfig {
+            attempts,
+            codes: codes.to_vec(),
+            backoff_ms: None,
+        }
+    }
+
+    /// A status the route retries goes to the next attempt, up to the
+    /// budget; the last attempt's response is returned.
+    #[tokio::test]
+    async fn a_retried_status_takes_the_next_attempt() {
+        let (port, hits) = backend(2, 500).await;
+        assert_eq!(status_through(on(&[500], 3), port).await, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let (port, hits) = backend(4, 500).await;
+        assert_eq!(status_through(on(&[500], 3), port).await, 500);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// Another status, or a route listing none, is returned at once.
+    #[tokio::test]
+    async fn a_status_not_listed_is_not_retried() {
+        let (port, hits) = backend(1, 503).await;
+        assert_eq!(status_through(on(&[500], 3), port).await, 503);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let (port, hits) = backend(1, 500).await;
+        assert_eq!(status_through(on(&[], 3), port).await, 500);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A retry waits the backoff first.
+    #[tokio::test]
+    async fn a_retry_waits_the_backoff() {
+        let (port, hits) = backend(1, 502).await;
+        let started = std::time::Instant::now();
+        let retry = RetryConfig {
+            backoff_ms: Some(200),
+            ..on(&[502], 2)
+        };
+        assert_eq!(status_through(retry, port).await, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
     }
 }

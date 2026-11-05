@@ -494,7 +494,10 @@ pub fn parse_retry(
     match raw.parse::<u32>() {
         // 0 or 1 attempt means "no retry" — nothing to configure.
         Ok(attempts) if attempts <= 1 => None,
-        Ok(attempts) => Some(RetryConfig { attempts }),
+        Ok(attempts) => Some(RetryConfig {
+            attempts,
+            ..Default::default()
+        }),
         Err(_) => {
             diagnostics.push(
                 Diagnostic::new(

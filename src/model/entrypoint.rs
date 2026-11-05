@@ -472,14 +472,22 @@ pub struct HealthCheckConfig {
 /// Retry policy for forwarding a request to a backend.
 ///
 /// Retries cover **connection-level failures and timeouts** — the backend
-/// never produced a response. A response that arrives (even a 5xx) is *not*
-/// retried: the backend acted on the request, so a blind replay could double a
-/// side effect. This matches Traefik's default retry semantics.
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+/// never produced a response. A response that arrives is *not* retried unless
+/// its status is one of `codes`: the backend acted on the request, so a blind
+/// replay could double a side effect. Without `codes`, this matches Traefik's
+/// default retry semantics.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
 pub struct RetryConfig {
     /// Total number of attempts (the first try plus retries). `2` means one
     /// retry. Values `<= 1` are treated as "no retry" by the parser.
     pub attempts: u32,
+    /// Response statuses retried as if the backend gave no response. The
+    /// last attempt's response is returned whatever its status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codes: Vec<u16>,
+    /// Milliseconds waited before each retry. None: retries go back-to-back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
 }
 
 /// Per-route circuit-breaker tunables. The breaker trips when the recent
