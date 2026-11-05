@@ -387,6 +387,7 @@ fn build_entrypoint(
             h2c_backends: false,
             entrypoint: None,
             sni: None,
+            terminate_tls: false,
             methods,
             acme,
             plugins,
@@ -518,6 +519,7 @@ fn build_l4_entrypoint(
         name: service_name.to_string(),
         protocol,
         config: EntrypointConfig {
+            terminate_tls: false,
             hostnames: Vec::new(),
             path: None,
             tls: false,

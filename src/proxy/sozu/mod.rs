@@ -208,6 +208,9 @@ struct Channels {
     certificate_holders: HashMap<String, usize>,
     /// The certificates the HTTPS worker holds, by fingerprint.
     certificates: BTreeMap<String, HeldCertificate>,
+    /// The terminators of the TCP routes that terminate TLS, which present
+    /// the certificates of `certificates`.
+    terminators: crate::proxy::tls_terminator::Terminators,
 }
 
 impl Channels {
@@ -921,6 +924,7 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
         ),
         certificate_holders: HashMap::new(),
         certificates: BTreeMap::new(),
+        terminators: crate::proxy::tls_terminator::Terminators::new(),
     };
 
     let reload_handle = thread::spawn(move || {
@@ -1077,7 +1081,9 @@ pub fn start_sozu_proxy(inputs: ProxyInputs, config: &ProxyConfig) -> anyhow::Re
                     &unhealthy_backends,
                 );
                 match live_routes.write() {
-                    Ok(mut live) => *live = previous_snapshot.clone(),
+                    // The routes that terminate TLS by the backends they
+                    // reach, not their terminator.
+                    Ok(mut live) => *live = channels.terminators.as_served(&previous_snapshot),
                     Err(e) => error!(
                         "internal state corrupted (live routes), restart required: {}",
                         e
@@ -1307,6 +1313,17 @@ fn apply_certificate(channels: &mut Channels, cmd: CertCommand) -> bool {
         }
     }
 
+    channels
+        .terminators
+        .set_certificates(channels.certificates.values().map(|held| {
+            crate::proxy::tls_terminator::TerminatorCertificate {
+                names: &held.names,
+                cert_pem: &held.cert_pem,
+                chain: &held.chain,
+                key_pem: &held.key_pem,
+            }
+        }));
+
     // The sender wrote the certificate to disk before handing it over, so
     // only this answer tells it whether the hostname can actually serve TLS.
     if let Some(accepted) = cmd.accepted {
@@ -1367,6 +1384,9 @@ fn handle_reload(
 
     let (storage_read, _) =
         routes_as_applied(&storage_read, client_certificate_redirect, &unhealthy);
+    // The TCP routes that terminate TLS go to their terminator, which
+    // forwards to their backends.
+    let storage_read = channels.terminators.route_through(&storage_read);
     let mut current_snapshot = snapshot_from_storage(&storage_read);
     // A live route another one now shadows on its listener comes off it
     // before that one is installed: left in place, its removal later would
@@ -5813,6 +5833,7 @@ mod tests {
             protocol: Protocol::Http,
             source: None,
             config: EntrypointConfig {
+                terminate_tls: false,
                 hostnames: vec!["app.example.com".into()],
                 path: None,
                 tls: false,

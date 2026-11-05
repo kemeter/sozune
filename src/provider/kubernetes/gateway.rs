@@ -137,6 +137,14 @@ pub(crate) async fn bounded_status_write<T>(
         .unwrap_or_else(|elapsed| Err(kube::Error::Service(Box::new(elapsed))))
 }
 
+/// Where a TLSRoute's names are served: a listener port, and whether the
+/// listener terminates TLS there or passes it through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TlsBinding {
+    pub port: i32,
+    pub terminate: bool,
+}
+
 /// In-memory snapshot of the Gateway API resources sōzune has decided to
 /// honour. The HTTPRoute watcher consults this on every apply to decide
 /// whether a route is in scope; the GatewayClass and Gateway watchers
@@ -1046,7 +1054,9 @@ impl GatewayScope {
                     .iter()
                     // A listener refused for its client certificates
                     // serves nothing over HTTPS, its certificate included.
-                    .filter(|l| serves_https(l) && !requires_client_certificate(gateway, l.port))
+                    .filter(|l| {
+                        takes_certificates(l) && !requires_client_certificate(gateway, l.port)
+                    })
                     .flat_map(|l| listener_certificates(&g.tls_secrets, &g.secret_grants, ns, l).0)
                     .collect::<Vec<_>>()
             })
@@ -1088,7 +1098,7 @@ impl GatewayScope {
                     .spec
                     .listeners
                     .iter()
-                    .find(|l| l.name == listener.name && serves_https(l))
+                    .find(|l| l.name == listener.name && takes_certificates(l))
                     .and_then(|l| listener_certificates(&g.tls_secrets, &g.secret_grants, ns, l).1);
                 build_listener_status(gateway, listener, &g.served, attached, certificates)
             })
@@ -1266,16 +1276,32 @@ impl GatewayScope {
             && !l.checks_client_certificates
     }
 
-    /// True iff this listener can carry a TLSRoute: protocol `TLS` with
-    /// `tls.mode: Passthrough`. `Terminate` is deliberately excluded — the
-    /// Gateway would decrypt, which is what HTTPS entrypoints are for.
+    /// True iff this listener can carry a TLSRoute: protocol `TLS`, in
+    /// `tls.mode` `Passthrough`, or `Terminate`, the default, unless it
+    /// would have to check client certificates.
+    fn listener_serves_tls(l: &ListenerInfo) -> bool {
+        Self::listener_serves_tls_passthrough(l) || Self::listener_terminates_tls(l)
+    }
+
+    /// True iff this `TLS` listener forwards its connections undecrypted:
+    /// `tls.mode: Passthrough`.
     fn listener_serves_tls_passthrough(l: &ListenerInfo) -> bool {
         l.protocol.eq_ignore_ascii_case("TLS")
             && matches!(l.tls_mode, Some(GatewayListenersTlsMode::Passthrough))
     }
 
-    /// True iff `parent_ref` binds this TLSRoute to a `TLS`/`Passthrough`
-    /// listener on a Gateway we own.
+    /// True iff this `TLS` listener terminates TLS and hands its routes'
+    /// backends the plaintext: `tls.mode: Terminate`, the default.
+    /// Refused, like an `HTTPS` listener, where the Gateway asks for client
+    /// certificates to be checked: Sōzune cannot check them.
+    fn listener_terminates_tls(l: &ListenerInfo) -> bool {
+        l.protocol.eq_ignore_ascii_case("TLS")
+            && matches!(l.tls_mode, None | Some(GatewayListenersTlsMode::Terminate))
+            && !l.checks_client_certificates
+    }
+
+    /// True iff `parent_ref` binds this TLSRoute to a `TLS` listener on a
+    /// Gateway we own.
     fn accepts_tls_parent_ref(
         &self,
         route_namespace: &str,
@@ -1285,7 +1311,7 @@ impl GatewayScope {
             route_namespace,
             parent_ref,
             "TLSRoute",
-            Some(Self::listener_serves_tls_passthrough),
+            Some(Self::listener_serves_tls),
         )
     }
 
@@ -1435,9 +1461,23 @@ impl GatewayScope {
     /// hostnames of its own inherits the listener's; if neither names anything,
     /// there is no SNI to match on and the route is refused rather than
     /// silently serving nothing.
-    fn effective_tls_hostnames_by_port(&self, route: &TlsRoute) -> BTreeMap<i32, Vec<String>> {
+    fn effective_tls_hostnames_by_port(
+        &self,
+        route: &TlsRoute,
+    ) -> BTreeMap<TlsBinding, Vec<String>> {
+        self.tls_hostnames_where(route, true)
+    }
+
+    /// [`Self::effective_tls_hostnames_by_port`], listeners terminating TLS
+    /// without a certificate yet included unless `need_certificate`: they
+    /// still admit the route.
+    fn tls_hostnames_where(
+        &self,
+        route: &TlsRoute,
+        need_certificate: bool,
+    ) -> BTreeMap<TlsBinding, Vec<String>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let mut by_port: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        let mut by_port: BTreeMap<TlsBinding, Vec<String>> = BTreeMap::new();
         for p in route
             .spec
             .parent_refs
@@ -1445,8 +1485,9 @@ impl GatewayScope {
             .flatten()
             .filter(|p| self.accepts_tls_parent_ref(route_ns, p))
         {
-            for (port, hostnames) in self.tls_parent_hostnames_by_port(route, p) {
-                let entry = by_port.entry(port).or_default();
+            for (binding, hostnames) in self.tls_parent_hostnames_where(route, p, need_certificate)
+            {
+                let entry = by_port.entry(binding).or_default();
                 for h in hostnames {
                     if !entry.contains(&h) {
                         entry.push(h);
@@ -1458,15 +1499,26 @@ impl GatewayScope {
     }
 
     /// [`Self::effective_tls_hostnames_by_port`] through the listeners one
-    /// `parentRef` selects.
+    /// `parentRef` selects, whether or not they can serve them yet.
     fn tls_parent_hostnames_by_port(
         &self,
         route: &TlsRoute,
         p: &TlsRouteParentRefs,
-    ) -> BTreeMap<i32, Vec<String>> {
+    ) -> BTreeMap<TlsBinding, Vec<String>> {
+        self.tls_parent_hostnames_where(route, p, false)
+    }
+
+    /// [`Self::tls_parent_hostnames_by_port`], a listener that terminates
+    /// TLS left out until it has a certificate when `need_certificate`.
+    fn tls_parent_hostnames_where(
+        &self,
+        route: &TlsRoute,
+        p: &TlsRouteParentRefs,
+        need_certificate: bool,
+    ) -> BTreeMap<TlsBinding, Vec<String>> {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
-        let mut by_port: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        let mut by_port: BTreeMap<TlsBinding, Vec<String>> = BTreeMap::new();
         {
             let ns = p.namespace.as_deref().unwrap_or(route_ns);
             let Some(listeners) = self.gateway_listeners(ns, &p.name, route_ns, "TLSRoute") else {
@@ -1474,7 +1526,12 @@ impl GatewayScope {
             };
             for listener in listeners
                 .into_iter()
-                .filter(Self::listener_serves_tls_passthrough)
+                .filter(|l| {
+                    Self::listener_serves_tls_passthrough(l)
+                        || (Self::listener_terminates_tls(l)
+                            && (!need_certificate
+                                || self.listener_has_certificate(ns, &p.name, &l.name)))
+                })
                 .filter(|l| {
                     let name_ok = p.section_name.as_deref().is_none_or(|s| s == l.name);
                     let port_ok = p.port.is_none_or(|port| port == l.port);
@@ -1486,13 +1543,16 @@ impl GatewayScope {
                 // Unioning first and picking one port would expose a name on a
                 // listener that refused it, and strand it on the one that
                 // wanted it.
-                let port = listener.port;
+                let binding = TlsBinding {
+                    port: listener.port,
+                    terminate: Self::listener_terminates_tls(&listener),
+                };
                 let Some(hs) =
                     intersect_hostnames(&route_hostnames, std::slice::from_ref(&listener))
                 else {
                     continue;
                 };
-                let entry = by_port.entry(port).or_default();
+                let entry = by_port.entry(binding).or_default();
                 for h in hs {
                     if !entry.contains(&h) {
                         entry.push(h);
@@ -2566,6 +2626,23 @@ fn requires_client_certificate(gateway: &Gateway, port: i32) -> bool {
     })
 }
 
+/// Whether a listener of the Gateway spec is a `TLS` one terminating TLS
+/// for TLSRoutes, as [`GatewayScope::listener_terminates_tls`] says of its
+/// [`ListenerInfo`].
+fn terminates_tls(l: &GatewayListeners) -> bool {
+    l.protocol.eq_ignore_ascii_case("TLS")
+        && matches!(
+            l.tls.as_ref().and_then(|t| t.mode.as_ref()),
+            None | Some(GatewayListenersTlsMode::Terminate)
+        )
+}
+
+/// Whether a listener of the Gateway spec presents the certificates its
+/// `certificateRefs` name: an `HTTPS` one, or a `TLS` one terminating TLS.
+fn takes_certificates(l: &GatewayListeners) -> bool {
+    serves_https(l) || terminates_tls(l)
+}
+
 /// The TLS Secrets a listener's `certificateRefs` name, as `(namespace,
 /// name)`, with the reference itself.
 fn certificate_refs<'a>(
@@ -2581,7 +2658,8 @@ fn certificate_refs<'a>(
         })
 }
 
-/// Whether one of the Gateway's `HTTPS` listeners names a Secret of
+/// Whether one of the Gateway's `HTTPS` or terminating `TLS` listeners
+/// names a Secret of
 /// `namespace`.
 fn references_secret_in(gateway: &Gateway, namespace: &str) -> bool {
     let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
@@ -2589,18 +2667,19 @@ fn references_secret_in(gateway: &Gateway, namespace: &str) -> bool {
         .spec
         .listeners
         .iter()
-        .filter(|l| serves_https(l))
+        .filter(|l| takes_certificates(l))
         .any(|l| certificate_refs(ns, l).any(|((secret_ns, _), _)| secret_ns == namespace))
 }
 
-/// Whether one of the Gateway's `HTTPS` listeners references `secret`.
+/// Whether one of the Gateway's `HTTPS` or terminating `TLS` listeners
+/// references `secret`.
 fn references_secret(gateway: &Gateway, secret: &(String, String)) -> bool {
     let ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
     gateway
         .spec
         .listeners
         .iter()
-        .filter(|l| serves_https(l))
+        .filter(|l| takes_certificates(l))
         .any(|l| certificate_refs(ns, l).any(|(key, _)| &key == secret))
 }
 
@@ -2619,7 +2698,7 @@ fn listener_certificates(
     if refs.peek().is_none() {
         problem = Some((
             REASON_INVALID_CERTIFICATE_REF,
-            "an HTTPS listener needs a certificateRefs entry naming a kubernetes.io/tls Secret"
+            "a listener terminating TLS needs a certificateRefs entry naming a kubernetes.io/tls Secret"
                 .to_string(),
         ));
     }
@@ -3574,7 +3653,7 @@ impl L4Route for TlsRoute {
             self.spec.parent_refs.as_deref().unwrap_or_default(),
             Self::KIND,
             &|p| scope.accepts_tls_parent_ref(route_ns, p),
-            GatewayScope::listener_serves_tls_passthrough,
+            GatewayScope::listener_serves_tls,
             // Each parent by the listeners it selects: one admitting none of
             // the route's names refuses it, whatever another does.
             &|p| {
@@ -3979,8 +4058,8 @@ fn build_listener_status(
         "HTTPS" if GatewayScope::listener_serves_https(listener) => {
             (&["HTTPRoute"], served.https_problem(listener.port))
         }
-        // A TLS listener carries TLSRoutes in Passthrough mode only.
-        "TLS" if !GatewayScope::listener_serves_tls_passthrough(listener) => (&[], None),
+        // A TLS listener carries TLSRoutes in either mode, terminated by
+        // Sōzune in Terminate mode.
         // On the HTTPS port, by its passthrough listener when it has one.
         "TLS" if served.https_passthrough && port == Some(served.https) => (&["TLSRoute"], None),
         "TLS" => (&["TLSRoute"], served.tcp_problem(listener.port)),
@@ -4000,7 +4079,7 @@ fn build_listener_status(
         observed_generation: generation,
     };
     // Refused like a listener of another TLS mode: it carries no kind.
-    let checks_client_certificates = protocol == "HTTPS"
+    let checks_client_certificates = (protocol == "HTTPS" || protocol == "TLS")
         && matches!(
             listener.tls_mode,
             None | Some(GatewayListenersTlsMode::Terminate)
@@ -4020,14 +4099,9 @@ fn build_listener_status(
             ]
         }
         (None, _) => {
-            // A TLS or HTTPS listener is refused for its `tls.mode`, a value
-            // of a field Sōzune does not support; any other for its protocol.
-            let (reason, message) = if protocol == "TLS" {
-                (
-                    REASON_UNSUPPORTED_VALUE,
-                    "TLS listeners are served in Passthrough mode only".to_string(),
-                )
-            } else if protocol == "HTTPS" {
+            // An HTTPS listener is refused for its `tls.mode`, a value of a
+            // field Sōzune does not support; any other for its protocol.
+            let (reason, message) = if protocol == "HTTPS" {
                 (
                     REASON_UNSUPPORTED_VALUE,
                     "HTTPS listeners terminate TLS: Passthrough belongs on a TLS listener"
@@ -4262,6 +4336,8 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
     "TLSRoute",
+    "TLSRouteModeMixed",
+    "TLSRouteModeTerminate",
 ];
 
 /// The features of [`SUPPORTED_FEATURES`] this Sōzune serves as configured,
@@ -6527,6 +6603,7 @@ fn rule_to_entrypoints(
                 backends: backends.clone(),
                 protocol: Protocol::Http,
                 config: EntrypointConfig {
+                    terminate_tls: false,
                     hostnames: hostnames.to_vec(),
                     path,
                     tls: false,
@@ -6715,7 +6792,7 @@ fn apply_tls_route(
         route.metadata.namespace.as_deref().unwrap_or("default"),
         route.spec.hostnames.as_deref().unwrap_or_default(),
         route.spec.parent_refs.as_deref().unwrap_or_default(),
-        GatewayScope::listener_serves_tls_passthrough,
+        GatewayScope::listener_serves_tls,
     );
 
     // Out-of-scope routes stay tracked with zero entrypoints so they activate
@@ -6732,16 +6809,21 @@ fn apply_tls_route(
         // entrypoint set, serving only the names that listener admits.
         Some(by_port) => by_port
             .into_iter()
-            .flat_map(|(port, hostnames)| match listener_ports.get(port) {
-                Some(listener_name) => {
-                    tls_route_to_entrypoints(route, resolver, scope, &hostnames, &listener_name, port)
-                }
+            .flat_map(|(binding, hostnames)| match listener_ports.get(binding.port) {
+                Some(listener_name) => tls_route_to_entrypoints(
+                    route,
+                    resolver,
+                    scope,
+                    &hostnames,
+                    &listener_name,
+                    binding,
+                ),
                 None => {
                     let ns = route.metadata.namespace.as_deref().unwrap_or("default");
                     let name = route.metadata.name.as_deref().unwrap_or("<no-name>");
                     warn!(
                         "Gateway API: TLSRoute {}/{} binds to a Gateway listener on port {}, which is neither a `proxy.tcp` listener nor in `proxy.gateway_ports.tcp` in config.yaml",
-                        ns, name, port
+                        ns, name, binding.port
                     );
                     Vec::new()
                 }
@@ -6749,9 +6831,13 @@ fn apply_tls_route(
             .collect(),
     };
 
-    // A port Sōzune does not serve is the listener's to report, on its
-    // status: the route stays accepted.
-    let outcome = match &by_port {
+    // A port Sōzune does not serve, or a listener without its certificate
+    // yet, is the listener's to report, on its status: the route stays
+    // accepted.
+    let admitted = by_port
+        .as_ref()
+        .map(|_| scope.tls_hostnames_where(route, false));
+    let outcome = match &admitted {
         None => RouteOutcome::NotMine,
         Some(ports) if ports.is_empty() => RouteOutcome::NoMatchingListenerHostname,
         Some(_) if !l4_route_backends_ready(route, resolver, scope) => {
@@ -7864,8 +7950,16 @@ pub fn tls_route_to_entrypoints(
     grants: &dyn BackendRefAuthorizer,
     hostnames: &[String],
     listener_name: &str,
-    port: i32,
+    binding: TlsBinding,
 ) -> Vec<Entrypoint> {
+    let port = binding.port;
+    // A listener of each mode can serve the route on one port: their
+    // entrypoints must not share an id.
+    let at = if binding.terminate {
+        format!("{port}-terminate")
+    } else {
+        port.to_string()
+    };
     let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
     let Some(route_name) = route.metadata.name.as_deref() else {
         return Vec::new();
@@ -7925,8 +8019,8 @@ pub fn tls_route_to_entrypoints(
                         // The port is part of the id: one route can serve
                         // several listeners, and their entrypoint sets must not
                         // overwrite each other.
-                        id: format!("{SOURCE_TAG}-tls/{namespace}/{route_name}/{port}/{suffix}"),
-                        name: format!("{route_name}-{port}-{suffix}"),
+                        id: format!("{SOURCE_TAG}-tls/{namespace}/{route_name}/{at}/{suffix}"),
+                        name: format!("{route_name}-{at}-{suffix}"),
                         backends: backends.clone(),
                         protocol: Protocol::Tcp,
                         config: EntrypointConfig {
@@ -7935,6 +8029,7 @@ pub fn tls_route_to_entrypoints(
                             // would imply an HTTP Host match that never runs.
                             hostnames: Vec::new(),
                             sni: Some(hostname.clone()),
+                            terminate_tls: binding.terminate,
                             entrypoint: Some(listener_name.to_string()),
                             ..tls_entrypoint_defaults()
                         },
@@ -7990,6 +8085,7 @@ fn tls_rule_backends(
 /// authenticate — only bytes to forward.
 fn tls_entrypoint_defaults() -> EntrypointConfig {
     EntrypointConfig {
+        terminate_tls: false,
         hostnames: Vec::new(),
         path: None,
         tls: false,
@@ -8083,6 +8179,14 @@ mod tests {
         GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
     };
     use kube::api::ObjectMeta;
+
+    /// Where a TLSRoute is passed through on `port`.
+    fn pt(port: i32) -> TlsBinding {
+        TlsBinding {
+            port,
+            terminate: false,
+        }
+    }
 
     /// Builds a [`GatewayScope`] pre-populated with one accepted
     /// GatewayClass (`sozune`) and one accepted Gateway (`default/gw`).
@@ -8233,9 +8337,9 @@ mod tests {
         let scope = tls_scope(None, 8443);
         let route = tls_route(vec!["a.example.com", "b.example.com"], 8443);
         let by_port = scope.effective_tls_hostnames_by_port(&route);
-        let hostnames = by_port.get(&8443).expect("listener on 8443");
+        let hostnames = by_port.get(&pt(8443)).expect("listener on 8443");
 
-        let eps = tls_route_to_entrypoints(&route, &r1(), &scope, hostnames, "tlsgw", 8443);
+        let eps = tls_route_to_entrypoints(&route, &r1(), &scope, hostnames, "tlsgw", pt(8443));
         assert_eq!(eps.len(), 2);
         let snis: Vec<_> = eps.iter().filter_map(|e| e.config.sni.clone()).collect();
         assert!(snis.contains(&"a.example.com".to_string()));
@@ -8259,9 +8363,9 @@ mod tests {
             &route,
             &r1(),
             &scope,
-            by_port.get(&8443).unwrap(),
+            by_port.get(&pt(8443)).unwrap(),
             "tlsgw",
-            8443,
+            pt(8443),
         );
         assert_eq!(eps[0].config.sni.as_deref(), Some("api.example.com"));
     }
@@ -8272,7 +8376,7 @@ mod tests {
         // catch-all once a listener carries SNI routes.
         let scope = tls_scope(None, 8443);
         let route = tls_route(vec![], 8443);
-        let eps = tls_route_to_entrypoints(&route, &r1(), &scope, &[], "tlsgw", 8443);
+        let eps = tls_route_to_entrypoints(&route, &r1(), &scope, &[], "tlsgw", pt(8443));
         assert!(eps.is_empty());
     }
 
@@ -8285,17 +8389,18 @@ mod tests {
             &route,
             &r0(),
             &scope,
-            by_port.get(&8443).unwrap(),
+            by_port.get(&pt(8443)).unwrap(),
             "tlsgw",
-            8443,
+            pt(8443),
         );
         assert!(eps.is_empty());
     }
 
     #[test]
-    fn tls_route_needs_a_passthrough_listener() {
-        // A `Terminate` listener means the Gateway decrypts — a different
-        // feature, served by HTTPS entrypoints, so the route is not ours.
+    fn a_terminate_listener_serves_tls_routes_once_it_has_a_certificate() {
+        // A `Terminate` listener has Sōzune decrypt and hand the backends the
+        // plaintext: the route attaches, and is served once the listener's
+        // certificate resolves.
         let scope = GatewayScope::new();
         scope.upsert_gateway_class(&GatewayClass {
             metadata: ObjectMeta {
@@ -8322,6 +8427,10 @@ mod tests {
                     protocol: "TLS".into(),
                     tls: Some(gateway_api::apis::standard::gateways::GatewayListenersTls {
                         mode: Some(GatewayListenersTlsMode::Terminate),
+                        certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                            name: "tls-cert".into(),
+                            ..Default::default()
+                        }]),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -8330,7 +8439,34 @@ mod tests {
             },
             status: Default::default(),
         });
-        assert!(!scope.accepts_tls_route(&tls_route(vec!["a.example.com"], 8443)));
+        let route = tls_route(vec!["a.example.com"], 8443);
+        assert!(scope.accepts_tls_route(&route));
+        assert!(scope.effective_tls_hostnames_by_port(&route).is_empty());
+        // Admitted all the same: the listener says what it lacks.
+        assert!(!scope.tls_hostnames_where(&route, false).is_empty());
+        assert!(
+            !scope
+                .tls_parent_hostnames_by_port(&route, &route.spec.parent_refs.as_ref().unwrap()[0])
+                .is_empty()
+        );
+
+        store_secret(&scope, "default", "tls-cert", "a.example.com");
+        let binding = TlsBinding {
+            port: 8443,
+            terminate: true,
+        };
+        let by_port = scope.effective_tls_hostnames_by_port(&route);
+        assert_eq!(
+            by_port.get(&binding),
+            Some(&vec!["a.example.com".to_string()])
+        );
+        let eps =
+            tls_route_to_entrypoints(&route, &r1(), &scope, &by_port[&binding], "tlsgw", binding);
+        assert_eq!(eps.len(), 1);
+        assert!(eps[0].config.terminate_tls);
+        assert!(eps[0].id.contains("/8443-terminate/"), "{}", eps[0].id);
+        // The listener's certificate is served.
+        assert_eq!(scope.referenced_certificates().len(), 1);
     }
 
     #[test]
@@ -8345,7 +8481,10 @@ mod tests {
         let scope = tls_scope(Some("*.example.com"), 8443);
         let route = tls_route(vec!["a.example.com", "b.other.net"], 8443);
         let by_port = scope.effective_tls_hostnames_by_port(&route);
-        assert_eq!(by_port.get(&8443), Some(&vec!["a.example.com".to_string()]));
+        assert_eq!(
+            by_port.get(&pt(8443)),
+            Some(&vec!["a.example.com".to_string()])
+        );
     }
 
     /// A TLSRoute reports, on each parent of ours, `Accepted` and
@@ -8438,7 +8577,7 @@ mod tests {
         let scope = tls_scope(None, 9443);
         let route = tls_route(vec!["a.example.com"], 8443);
         let by_port = scope.effective_tls_hostnames_by_port(&route);
-        assert!(by_port.contains_key(&9443));
+        assert!(by_port.contains_key(&pt(9443)));
         assert!(ports_8443().get(9443).is_none());
     }
 
@@ -8502,9 +8641,9 @@ mod tests {
             &one,
             &r1(),
             &scope,
-            by_port.get(&8443).unwrap(),
+            by_port.get(&pt(8443)).unwrap(),
             "tlsgw",
-            8443,
+            pt(8443),
         );
         // Single hostname keeps the plain `…/{rule}` shape.
         assert_eq!(eps[0].id, "k8s-gateway-tls/default/passthrough/8443/0");
@@ -8515,9 +8654,9 @@ mod tests {
             &two,
             &r1(),
             &scope,
-            by_port.get(&8443).unwrap(),
+            by_port.get(&pt(8443)).unwrap(),
             "tlsgw",
-            8443,
+            pt(8443),
         );
         let ids: Vec<_> = eps.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"k8s-gateway-tls/default/passthrough/8443/0-h0"));
@@ -8539,8 +8678,8 @@ mod tests {
         second.metadata.name = Some("b-c".into());
 
         let hs = vec!["x.example.com".to_string()];
-        let a = tls_route_to_entrypoints(&first, &r1(), &scope, &hs, "tlsgw", 8443);
-        let b = tls_route_to_entrypoints(&second, &r1(), &scope, &hs, "tlsgw", 8443);
+        let a = tls_route_to_entrypoints(&first, &r1(), &scope, &hs, "tlsgw", pt(8443));
+        let b = tls_route_to_entrypoints(&second, &r1(), &scope, &hs, "tlsgw", pt(8443));
         assert_ne!(a[0].id, b[0].id);
     }
 
@@ -8559,7 +8698,7 @@ mod tests {
                 "*.*.bad.example.com".to_string(),
             ],
             "tlsgw",
-            8443,
+            pt(8443),
         );
         let snis: Vec<_> = eps.iter().filter_map(|e| e.config.sni.clone()).collect();
         assert_eq!(snis, vec!["ok.example.com".to_string()]);
@@ -8611,22 +8750,32 @@ mod tests {
 
         let route = tls_route(vec!["a.example.com", "b.example.com"], 8443);
         let by_port = scope.effective_tls_hostnames_by_port(&route);
-        assert_eq!(by_port.get(&8443), Some(&vec!["a.example.com".to_string()]));
-        assert_eq!(by_port.get(&9443), Some(&vec!["b.example.com".to_string()]));
+        assert_eq!(
+            by_port.get(&pt(8443)),
+            Some(&vec!["a.example.com".to_string()])
+        );
+        assert_eq!(
+            by_port.get(&pt(9443)),
+            Some(&vec!["b.example.com".to_string()])
+        );
     }
 
     #[test]
-    fn only_tls_passthrough_listeners_carry_tls_routes() {
-        // Passthrough is the one shape we can serve: the bytes stay encrypted
-        // and we route on the name alone.
+    fn tls_passthrough_is_told_from_terminate() {
+        // Passthrough: the bytes stay encrypted and are routed on the name.
         assert!(GatewayScope::listener_serves_tls_passthrough(&li_tls(
             "tls",
             8443,
             None,
             GatewayListenersTlsMode::Passthrough
         )));
-        // Terminate would have the Gateway decrypt — that is an HTTPS
-        // entrypoint's job, not this path's.
+        // Terminate: Sōzune decrypts.
+        assert!(GatewayScope::listener_terminates_tls(&li_tls(
+            "tls",
+            8443,
+            None,
+            GatewayListenersTlsMode::Terminate
+        )));
         assert!(!GatewayScope::listener_serves_tls_passthrough(&li_tls(
             "tls",
             8443,
@@ -8655,6 +8804,7 @@ mod tests {
         let mut no_mode = li_tls("tls", 8443, None, GatewayListenersTlsMode::Passthrough);
         no_mode.tls_mode = None;
         assert!(!GatewayScope::listener_serves_tls_passthrough(&no_mode));
+        assert!(GatewayScope::listener_terminates_tls(&no_mode));
     }
 
     #[test]
@@ -13706,22 +13856,40 @@ mod tests {
     /// A TLS listener that terminates carries no TLSRoute: it is not ready,
     /// whatever its port.
     #[test]
-    fn a_terminating_tls_listener_is_not_programmed() {
+    fn tls_listeners_of_either_mode_carry_tls_routes() {
         let gw = gateway("default", "gw", "sozune");
         let terminate = li_tls("tls", 5432, None, GatewayListenersTlsMode::Terminate);
         let passthrough = li_tls("tls", 5432, None, GatewayListenersTlsMode::Passthrough);
 
         let status = build_listener_status(&gw, &terminate, &served(), 0, None);
-        let accepted = condition_of(&status, CONDITION_TYPE_ACCEPTED);
-        assert_eq!(accepted.status, "False");
-        assert_eq!(accepted.reason, REASON_UNSUPPORTED_VALUE);
-        assert!(accepted.message.contains("Passthrough"));
-        assert!(
-            status
-                .supported_kinds
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
+        assert_eq!(
+            condition_of(&status, CONDITION_TYPE_ACCEPTED).status,
+            "True"
+        );
+        assert_eq!(
+            status.supported_kinds.as_deref().unwrap_or_default()[0].kind,
+            "TLSRoute"
+        );
+        // Refused where client certificates are to be checked.
+        let mut checking = terminate.clone();
+        checking.checks_client_certificates = true;
+        assert!(!GatewayScope::listener_serves_tls(&checking));
+        let status = build_listener_status(&gw, &checking, &served(), 0, None);
+        assert_eq!(
+            condition_of(&status, CONDITION_TYPE_ACCEPTED).reason,
+            REASON_UNSUPPORTED_VALUE
+        );
+        // Without its certificate, not programmed.
+        let status = build_listener_status(
+            &gw,
+            &terminate,
+            &served(),
+            0,
+            Some((REASON_INVALID_CERTIFICATE_REF, "no Secret".to_string())),
+        );
+        assert_eq!(
+            condition_of(&status, CONDITION_TYPE_PROGRAMMED).status,
+            "False"
         );
 
         let status = build_listener_status(&gw, &passthrough, &served(), 0, None);
