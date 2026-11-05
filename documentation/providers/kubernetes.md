@@ -416,6 +416,8 @@ spec:
 
 A listener whose certificateRefs cannot be used says so in its status (see [Status conditions](#status-conditions)): `ResolvedRefs=False` with `InvalidCertificateRef` for a missing Secret, one of another type or kind, or one whose certificate is expired (checked every minute, so a certificate expiring unrenewed is caught) or does not match its key, and `RefNotPermitted` for a Secret in another namespace that no `ReferenceGrant` opens to the Gateway. The references that resolve are still served. A listener left with no usable certificate serves no route over HTTPS, and redirects none there: its routes come back once a Secret it names is fixed.
 
+Client certificate validation (`spec.tls.frontend`) is not supported: SÅzu checks client certificates for a whole HTTPS port, shared by every Gateway and Ingress served there, not per Gateway. Rather than serve without the check, an `HTTPS` listener on a port where the Gateway asks for it (a `perPort` entry for that port, or else `default`, with a `validation` in mode `AllowValidOnly`, the default) is refused with `Accepted=False reason=UnsupportedValue`, like an `HTTPS` listener in `Passthrough` mode: no route attaches to it. A `validation` in mode `AllowInsecureFallback` accepts any client, and is served so. For client certificates on every HTTPS connection, see [`proxy.https.tls.client_auth`](../tls/overview.md#client-certificates-mutual-tls). (since 0.16)
+
 ### HTTP listeners on their own port
 
 > Since 0.16
@@ -522,6 +524,7 @@ With `publish_service` or `publish_addresses` set, `status.addresses` carries SÅ
 | `ResolvedRefs` | `False` (`InvalidRouteKinds`) | `allowedRoutes.kinds` lists a kind the listener's protocol cannot carry. If it leaves out the one it can, `Programmed` is `False` (`Invalid`) too: no route attaches |
 | `ResolvedRefs` | `False` (`InvalidCertificateRef`, `RefNotPermitted`) | An `HTTPS` listener's certificateRef cannot be used (see [HTTPS listeners](#https-listeners)); `Programmed` is `False` (`Invalid`) too |
 | `Accepted`, `Programmed` | `False` (`UnsupportedValue`, `Invalid`) | An `HTTPS` listener in `Passthrough` mode (that belongs on a `TLS` listener), or a `TLS` listener in `Terminate` mode (TLSRoutes need `Passthrough`) (since 0.16; `UnsupportedProtocol` before) |
+| `Accepted`, `Programmed` | `False` (`UnsupportedValue`, `Invalid`) | An `HTTPS` listener on a port where the Gateway asks for client certificates to be checked (`spec.tls.frontend`, see [HTTPS listeners](#https-listeners)) (since 0.16) |
 | `Accepted`, `Programmed` | `False` (`UnsupportedProtocol`, `Invalid`) | Any other protocol |
 
 **GatewayClass** (`status.conditions[]`) (since 0.15):
