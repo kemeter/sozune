@@ -165,7 +165,7 @@ providers:
     publish_service: sozune/sozune   # the LoadBalancer Service in front of Sōzune
 ```
 
-The Gateways Sōzune owns get the same addresses in `status.addresses`, typed `IPAddress` or `Hostname`, which external-dns reads for Gateways too.
+The Gateways Sōzune owns get the same addresses in `status.addresses`, typed `IPAddress` or `Hostname`, which external-dns reads for Gateways too. A Gateway that lists some of them in `spec.addresses` gets only those; an entry with a type and no value gets every address of that type (since 0.16). Sōzune serves every Gateway on the same addresses: `spec.addresses` cannot give a Gateway an address Sōzune does not publish.
 
 With `publish_service`, the Ingresses get the addresses that Service's load balancer was given, updated when they change. With `publish_addresses`, they get those addresses, an IP as `ip` and anything else as `hostname`. An Ingress Sōzune stops serving keeps the status it had. Sōzune needs to update `ingresses/status` for this (see [Minimum RBAC](#minimum-rbac)).
 
@@ -310,7 +310,7 @@ spec:
   controllerName: kemeter.io/sozune
 ```
 
-Sōzune marks the class `Accepted` and lists on its `status.supportedFeatures` the Gateway API features it serves, by their conformance names: the route kinds, and the extended features whose conformance tests pass (since 0.16). Those that depend on the deployment are listed only when it provides them: GRPCRoute when a listener speaks HTTP/2 (`proxy.http.h2c`, or `h2` in the HTTPS ALPN), `GatewayAddressEmpty` when Sōzune publishes its addresses (`publish_service` or `publish_addresses`), `GatewayPort8080` when it serves HTTP on port 8080 (`proxy.http.listen_address` or `proxy.gateway_ports.http`), `HTTPRouteRetry` when the HTTPRoute CRD has a rule's `retry`, as Sōzune reads it at startup.
+Sōzune marks the class `Accepted` and lists on its `status.supportedFeatures` the Gateway API features it serves, by their conformance names: the route kinds, and the extended features whose conformance tests pass (since 0.16). Those that depend on the deployment are listed only when it provides them: GRPCRoute when a listener speaks HTTP/2 (`proxy.http.h2c`, or `h2` in the HTTPS ALPN), `GatewayAddressEmpty` and `GatewayStaticAddresses` when Sōzune publishes its addresses (`publish_service` or `publish_addresses`), `GatewayPort8080` when it serves HTTP on port 8080 (`proxy.http.listen_address` or `proxy.gateway_ports.http`), `HTTPRouteRetry` when the HTTPRoute CRD has a rule's `retry`, as Sōzune reads it at startup.
 
 Then a `Gateway` that references it:
 
@@ -502,8 +502,12 @@ Routes whose parent is not sōzune-owned receive **no status entry** from sōzun
 | `Programmed` | `True` (`Programmed`) | Same instant as acceptance — sōzune does not stage programming |
 | `Accepted` | `True` (`ListenersNotValid`) | Some of its listeners are not accepted (see the listener conditions below), others are (since 0.16) |
 | `Accepted`, `Programmed` | `False` (`ListenersNotValid`, `Invalid`) | None of its listeners is accepted (since 0.16) |
+| `Accepted`, `Programmed` | `False` (`UnsupportedAddress`, `Invalid`) | An entry of `spec.addresses` has a type other than `IPAddress` and `Hostname` (since 0.16) |
+| `Accepted`, `Programmed` | `False` (`InvalidParameters`, `Invalid`) | `spec.infrastructure.parametersRef` is set: Sōzune takes no infrastructure parameters (since 0.16) |
+| `Programmed` | `False` (`AddressNotUsable`) | An entry of `spec.addresses` is not an address Sōzune publishes, or none is published yet (since 0.16) |
+| `Programmed` | `False` (`AddressNotAssigned`) | An entry of `spec.addresses` has no value and Sōzune publishes no address of its type (since 0.16) |
 
-With `publish_service` or `publish_addresses` set, `status.addresses` carries Sōzune's address (see [Ingress status](#ingress-status)). (since 0.16)
+With `publish_service` or `publish_addresses` set, `status.addresses` carries Sōzune's address, or those of `spec.addresses` (see [Ingress status](#ingress-status)). A Gateway whose spec cannot be served as written gets none. These conditions only report: Sōzune keeps serving the Gateway's routes. `spec.infrastructure.labels` and `annotations` are ignored, as Sōzune creates no resources per Gateway. (since 0.16)
 
 **Gateway listeners** (`status.listeners[]`), one entry per listener (since 0.16):
 

@@ -86,6 +86,12 @@ sed -e "s|__IMAGE__|$SOZUNE_IMAGE_REF|" -e "s|__NODE_IP__|$node_ip|" \
 kubectl wait --for=condition=Ready pod/sozune -n sozune-conformance --timeout=120s >/dev/null
 
 log "Running the suite (Sōzune at $node_ip)..."
+# GatewayStaticAddresses needs an address Sōzune publishes and one it does
+# not, from suites that take them.
+address_args=()
+if grep -q '"usable-address"' "$suite/conformance/utils/flags/flags.go" 2>/dev/null; then
+    address_args=(--usable-address="$node_ip" --unusable-address=192.0.2.1)
+fi
 status=0
 # shellcheck disable=SC2086
 # The Go the suite's release asks for.
@@ -101,6 +107,7 @@ docker run --rm --network host \
         --url=https://github.com/kemeter/sozune --version=dev \
         --contact=https://github.com/kemeter/sozune/issues \
         --report-output=/out/report.yaml \
+        "${address_args[@]}" \
         ${CONFORMANCE_ARGS:-} || status=$?
 
 if [[ $status -ne 0 ]]; then

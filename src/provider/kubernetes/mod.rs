@@ -1,4 +1,5 @@
 pub mod gateway;
+mod gateway_addresses;
 mod gateway_compat;
 pub mod gateway_filters;
 pub mod gateway_grpc;
