@@ -176,6 +176,10 @@ pub struct ListenerInfo {
     /// when unset or empty: the protocol decides, which the per-kind listener
     /// predicates already do.
     pub allowed_kinds: Option<Vec<String>>,
+    /// Whether the Gateway asks for the client certificates of this listener
+    /// to be checked, which Sōzune cannot do: an `HTTPS` one is then refused
+    /// (see [`requires_client_certificate`]).
+    pub checks_client_certificates: bool,
 }
 
 /// `allowedRoutes.namespaces.from` of a Gateway listener.
@@ -1040,7 +1044,9 @@ impl GatewayScope {
                     .spec
                     .listeners
                     .iter()
-                    .filter(|l| serves_https(l))
+                    // A listener refused for its client certificates
+                    // serves nothing over HTTPS, its certificate included.
+                    .filter(|l| serves_https(l) && !requires_client_certificate(gateway, l.port))
                     .flat_map(|l| listener_certificates(&g.tls_secrets, &g.secret_grants, ns, l).0)
                     .collect::<Vec<_>>()
             })
@@ -1257,6 +1263,7 @@ impl GatewayScope {
     pub(crate) fn listener_serves_https(l: &ListenerInfo) -> bool {
         l.protocol.eq_ignore_ascii_case("HTTPS")
             && matches!(l.tls_mode, None | Some(GatewayListenersTlsMode::Terminate))
+            && !l.checks_client_certificates
     }
 
     /// True iff this listener can carry a TLSRoute: protocol `TLS` with
@@ -1968,10 +1975,19 @@ impl GatewayScope {
         };
         let key = (ns, name.to_string());
         let accepted = g.gateway_classes.contains(class);
-        let tls_of =
-            |gw: &Gateway| -> Vec<_> { gw.spec.listeners.iter().map(|l| l.tls.clone()).collect() };
-        // The certificateRefs decide which HTTPS listeners serve their routes,
-        // and they are not in the listener list compared below.
+        let tls_of = |gw: &Gateway| {
+            (
+                gw.spec
+                    .listeners
+                    .iter()
+                    .map(|l| l.tls.clone())
+                    .collect::<Vec<_>>(),
+                gw.spec.tls.clone(),
+            )
+        };
+        // The certificateRefs, and whether client certificates are to be
+        // checked, decide which HTTPS listeners serve their routes, and they
+        // are not in the listener list compared below.
         let tls_changed = accepted
             && g.gateway_objects
                 .get(&key)
@@ -2520,6 +2536,36 @@ fn serves_https(l: &GatewayListeners) -> bool {
         )
 }
 
+/// Whether `gateway` asks for the client certificates of its `HTTPS`
+/// listeners on `port` to be checked (`spec.tls.frontend`, in mode
+/// `AllowValidOnly`, the default): a `perPort` entry for the port, or else
+/// `default`. Sōzu checks client certificates for a whole listener, shared
+/// by every Gateway and Ingress on its port, not per Gateway: such a
+/// listener is refused rather than served without the check.
+/// `AllowInsecureFallback` accepts any client, which serving it does.
+fn requires_client_certificate(gateway: &Gateway, port: i32) -> bool {
+    use gateway_api::apis::standard::gateways::{
+        GatewayTlsFrontendDefaultValidationMode, GatewayTlsFrontendPerPortTlsValidationMode,
+    };
+    let Some(frontend) = gateway.spec.tls.as_ref().and_then(|t| t.frontend.as_ref()) else {
+        return false;
+    };
+    if let Some(per_port) = frontend.per_port.iter().flatten().find(|p| p.port == port) {
+        return per_port.tls.validation.as_ref().is_some_and(|v| {
+            !matches!(
+                v.mode,
+                Some(GatewayTlsFrontendPerPortTlsValidationMode::AllowInsecureFallback)
+            )
+        });
+    }
+    frontend.default.validation.as_ref().is_some_and(|v| {
+        !matches!(
+            v.mode,
+            Some(GatewayTlsFrontendDefaultValidationMode::AllowInsecureFallback)
+        )
+    })
+}
+
 /// The TLS Secrets a listener's `certificateRefs` name, as `(namespace,
 /// name)`, with the reference itself.
 fn certificate_refs<'a>(
@@ -2663,6 +2709,7 @@ fn listeners_of(gateway: &Gateway) -> Vec<ListenerInfo> {
                         .map(|k| k.kind.clone())
                         .collect()
                 }),
+            checks_client_certificates: requires_client_certificate(gateway, l.port),
         })
         .collect()
 }
@@ -3952,7 +3999,26 @@ fn build_listener_status(
         last_transition_time: now.clone(),
         observed_generation: generation,
     };
+    // Refused like a listener of another TLS mode: it carries no kind.
+    let checks_client_certificates = protocol == "HTTPS"
+        && matches!(
+            listener.tls_mode,
+            None | Some(GatewayListenersTlsMode::Terminate)
+        )
+        && listener.checks_client_certificates;
     let mut conditions = match (protocol_kinds.first(), problem) {
+        _ if checks_client_certificates => {
+            let message = "client certificate validation (spec.tls.frontend) is not supported: Sōzune cannot check client certificates per Gateway".to_string();
+            vec![
+                condition(
+                    CONDITION_TYPE_ACCEPTED,
+                    false,
+                    REASON_UNSUPPORTED_VALUE,
+                    message.clone(),
+                ),
+                condition(CONDITION_TYPE_PROGRAMMED, false, REASON_INVALID, message),
+            ]
+        }
         (None, _) => {
             // A TLS or HTTPS listener is refused for its `tls.mode`, a value
             // of a field Sōzune does not support; any other for its protocol.
@@ -11521,6 +11587,7 @@ mod tests {
             tls_mode: None,
             allowed_namespaces: AllowedNamespaces::Same,
             allowed_kinds: None,
+            checks_client_certificates: false,
         }
     }
 
@@ -11539,6 +11606,7 @@ mod tests {
             tls_mode: Some(mode),
             allowed_namespaces: AllowedNamespaces::Same,
             allowed_kinds: None,
+            checks_client_certificates: false,
         }
     }
 
@@ -11859,6 +11927,116 @@ mod tests {
                 .message
                 .contains("the certificate has expired")
         );
+    }
+
+    /// A Gateway asking for client certificates to be checked on an HTTPS
+    /// port gets its listeners there refused, their routes not served over
+    /// HTTPS: Sōzune cannot check them per Gateway. `AllowInsecureFallback`
+    /// accepts any client, and a `perPort` entry overrides `default`.
+    #[test]
+    fn https_listeners_checking_client_certificates_are_refused() {
+        use gateway_api::apis::standard::gateways::{
+            GatewayTls, GatewayTlsFrontend, GatewayTlsFrontendDefault,
+            GatewayTlsFrontendDefaultValidation, GatewayTlsFrontendDefaultValidationMode,
+            GatewayTlsFrontendPerPort, GatewayTlsFrontendPerPortTls,
+            GatewayTlsFrontendPerPortTlsValidation,
+        };
+        let scope = GatewayScope::new();
+        scope.upsert_gateway_class(&class("sozune", SOZUNE_CONTROLLER_NAME));
+        let mut gw = gateway("default", "gw", "sozune");
+        let mut https = https_listener("tls", None, "shop-tls");
+        https.hostname = Some("www.shop.example".into());
+        let mut other = https_listener("other", None, "shop-tls");
+        other.port = 8443;
+        other.hostname = Some("www.shop.example".into());
+        gw.spec.listeners = vec![https, other];
+        let validation = |mode| GatewayTlsFrontendDefaultValidation {
+            mode,
+            ..Default::default()
+        };
+        gw.spec.tls = Some(GatewayTls {
+            frontend: Some(GatewayTlsFrontend {
+                default: GatewayTlsFrontendDefault {
+                    validation: Some(validation(None)),
+                },
+                per_port: Some(vec![GatewayTlsFrontendPerPort {
+                    port: 8443,
+                    tls: GatewayTlsFrontendPerPortTls { validation: None },
+                }]),
+            }),
+            ..Default::default()
+        });
+        scope.upsert_gateway(&gw);
+        store_secret(&scope, "default", "shop-tls", "www.shop.example");
+        let route = route_with_parents(
+            vec![rule(None, vec![backend("api", 80)])],
+            vec!["www.shop.example".into()],
+            vec![parent("gw")],
+        );
+        let accepted = |gw: &Gateway, name: &str| {
+            let statuses = scope.listener_statuses(gw);
+            let l = statuses.iter().find(|l| l.name == name).unwrap();
+            let c = condition_of(l, CONDITION_TYPE_ACCEPTED);
+            (c.status.clone(), c.reason.clone())
+        };
+        let over_https = |route: &HttpRoute, section: &str| {
+            let mut route = route.clone();
+            route.spec.parent_refs.as_mut().unwrap()[0].section_name = Some(section.into());
+            scope.effective_hostnames_for_route(&route, &GatewayScope::listener_serves_https)
+        };
+
+        assert_eq!(
+            accepted(&gw, "tls"),
+            ("False".to_string(), REASON_UNSUPPORTED_VALUE.to_string())
+        );
+        assert_eq!(over_https(&route, "tls"), None);
+        // Nor attached there: the route is refused by that listener.
+        let mut through_tls = route.clone();
+        through_tls.spec.parent_refs.as_mut().unwrap()[0].section_name = Some("tls".into());
+        assert!(!scope.accepts_route(&through_tls));
+        // Only the listener served on 8443 brings the certificate.
+        assert_eq!(scope.referenced_certificates().len(), 1);
+        // Port 8443 has an entry of its own, without validation.
+        assert_eq!(accepted(&gw, "other").0, "True");
+        assert!(over_https(&route, "other").is_some());
+
+        // Validation on 8443 only.
+        let mut per_port = gw.clone();
+        let frontend = per_port
+            .spec
+            .tls
+            .as_mut()
+            .and_then(|t| t.frontend.as_mut())
+            .unwrap();
+        frontend.default.validation = None;
+        frontend.per_port.as_mut().unwrap()[0].tls.validation =
+            Some(GatewayTlsFrontendPerPortTlsValidation::default());
+        // A change of spec.tls alone re-resolves the routes.
+        assert!(scope.upsert_gateway(&per_port));
+        assert_eq!(accepted(&per_port, "tls").0, "True");
+        assert_eq!(accepted(&per_port, "other").0, "False");
+        assert_eq!(over_https(&route, "other"), None);
+        let mut both = per_port.clone();
+        both.spec.listeners.remove(0);
+        scope.upsert_gateway(&both);
+        assert!(scope.referenced_certificates().is_empty());
+        scope.upsert_gateway(&per_port);
+
+        // Any client is accepted: served.
+        let mut fallback = gw.clone();
+        fallback
+            .spec
+            .tls
+            .as_mut()
+            .and_then(|t| t.frontend.as_mut())
+            .unwrap()
+            .default
+            .validation = Some(validation(Some(
+            GatewayTlsFrontendDefaultValidationMode::AllowInsecureFallback,
+        )));
+        scope.upsert_gateway(&fallback);
+        assert_eq!(accepted(&fallback, "tls").0, "True");
+        assert!(over_https(&route, "tls").is_some());
     }
 
     /// A certificate stops being used once it expires.
@@ -13269,6 +13447,7 @@ mod tests {
                 tls_mode: None,
                 allowed_namespaces: AllowedNamespaces::Same,
                 allowed_kinds: None,
+                checks_client_certificates: false,
             };
             build_listener_status(&gw, &listener, &served(), 0, None)
         };
@@ -13306,6 +13485,7 @@ mod tests {
             tls_mode: Some(GatewayListenersTlsMode::Passthrough),
             allowed_namespaces: AllowedNamespaces::Same,
             allowed_kinds: None,
+            checks_client_certificates: false,
         };
         let passthrough = build_listener_status(&gw, &passthrough, &served(), 0, None);
         assert_eq!(
@@ -13371,6 +13551,7 @@ mod tests {
             tls_mode: None,
             allowed_namespaces: AllowedNamespaces::Same,
             allowed_kinds: None,
+            checks_client_certificates: false,
         };
         let mut served = served();
         served
