@@ -81,3 +81,34 @@ data_ts_str=$(echo "$data_line" | awk '{print $1}')
 data_ts=$(echo "$data_ts_str" | awk -F. '{printf "%d", $1 * 1000 + $2}')
 delta_ms=$((data_ts - publish_ts))
 pass "event streamed while the connection was open (${delta_ms} ms after publish)"
+
+log "[08] SSE: a compressed stream delivers each event as it comes"
+
+gz_out="$(mktemp)"
+gz_headers="$(mktemp)"
+trap "rm -f $sub_out $gz_out $gz_headers" RETURN
+
+curl -s -N --compressed -H "Accept-Encoding: gzip" --max-time 6 -D "$gz_headers" \
+    -H "Host: $HOST_SSE_GZ" \
+    "http://127.0.0.1:$HTTP_PORT/.well-known/mercure?topic=e2e-sse-gz" > "$gz_out" 2>/dev/null &
+gz_pid=$!
+sleep 1.5
+
+curl -s -o /dev/null --max-time 3 \
+    -H "Host: $HOST_SSE" \
+    -H "Authorization: Bearer $SSE_PUBLISHER_JWT" \
+    -d "topic=e2e-sse-gz&data=hello-compressed" \
+    "http://127.0.0.1:$HTTP_PORT/.well-known/mercure"
+
+# Stopped while Mercure keeps the stream open: only an event compressed and
+# sent on at once has reached the subscriber by then.
+sleep 2
+kill "$gz_pid" 2>/dev/null || true
+wait "$gz_pid" 2>/dev/null || true
+
+if grep -qi "^content-encoding: gzip" "$gz_headers" \
+    && grep -q "data: hello-compressed" "$gz_out"; then
+    pass "a gzip SSE stream delivers its event while open"
+else
+    fail "compressed SSE event not delivered (headers: $(tr -d '\r' < "$gz_headers" | grep -i encoding), body: $(head -c 200 "$gz_out"))"
+fi

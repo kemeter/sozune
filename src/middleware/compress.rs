@@ -1,15 +1,11 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response};
-use axum::response::IntoResponse;
-use brotli::enc::BrotliEncoderParams;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use http_body_util::BodyExt;
 use std::io::Write;
-use tracing::{debug, error};
+use tracing::debug;
 
 use super::chain::{Flow, Middleware, RequestCtx};
-use super::diag;
 
 const COMPRESSIBLE_TYPES: &[&str] = &[
     "text/",
@@ -76,32 +72,99 @@ pub fn is_already_compressed(headers: &HeaderMap) -> bool {
     headers.contains_key("content-encoding")
 }
 
-pub fn compress(data: &[u8], encoding: Encoding) -> Result<Vec<u8>, std::io::Error> {
-    match encoding {
-        Encoding::Gzip => gzip_compress(data),
-        Encoding::Brotli => brotli_compress(data),
-        Encoding::Zstd => zstd_compress(data),
+/// A compressor fed a response part by part. Each part goes out compressed
+/// as soon as it comes in, flushed: a stream (Server-Sent Events, a long
+/// download) reaches the client as it goes, never held whole in memory.
+enum StreamEncoder {
+    Gzip(GzEncoder<Vec<u8>>),
+    Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
+    Zstd(zstd::stream::write::Encoder<'static, Vec<u8>>),
+}
+
+impl StreamEncoder {
+    fn new(encoding: Encoding) -> std::io::Result<Self> {
+        Ok(match encoding {
+            Encoding::Gzip => Self::Gzip(GzEncoder::new(Vec::new(), Compression::fast())),
+            Encoding::Brotli => Self::Brotli(Box::new(brotli::CompressorWriter::new(
+                Vec::new(),
+                4096,
+                4,
+                22,
+            ))),
+            Encoding::Zstd => Self::Zstd(zstd::stream::write::Encoder::new(Vec::new(), 3)?),
+        })
+    }
+
+    /// `data` compressed, with whatever the compressor held back before.
+    fn part(&mut self, data: &[u8]) -> std::io::Result<axum::body::Bytes> {
+        let out = match self {
+            Self::Gzip(e) => {
+                e.write_all(data)?;
+                e.flush()?;
+                e.get_mut()
+            }
+            Self::Brotli(e) => {
+                e.write_all(data)?;
+                e.flush()?;
+                e.get_mut()
+            }
+            Self::Zstd(e) => {
+                e.write_all(data)?;
+                e.flush()?;
+                e.get_mut()
+            }
+        };
+        Ok(std::mem::take(out).into())
+    }
+
+    /// The end of the compressed body.
+    fn finish(self) -> std::io::Result<axum::body::Bytes> {
+        Ok(match self {
+            Self::Gzip(e) => e.finish()?,
+            Self::Brotli(e) => e.into_inner(),
+            Self::Zstd(e) => e.finish()?,
+        }
+        .into())
     }
 }
 
-fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data)?;
-    encoder.finish()
-}
+/// `body` compressed by `encoder`, part by part. Its trailers follow the
+/// end of the compressed data; an error from it ends the body as it would
+/// have uncompressed.
+fn compressed(body: Body, encoder: StreamEncoder) -> Body {
+    use futures_util::StreamExt;
+    use http_body_util::{BodyStream, StreamBody};
+    use hyper::body::Frame;
 
-fn brotli_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut out = Vec::with_capacity(data.len());
-    let params = BrotliEncoderParams {
-        quality: 4,
-        ..Default::default()
-    };
-    brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut out, &params)?;
-    Ok(out)
-}
-
-fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    zstd::encode_all(std::io::Cursor::new(data), 3)
+    type Item = Result<Frame<axum::body::Bytes>, axum::Error>;
+    let frames =
+        futures_util::stream::unfold(Some((BodyStream::new(body), encoder)), |state| async move {
+            let (mut frames, mut encoder) = state?;
+            loop {
+                let next: Vec<Item> = match frames.next().await {
+                    Some(Ok(frame)) => match frame.into_data() {
+                        Ok(data) => match encoder.part(&data) {
+                            Ok(out) if out.is_empty() => continue,
+                            Ok(out) => vec![Ok(Frame::data(out))],
+                            Err(e) => return Some((vec![Err(axum::Error::new(e))], None)),
+                        },
+                        // Trailers come last: the compressed data ends first.
+                        Err(trailers) => {
+                            let end = encoder.finish().map_err(axum::Error::new);
+                            return Some((vec![end.map(Frame::data), Ok(trailers)], None));
+                        }
+                    },
+                    Some(Err(e)) => return Some((vec![Err(e)], None)),
+                    None => {
+                        let end = encoder.finish().map_err(axum::Error::new);
+                        return Some((vec![end.map(Frame::data)], None));
+                    }
+                };
+                return Some((next, Some((frames, encoder))));
+            }
+        })
+        .flat_map(futures_util::stream::iter);
+    Body::new(StreamBody::new(frames))
 }
 
 /// Middleware wrapper: compresses the response body when the client accepts a
@@ -133,34 +196,20 @@ impl Middleware for CompressMiddleware {
             return Response::from_parts(parts, body);
         };
 
-        let body = Body::new(body.map_err(|e| axum::Error::new(std::io::Error::other(e))));
-        match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-            Ok(bytes) => match compress(&bytes, encoding) {
-                Ok(compressed) => {
-                    parts
-                        .headers
-                        .insert("content-encoding", encoding.header_value().parse().unwrap());
-                    parts.headers.insert(
-                        "content-length",
-                        compressed.len().to_string().parse().unwrap(),
-                    );
-                    parts.headers.remove("transfer-encoding");
-                    Response::from_parts(parts, Body::from(compressed))
-                }
-                Err(e) => {
-                    debug!("Compression failed, sending uncompressed: {}", e);
-                    Response::from_parts(parts, Body::from(bytes))
-                }
-            },
+        // The compressed body is streamed: its length is not known ahead.
+        let encoder = match StreamEncoder::new(encoding) {
+            Ok(encoder) => encoder,
             Err(e) => {
-                error!("Failed to read response body for compression: {}", e);
-                // A body cut short by the route's timeout is a timeout.
-                if super::timed_out(&e) {
-                    return diag::backend_timeout("the backend", None).into_response();
-                }
-                diag::forwarding_failed("response-body-read-failed", &e.to_string()).into_response()
+                debug!("Compression unavailable, sending uncompressed: {}", e);
+                return Response::from_parts(parts, body);
             }
-        }
+        };
+        let body = compressed(body, encoder);
+        parts
+            .headers
+            .insert("content-encoding", encoding.header_value().parse().unwrap());
+        parts.headers.remove("content-length");
+        Response::from_parts(parts, body)
     }
 }
 
@@ -181,9 +230,10 @@ mod tests {
         headers
     }
 
-    /// A body cut short by the route's timeout answers 504, not 502.
+    /// A body cut short by the route's timeout ends the compressed body with
+    /// the error, as it would end an uncompressed one.
     #[tokio::test]
-    async fn a_body_cut_short_by_the_timeout_is_a_timeout() {
+    async fn a_body_cut_short_ends_the_compressed_body() {
         let ctx = RequestCtx {
             host: "example.com".to_string(),
             client_addr: None,
@@ -203,7 +253,65 @@ mod tests {
             .body(Body::from_stream(cut))
             .unwrap();
         let resp = CompressMiddleware.on_response(&ctx, resp).await;
-        assert_eq!(resp.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Each part goes out compressed as it comes, and the whole decodes to
+    /// the body, trailers kept, whatever the encoding.
+    #[tokio::test]
+    async fn a_body_is_compressed_part_by_part() {
+        use futures_util::StreamExt;
+        use hyper::body::Frame;
+        for encoding in [Encoding::Gzip, Encoding::Brotli, Encoding::Zstd] {
+            let parts = futures_util::stream::iter([
+                Ok::<_, std::convert::Infallible>(Frame::data(axum::body::Bytes::from_static(
+                    b"data: one\n\n",
+                ))),
+                Ok(Frame::data(axum::body::Bytes::from_static(
+                    b"data: two\n\n",
+                ))),
+                Ok(Frame::trailers({
+                    let mut t = HeaderMap::new();
+                    t.insert("x-done", "1".parse().unwrap());
+                    t
+                })),
+            ]);
+            let body = compressed(
+                Body::new(http_body_util::StreamBody::new(parts)),
+                StreamEncoder::new(encoding).unwrap(),
+            );
+            let mut frames = http_body_util::BodyStream::new(body);
+            // The first part is out before the rest comes.
+            let first = frames.next().await.unwrap().unwrap().into_data().unwrap();
+            assert!(!first.is_empty());
+            let mut wire = first.to_vec();
+            let mut trailers = None;
+            while let Some(frame) = frames.next().await {
+                match frame.unwrap().into_data() {
+                    Ok(data) => wire.extend_from_slice(&data),
+                    Err(frame) => trailers = frame.into_trailers().ok(),
+                }
+            }
+            let plain = match encoding {
+                Encoding::Gzip => {
+                    let mut out = String::new();
+                    GzDecoder::new(&wire[..]).read_to_string(&mut out).unwrap();
+                    out.into_bytes()
+                }
+                Encoding::Brotli => {
+                    let mut out = Vec::new();
+                    brotli::BrotliDecompress(&mut std::io::Cursor::new(&wire), &mut out).unwrap();
+                    out
+                }
+                Encoding::Zstd => zstd::decode_all(std::io::Cursor::new(&wire)).unwrap(),
+            };
+            assert_eq!(plain, b"data: one\n\ndata: two\n\n", "{encoding:?}");
+            assert_eq!(trailers.unwrap()["x-done"], "1");
+        }
     }
 
     #[test]
@@ -285,38 +393,6 @@ mod tests {
             "br"
         )));
         assert!(!is_already_compressed(&HeaderMap::new()));
-    }
-
-    #[test]
-    fn gzip_roundtrip() {
-        let original = b"Hello, World! This is a test of gzip compression.";
-        let compressed = compress(original, Encoding::Gzip).unwrap();
-        let mut decoder = GzDecoder::new(&compressed[..]);
-        let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed).unwrap();
-        assert_eq!(decompressed.as_bytes(), original);
-    }
-
-    #[test]
-    fn brotli_roundtrip() {
-        let original = b"Hello, World! This is a test of brotli compression. \
-                         Repetitive text compresses very well with brotli, \
-                         which usually beats gzip on HTML and JSON payloads.";
-        let compressed = compress(original, Encoding::Brotli).unwrap();
-        let mut decompressed = Vec::new();
-        brotli::BrotliDecompress(&mut std::io::Cursor::new(&compressed), &mut decompressed)
-            .unwrap();
-        assert_eq!(decompressed, original);
-    }
-
-    #[test]
-    fn zstd_roundtrip() {
-        let original = b"Hello, World! This is a test of zstd compression. \
-                         Repetitive text compresses very well with zstd, \
-                         which usually beats gzip and matches brotli on speed.";
-        let compressed = compress(original, Encoding::Zstd).unwrap();
-        let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap();
-        assert_eq!(decompressed, original);
     }
 
     #[test]

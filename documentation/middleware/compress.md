@@ -64,14 +64,11 @@ Anything else (binary, images, video, archives) is forwarded as-is.
 When a response is compressed, Sōzune:
 
 - Sets `Content-Encoding` to the chosen algorithm (`zstd`, `br`, or `gzip`).
-- Recomputes `Content-Length`.
-- Removes `Transfer-Encoding` (the response is fully buffered before sending).
+- Removes `Content-Length`: the compressed body is streamed, its length not known ahead.
 
-## Body size cap
+## Streaming
 
-To bound memory, the response body must fit in **10 MiB** in memory before being compressed. A larger body returns `502 Bad Gateway` to the client.
-
-If you serve large compressible payloads (long log streams, large JSON dumps), turn compression off for that service and rely on the backend to compress.
+The body is compressed as it comes from the backend, part by part, each part sent on to the client at once: a large response is never held in memory, and a stream (Server-Sent Events, a long log tail) reaches the client as it goes. Trailers follow the compressed body (since 0.16; the body was read whole first, up to 10 MiB, before).
 
 ## Compression levels
 
@@ -87,6 +84,5 @@ These levels are not configurable today.
 
 ## Limitations
 
-- **No streaming.** The body is buffered, compressed, then sent. Combined with the 10 MiB cap, this rules out streaming responses larger than that.
 - **No deflate.** Considered obsolete and not supported.
 - **Compression levels are fixed.** No knob to trade speed for ratio per service yet.

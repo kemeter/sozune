@@ -31,7 +31,7 @@ End-to-end latency through Sōzune for an SSE event is typically **under 100 ms*
 
 ## Compression
 
-Do **not** enable `sozune.http.<svc>.compress=true` on an SSE endpoint. Compression buffers chunks to fill the encoder's window, which defeats real-time delivery. Sōzune does not auto-detect SSE and skip compression for you — the choice is yours, but pick one or the other.
+`sozune.http.<svc>.compress=true` works on an SSE endpoint: each event is compressed and sent on as soon as it comes (since 0.16; the response was read whole first before, so a compressed stream delivered nothing). Each event costs a few bytes of flush overhead.
 
 ## Mercure example
 
@@ -57,6 +57,5 @@ This setup is exercised by the e2e suite: a publish through Sōzune to the hub r
 
 ## Limitations
 
-- **Compression** disabled by hand, as noted above.
 - **HTTP/2 SSE** works as long as the client speaks it, over HTTPS or, with `proxy.http.h2c`, over plain HTTP: Sōzu forwards the chunks as they come. HTTP/3 is not supported. Polling intervals (e.g. browser auto-reconnect on `EventSource` close) are entirely client-side.
 - **No SSE-specific framing.** Sōzune does not inspect `data:` / `event:` / `id:` lines; it only shuffles bytes. Subscriber lifecycle, retry policies and topic filtering are the backend's responsibility.
