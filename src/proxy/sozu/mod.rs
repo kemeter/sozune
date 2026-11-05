@@ -2548,10 +2548,11 @@ pub(crate) enum FrontListener {
     Https,
 }
 
-/// Whether Sōzu speaks h2c to the route's backends. It reaches the
-/// middleware over HTTP/1.1, so only a route that does not go through it.
+/// Whether Sōzu speaks h2c to the route's backends, or to the middleware
+/// when the route goes through it: the middleware takes h2c, and speaks it
+/// to the backends in turn.
 fn backend_http2(entrypoint: &Entrypoint) -> Option<bool> {
-    (entrypoint.config.h2c_backends && !middleware::needs_middleware(entrypoint)).then_some(true)
+    entrypoint.config.h2c_backends.then_some(true)
 }
 
 /// The frontends of an HTTP `entrypoint`, in the order they are sent: one per
@@ -6265,13 +6266,14 @@ mod tests {
     }
 
     #[test]
-    fn h2c_backends_are_reached_over_http2_unless_through_the_middleware() {
+    fn h2c_backends_are_reached_over_http2_through_the_middleware_too() {
         let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
         assert_eq!(backend_http2(&ep), None);
         ep.config.h2c_backends = true;
         assert_eq!(backend_http2(&ep), Some(true));
+        // The middleware takes h2c and speaks it on.
         ep.config.compress = true;
-        assert_eq!(backend_http2(&ep), None);
+        assert_eq!(backend_http2(&ep), Some(true));
     }
 
     #[test]

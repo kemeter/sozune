@@ -5,6 +5,7 @@ mod cors;
 mod diag;
 mod fixed_answer;
 mod forward_auth;
+mod h2c;
 pub mod in_flight_req;
 pub mod ip_allow_list;
 pub mod passive_health;
@@ -53,6 +54,9 @@ pub fn build_forward_auth_client() -> reqwest::Client {
 pub struct MiddlewareAppState {
     pub route_table: Arc<RwLock<MiddlewareRouteTable>>,
     pub http_client: Client<hyper_util::client::legacy::connect::HttpConnector, axum::body::Body>,
+    /// The connections to the backends of the routes that speak HTTP/2 in
+    /// cleartext with prior knowledge (h2c), as gRPC servers do.
+    pub h2c: h2c::H2cPool,
     /// Live request-latency histogram. The proxy handler records each
     /// completed request here; the API `/metrics` endpoint reads the same Arc.
     pub request_metrics: crate::proxy::request_metrics::RequestMetricsStore,
@@ -204,6 +208,8 @@ pub struct MiddlewareRoute {
     pub retry_attempts: u32,
     /// Response statuses retried too, within `retry_attempts`.
     pub retry_codes: Vec<u16>,
+    /// Whether the backends speak h2c (`h2c_backends`).
+    pub h2c: bool,
     /// Wait before each retry.
     pub retry_backoff: Option<std::time::Duration>,
     /// Per-route circuit breaker, shared across requests so its state persists.
@@ -1141,6 +1147,7 @@ pub fn build_middleware_route(
             .as_ref()
             .map(|r| r.codes.clone())
             .unwrap_or_default(),
+        h2c: config.h2c_backends,
         retry_backoff: config
             .retry
             .as_ref()
@@ -1176,7 +1183,9 @@ fn rewrites_host_next_to_a_forwarded_host_edit(config: &EntrypointConfig) -> boo
         })
 }
 
-/// Start the middleware reverse proxy server
+/// Start the middleware reverse proxy server: it takes HTTP/1.1 and h2c
+/// alike. Sōzu reaches it over h2c for the routes whose backends speak it,
+/// so that gRPC goes through, its trailers included.
 pub async fn serve(
     port: u16,
     route_table: MiddlewareState,
@@ -1185,6 +1194,7 @@ pub async fn serve(
     let app_state = MiddlewareAppState {
         route_table,
         http_client: Client::builder(TokioExecutor::new()).build_http(),
+        h2c: h2c::H2cPool::default(),
         request_metrics,
         passive_health: Arc::default(),
     };
@@ -1305,6 +1315,7 @@ mod route_key_tests {
             request_timeout: None,
             retry_attempts: 1,
             retry_codes: Vec::new(),
+            h2c: false,
             retry_backoff: None,
             circuit_breaker: None,
             middlewares: Vec::new(),
@@ -1653,6 +1664,7 @@ mod route_key_tests {
             request_timeout: None,
             retry_attempts: 1,
             retry_codes: Vec::new(),
+            h2c: false,
             retry_backoff: None,
             circuit_breaker: None,
             middlewares: Vec::new(),
