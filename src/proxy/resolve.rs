@@ -32,8 +32,8 @@ use crate::model::{Backend, Entrypoint, PathRuleType, Protocol};
 use crate::proxy::health::UnhealthyMap;
 use crate::proxy::sozu::{
     ACME_CHALLENGE_CLUSTER, FrontListener, build_acme_frontend, build_acme_twins,
-    build_http_frontends, fill_middleware_table, header_predicate, listener_http_port,
-    listener_https_port, routing_order,
+    build_http_frontends, fill_middleware_table, listener_http_port, listener_https_port,
+    routing_order,
 };
 use crate::util::fuzzy::closest_match;
 
@@ -697,10 +697,16 @@ fn explain_candidates(
             MethodRule::new(front.method.clone()).matches(&method) != MethodRuleResult::None
         };
 
-        if let Some(reason) = fronts
-            .iter()
-            .filter(|f| path_ok(f) && method_ok(f))
-            .find_map(|f| failed_header_predicate(f, target))
+        // A route with copies of its frontends on other routes' headers
+        // matches when any of them does, its own frontends among them.
+        let matching = |f: &RequestHttpFrontend| {
+            path_ok(f) && method_ok(f) && failed_header_predicate(f, target).is_none()
+        };
+        if !fronts.iter().any(matching)
+            && let Some(reason) = fronts
+                .iter()
+                .filter(|f| path_ok(f) && method_ok(f))
+                .find_map(|f| failed_header_predicate(f, target))
         {
             candidates.push(candidate(Verdict::Rejected, reason));
         } else if fronts.iter().any(|f| path_ok(f) && method_ok(f)) {
@@ -761,20 +767,7 @@ fn failed_header_predicate(front: &RequestHttpFrontend, target: &Target) -> Opti
 }
 
 fn shadowed_reason(winner: &Entrypoint, loser: &Entrypoint) -> String {
-    let routes_on_headers = |entrypoint: &Entrypoint| {
-        entrypoint
-            .config
-            .match_headers
-            .iter()
-            .any(|c| header_predicate(c).is_some())
-    };
-    if routes_on_headers(winner) && !routes_on_headers(loser) {
-        format!(
-            "matches too, but `{}` matches on its headers, which Sōzu tries before \
-             routes without header conditions whatever their priority",
-            winner.name
-        )
-    } else if winner.config.priority > loser.config.priority {
+    if winner.config.priority > loser.config.priority {
         format!(
             "matches too, but `{}` has a higher priority ({} > {})",
             winner.name, winner.config.priority, loser.config.priority
@@ -1167,8 +1160,11 @@ mod tests {
         serde_json::json!({ "rule_type": "Prefix", "value": value })
     }
 
+    /// The routes as a reload applies them.
     fn storage(routes: Vec<Entrypoint>) -> BTreeMap<String, Entrypoint> {
-        routes.into_iter().map(|r| (r.id.clone(), r)).collect()
+        crate::proxy::sozu::with_outranked_headers(
+            routes.into_iter().map(|r| (r.id.clone(), r)).collect(),
+        )
     }
 
     async fn resolve_in(routes: Vec<Entrypoint>, request: serde_json::Value) -> Resolution {
@@ -1592,12 +1588,65 @@ mod tests {
         );
     }
 
-    /// Sōzu tries a route whose header conditions hold before every route
-    /// without any, so a lower priority does not keep it from serving.
+    /// A higher priority keeps its requests from a route on headers, even
+    /// those carrying them: Sōzu would try the route on headers first, so the
+    /// other route is sent a copy of its frontends with the same headers.
     #[tokio::test]
-    async fn a_matching_header_condition_wins_over_a_higher_priority() {
+    async fn a_higher_priority_wins_over_a_matching_header_condition() {
+        let routes = |canary_path: &str| {
+            vec![
+                route(
+                    "web",
+                    &["app.example.com"],
+                    serde_json::json!({ "priority": 10 }),
+                ),
+                route(
+                    "canary",
+                    &["app.example.com"],
+                    serde_json::json!({
+                        "path": prefix(canary_path),
+                        "match_headers": [{ "key": "X-Canary", "value": "" }]
+                    }),
+                ),
+            ]
+        };
+        let request = serde_json::json!({
+            "url": "http://app.example.com/api",
+            "headers": { "X-Canary": "1" }
+        });
+
+        let resolution = resolve_in(routes("/api"), request.clone()).await;
+        // On the same host and path too: the copy is not the same Sōzu
+        // frontend as the route on headers, which stays live.
+        let same_path = resolve_in(routes("/"), request).await;
+
+        assert_eq!(served_by(&resolution), Some("web"));
+        assert_eq!(resolution.candidates[0].verdict, Verdict::Shadowed);
+        assert!(
+            resolution.candidates[0]
+                .reason
+                .contains("has a higher priority"),
+            "{}",
+            resolution.candidates[0].reason
+        );
+        assert_eq!(served_by(&same_path), Some("web"));
+        assert_eq!(same_path.candidates[0].verdict, Verdict::Shadowed);
+    }
+
+    /// A route matching by its own frontends is shadowed, not rejected on the
+    /// headers of a copy it carries for a route it outranks.
+    #[tokio::test]
+    async fn a_route_with_copies_is_shadowed_when_its_own_frontend_matches() {
         let resolution = resolve_in(
             vec![
+                route(
+                    "other",
+                    &["app.example.com"],
+                    serde_json::json!({
+                        "priority": 20,
+                        "match_headers": [{ "key": "X-Other", "value": "" }]
+                    }),
+                ),
                 route(
                     "web",
                     &["app.example.com"],
@@ -1609,17 +1658,58 @@ mod tests {
                     serde_json::json!({ "match_headers": [{ "key": "X-Canary", "value": "" }] }),
                 ),
             ],
-            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Canary": "1" } }),
+            serde_json::json!({ "url": "http://app.example.com/", "headers": { "X-Other": "1" } }),
         )
         .await;
 
-        assert_eq!(served_by(&resolution), Some("canary"));
-        assert_eq!(resolution.candidates[0].verdict, Verdict::Shadowed);
-        assert!(
-            resolution.candidates[0]
-                .reason
-                .contains("matches on its headers")
-        );
+        assert_eq!(served_by(&resolution), Some("other"));
+        let web = resolution
+            .candidates
+            .iter()
+            .find(|c| c.id == "web")
+            .unwrap();
+        assert_eq!(web.verdict, Verdict::Shadowed, "{}", web.reason);
+    }
+
+    /// Gateway API precedence: on one path, a rule on a method goes before a
+    /// rule on headers, and a longer path before both, whatever headers the
+    /// request carries.
+    #[tokio::test]
+    async fn a_method_or_a_longer_path_wins_over_a_header_condition() {
+        let routes = || {
+            vec![
+                route(
+                    "path5",
+                    &["app.example.com"],
+                    serde_json::json!({ "path": prefix("/path5") }),
+                ),
+                route(
+                    "patch",
+                    &["app.example.com"],
+                    serde_json::json!({ "methods": ["PATCH"] }),
+                ),
+                route(
+                    "four",
+                    &["app.example.com"],
+                    serde_json::json!({ "match_headers": [{ "key": "version", "value": "four" }] }),
+                ),
+            ]
+        };
+        let request = |method: &str, path: &str| {
+            serde_json::json!({
+                "url": format!("http://app.example.com{path}"),
+                "method": method,
+                "headers": { "version": "four" }
+            })
+        };
+
+        let patch = resolve_in(routes(), request("PATCH", "/")).await;
+        let path5 = resolve_in(routes(), request("GET", "/path5")).await;
+        let other = resolve_in(routes(), request("GET", "/")).await;
+
+        assert_eq!(served_by(&patch), Some("patch"));
+        assert_eq!(served_by(&path5), Some("path5"));
+        assert_eq!(served_by(&other), Some("four"));
     }
 
     /// Sōzu cannot route on `Cookie`: the middleware still checks it, after
@@ -1826,11 +1916,31 @@ mod tests {
     /// challenge with the responder.
     #[tokio::test]
     async fn a_header_route_does_not_take_the_acme_challenge() {
-        let storage = storage(vec![route(
-            "web",
-            &["app.example.com"],
-            serde_json::json!({ "match_headers": [{ "key": "User-Agent", "value": "" }] }),
-        )]);
+        let web = || {
+            route(
+                "web",
+                &["app.example.com"],
+                serde_json::json!({ "match_headers": [{ "key": "User-Agent", "value": "" }] }),
+            )
+        };
+        // A wildcard outranking it is sent a copy on its header: that one
+        // must not take the challenge either.
+        let wildcard = route(
+            "wildcard",
+            &["*.example.com"],
+            serde_json::json!({ "priority": 10 }),
+        );
+        assert_eq!(
+            acme_challenge_outcome(storage(vec![web()])).await,
+            Outcome::AcmeChallenge
+        );
+        assert_eq!(
+            acme_challenge_outcome(storage(vec![web(), wildcard])).await,
+            Outcome::AcmeChallenge
+        );
+    }
+
+    async fn acme_challenge_outcome(storage: BTreeMap<String, Entrypoint>) -> Outcome {
         let unhealthy = UnhealthyMap::new();
         let trusted = TrustedProxies::default();
         let inputs = ResolveInputs {
@@ -1851,9 +1961,7 @@ mod tests {
         }))
         .unwrap();
 
-        let resolution = resolve(&inputs, &request).await.unwrap();
-
-        assert_eq!(resolution.outcome, Outcome::AcmeChallenge);
+        resolve(&inputs, &request).await.unwrap().outcome
     }
 
     /// Until the next reload, Sōzu serves the route as it was installed: a
