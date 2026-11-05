@@ -57,7 +57,7 @@ use gateway_api::apis::standard::gateways::{
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
 };
 use gateway_api::apis::standard::grpcroutes::GrpcRoute;
-use gateway_api::apis::standard::httproutes::{
+use gateway_api::apis::experimental::httproutes::{
     HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
     HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteRulesMatchesPathType, HttpRouteStatus,
     HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
@@ -5574,7 +5574,7 @@ pub fn route_has_unsupported_filters(
 /// Gateway API allows it with a `PathPrefix` match only.
 fn replaces_prefix_off_a_prefix_match(
     rule: &HttpRouteRules,
-    filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
+    filters: &[gateway_api::apis::experimental::httproutes::HttpRouteRulesFilters],
 ) -> bool {
     let replaces_prefix = filters.iter().any(|f| {
         f.request_redirect
@@ -7900,7 +7900,7 @@ mod tests {
         GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
         GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
     };
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesBackendRefs, HttpRouteRulesFiltersRequestRedirect,
         HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesMatches,
         HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
@@ -9003,6 +9003,7 @@ mod tests {
                 } else {
                     Some(parent_refs)
                 },
+                use_default_gateways: None,
             },
             status: Default::default(),
         }
@@ -9116,7 +9117,7 @@ mod tests {
     /// zero `backendRequest` disables the backend timeout.
     #[test]
     fn rule_timeouts_map_to_request_and_backend_timeouts() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesTimeouts;
         let with = |request: Option<&str>, backend_request: Option<&str>| {
             let mut r = rule(None, vec![backend("api", 80)]);
             r.timeouts = Some(HttpRouteRulesTimeouts {
@@ -9159,7 +9160,7 @@ mod tests {
     /// A prefix replacement on an exact match is refused, as Gateway API says.
     #[test]
     fn a_prefix_replacement_on_an_exact_match_is_refused() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
             HttpRouteRulesFiltersRequestRedirectPathType,
         };
@@ -9197,7 +9198,7 @@ mod tests {
     /// builds the `Location` path.
     #[test]
     fn a_prefix_redirect_rewrites_the_location_path() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
             HttpRouteRulesFiltersRequestRedirectPathType,
         };
@@ -9235,7 +9236,7 @@ mod tests {
     /// weight-0 one with others does not drop the route.
     #[test]
     fn unusable_backend_refs_do_not_have_to_agree_on_filters() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesBackendRefsFilters,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
@@ -9278,7 +9279,7 @@ mod tests {
     /// middleware edits what it sends each backend.
     #[test]
     fn backend_refs_keep_filters_of_their_own() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesBackendRefsFilters,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
@@ -9306,7 +9307,7 @@ mod tests {
         let mut shared = rule(None, vec![api, web]);
         shared.filters = Some(vec![HttpRouteRulesFilters {
             response_header_modifier: Some(
-                gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersResponseHeaderModifier {
+                gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersResponseHeaderModifier {
                     remove: Some(vec!["Server".into()]),
                     ..Default::default()
                 },
@@ -9351,7 +9352,7 @@ mod tests {
     /// A redirect answers by itself: its rule needs no backend.
     #[test]
     fn a_redirect_rule_without_backends_redirects() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirect;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersRequestRedirect;
         let r = route_with(
             vec![HttpRouteRules {
                 filters: Some(vec![HttpRouteRulesFilters {
@@ -10351,7 +10352,7 @@ mod tests {
     // ---------- Filters & multi-match tests ----------
 
     use crate::model::entrypoint::{HeaderDirection, PathRewrite};
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersResponseHeaderModifier,
         HttpRouteRulesFiltersResponseHeaderModifierSet, HttpRouteRulesFiltersUrlRewrite,
@@ -10516,7 +10517,7 @@ mod tests {
     /// requests to the mirror's pods, through the middleware.
     #[test]
     fn route_with_request_mirror_copies_its_requests() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesFiltersRequestMirror, HttpRouteRulesFiltersRequestMirrorBackendRef,
         };
         let filter = HttpRouteRulesFilters {
@@ -12290,7 +12291,7 @@ mod tests {
     /// scheme or names one.
     #[test]
     fn a_redirect_on_its_own_port_keeps_it() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirect;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersRequestRedirect;
         let route = |redirect: HttpRouteRulesFiltersRequestRedirect| {
             route_with(
                 vec![HttpRouteRules {

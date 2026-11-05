@@ -22,8 +22,8 @@
 //! so its entrypoints never collide with those of an HTTPRoute of the same
 //! name, and [`route_kind`] tells it apart.
 
+use gateway_api::apis::experimental::httproutes::HttpRoute;
 use gateway_api::apis::standard::grpcroutes::GrpcRoute;
-use gateway_api::apis::standard::httproutes::HttpRoute;
 use serde_json::{Map, Value, json};
 
 /// Put before the name of the HTTPRoute a GRPCRoute is translated into.
@@ -174,7 +174,7 @@ fn method_path(method: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
         HttpRouteRulesMatchesPathType,
     };
