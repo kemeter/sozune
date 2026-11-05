@@ -27,6 +27,7 @@
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gatewayclass/>
 //!   - <https://gateway-api.sigs.k8s.io/api-types/gateway/>
 
+use super::gateway_addresses::{self, SpecIssue};
 use super::gateway_compat::{ReferenceGrant, ServedVersion};
 use super::gateway_filters;
 use super::gateway_grpc::{self, route_kind};
@@ -2212,19 +2213,10 @@ impl GatewayScope {
         self.state.read().ok()?.addresses.clone()
     }
 
-    /// The `status.addresses` of the Gateways Sōzune owns, `None` when it
-    /// publishes none.
-    fn gateway_addresses(&self) -> Option<Vec<GatewayStatusAddresses>> {
-        let g = self.state.read().ok()?;
-        g.addresses.as_ref().map(|addresses| {
-            addresses
-                .iter()
-                .map(|(type_, value)| GatewayStatusAddresses {
-                    r#type: Some(type_.clone()),
-                    value: value.clone(),
-                })
-                .collect()
-        })
+    /// Sōzune's addresses, `None` when it publishes none or they are not
+    /// known yet.
+    fn published_addresses(&self) -> Option<Vec<(String, String)>> {
+        self.state.read().ok()?.addresses.clone()
     }
 
     /// Record the labels of a namespace; `None` once it is gone.
@@ -3871,6 +3863,31 @@ fn mark_invalid_listeners(
     }
 }
 
+/// Marks a Gateway whose spec cannot be served as written: refused, or
+/// accepted but not programmed when only its addresses are not available.
+/// Wins over what the listeners say.
+fn mark_spec_issue(conditions: &mut [Condition], issue: &SpecIssue) {
+    let accepted = issue.accepted();
+    for condition in conditions.iter_mut() {
+        if condition.type_ == CONDITION_TYPE_ACCEPTED {
+            if accepted {
+                continue;
+            }
+            condition.reason = issue.reason().to_string();
+        } else if condition.type_ == CONDITION_TYPE_PROGRAMMED {
+            condition.reason = if accepted {
+                issue.reason().to_string()
+            } else {
+                REASON_INVALID.to_string()
+            };
+        } else {
+            continue;
+        }
+        condition.status = "False".to_string();
+        condition.message = issue.message();
+    }
+}
+
 const REASON_LISTENERS_NOT_VALID: &str = "ListenersNotValid";
 const REASON_PORT_UNAVAILABLE: &str = "PortUnavailable";
 const REASON_UNSUPPORTED_PROTOCOL: &str = "UnsupportedProtocol";
@@ -4151,6 +4168,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "GatewayAddressEmpty",
     "GatewayHTTPListenerIsolation",
     "GatewayPort8080",
+    "GatewayStaticAddresses",
     "GRPCRoute",
     "HTTPRoute",
     "HTTPRoute303RedirectStatusCode",
@@ -4183,7 +4201,8 @@ const SUPPORTED_FEATURES: &[&str] = &[
 /// The features of [`SUPPORTED_FEATURES`] this Sōzune serves as configured,
 /// sorted by name as Gateway API requires. GRPCRoute needs HTTP/2 on a
 /// listener: `proxy.http.h2c`, or `h2` in the HTTPS listener's ALPN. A
-/// Gateway gets an address only where Sōzune publishes its own, and a
+/// Gateway gets an address, or names one in `spec.addresses`, only where
+/// Sōzune publishes its own, and a
 /// listener on port 8080 is served there only on an HTTP port of Sōzune's.
 /// A rule's `retry` needs CRDs that have it.
 fn supported_features(served: &ServedPorts) -> Vec<GatewayClassStatusSupportedFeatures> {
@@ -4193,7 +4212,10 @@ fn supported_features(served: &ServedPorts) -> Vec<GatewayClassStatusSupportedFe
         .iter()
         .copied()
         .filter(|name| grpc || !name.starts_with("GRPCRoute"))
-        .filter(|name| served.publishes_addresses || *name != "GatewayAddressEmpty")
+        .filter(|name| {
+            served.publishes_addresses
+                || (*name != "GatewayAddressEmpty" && *name != "GatewayStaticAddresses")
+        })
         .filter(|name| port_8080 || *name != "GatewayPort8080")
         .filter(|name| served.crd_has_retry || *name != "HTTPRouteRetry")
         .collect();
@@ -4356,6 +4378,26 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
     let listener_statuses = scope.listener_statuses(gateway);
     let mut ours = build_gateway_conditions(gateway, true);
     mark_invalid_listeners(&mut ours, &listener_statuses);
+    // Written only when Sōzune publishes an address or the Gateway names
+    // some: otherwise what is there is left alone. A Gateway it cannot
+    // serve as written is given none.
+    let addresses =
+        match gateway_addresses::resolve(gateway, scope.published_addresses().as_deref()) {
+            Ok(addresses) => addresses,
+            Err(issue) => {
+                mark_spec_issue(&mut ours, &issue);
+                Some(Vec::new())
+            }
+        };
+    let addresses: Option<Vec<GatewayStatusAddresses>> = addresses.map(|addresses| {
+        addresses
+            .into_iter()
+            .map(|(type_, value)| GatewayStatusAddresses {
+                r#type: Some(type_),
+                value,
+            })
+            .collect()
+    });
     let existing = gateway
         .status
         .as_ref()
@@ -4365,9 +4407,6 @@ async fn patch_gateway_status(client: &Client, scope: &GatewayScope, gateway: &G
         gateway.status.as_ref().and_then(|s| s.listeners.as_deref()),
         listener_statuses,
     );
-    // Written only when Sōzune publishes an address: otherwise what is
-    // there is left alone.
-    let addresses = scope.gateway_addresses();
     let addresses_changed = addresses.as_ref().is_some_and(|ours| {
         gateway
             .status
@@ -11215,8 +11254,10 @@ mod tests {
         let mut ports = served();
         ports.publishes_addresses = false;
         assert!(!has(&ports, "GatewayAddressEmpty"));
+        assert!(!has(&ports, "GatewayStaticAddresses"));
         ports.publishes_addresses = true;
         assert!(has(&ports, "GatewayAddressEmpty"));
+        assert!(has(&ports, "GatewayStaticAddresses"));
 
         ports.http = 80;
         ports.gateway = Default::default();
@@ -11315,6 +11356,32 @@ mod tests {
         let mut conds = build_gateway_conditions(&gw, true);
         mark_invalid_listeners(&mut conds, &[listener(true)]);
         assert_eq!(conds[0].reason, REASON_ACCEPTED);
+    }
+
+    #[test]
+    fn spec_issues_mark_the_gateway() {
+        let gw = gateway("default", "gw", "sozune");
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_spec_issue(&mut conds, &SpecIssue::UnsupportedAddress("x/y".into()));
+        assert_eq!(conds[0].status, "False");
+        assert_eq!(conds[0].reason, "UnsupportedAddress");
+        assert_eq!(conds[1].status, "False");
+        assert_eq!(conds[1].reason, REASON_INVALID);
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_spec_issue(&mut conds, &SpecIssue::InvalidParameters);
+        assert_eq!(conds[0].reason, "InvalidParameters");
+
+        let mut conds = build_gateway_conditions(&gw, true);
+        mark_spec_issue(
+            &mut conds,
+            &SpecIssue::AddressNotUsable("198.51.100.1".into()),
+        );
+        assert_eq!(conds[0].status, "True");
+        assert_eq!(conds[0].reason, REASON_ACCEPTED);
+        assert_eq!(conds[1].status, "False");
+        assert_eq!(conds[1].reason, "AddressNotUsable");
     }
 
     #[test]
