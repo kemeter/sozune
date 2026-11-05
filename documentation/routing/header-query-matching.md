@@ -73,7 +73,7 @@ labels:
 - All conditions are **AND**-combined: every header and every query condition must hold.
 - Header conditions are part of routing: Sōzu checks them when it picks the route, and a request that fails them goes on to the next route. (since 0.16)
 - Query conditions are part of routing too, up to three per route: a request that fails them goes on to the next route. Among routes on the same host, path, method and headers, the one with more query conditions is tried first. A repeated query parameter matches on any of its occurrences: `?v=2&v=3` meets both `v:2` and `v:3`. (since 0.16)
-- A route whose header conditions hold is tried **before every route without header conditions**, whatever their `priority`. Among routes with header conditions, or among routes without, `priority` decides as usual. (since 0.16)
+- A route with header conditions takes its place in the [route order](/documentation/routing/hostnames#priority) like any other: a route of higher priority, or of the same priority on a more specific hostname, path or method, still gets the requests carrying those headers. (since 0.16)
 
 ## Limitations
 

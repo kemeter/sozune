@@ -1335,6 +1335,7 @@ pub(super) mod merge_tests {
                 mirror_of: None,
                 failing_shares: None,
                 cors: None,
+                outranked_headers: Vec::new(),
                 ip_allow_list: Vec::new(),
             },
             source: None,

@@ -30,11 +30,11 @@ use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddBackend, CloseSessions, Cluster, HardStop, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, QueryMetricsOptions, RemoveBackend,
-        Request, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, ResponseStatus,
-        RulePosition, SocketAddress, TlsVersion, UdpClusterConfig, WorkerRequest, WorkerResponse,
-        request::RequestType, response_content::ContentType,
+        ActivateListener, AddBackend, CloseSessions, Cluster, HardStop, HeaderPredicate,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, QueryMetricsOptions,
+        RemoveBackend, Request, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
+        ResponseStatus, RulePosition, SocketAddress, TlsVersion, UdpClusterConfig, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1570,7 +1570,214 @@ pub(crate) fn routes_as_applied(
         &require_https_for_client_certificates(storage, client_certificate_https_port),
         unhealthy,
     );
-    (with_mirror_routes(routes), evicted)
+    (with_outranked_headers(with_mirror_routes(routes)), evicted)
+}
+
+/// `routes` with each HTTP route on no header told the header conditions of
+/// the routes after it in [`routing_order`] that could take its requests.
+///
+/// Sōzu tries a frontend whose header predicates hold before every frontend
+/// without any, whatever their order, so a route on headers would take the
+/// requests that carry them from a more specific route on none. That route
+/// gets one more set of frontends per such set of conditions (see
+/// [`frontend_predicate_sets`] and [`copied_conditions`]), sent with it, so
+/// ahead of the other route.
+pub(crate) fn with_outranked_headers(
+    mut routes: BTreeMap<String, Entrypoint>,
+) -> BTreeMap<String, Entrypoint> {
+    let order: Vec<(String, Vec<crate::model::MatchCondition>)> = routing_order(&routes)
+        .into_iter()
+        .filter(|(_, ep)| ep.protocol == Protocol::Http)
+        .map(|(id, ep)| (id.clone(), copied_conditions(ep)))
+        .collect();
+    if order.iter().all(|(_, conditions)| conditions.is_empty()) {
+        return routes;
+    }
+    // A copy is left out in the unlikely case it reads as the conditions a
+    // route that may share its requests states itself: Sōzu could refuse it
+    // as a duplicate of that route's frontend, and take the whole route down.
+    let stated = |ep: &Entrypoint| {
+        let mut conditions: Vec<_> = predicate_conditions(ep)
+            .into_iter()
+            .map(|condition| crate::model::MatchCondition {
+                key: condition.key.to_ascii_lowercase(),
+                ..condition
+            })
+            .collect();
+        conditions.sort_by(|a, b| (&a.key, &a.value).cmp(&(&b.key, &b.value)));
+        conditions
+    };
+    // Only conditions all on regular expressions can read as a copy.
+    let all_regex: Vec<(&Entrypoint, Vec<crate::model::MatchCondition>)> = routes
+        .values()
+        .map(|ep| (ep, stated(ep)))
+        .filter(|(_, conditions)| !conditions.is_empty() && conditions.iter().all(|c| c.regex))
+        .collect();
+    let mut outranked: Vec<(String, Vec<crate::model::OutrankedHeaders>)> = Vec::new();
+    for (index, (id, conditions)) in order.iter().enumerate() {
+        if !conditions.is_empty() {
+            continue;
+        }
+        let route = &routes[id];
+        let mut sets: Vec<crate::model::OutrankedHeaders> = Vec::new();
+        for (later, later_conditions) in &order[index + 1..] {
+            let other = &routes[later];
+            if later_conditions.is_empty()
+                || !may_share_requests(route, other)
+                || all_regex.iter().any(|(ep, conditions)| {
+                    conditions == later_conditions && may_share_requests(route, ep)
+                })
+            {
+                continue;
+            }
+            let hostnames = other.config.hostnames.iter().cloned();
+            match sets
+                .iter_mut()
+                .find(|set| &set.conditions == later_conditions)
+            {
+                Some(set) => {
+                    for hostname in hostnames {
+                        if !set.hostnames.contains(&hostname) {
+                            set.hostnames.push(hostname);
+                        }
+                    }
+                }
+                None => sets.push(crate::model::OutrankedHeaders {
+                    conditions: later_conditions.clone(),
+                    hostnames: hostnames.collect(),
+                }),
+            }
+        }
+        if !sets.is_empty() {
+            outranked.push((id.clone(), sets));
+        }
+    }
+    for (id, sets) in outranked {
+        if let Some(route) = routes.get_mut(&id) {
+            route.config.outranked_headers = sets;
+        }
+    }
+    routes
+}
+
+/// The header conditions of a route Sōzu routes on, as opposed to those left
+/// to the middleware.
+fn predicate_conditions(ep: &Entrypoint) -> Vec<crate::model::MatchCondition> {
+    ep.config
+        .match_headers
+        .iter()
+        .filter(|condition| header_predicate(condition).is_some())
+        .cloned()
+        .collect()
+}
+
+/// The header conditions of `ep` Sōzu routes on, as the copy of another
+/// route's frontends carries them: each one a regular expression holding for
+/// the same values, written so that the copy is never the same Sōzu frontend
+/// as one a route sends for itself (which Sōzu would refuse as a duplicate),
+/// and in Sōzu's own order,
+/// names lowercased, so two routes on the same headers give one copy.
+fn copied_conditions(ep: &Entrypoint) -> Vec<crate::model::MatchCondition> {
+    let mut conditions: Vec<crate::model::MatchCondition> = predicate_conditions(ep)
+        .into_iter()
+        .map(|condition| crate::model::MatchCondition {
+            key: condition.key.to_ascii_lowercase(),
+            // The empty group changes nothing it matches, and keeps it from
+            // reading like a condition a route states itself.
+            value: if condition.regex {
+                format!("(?:{})(?:)", condition.value)
+            } else if condition.value.is_empty() {
+                // Any byte: a value may hold some outside UTF-8.
+                "(?s-u:.)*(?:)".to_string()
+            } else {
+                format!("{}(?:)", regex::escape(&condition.value))
+            },
+            regex: true,
+        })
+        .collect();
+    conditions.sort_by(|a, b| (&a.key, &a.value).cmp(&(&b.key, &b.value)));
+    conditions.dedup();
+    conditions
+}
+
+/// Whether one request could match both routes, as far as their listener,
+/// hostnames, methods and paths tell. Errs on the side of yes.
+fn may_share_requests(a: &Entrypoint, b: &Entrypoint) -> bool {
+    let exact = |host: &str| !host.starts_with('*') && !host.contains('/');
+    let hosts = a.config.hostnames.iter().any(|ha| {
+        b.config
+            .hostnames
+            .iter()
+            .any(|hb| !exact(ha) || !exact(hb) || ha.eq_ignore_ascii_case(hb))
+    });
+    let methods = a.config.methods.is_empty()
+        || b.config.methods.is_empty()
+        || a.config
+            .methods
+            .iter()
+            .any(|m| b.config.methods.contains(m));
+    share_a_listener(a, b)
+        && hosts
+        && methods
+        && paths_may_overlap(a.config.path.as_ref(), b.config.path.as_ref())
+}
+
+/// Whether the two routes are served on a common Sōzu listener, whatever
+/// Gateway listeners name them: `0` stands for the main ports, the same for
+/// both.
+fn share_a_listener(a: &Entrypoint, b: &Entrypoint) -> bool {
+    let listeners = |ep: &Entrypoint| {
+        let mut listeners = Vec::new();
+        if !ep.config.https_only {
+            listeners.push((FrontListener::Http, listener_http_port(ep, 0)));
+        }
+        if ep.config.tls {
+            listeners.push((FrontListener::Https, listener_https_port(ep, 0)));
+        }
+        listeners
+    };
+    let b_listeners = listeners(b);
+    listeners(a).iter().any(|l| b_listeners.contains(l))
+}
+
+/// Whether some path matches both rules. No rule is `/`, and a regex is taken
+/// to match anything.
+fn paths_may_overlap(
+    a: Option<&crate::model::PathConfig>,
+    b: Option<&crate::model::PathConfig>,
+) -> bool {
+    use crate::model::PathRuleType::{Exact, Prefix};
+    let (Some(a), Some(b)) = (a, b) else {
+        return true;
+    };
+    match (&a.rule_type, &b.rule_type) {
+        (Exact, Exact) => a.value == b.value,
+        (Exact, Prefix) => a.value.starts_with(&b.value),
+        (Prefix, Exact) => b.value.starts_with(&a.value),
+        (Prefix, Prefix) => a.value.starts_with(&b.value) || b.value.starts_with(&a.value),
+        _ => true,
+    }
+}
+
+/// The header predicates each set of a route's frontends carries: its own,
+/// and when it has none, one set per route on headers it outranks
+/// ([`with_outranked_headers`]), so Sōzu picks it over that route when the
+/// request carries their headers.
+pub(crate) fn frontend_predicate_sets(
+    config: &crate::model::EntrypointConfig,
+) -> Vec<Vec<HeaderPredicate>> {
+    let own = build_header_predicates(&config.match_headers);
+    if !own.is_empty() {
+        return vec![own];
+    }
+    std::iter::once(own)
+        .chain(
+            config
+                .outranked_headers
+                .iter()
+                .map(|set| build_header_predicates(&set.conditions)),
+        )
+        .collect()
 }
 
 /// `routes` with each route that mirrors another (`mirror_of`) folded into
@@ -1979,6 +2186,21 @@ fn configure_sozu_routing(
         // apply_routing_diff() updated in place): re-adding it would make Sōzu
         // reject the command as a duplicate. Its frontends only move when a
         // route installed earlier in this loop must pass in front of them.
+        // The routes on headers it outranks changed alone: only its frontends
+        // are sent again, and the routes after it move behind them.
+        if let Some(old) = previous.get(cluster_id)
+            && is_outranked_only_change(old, entrypoint)
+        {
+            add_acme_frontends(channels, cluster_id, entrypoint);
+            let outcome = reinstall_http_frontends(channels, cluster_id, old, entrypoint);
+            if outcome == FrontendOutcome::Installed {
+                reorder_live_routes = true;
+                applied.insert(cluster_id.clone());
+            }
+            note_frontend_outcome(cluster_id, outcome, &mut skipped);
+            continue;
+        }
+
         if let Some(old) = previous.get(cluster_id)
             && (old == entrypoint
                 || is_backends_only_change(old, entrypoint)
@@ -2013,40 +2235,7 @@ fn configure_sozu_routing(
             Protocol::Http => {
                 debug!("Configuring HTTP cluster: {}", entrypoint.name);
 
-                // Register ACME challenge frontend BEFORE normal frontend
-                // Pre rules are checked in insertion order, so the more specific
-                // ACME path must be registered first to take priority over "/"
-                if channels.acme_challenge_port.is_some() {
-                    for hostname in acme_hostnames(&entrypoint.config.hostnames) {
-                        let acme_front = build_acme_frontend(
-                            hostname,
-                            listener_http_port(entrypoint, channels.http_port),
-                        );
-                        if let Err(e) = send_to_worker(
-                            &mut channels.http,
-                            format!("add-frontend-acme-{}", hostname),
-                            RequestType::AddHttpFrontend(acme_front),
-                        ) {
-                            debug!(
-                                "Failed to add ACME frontend for {} (may already exist): {}",
-                                hostname, e
-                            );
-                        }
-                    }
-                    for twin in build_acme_twins(entrypoint, channels.http_port) {
-                        let hostname = twin.hostname.clone();
-                        if let Err(e) = send_to_worker(
-                            &mut channels.http,
-                            format!("add-frontend-acme-headers-{}-{}", cluster_id, hostname),
-                            RequestType::add_http_frontend(twin),
-                        ) {
-                            debug!(
-                                "Failed to add ACME frontend with header predicates for {} (may already exist): {}",
-                                hostname, e
-                            );
-                        }
-                    }
-                }
+                add_acme_frontends(channels, cluster_id, entrypoint);
 
                 let https_addr = channels.https_addr();
                 let http_port = channels.http_port;
@@ -2103,6 +2292,43 @@ fn configure_sozu_routing(
 
     info!("Sōzu configuration applied successfully");
     Ok(skipped)
+}
+
+/// Sends the ACME challenge frontends of `entrypoint`, and their copies with
+/// its header predicates ([`build_acme_twins`]), when ACME is on. Pre rules
+/// are checked in insertion order, so they go before the route's frontends to
+/// take the challenge path from it. One another route already sent is refused
+/// as a duplicate, which changes nothing.
+fn add_acme_frontends(channels: &mut Channels, cluster_id: &str, entrypoint: &Entrypoint) {
+    if channels.acme_challenge_port.is_some() {
+        for hostname in acme_hostnames(&entrypoint.config.hostnames) {
+            let acme_front =
+                build_acme_frontend(hostname, listener_http_port(entrypoint, channels.http_port));
+            if let Err(e) = send_to_worker(
+                &mut channels.http,
+                format!("add-frontend-acme-{}", hostname),
+                RequestType::AddHttpFrontend(acme_front),
+            ) {
+                debug!(
+                    "Failed to add ACME frontend for {} (may already exist): {}",
+                    hostname, e
+                );
+            }
+        }
+        for twin in build_acme_twins(entrypoint, channels.http_port) {
+            let hostname = twin.hostname.clone();
+            if let Err(e) = send_to_worker(
+                &mut channels.http,
+                format!("add-frontend-acme-headers-{}-{}", cluster_id, hostname),
+                RequestType::add_http_frontend(twin),
+            ) {
+                debug!(
+                    "Failed to add ACME frontend with header predicates for {} (may already exist): {}",
+                    hostname, e
+                );
+            }
+        }
+    }
 }
 
 /// Moves a live route's frontends to the end of Sōzu's Pre rules, behind a
@@ -2179,27 +2405,51 @@ pub(crate) fn build_acme_frontend(hostname: &str, http_port: u16) -> RequestHttp
     }
 }
 
-/// The ACME challenge frontends a route with header conditions needs on top
-/// of [`build_acme_frontend`]: Sōzu tries a frontend whose header predicates
-/// hold before every frontend without any, so the route would take the
-/// challenge requests that carry its headers. Each copy carries the route's
-/// predicates and is installed before it, which keeps the challenge first.
+/// The ACME challenge frontends a route whose frontends carry header
+/// predicates needs on top of [`build_acme_frontend`]: Sōzu tries a frontend
+/// whose header predicates hold before every frontend without any, so the
+/// route would take the challenge requests that carry those headers. One copy
+/// per set of predicates ([`frontend_predicate_sets`]), installed before the
+/// route, keeps the challenge first.
 pub(crate) fn build_acme_twins(
     entrypoint: &Entrypoint,
     http_port: u16,
 ) -> Vec<RequestHttpFrontend> {
-    let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
-    if header_predicates.is_empty() {
-        return Vec::new();
-    }
     // On the route's own listener: challenges reach it there.
     let http_port = listener_http_port(entrypoint, http_port);
-    acme_hostnames(&entrypoint.config.hostnames)
-        .map(|hostname| RequestHttpFrontend {
-            header_predicates: header_predicates.clone(),
-            ..build_acme_frontend(hostname, http_port)
-        })
-        .collect()
+    let config = &entrypoint.config;
+    let own = build_header_predicates(&config.match_headers);
+    // A copy for the routes it outranks takes the challenges of their hosts
+    // too: a wildcard covers names it does not list.
+    let sets: Vec<(Vec<HeaderPredicate>, Vec<String>)> = if own.is_empty() {
+        config
+            .outranked_headers
+            .iter()
+            .map(|set| {
+                let mut hostnames = config.hostnames.clone();
+                hostnames.extend(set.hostnames.iter().cloned());
+                (build_header_predicates(&set.conditions), hostnames)
+            })
+            .collect()
+    } else {
+        vec![(own, config.hostnames.clone())]
+    };
+    let mut twins: Vec<RequestHttpFrontend> = Vec::new();
+    for (predicates, hostnames) in sets {
+        for hostname in acme_hostnames(&hostnames) {
+            let twin = RequestHttpFrontend {
+                header_predicates: predicates.clone(),
+                ..build_acme_frontend(hostname, http_port)
+            };
+            if !twins
+                .iter()
+                .any(|t| acme_twin_key(t) == acme_twin_key(&twin))
+            {
+                twins.push(twin);
+            }
+        }
+    }
+    twins
 }
 
 /// The hostnames that get an ACME HTTP-01 challenge frontend: exact names
@@ -2394,7 +2644,7 @@ pub(crate) fn build_http_frontends(
                     frontend_rewrite_port,
                 )
             };
-        let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
+        let predicate_sets = frontend_predicate_sets(&entrypoint.config);
 
         // The scheme a redirect the middleware answers keeps, set by the
         // listener rather than taken from the client's `X-Forwarded-Proto`.
@@ -2411,7 +2661,11 @@ pub(crate) fn build_http_frontends(
             headers
         };
 
-        for method in methods_for_frontend(&entrypoint.config.methods) {
+        for (header_predicates, method) in predicate_sets.iter().flat_map(|predicates| {
+            methods_for_frontend(&entrypoint.config.methods)
+                .into_iter()
+                .map(move |method| (predicates, method))
+        }) {
             let front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
                 address: SocketAddress::new_v4(
@@ -3177,9 +3431,13 @@ fn remove_http_frontends(
     );
     let path_rule = builders::query_path_rule(&entrypoint.config).unwrap_or(path_rule);
 
-    let header_predicates = build_header_predicates(&entrypoint.config.match_headers);
+    let predicate_sets = frontend_predicate_sets(&entrypoint.config);
     for hostname in &entrypoint.config.hostnames {
-        for method in methods_for_frontend(&entrypoint.config.methods) {
+        for (header_predicates, method) in predicate_sets.iter().flat_map(|predicates| {
+            methods_for_frontend(&entrypoint.config.methods)
+                .into_iter()
+                .map(move |method| (predicates, method))
+        }) {
             let method_tag = method.as_deref().unwrap_or("any");
             let http_front = RequestHttpFrontend {
                 cluster_id: Some(cluster_id.to_string()),
@@ -3746,6 +4004,23 @@ fn is_backends_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
         && !middleware::needs_middleware(new)
 }
 
+/// True when an HTTP route changed in nothing but the header conditions of
+/// the routes it outranks ([`with_outranked_headers`]): its cluster and
+/// backends stay, only its frontends are sent again.
+fn is_outranked_only_change(old: &Entrypoint, new: &Entrypoint) -> bool {
+    let without = |ep: &Entrypoint| Entrypoint {
+        config: crate::model::EntrypointConfig {
+            outranked_headers: Vec::new(),
+            ..ep.config.clone()
+        },
+        ..ep.clone()
+    };
+    old.protocol == Protocol::Http
+        && new.protocol == Protocol::Http
+        && old.config.outranked_headers != new.config.outranked_headers
+        && without(old) == without(new)
+}
+
 /// True when a changed cluster needs nothing from Sōzu: its frontend is
 /// unchanged and it goes through the middleware, before as after, so Sōzu's
 /// only backend for it is the middleware. Its backends and mirrors are the
@@ -4005,6 +4280,16 @@ fn apply_routing_diff(
             // rescale. configure_sozu_routing() skips re-adding such clusters
             // (see is_backends_only_change check there), so this is the whole
             // update.
+            if is_outranked_only_change(old, new) {
+                debug!(
+                    "Cluster {} changed for the routes it outranks only: its frontends are reinstalled",
+                    cluster_id
+                );
+                if channels.acme_challenge_port.is_some() {
+                    remove_acme_twins(&mut channels.http, old, channels.http_port, &needed_twins);
+                }
+                continue;
+            }
             if is_middleware_only_change(old, new) {
                 debug!(
                     "Cluster {} changed for the middleware only: Sōzu keeps it as is",
@@ -5575,6 +5860,7 @@ mod tests {
                 mirror_of: None,
                 failing_shares: None,
                 cors: None,
+                outranked_headers: Vec::new(),
             },
             candidates: Vec::new(),
         }
@@ -5711,6 +5997,163 @@ mod tests {
             1
         );
         assert_eq!(stale_acme_twins(&a, 80, &[]), twins);
+    }
+
+    /// A route on no header is told the header conditions of each later
+    /// route that could take its requests, once per set; not those of a
+    /// route on another listener, path or method, nor those Sōzu does not
+    /// route on.
+    #[test]
+    fn a_route_learns_the_headers_of_the_routes_it_outranks() {
+        use crate::model::{MatchCondition, PathConfig, PathRuleType};
+        let version = |value: &str| MatchCondition {
+            key: "Version".into(),
+            value: value.into(),
+            regex: false,
+        };
+        // As the copies carry them.
+        let copied = |value: &str| MatchCondition {
+            key: "version".into(),
+            value: format!("{value}(?:)"),
+            regex: true,
+        };
+        let route = |id: &str| {
+            let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+            ep.id = id.into();
+            ep.config.hostnames = vec!["app.example.com".into()];
+            ep
+        };
+        let prefix = |value: &str| {
+            Some(PathConfig {
+                value: value.into(),
+                rule_type: PathRuleType::Prefix,
+            })
+        };
+        let mut patch = route("patch");
+        patch.config.methods = vec!["PATCH".into()];
+        let mut path5 = route("path5");
+        path5.config.path = prefix("/path5");
+        let mut four = route("four");
+        four.config.match_headers = vec![version("four")];
+        // The same header, named in another case.
+        let mut four_again = route("four-again");
+        four_again.config.match_headers = vec![MatchCondition {
+            key: "VERSION".into(),
+            ..version("four")
+        }];
+        let mut get_only = route("get-only");
+        get_only.config.methods = vec!["GET".into()];
+        get_only.config.match_headers = vec![version("get")];
+        let mut elsewhere = route("elsewhere");
+        elsewhere.config.path = prefix("/other");
+        elsewhere.config.match_headers = vec![version("elsewhere")];
+        let mut other_listener = route("other-listener");
+        other_listener.config.entrypoint = Some("gateway:http:8080".into());
+        other_listener.config.match_headers = vec![version("listener")];
+        let mut cookie = route("cookie");
+        cookie.config.match_headers = vec![MatchCondition {
+            key: "Cookie".into(),
+            value: "beta=1".into(),
+            regex: false,
+        }];
+        let routes = with_outranked_headers(
+            [
+                patch,
+                path5,
+                four,
+                four_again,
+                get_only,
+                elsewhere,
+                other_listener,
+                cookie,
+            ]
+            .into_iter()
+            .map(|ep| (ep.id.clone(), ep))
+            .collect(),
+        );
+
+        let conditions = |id: &str| -> Vec<Vec<MatchCondition>> {
+            routes[id]
+                .config
+                .outranked_headers
+                .iter()
+                .map(|set| set.conditions.clone())
+                .collect()
+        };
+        assert_eq!(conditions("patch"), vec![vec![copied("four")]]);
+        // In routing order: a route on a method comes first.
+        assert_eq!(
+            conditions("path5"),
+            vec![vec![copied("get")], vec![copied("four")]]
+        );
+        assert!(routes["four"].config.outranked_headers.is_empty());
+        assert!(routes["cookie"].config.outranked_headers.is_empty());
+
+        // One more set of frontends, carrying the headers it outranks.
+        let fronts = build_http_frontends(
+            "patch",
+            &routes["patch"],
+            80,
+            SocketAddress::new_v4(0, 0, 0, 0, 443),
+        );
+        let predicates: Vec<usize> = fronts
+            .iter()
+            .map(|(_, front)| front.header_predicates.len())
+            .collect();
+        assert_eq!(predicates, [0, 1]);
+    }
+
+    /// Only the routes it outranks changed: the route keeps its cluster and
+    /// backends, and its challenge frontends follow its new predicates.
+    #[test]
+    fn a_change_of_the_outranked_headers_only_reinstalls_frontends() {
+        let old = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        let mut new = old.clone();
+        new.config.outranked_headers = vec![crate::model::OutrankedHeaders {
+            conditions: vec![crate::model::MatchCondition {
+                key: "X-Canary".into(),
+                value: String::new(),
+                regex: false,
+            }],
+            hostnames: vec!["other.example.com".into()],
+        }];
+        assert!(is_outranked_only_change(&old, &new));
+        assert!(!is_outranked_only_change(&old, &old));
+        let mut moved = new.clone();
+        moved.backends = vec![Backend::new("10.0.0.2", 80)];
+        assert!(!is_outranked_only_change(&old, &moved));
+
+        // A copy of every kind of condition is one Sōzu takes.
+        let copies = copied_conditions(&Entrypoint {
+            config: crate::model::EntrypointConfig {
+                match_headers: vec![
+                    crate::model::MatchCondition {
+                        key: "A".into(),
+                        value: String::new(),
+                        regex: false,
+                    },
+                    crate::model::MatchCondition {
+                        key: "B".into(),
+                        value: "a.b".into(),
+                        regex: false,
+                    },
+                    crate::model::MatchCondition {
+                        key: "C".into(),
+                        value: "v[0-9]+".into(),
+                        regex: true,
+                    },
+                ],
+                ..old.config.clone()
+            },
+            ..old.clone()
+        });
+        assert_eq!(build_header_predicates(&copies).len(), 3);
+        assert!(build_acme_twins(&old, 80).is_empty());
+        // Its own hosts, and those of the route it outranks.
+        assert_eq!(
+            build_acme_twins(&new, 80).len(),
+            new.config.hostnames.len() + 1
+        );
     }
 
     /// The middleware cannot tell apart two routes on one host and path, so

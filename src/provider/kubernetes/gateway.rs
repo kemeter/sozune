@@ -4158,6 +4158,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteCORS",
     "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",
+    "HTTPRouteMethodMatching",
     "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
     "HTTPRoutePathRedirect",
@@ -6439,6 +6440,7 @@ fn rule_to_entrypoints(
                     mirror_of: None,
                     failing_shares,
                     cors: cors.clone(),
+                    outranked_headers: Vec::new(),
                 },
                 source: Some(id),
                 candidates: Vec::new(),
@@ -7859,6 +7861,7 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         mirror_of: None,
         failing_shares: None,
         cors: None,
+        outranked_headers: Vec::new(),
         ip_allow_list: Vec::new(),
     }
 }

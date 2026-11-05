@@ -262,6 +262,19 @@ pub struct EntrypointConfig {
     /// answers their preflight requests and marks the responses they get.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<CorsConfig>,
+    /// The header conditions of the routes this one outranks on its listener
+    /// and could share a request with. Never configured: the proxy derives it
+    /// from the whole route table before applying it.
+    #[serde(skip)]
+    pub outranked_headers: Vec<OutrankedHeaders>,
+}
+
+/// One set of header conditions of the routes a route outranks, with the
+/// hostnames of those routes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OutrankedHeaders {
+    pub conditions: Vec<MatchCondition>,
+    pub hostnames: Vec<String>,
 }
 
 /// A route's CORS policy, as a Gateway API `CORS` filter states it.

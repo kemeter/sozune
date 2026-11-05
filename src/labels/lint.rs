@@ -199,28 +199,31 @@ pub fn lint_collection(entrypoints: &[(&str, &Entrypoint)]) -> Vec<(String, Diag
 
 /// Whether one request can match both routes and only one serves it.
 fn conditions_overlap(a: &RouteConditions, b: &RouteConditions) -> bool {
+    let rank = |r: &RouteConditions| (r.priority, r.on_methods, r.headers.len());
+    // A route without header conditions is tried after one with them, unless
+    // its priority is higher, or at equal priority it routes on methods and
+    // the other does not: then it takes every request the other could serve.
+    if a.headers.is_empty() != b.headers.is_empty() {
+        let (with, without) = if a.headers.is_empty() { (b, a) } else { (a, b) };
+        return rank(without) > rank(with);
+    }
     if !can_overlap(&a.headers, &b.headers) {
         return false;
     }
-    // A route without query conditions is tried after one with them, unless
-    // its priority is higher, or at equal priority it routes on methods and
-    // the other does not, or has more header conditions. Two routes with query conditions always overlap: Sōzu
+    // The same goes for query conditions, a route with more header conditions
+    // also coming first. Two routes with query conditions always overlap: Sōzu
     // takes any occurrence of a parameter, and a request can repeat one with
     // each value (`?v=2&v=3`).
     if a.query.is_empty() != b.query.is_empty() {
         let (with, without) = if a.query.is_empty() { (b, a) } else { (a, b) };
-        let rank = |r: &RouteConditions| (r.priority, r.on_methods, r.headers.len());
         return rank(without) > rank(with);
     }
     true
 }
 
-/// Whether one request can match both sets of header conditions, given that
-/// Sōzu serves a route with conditions before any route without.
+/// Whether one request can match both sets of header conditions, both empty
+/// or both not.
 fn can_overlap(a: &[(String, String)], b: &[(String, String)]) -> bool {
-    if a.is_empty() != b.is_empty() {
-        return false;
-    }
     !a.iter().any(|(key, value)| {
         !value.is_empty()
             && b.iter().any(|(other_key, other_value)| {
@@ -420,6 +423,7 @@ mod tests {
                 mirror_of: None,
                 failing_shares: None,
                 cors: None,
+                outranked_headers: Vec::new(),
                 ip_allow_list: Vec::new(),
             },
             source: None,
@@ -508,6 +512,14 @@ mod tests {
         }];
         let pairs = vec![("cand-a", &a), ("cand-b", &b)];
         assert!(lint_collection(&pairs).is_empty());
+
+        // Of higher priority, the route on no header takes them all.
+        let mut first = a.clone();
+        first.config.priority = 10;
+        assert_eq!(
+            lint_collection(&[("cand-first", &first), ("cand-b", &b)]).len(),
+            2
+        );
 
         let mut c = b.clone();
         c.config.match_headers[0].key = "x-canary".into();

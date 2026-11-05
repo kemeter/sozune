@@ -1396,6 +1396,7 @@ impl IngressParseCtx<'_> {
                 mirror_of: None,
                 failing_shares: None,
                 cors: None,
+                outranked_headers: Vec::new(),
                 ip_allow_list: Vec::new(),
             },
             source: Some(self.provider.name.to_string()),
