@@ -4158,6 +4158,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteCORS",
     "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",
+    "HTTPRouteMethodMatching",
     "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
     "HTTPRoutePathRedirect",
