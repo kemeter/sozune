@@ -988,11 +988,15 @@ async fn run_middleware(
         ));
     }
     if let Some(retry) = entrypoint.config.retry.as_ref().filter(|r| r.attempts > 1) {
-        pipeline.push(step(
-            "retry",
-            StepVerdict::Applies,
-            Some(&format!("{} attempts", retry.attempts)),
-        ));
+        let mut detail = format!("{} attempts", retry.attempts);
+        if !retry.codes.is_empty() {
+            let codes: Vec<String> = retry.codes.iter().map(u16::to_string).collect();
+            detail.push_str(&format!(", on {}", codes.join(", ")));
+        }
+        if let Some(ms) = retry.backoff_ms.filter(|ms| *ms > 0) {
+            detail.push_str(&format!(", {ms} ms apart"));
+        }
+        pipeline.push(step("retry", StepVerdict::Applies, Some(&detail)));
     }
     if entrypoint.config.circuit_breaker.is_some() {
         pipeline.push(step("circuit-breaker", StepVerdict::Applies, None));
@@ -1740,6 +1744,30 @@ mod tests {
                 .pipeline
                 .iter()
                 .any(|s| s.name == "request-match" && s.verdict == StepVerdict::Blocked)
+        );
+    }
+
+    /// The retry step names the statuses it retries and its backoff.
+    #[tokio::test]
+    async fn the_retry_step_names_its_codes_and_backoff() {
+        let routes = vec![route(
+            "web",
+            &["app.example.com"],
+            serde_json::json!({
+                "retry": { "attempts": 3, "codes": [500, 503], "backoff_ms": 100 }
+            }),
+        )];
+
+        let resolution = resolve_in(routes, get("http://app.example.com/")).await;
+
+        let retry = resolution
+            .pipeline
+            .iter()
+            .find(|s| s.name == "retry")
+            .expect("a retry step");
+        assert_eq!(
+            retry.detail.as_deref(),
+            Some("3 attempts, on 500, 503, 100 ms apart")
         );
     }
 

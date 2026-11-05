@@ -22,9 +22,11 @@ Retries cover **connection-level failures and timeouts**, where the backend prod
 |---|---|
 | Connection refused / reset | ✅ |
 | Backend timeout (`backendTimeout`) | ✅ |
-| Backend returned a response — even `500`/`502`/`503` | ❌ |
+| Backend returned a response — even `500`/`502`/`503` | ❌, unless its status is in `codes` |
 
 A response that arrives is returned to the client as-is and **never** retried: the backend already acted on the request, so replaying it could double a side effect (a payment, an order…). This matches Traefik's default retry behaviour.
+
+A route can still retry some statuses, through the [REST / YAML surface](#rest--yaml-surface) or a Gateway API [HTTPRoute](/documentation/providers/kubernetes) `retry` (since 0.16). A response with one of its `codes` takes the next attempt, within `attempts`; the last attempt's response is returned whatever its status. Only list statuses a backend gives before acting on the request, or for requests that are safe to replay.
 
 After all attempts fail, the client gets the usual error: `504` if the last failure was a timeout, `502` otherwise.
 
@@ -32,7 +34,7 @@ After all attempts fail, the client gets the usual error: `504` if the last fail
 
 - The request body is buffered in memory so it can be replayed on each attempt. Keep that in mind for very large uploads on retried routes.
 - A retry goes to the heaviest backend the request has not tried yet, so with multiple backends it lands on a different one; once every backend was tried, the balancer picks again. When every attempt fails on a route with [backup](/documentation/routing/load-balancing#weighted-load-balancing) backends (weight `0`), each backend not tried yet gets one more try, heaviest first, then each backup. (since 0.16)
-- Retries are attempted back-to-back; there is no backoff delay between them yet.
+- Retries are attempted back-to-back, unless the route sets `backoff_ms`: each retry then waits that long first (since 0.16). A Gateway API `timeouts.request` bounds the waits too.
 - A WebSocket upgrade is never retried: `retry.attempts` does not apply to it. On a route with backup backends, an upgrade no backend answered still goes to each backend not tried yet, then each backup (since 0.16).
 - With a [circuit breaker](./circuit-breaker.md), a request whose every attempt failed counts as one failure.
 - Declaring `retry.attempts` routes the entrypoint through the Sōzune middleware layer (where the retry loop lives), like any other middleware.
@@ -49,5 +51,15 @@ Also available on the entrypoint payload as `retry`:
     "hostnames": ["app.example.com"],
     "retry": { "attempts": 3 }
   }
+}
+```
+
+Two more fields, not available as labels (since 0.16):
+
+```jsonc
+"retry": {
+  "attempts": 3,
+  "codes": [502, 503],  // statuses retried too
+  "backoff_ms": 100     // wait before each retry
 }
 ```

@@ -289,6 +289,9 @@ pub async fn start_services(
                 );
                 return;
             }
+            let mut served_ports_for_gateway = served_ports_for_gateway;
+            served_ports_for_gateway.crd_has_retry =
+                gateway::httproute_crd_has_retry(&client).await;
 
             // Gateways are watched in every namespace, and so are the Secrets
             // their listeners name, even when the provider is restricted to

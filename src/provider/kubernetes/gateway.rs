@@ -34,7 +34,7 @@ use super::gateway_matches;
 use super::gateway_tls::SecretCertificate;
 use crate::model::{
     Backend, Entrypoint, EntrypointConfig, HeaderConfig, LoadBalancer, Mirror, PathConfig,
-    PathRewrite, PathRuleType, Protocol, UrlRewrite,
+    PathRewrite, PathRuleType, Protocol, RetryConfig, UrlRewrite,
 };
 use crate::provider::kubernetes::gateway_compat::{
     TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteStatusParents,
@@ -49,6 +49,11 @@ use crate::provider::kubernetes::gateway_compat::{
     UdpRouteStatusParentsParentRef,
 };
 use futures_util::StreamExt;
+use gateway_api::apis::experimental::httproutes::{
+    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
+    HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteRulesMatchesPathType, HttpRouteStatus,
+    HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+};
 use gateway_api::apis::standard::gatewayclasses::{
     GatewayClass, GatewayClassStatusSupportedFeatures,
 };
@@ -57,11 +62,6 @@ use gateway_api::apis::standard::gateways::{
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewayStatusAddresses,
 };
 use gateway_api::apis::standard::grpcroutes::GrpcRoute;
-use gateway_api::apis::standard::httproutes::{
-    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
-    HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteRulesMatchesPathType, HttpRouteStatus,
-    HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
-};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::watcher::{self, Event};
@@ -461,6 +461,9 @@ pub struct ServedPorts {
     pub publishes_addresses: bool,
     /// The ports of `gateway` Sōzune could not open, as the proxy reported.
     pub unopened: crate::proxy::backend::UnopenedGatewayPorts,
+    /// Whether the cluster's HTTPRoute CRD has a rule's `retry`, which only
+    /// the experimental channel has: the API server drops it otherwise.
+    pub crd_has_retry: bool,
 }
 
 impl ServedPorts {
@@ -481,6 +484,7 @@ impl ServedPorts {
             gateway: proxy.gateway_ports.clone(),
             publishes_addresses: false,
             unopened: Default::default(),
+            crd_has_retry: false,
         }
     }
 
@@ -4170,6 +4174,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRequestPercentageMirror",
     "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
+    "HTTPRouteRetry",
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
     "TLSRoute",
@@ -4180,6 +4185,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
 /// listener: `proxy.http.h2c`, or `h2` in the HTTPS listener's ALPN. A
 /// Gateway gets an address only where Sōzune publishes its own, and a
 /// listener on port 8080 is served there only on an HTTP port of Sōzune's.
+/// A rule's `retry` needs CRDs that have it.
 fn supported_features(served: &ServedPorts) -> Vec<GatewayClassStatusSupportedFeatures> {
     let grpc = served.h2c || served.https_h2;
     let port_8080 = served.http == 8080 || served.gateway.allows_http(8080);
@@ -4189,6 +4195,7 @@ fn supported_features(served: &ServedPorts) -> Vec<GatewayClassStatusSupportedFe
         .filter(|name| grpc || !name.starts_with("GRPCRoute"))
         .filter(|name| served.publishes_addresses || *name != "GatewayAddressEmpty")
         .filter(|name| port_8080 || *name != "GatewayPort8080")
+        .filter(|name| served.crd_has_retry || *name != "HTTPRouteRetry")
         .collect();
     names.sort_unstable();
     names
@@ -4903,6 +4910,37 @@ pub async fn httproute_crd_installed(client: &Client) -> bool {
     false
 }
 
+/// Whether the cluster's HTTPRoute CRD has a rule's `retry`, from the
+/// OpenAPI document of the Gateway API group, which every authenticated
+/// client may read. False when it cannot be read.
+pub async fn httproute_crd_has_retry(client: &Client) -> bool {
+    let request = match axum::http::Request::get("/openapi/v3/apis/gateway.networking.k8s.io/v1")
+        .body(Vec::new())
+    {
+        Ok(request) => request,
+        Err(_) => return false,
+    };
+    match client.request::<serde_json::Value>(request).await {
+        Ok(document) => rules_have_retry(&document),
+        Err(e) => {
+            warn!(
+                "Gateway API: cannot read the HTTPRoute schema ({}); HTTPRouteRetry not listed",
+                e
+            );
+            false
+        }
+    }
+}
+
+/// Whether an OpenAPI document's HTTPRoute rules have `retry`.
+fn rules_have_retry(document: &serde_json::Value) -> bool {
+    document
+        .pointer(
+            "/components/schemas/io.k8s.networking.gateway.v1.HTTPRoute/properties/spec/properties/rules/items/properties/retry",
+        )
+        .is_some()
+}
+
 /// One backendRef, resolved: its weight, its Service's ready pods and the
 /// port to reach them on.
 struct ResolvedRef {
@@ -5574,7 +5612,7 @@ pub fn route_has_unsupported_filters(
 /// Gateway API allows it with a `PathPrefix` match only.
 fn replaces_prefix_off_a_prefix_match(
     rule: &HttpRouteRules,
-    filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
+    filters: &[gateway_api::apis::experimental::httproutes::HttpRouteRulesFilters],
 ) -> bool {
     let replaces_prefix = filters.iter().any(|f| {
         f.request_redirect
@@ -6309,6 +6347,7 @@ fn rule_to_entrypoints(
     };
 
     let (request_timeout, backend_timeout) = rule_timeouts_ms(rule);
+    let retry = if answers { None } else { rule_retry(rule) };
     // A redirect answers every request, preflights included.
     let cors = if answers {
         None
@@ -6417,7 +6456,7 @@ fn rule_to_entrypoints(
                     request_timeout,
                     health_check: None,
                     load_balancer: LoadBalancer::default(),
-                    retry: None,
+                    retry: retry.clone(),
                     circuit_breaker: None,
                     rate_limit: None,
                     in_flight_req: None,
@@ -6468,6 +6507,37 @@ fn rule_timeouts_ms(rule: &HttpRouteRules) -> (Option<u64>, Option<u64>) {
         parse(timeouts.request.as_deref()).filter(|ms| *ms > 0),
         parse(timeouts.backend_request.as_deref()),
     )
+}
+
+/// The rule's `retry`: `attempts` retries after the first try, one when
+/// unset, on a connection failure, a timeout or a status of `codes`, with
+/// `backoff` between them. An invalid backoff is ignored.
+fn rule_retry(rule: &HttpRouteRules) -> Option<RetryConfig> {
+    let retry = rule.retry.as_ref()?;
+    let retries = retry
+        .attempts
+        .map_or(1, |n| u32::try_from(n.max(1)).unwrap_or(u32::MAX));
+    let mut codes: Vec<u16> = retry
+        .codes
+        .iter()
+        .flatten()
+        .filter_map(|code| u16::try_from(*code).ok())
+        .filter(|code| (400..=599).contains(code))
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    let backoff_ms = retry.backoff.as_deref().and_then(|raw| {
+        let ms = gateway_duration_ms(raw);
+        if ms.is_none() {
+            warn!("Gateway API: ignoring the invalid retry backoff {:?}", raw);
+        }
+        ms
+    });
+    Some(RetryConfig {
+        attempts: retries.saturating_add(1),
+        codes,
+        backoff_ms,
+    })
 }
 
 /// A Gateway API duration (`1h`, `30s`, `500ms`, `1m30s`) in milliseconds.
@@ -7895,17 +7965,17 @@ fn log_route(action: &str, route: &HttpRoute) {
 mod tests {
     use super::*;
     use crate::model::entrypoint::{RedirectPolicy, RedirectScheme};
-    use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
-    use gateway_api::apis::standard::gateways::{
-        GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
-        GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
-    };
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesBackendRefs, HttpRouteRulesFiltersRequestRedirect,
         HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesMatches,
         HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
         HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesQueryParams,
         HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
+    };
+    use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
+    use gateway_api::apis::standard::gateways::{
+        GatewayListeners, GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds,
+        GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
     };
     use kube::api::ObjectMeta;
 
@@ -9003,6 +9073,7 @@ mod tests {
                 } else {
                     Some(parent_refs)
                 },
+                use_default_gateways: None,
             },
             status: Default::default(),
         }
@@ -9116,7 +9187,7 @@ mod tests {
     /// zero `backendRequest` disables the backend timeout.
     #[test]
     fn rule_timeouts_map_to_request_and_backend_timeouts() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesTimeouts;
         let with = |request: Option<&str>, backend_request: Option<&str>| {
             let mut r = rule(None, vec![backend("api", 80)]);
             r.timeouts = Some(HttpRouteRulesTimeouts {
@@ -9131,6 +9202,42 @@ mod tests {
         assert_eq!(with(Some("0s"), None), (None, None));
         assert_eq!(with(None, Some("0s")), (None, Some(0)));
         assert_eq!(with(None, Some("1m")), (None, Some(60_000)));
+    }
+
+    /// `attempts` counts the retries after the first try; the codes keep
+    /// their 4xx and 5xx, and the backoff is in milliseconds.
+    #[test]
+    fn a_rule_retry_maps_to_the_route_retry() {
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesRetry;
+        let with = |retry: Option<HttpRouteRulesRetry>| {
+            let mut r = rule(None, vec![backend("api", 80)]);
+            r.retry = retry;
+            let route = route_with(vec![r], vec!["app.example.com".into()]);
+            route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs)[0]
+                .config
+                .retry
+                .clone()
+        };
+        assert_eq!(with(None), None);
+        assert_eq!(
+            with(Some(HttpRouteRulesRetry {
+                attempts: Some(3),
+                backoff: Some("100ms".into()),
+                codes: Some(vec![503, 500, 500, 200, 700]),
+            })),
+            Some(RetryConfig {
+                attempts: 4,
+                codes: vec![500, 503],
+                backoff_ms: Some(100),
+            })
+        );
+        assert_eq!(
+            with(Some(HttpRouteRulesRetry::default())),
+            Some(RetryConfig {
+                attempts: 2,
+                ..Default::default()
+            })
+        );
     }
 
     /// A redirect on a condition only the middleware checks would skip it:
@@ -9159,7 +9266,7 @@ mod tests {
     /// A prefix replacement on an exact match is refused, as Gateway API says.
     #[test]
     fn a_prefix_replacement_on_an_exact_match_is_refused() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
             HttpRouteRulesFiltersRequestRedirectPathType,
         };
@@ -9197,7 +9304,7 @@ mod tests {
     /// builds the `Location` path.
     #[test]
     fn a_prefix_redirect_rewrites_the_location_path() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
             HttpRouteRulesFiltersRequestRedirectPathType,
         };
@@ -9235,7 +9342,7 @@ mod tests {
     /// weight-0 one with others does not drop the route.
     #[test]
     fn unusable_backend_refs_do_not_have_to_agree_on_filters() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesBackendRefsFilters,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
@@ -9278,7 +9385,7 @@ mod tests {
     /// middleware edits what it sends each backend.
     #[test]
     fn backend_refs_keep_filters_of_their_own() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesBackendRefsFilters,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,
@@ -9306,7 +9413,7 @@ mod tests {
         let mut shared = rule(None, vec![api, web]);
         shared.filters = Some(vec![HttpRouteRulesFilters {
             response_header_modifier: Some(
-                gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersResponseHeaderModifier {
+                gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersResponseHeaderModifier {
                     remove: Some(vec!["Server".into()]),
                     ..Default::default()
                 },
@@ -9351,7 +9458,7 @@ mod tests {
     /// A redirect answers by itself: its rule needs no backend.
     #[test]
     fn a_redirect_rule_without_backends_redirects() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirect;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersRequestRedirect;
         let r = route_with(
             vec![HttpRouteRules {
                 filters: Some(vec![HttpRouteRulesFilters {
@@ -10351,7 +10458,7 @@ mod tests {
     // ---------- Filters & multi-match tests ----------
 
     use crate::model::entrypoint::{HeaderDirection, PathRewrite};
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersResponseHeaderModifier,
         HttpRouteRulesFiltersResponseHeaderModifierSet, HttpRouteRulesFiltersUrlRewrite,
@@ -10516,7 +10623,7 @@ mod tests {
     /// requests to the mirror's pods, through the middleware.
     #[test]
     fn route_with_request_mirror_copies_its_requests() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesFiltersRequestMirror, HttpRouteRulesFiltersRequestMirrorBackendRef,
         };
         let filter = HttpRouteRulesFilters {
@@ -11116,6 +11223,35 @@ mod tests {
         assert!(!has(&ports, "GatewayPort8080"));
         ports.http = 8080;
         assert!(has(&ports, "GatewayPort8080"));
+
+        ports.crd_has_retry = false;
+        assert!(!has(&ports, "HTTPRouteRetry"));
+        ports.crd_has_retry = true;
+        assert!(has(&ports, "HTTPRouteRetry"));
+    }
+
+    /// The experimental channel's HTTPRoute schema has `retry` in its rules,
+    /// the standard one's does not.
+    #[test]
+    fn the_openapi_document_tells_whether_rules_have_retry() {
+        let document = |rule: serde_json::Value| {
+            serde_json::json!({
+                "components": { "schemas": {
+                    "io.k8s.networking.gateway.v1.HTTPRoute": { "properties": {
+                        "spec": { "properties": {
+                            "rules": { "items": { "properties": rule } }
+                        } }
+                    } }
+                } }
+            })
+        };
+        assert!(rules_have_retry(&document(serde_json::json!({
+            "matches": {}, "retry": { "type": "object" }
+        }))));
+        assert!(!rules_have_retry(&document(serde_json::json!({
+            "matches": {}
+        }))));
+        assert!(!rules_have_retry(&serde_json::json!({})));
     }
     //
     // Same contract as the route status tests: the pure builders and the
@@ -11449,6 +11585,7 @@ mod tests {
             },
             publishes_addresses: false,
             unopened: Default::default(),
+            crd_has_retry: false,
         }
     }
 
@@ -12290,7 +12427,7 @@ mod tests {
     /// scheme or names one.
     #[test]
     fn a_redirect_on_its_own_port_keeps_it() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirect;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersRequestRedirect;
         let route = |redirect: HttpRouteRulesFiltersRequestRedirect| {
             route_with(
                 vec![HttpRouteRules {

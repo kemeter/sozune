@@ -21,7 +21,7 @@
 //! widely.
 
 use crate::model::MatchCondition;
-use gateway_api::apis::standard::httproutes::{
+use gateway_api::apis::experimental::httproutes::{
     HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
     HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParamsType,
 };

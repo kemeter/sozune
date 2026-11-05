@@ -16,7 +16,7 @@ use crate::model::entrypoint::{
     CorsConfig, HeaderConfig, HeaderDirection, MirrorFraction, PathRewrite, RedirectPolicy,
     RedirectScheme, UrlRewrite,
 };
-use gateway_api::apis::standard::httproutes::{
+use gateway_api::apis::experimental::httproutes::{
     HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
     HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestMirror,
     HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectScheme,
@@ -474,7 +474,7 @@ fn redirect_from_redirect_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesFiltersRequestRedirectPath, HttpRouteRulesFiltersRequestRedirectPathType,
     };
     // `HTTPRouteRulesFiltersUrlRewrite*` come in via `super::*`.
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn a_mirror_copies_its_percent_or_fraction() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestMirrorFraction;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersRequestMirrorFraction;
         let share = |numerator, denominator| {
             Some(MirrorFraction {
                 numerator,
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_cors_filter_maps_onto_the_route_policy() {
-        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersCors;
+        use gateway_api::apis::experimental::httproutes::HttpRouteRulesFiltersCors;
         let cors = HttpRouteRulesFilters {
             cors: Some(HttpRouteRulesFiltersCors {
                 allow_origins: Some(vec!["https://*.bar.com".into()]),
@@ -771,7 +771,7 @@ mod tests {
         assert!(!rule_filters_supported(&[both]));
     }
 
-    use gateway_api::apis::standard::httproutes::{
+    use gateway_api::apis::experimental::httproutes::{
         HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestHeaderModifierAdd,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersResponseHeaderModifier,
         HttpRouteRulesFiltersResponseHeaderModifierSet,
@@ -850,7 +850,7 @@ mod tests {
     /// rule; different ones, or another kind of filter, cannot be honoured.
     #[test]
     fn backend_ref_header_filters_apply_to_the_rule() {
-        use gateway_api::apis::standard::httproutes::{
+        use gateway_api::apis::experimental::httproutes::{
             HttpRouteRulesBackendRefs, HttpRouteRulesBackendRefsFilters,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifier,
             HttpRouteRulesBackendRefsFiltersRequestHeaderModifierSet,

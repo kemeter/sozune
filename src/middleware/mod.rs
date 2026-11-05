@@ -202,6 +202,10 @@ pub struct MiddlewareRoute {
     /// Total forward attempts (first try + retries) on a connection-level
     /// failure or timeout. `1` (or `0`) means no retry — the default.
     pub retry_attempts: u32,
+    /// Response statuses retried too, within `retry_attempts`.
+    pub retry_codes: Vec<u16>,
+    /// Wait before each retry.
+    pub retry_backoff: Option<std::time::Duration>,
     /// Per-route circuit breaker, shared across requests so its state persists.
     /// `None` when the route doesn't configure one.
     pub circuit_breaker: Option<Arc<circuit_breaker::CircuitBreaker>>,
@@ -1132,6 +1136,17 @@ pub fn build_middleware_route(
         backend_timeout: config.backend_timeout,
         request_timeout: config.request_timeout,
         retry_attempts: config.retry.as_ref().map_or(1, |r| r.attempts.max(1)),
+        retry_codes: config
+            .retry
+            .as_ref()
+            .map(|r| r.codes.clone())
+            .unwrap_or_default(),
+        retry_backoff: config
+            .retry
+            .as_ref()
+            .and_then(|r| r.backoff_ms)
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis),
         circuit_breaker,
         middlewares,
         rewrite_host: url_rewrite_host(config).map(str::to_string),
@@ -1289,6 +1304,8 @@ mod route_key_tests {
             backend_timeout: None,
             request_timeout: None,
             retry_attempts: 1,
+            retry_codes: Vec::new(),
+            retry_backoff: None,
             circuit_breaker: None,
             middlewares: Vec::new(),
             rewrite_host: None,
@@ -1635,6 +1652,8 @@ mod route_key_tests {
             backend_timeout: None,
             request_timeout: None,
             retry_attempts: 1,
+            retry_codes: Vec::new(),
+            retry_backoff: None,
             circuit_breaker: None,
             middlewares: Vec::new(),
             rewrite_host: None,
