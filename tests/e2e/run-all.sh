@@ -396,6 +396,10 @@ services:
       - "sozune.http.svcsse.host=$HOST_SSE"
       - "sozune.http.svcsse.port=80"
       - "sozune.http.svcsse.backendTimeout=0"
+      - "sozune.http.svcssegz.host=$HOST_SSE_GZ"
+      - "sozune.http.svcssegz.port=80"
+      - "sozune.http.svcssegz.backendTimeout=0"
+      - "sozune.http.svcssegz.compress=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   authelia:
