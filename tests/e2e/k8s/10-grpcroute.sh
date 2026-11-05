@@ -204,13 +204,26 @@ else
     fail "the HTTP listener does not list GRPCRoute (supportedKinds: '$attached')"
 fi
 
-log "[10] GRPCRoute: a request mirror, which the middleware would serve, is refused"
+log "[10] GRPCRoute: a request mirror goes through the middleware, over h2c"
 
-reason=$(grpc_accepted_reason grpc-mirrored UnsupportedValue)
-if [[ "$reason" == "UnsupportedValue" ]]; then
-    pass "a mirrored GRPCRoute is refused with UnsupportedValue"
+reason=$(grpc_accepted_reason grpc-mirrored Accepted)
+if [[ "$reason" == "Accepted" ]]; then
+    pass "a mirrored GRPCRoute is accepted"
 else
-    fail "mirrored GRPCRoute status wrong (reason='$reason', expected UnsupportedValue)"
+    fail "mirrored GRPCRoute status wrong (reason='$reason', expected Accepted)"
+fi
+
+reply=""
+for _ in $(seq 1 20); do
+    reply=$(grpc_call -authority grpc-mirror.k8s-test.localhost -d '{}' "127.0.0.1:$HTTP_PORT" \
+        "$GRPC_SERVICE/Echo" 2>&1)
+    [[ "$reply" == *"grpc-echo"* ]] && break
+    sleep 2
+done
+if [[ "$reply" == *"grpc-echo"* ]]; then
+    pass "a mirrored GRPCRoute serves $GRPC_SERVICE/Echo through the middleware"
+else
+    fail "mirrored GRPCRoute Echo call failed: $(head -c 300 <<<"$reply")"
 fi
 
 kubectl delete grpcroute grpc-echo grpc-mirrored -n sozune-test >/dev/null 2>&1

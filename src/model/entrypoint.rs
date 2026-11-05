@@ -172,8 +172,8 @@ pub struct EntrypointConfig {
     #[serde(default)]
     pub compress: bool,
     /// Speak HTTP/2 in cleartext with prior knowledge (h2c) to the backends,
-    /// as gRPC servers expect. A route that goes through the middleware is
-    /// still forwarded to them over HTTP/1.1.
+    /// as gRPC servers expect, through the middleware too when the route
+    /// goes through it.
     #[serde(default)]
     pub h2c_backends: bool,
     #[serde(default)]

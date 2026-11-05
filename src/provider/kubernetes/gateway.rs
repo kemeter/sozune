@@ -4830,7 +4830,7 @@ fn apply_route(
                     RouteOutcome::Accepted
                 };
                 if route_kind(route) == "GRPCRoute" {
-                    grpc_entrypoints(route, outcome, eps)
+                    grpc_entrypoints(outcome, eps)
                 } else {
                     (outcome, eps)
                 }
@@ -4904,30 +4904,17 @@ fn apply_route(
 }
 
 /// The entrypoints of a translated GRPCRoute, which reach their backends over
-/// h2c. One that would go through the middleware cannot carry gRPC: Sōzu
-/// reaches it over HTTP/1.1, and its client speaks HTTP/1.1 only. Such a
-/// route is refused whole rather than served without what made it need the
-/// middleware (a request mirror, or a backendRef answered with an error).
-/// The shadows that keep a more specific listener's hostnames from the route
-/// answer `404` from the middleware and forward nothing: they stay.
+/// h2c, through the middleware too when the route needs it (a request
+/// mirror, a backendRef answered with an error): Sōzu reaches it over h2c,
+/// and it the backends. The shadows that keep a more specific listener's
+/// hostnames from the route answer `404` from the middleware and forward
+/// nothing.
 fn grpc_entrypoints(
-    route: &HttpRoute,
     outcome: RouteOutcome,
     mut eps: Vec<Entrypoint>,
 ) -> (RouteOutcome, Vec<Entrypoint>) {
     let shadow =
         |ep: &Entrypoint| ep.config.answer == Some(crate::model::FixedAnswer::OtherListener);
-    if eps
-        .iter()
-        .any(|ep| !shadow(ep) && crate::middleware::needs_middleware(ep))
-    {
-        warn!(
-            "Gateway API: GRPCRoute {}/{} needs a request mirror or answers a backendRef that cannot take traffic, which sōzune cannot do over gRPC — dropping the route",
-            route.metadata.namespace.as_deref().unwrap_or("default"),
-            gateway_grpc::source_name(route).unwrap_or("<no-name>")
-        );
-        return (RouteOutcome::UnservableGrpc, Vec::new());
-    }
     for ep in eps.iter_mut().filter(|ep| !shadow(ep)) {
         ep.config.h2c_backends = true;
     }
@@ -6116,10 +6103,6 @@ pub enum RouteOutcome {
     /// other one is older (see [`GatewayScope::loses_kind_conflict`]).
     /// Reflected as `Accepted=False reason=NotAllowedByListeners`.
     KindConflict,
-    /// A GRPCRoute that would need the middleware, which cannot carry gRPC
-    /// (see [`grpc_entrypoints`]). Reflected as `Accepted=False
-    /// reason=UnsupportedValue`.
-    UnservableGrpc,
     /// None of the route's parentRefs matched a sōzune-owned Gateway
     /// (or the route declares no parentRefs at all). Gateway API says
     /// implementations only populate `parents[]` for parents they own, so
@@ -6278,11 +6261,6 @@ fn outcome_verdicts(outcome: RouteOutcome, invalid_ref: Option<InvalidRef>) -> (
             "False",
             REASON_NOT_ALLOWED_BY_LISTENERS,
             "An older route of the other kind (HTTPRoute or GRPCRoute) is attached to the same listener with a hostname in common: only one of them is served".to_string(),
-        ),
-        RouteOutcome::UnservableGrpc => (
-            "False",
-            REASON_UNSUPPORTED_VALUE,
-            "GRPCRoute needs a requestMirror, or answers a backendRef that cannot take traffic, which sōzune does not support over gRPC".to_string(),
         ),
         RouteOutcome::NoMatchingListenerHostname => (
             "False",
@@ -13544,10 +13522,10 @@ mod tests {
         assert_eq!(outcome_of(&grpc), RouteOutcome::Accepted);
     }
 
-    /// The middleware cannot carry gRPC: a GRPCRoute that would need it is
-    /// refused whole.
+    /// A GRPCRoute reaches its backends over h2c, through the middleware too
+    /// when it needs it.
     #[test]
-    fn a_grpc_route_needing_the_middleware_is_refused() {
+    fn a_grpc_route_speaks_h2c_through_the_middleware_too() {
         let mut route = route_with_uid_parents(
             "g1",
             vec![rule(None, vec![backend("api", 80)])],
@@ -13556,20 +13534,19 @@ mod tests {
         );
         route.metadata.name = Some(format!("{}web", gateway_grpc::GRPC_NAME_PREFIX));
         let eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
-        let (outcome, kept) = grpc_entrypoints(&route, RouteOutcome::Accepted, eps.clone());
+        let (outcome, kept) = grpc_entrypoints(RouteOutcome::Accepted, eps.clone());
         assert_eq!(outcome, RouteOutcome::Accepted);
         assert!(kept.iter().all(|ep| ep.config.h2c_backends));
 
         let mut eps = eps;
-        eps[0].config.compress = true;
-        let (outcome, kept) = grpc_entrypoints(&route, RouteOutcome::Accepted, eps);
-        assert_eq!(outcome, RouteOutcome::UnservableGrpc);
-        assert!(kept.is_empty());
-        let (accepted, _) = outcome_verdicts(outcome, None);
-        assert_eq!(
-            (accepted.0, accepted.1),
-            ("False", REASON_UNSUPPORTED_VALUE)
-        );
+        eps[0].config.mirrors = vec![crate::model::Mirror {
+            backends: vec![Backend::new("10.0.0.9", 80)],
+            fraction: None,
+        }];
+        assert!(crate::middleware::needs_middleware(&eps[0]));
+        let (outcome, kept) = grpc_entrypoints(RouteOutcome::Accepted, eps);
+        assert_eq!(outcome, RouteOutcome::Accepted);
+        assert!(kept[0].config.h2c_backends);
 
         // A listener-isolation shadow answers 404 itself: the route stays.
         let mut eps = route_to_entrypoints(&route, &r1(), &AllowAllBackendRefs);
@@ -13578,7 +13555,7 @@ mod tests {
         shadow.backends.clear();
         shadow.config.answer = Some(crate::model::FixedAnswer::OtherListener);
         eps.push(shadow);
-        let (outcome, kept) = grpc_entrypoints(&route, RouteOutcome::Accepted, eps);
+        let (outcome, kept) = grpc_entrypoints(RouteOutcome::Accepted, eps);
         assert_eq!(outcome, RouteOutcome::Accepted);
         assert_eq!(kept.len(), 2);
         assert!(kept[0].config.h2c_backends);

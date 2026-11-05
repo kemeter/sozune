@@ -32,7 +32,7 @@ After all attempts fail, the client gets the usual error: `504` if the last fail
 
 ## Notes
 
-- The request body is kept in memory, up to 1 MiB, so it can be sent again on each attempt. A larger body is streamed to the first attempt alone: that request is not retried, whatever happens to it (since 0.16; every body was kept whole before).
+- The request body is kept in memory, up to 1 MiB, so it can be sent again on each attempt, or to a backup. A larger body is streamed to the first attempt alone: that request is not retried, whatever happens to it (since 0.16; every body was kept whole before).
 - A retry goes to the heaviest backend the request has not tried yet, so with multiple backends it lands on a different one; once every backend was tried, the balancer picks again. When every attempt fails on a route with [backup](/documentation/routing/load-balancing#weighted-load-balancing) backends (weight `0`), each backend not tried yet gets one more try, heaviest first, then each backup. (since 0.16)
 - Retries are attempted back-to-back, unless the route sets `backoff_ms`: each retry then waits that long first (since 0.16). A Gateway API `timeouts.request` bounds the waits too.
 - A WebSocket upgrade is never retried: `retry.attempts` does not apply to it. On a route with backup backends, an upgrade no backend answered still goes to each backend not tried yet, then each backup (since 0.16).

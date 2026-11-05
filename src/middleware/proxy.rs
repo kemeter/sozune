@@ -78,6 +78,16 @@ pub async fn handle_proxy(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "-".to_string());
 
+    // Over HTTP/2 the host is the `:authority`, which Sōzu sends without a
+    // `Host` header: it becomes one, as the rest expects.
+    if !req.headers().contains_key(axum::http::header::HOST)
+        && let Some(value) = req
+            .uri()
+            .authority()
+            .and_then(|a| axum::http::HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(axum::http::header::HOST, value);
+    }
     let host = match req
         .headers()
         .get("host")
@@ -398,7 +408,13 @@ pub async fn handle_proxy(
             // `REPLAY_BODY_LIMIT`: a larger one is streamed all the same, to a
             // single attempt.
             // Backups take over a failed attempt even without retries.
-            let replays = attempts > 1 || !route.mirrors.is_empty() || !route.backups.is_empty();
+            // The backend's protocol, whatever the client spoke.
+            let version = if route.h2c {
+                axum::http::Version::HTTP_2
+            } else {
+                axum::http::Version::HTTP_11
+            };
+            let replays = attempts > 1 || !route.backups.is_empty();
             let request_body = if replays || hyper::body::Body::is_end_stream(&body) {
                 // An empty body costs nothing to keep: any backend the plan
                 // holds can be tried.
@@ -430,16 +446,29 @@ pub async fn handle_proxy(
 
             // A copy to each mirror, its answer ignored: the client's response
             // waits for none of them, and a mirror failing changes nothing.
+            // The mirrors this request is copied to: the body kept is
+            // copied whole, a streamed one part by part as it goes.
+            let copying: Vec<&super::MirrorTarget> =
+                route.mirrors.iter().filter(|m| m.copies_next()).collect();
+            let mut streamed_copies = match &mut request_body {
+                RequestBody::Streamed(body) if !copying.is_empty() => match body.take() {
+                    Some(whole) => {
+                        let (primary, copies) = tee(whole, copying.len());
+                        *body = Some(primary);
+                        copies.into_iter().map(Some).collect()
+                    }
+                    None => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
             let replayed = request_body.bytes().cloned();
-            if replayed.is_none() && !route.mirrors.is_empty() {
-                debug!("Request body past {REPLAY_BODY_LIMIT} bytes: not copied to the mirrors");
-            }
-            for mirror in route.mirrors.iter().filter(|_| replayed.is_some()) {
-                if !mirror.copies_next() {
-                    continue;
-                }
-                let Some(body_bytes) = replayed.clone() else {
-                    continue;
+            for (index, mirror) in copying.into_iter().enumerate() {
+                let copy_body = match &replayed {
+                    Some(bytes) => Body::from(bytes.clone()),
+                    None => match streamed_copies.get_mut(index).and_then(Option::take) {
+                        Some(body) => body,
+                        None => continue,
+                    },
                 };
                 // Too many copies under way already: this one is dropped.
                 let Ok(permit) = super::mirror_permits().try_acquire_owned() else {
@@ -458,16 +487,32 @@ pub async fn handle_proxy(
                 };
                 let mut copy = parts.clone();
                 copy.uri = mirror_uri;
-                let copy = Request::from_parts(copy, Body::from(body_bytes));
-                let client = state.http_client.clone();
+                copy.version = version;
+                // A copy streamed with the request is timed as an attempt is:
+                // the client's turns left out.
+                let (copy_body, copy_sent) = if replayed.is_some() {
+                    (copy_body, None)
+                } else {
+                    let (body, sent) = watch_end(copy_body);
+                    (body, Some(sent))
+                };
+                let copy = Request::from_parts(copy, copy_body);
+                let mirror_state = state.clone();
+                let mirror_route = route.clone();
+                let mirror_backend = (mirror_host.clone(), *mirror_port);
                 let limit = timeout.unwrap_or(MIRROR_TIMEOUT);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let uri = copy.uri().to_string();
-                    match tokio::time::timeout(limit, client.request(copy)).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => debug!("Mirror {} failed: {}", uri, e),
-                        Err(_) => debug!("Mirror {} timed out", uri),
+                    let sent = send_to(&mirror_state, &mirror_route, &mirror_backend, copy);
+                    let expiry = attempt_expiry(copy_sent, tokio::time::Instant::now(), limit);
+                    tokio::select! {
+                        result = sent => {
+                            if let Err(e) = result {
+                                debug!("Mirror {} failed: {}", uri, e);
+                            }
+                        }
+                        () = expiry => debug!("Mirror {} timed out", uri),
                     }
                 });
             }
@@ -507,6 +552,7 @@ pub async fn handle_proxy(
                 parts.uri = current;
                 // The picked backend's own header edits.
                 let mut attempt_parts = parts.clone();
+                attempt_parts.version = version;
                 super::edit_headers(
                     &mut attempt_parts.headers,
                     route.edits_for(picked),
@@ -531,7 +577,7 @@ pub async fn handle_proxy(
                     upload.clone_from(&body_sent);
                 }
                 forwarded.store(true, std::sync::atomic::Ordering::Relaxed);
-                let response_future = state.http_client.request(forwarded_req);
+                let response_future = send_to(&state, &route, &backend, forwarded_req);
 
                 // The attempt ends at the backend timeout or the request's
                 // deadline, whichever comes first. The backend timeout counts
@@ -542,11 +588,11 @@ pub async fn handle_proxy(
                 let result = if let Some(limit) = timeout {
                     let expiry = attempt_expiry(body_sent.clone(), attempt_start, limit);
                     tokio::select! {
-                        result = response_future => result.map_err(|e| (e.to_string(), false)),
+                        result = response_future => result.map_err(|e| (e, false)),
                         () = expiry => Err(("timed out".to_string(), true)),
                     }
                 } else {
-                    response_future.await.map_err(|e| (e.to_string(), false))
+                    response_future.await.map_err(|e| (e, false))
                 };
 
                 drop(waiting);
@@ -1012,9 +1058,113 @@ async fn handle_websocket(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// `body`, cut short with an error once `deadline` passes: the client then
-/// sees the response end early rather than wait past the route's timeout.
-/// `timed_out` is set when it does, before the body it wraps is dropped.
+/// Send `req` to `backend` with the route's protocol: HTTP/1.1, or h2c
+/// under the authority the request names.
+async fn send_to(
+    state: &MiddlewareAppState,
+    route: &super::MiddlewareRoute,
+    backend: &(String, u16),
+    req: Request<Body>,
+) -> Result<Response<hyper::body::Incoming>, String> {
+    if route.h2c {
+        let authority = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}:{}", uri_host(&backend.0), backend.1));
+        state
+            .h2c
+            .send(backend, &authority, req)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        state
+            .http_client
+            .request(req)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// `body` streamed on, each part also handed to `copies` bodies for the
+/// mirrors. A mirror that falls behind is cut off rather than slow the
+/// request or hold its parts: its copy ends with an error.
+fn tee(body: Body, copies: usize) -> (Body, Vec<Body>) {
+    use futures_util::StreamExt;
+    use http_body_util::{BodyStream, StreamBody};
+
+    /// How many parts a mirror may lag behind.
+    const MIRROR_LAG: usize = 64;
+    let (senders, bodies): (Vec<_>, Vec<_>) = (0..copies)
+        .map(|_| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<
+                Result<hyper::body::Frame<axum::body::Bytes>, axum::Error>,
+            >(MIRROR_LAG + 1);
+            let frames = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|frame| (frame, rx))
+            });
+            (Some(tx), Body::new(StreamBody::new(frames)))
+        })
+        .unzip();
+    let frames = futures_util::stream::unfold(
+        (BodyStream::new(body), Copies(senders)),
+        |(mut frames, mut copies)| async move {
+            let Some(frame) = frames.next().await else {
+                // Sent whole: the copies end as the body does.
+                copies.0.clear();
+                return None;
+            };
+            for sender in copies.0.iter_mut() {
+                let Some(tx) = sender else {
+                    continue;
+                };
+                let copy = match &frame {
+                    Ok(frame) => match (frame.data_ref(), frame.trailers_ref()) {
+                        (Some(data), _) => Ok(hyper::body::Frame::data(data.clone())),
+                        (_, Some(trailers)) => Ok(hyper::body::Frame::trailers(trailers.clone())),
+                        _ => continue,
+                    },
+                    Err(_) => Err(axum::Error::new(std::io::Error::other(
+                        "client body failed",
+                    ))),
+                };
+                // The last slot is kept for the error that cuts it off:
+                // a copy cut short must not look whole.
+                if tx.capacity() > 1 && tx.try_send(copy).is_ok() {
+                    continue;
+                }
+                if let Some(tx) = sender.take() {
+                    let _ = tx.try_send(Err(axum::Error::new(std::io::Error::other(
+                        "mirror fell behind",
+                    ))));
+                }
+            }
+            Some((frame, (frames, copies)))
+        },
+    );
+    (Body::new(StreamBody::new(frames)), bodies)
+}
+
+/// The mirrors' ends of a [`tee`]: a body dropped before its end, by an
+/// attempt that failed, ends their copies with an error, rather than with
+/// what looks like the whole body.
+struct Copies(Vec<Option<CopySender>>);
+
+/// Where a [`tee`] hands a mirror its parts.
+type CopySender =
+    tokio::sync::mpsc::Sender<Result<hyper::body::Frame<axum::body::Bytes>, axum::Error>>;
+
+impl Drop for Copies {
+    fn drop(&mut self) {
+        for tx in self.0.iter_mut().filter_map(Option::take) {
+            let _ = tx.try_send(Err(axum::Error::new(std::io::Error::other(
+                "the request body was not sent whole",
+            ))));
+        }
+    }
+}
+
 /// A request body on its way to the backends: kept to be sent to each
 /// attempt, or streamed to the first one alone.
 enum RequestBody {
@@ -1363,6 +1513,9 @@ async fn attempt_expiry(
     tokio::time::sleep_until(now + limit.saturating_sub(upload.spent(now))).await;
 }
 
+/// `body`, cut short with an error once `deadline` passes: the client then
+/// sees the response end early rather than wait past the route's timeout.
+/// `timed_out` is set when it does, before the body it wraps is dropped.
 fn body_before(
     body: Body,
     deadline: tokio::time::Instant,
@@ -1687,6 +1840,29 @@ mod retry_tests {
     /// The status a request of `body` to a route of `config` gets from
     /// `port`.
     async fn send_through(config: EntrypointConfig, port: u16, body: Body) -> u16 {
+        respond_through(config, port, body).await.status().as_u16()
+    }
+
+    /// The response a request of `body` to a route of `config` gets from
+    /// `port`.
+    async fn respond_through(config: EntrypointConfig, port: u16, body: Body) -> Response<Body> {
+        // A body of unknown length comes chunked, as Sōzu forwards it.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "retry.test")
+            .header("transfer-encoding", "chunked")
+            .body(body)
+            .unwrap();
+        request_through(config, port, request).await
+    }
+
+    /// The response `request` to a route of `config` gets from `port`.
+    async fn request_through(
+        config: EntrypointConfig,
+        port: u16,
+        request: Request<Body>,
+    ) -> Response<Body> {
         let backends = [Backend {
             address: "127.0.0.1".into(),
             port,
@@ -1709,22 +1885,11 @@ mod retry_tests {
                 hyper_util::rt::TokioExecutor::new(),
             )
             .build_http(),
+            h2c: Default::default(),
             request_metrics: Default::default(),
             passive_health: Arc::default(),
         };
-        // A body of unknown length comes chunked, as Sōzu forwards it.
-        let request = Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", "retry.test")
-            .header("transfer-encoding", "chunked")
-            .body(body)
-            .unwrap();
-        handle_proxy(State(state), request)
-            .await
-            .into_response()
-            .status()
-            .as_u16()
+        handle_proxy(State(state), request).await.into_response()
     }
 
     fn on(codes: &[u16], attempts: u32) -> RetryConfig {
@@ -1911,6 +2076,99 @@ mod retry_tests {
         let stalled = tokio::time::Instant::now();
         expiry.await.unwrap();
         assert!(stalled.elapsed() >= ms(90), "{:?}", stalled.elapsed());
+    }
+
+    /// A route whose backends speak h2c reaches them over HTTP/2, the
+    /// response's trailers passed on: gRPC goes through.
+    #[tokio::test]
+    async fn an_h2c_route_carries_trailers() {
+        use hyper::body::Frame;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service =
+                hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.version(), axum::http::Version::HTTP_2);
+                    // The client's authority, not the backend's address.
+                    assert_eq!(
+                        req.uri().authority().map(|a| a.as_str()),
+                        Some("retry.test")
+                    );
+                    let frames = futures_util::stream::iter([
+                        Ok::<_, std::convert::Infallible>(Frame::data(
+                            axum::body::Bytes::from_static(b"reply"),
+                        )),
+                        Ok(Frame::trailers({
+                            let mut t = axum::http::HeaderMap::new();
+                            t.insert("grpc-status", "0".parse().unwrap());
+                            t
+                        })),
+                    ]);
+                    Ok::<_, std::convert::Infallible>(Response::new(
+                        http_body_util::StreamBody::new(frames),
+                    ))
+                });
+            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+        let config = EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            h2c_backends: true,
+            ..Default::default()
+        };
+        // Over HTTP/2 from Sōzu: the authority, no Host header.
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://retry.test/svc/Call")
+            .version(axum::http::Version::HTTP_2)
+            .body(Body::from("call"))
+            .unwrap();
+        let response = request_through(config, port, request).await;
+        assert_eq!(response.status(), 200);
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(
+            collected
+                .trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .map(|v| v.as_bytes()),
+            Some(&b"0"[..])
+        );
+        assert_eq!(collected.to_bytes(), "reply");
+    }
+
+    /// A streamed body reaches its mirrors part by part, whole; a mirror
+    /// that does not keep up is cut off, the request going on without it.
+    #[tokio::test]
+    async fn a_streamed_body_is_copied_as_it_goes() {
+        let parts = || {
+            futures_util::stream::iter(
+                (0..200).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x"))),
+            )
+        };
+        let (primary, mut copies) = tee(Body::from_stream(parts()), 2);
+        let reader = copies.remove(0);
+        let lagging = copies.remove(0);
+        let read = tokio::spawn(async move { reader.collect().await.map(|c| c.to_bytes().len()) });
+        // The request is sent whole although one mirror never reads, at
+        // the pace of a network the reading mirror keeps up with.
+        let mut frames = http_body_util::BodyStream::new(primary);
+        let mut sent = 0;
+        while let Some(frame) = futures_util::StreamExt::next(&mut frames).await {
+            sent += frame.unwrap().into_data().unwrap().len();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sent, 200);
+        assert_eq!(read.await.unwrap().unwrap(), 200);
+        assert!(lagging.collect().await.is_err());
+
+        // A body dropped before its end leaves its copies failed, not short.
+        let (primary, mut copies) = tee(Body::from_stream(parts()), 1);
+        let mut frames = http_body_util::BodyStream::new(primary);
+        let _ = futures_util::StreamExt::next(&mut frames).await;
+        drop(frames);
+        assert!(copies.remove(0).collect().await.is_err());
     }
 
     /// A body the client fails to send is the client's fault.
