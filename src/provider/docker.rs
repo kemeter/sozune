@@ -75,6 +75,10 @@ pub struct DockerProvider {
     /// rebuilt from its remaining containers when one leaves, so it takes
     /// what they declare, not what the one that left did.
     declared: std::sync::Mutex<HashMap<String, HashMap<String, Entrypoint>>>,
+    /// Containers whose routes were taken off when they stopped: Docker sends
+    /// `stop`, `die` and `destroy` for one container, and only the first has
+    /// anything left to do.
+    departed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[async_trait]
@@ -145,6 +149,7 @@ impl DockerProvider {
             name,
             container_ips: std::sync::Mutex::new(HashMap::new()),
             declared: std::sync::Mutex::new(HashMap::new()),
+            departed: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -381,6 +386,11 @@ impl DockerProvider {
                         let action_str = action.as_str();
                         match action_str {
                             "start" | "health_status: healthy" => {
+                                if action_str == "start"
+                                    && let Ok(mut departed) = self.departed.lock()
+                                {
+                                    departed.remove(container_id.as_str());
+                                }
                                 if let Ok(entrypoints) = self
                                     .get_container_entrypoints(container_id, diagnostics)
                                     .await
@@ -425,6 +435,14 @@ impl DockerProvider {
                                         );
                                     }
                                     storage_changed = true;
+                                } else if action_str == "start"
+                                    && let Ok(mut ips) = self.container_ips.lock()
+                                {
+                                    // Seen, serving nothing: no labels, or
+                                    // gone before it could be read (a
+                                    // container crashing at start). Its stop
+                                    // then has nothing to take off.
+                                    ips.entry(container_id.to_string()).or_default();
                                 }
                             }
                             "health_status: unhealthy" => {
@@ -437,9 +455,11 @@ impl DockerProvider {
                                     .lock()
                                     .ok()
                                     .and_then(|ips| ips.get(container_id.as_str()).cloned());
-                                let Some(container_ip) = container_ip else {
+                                let Some(container_ip) = container_ip.filter(|backends| {
+                                    self.serves_anything(container_id, backends)
+                                }) else {
                                     debug!(
-                                        "Container {} went unhealthy but had no tracked IP; nothing to remove",
+                                        "Container {} went unhealthy but served nothing; nothing to remove",
                                         container_id
                                     );
                                     continue;
@@ -475,12 +495,49 @@ impl DockerProvider {
                                     .ok()
                                     .and_then(|mut ips| ips.remove(container_id.as_str()))
                                 else {
-                                    warn!(
-                                        "container {} stopped but we never recorded what it served; its routes stay until sozune restarts",
-                                        container_id
-                                    );
+                                    // Said once per stop, not for each of its
+                                    // `stop`, `die` and `destroy` events.
+                                    let already_off = self.departed.lock().is_ok_and(|mut d| {
+                                        if action_str == "destroy" {
+                                            d.remove(container_id.as_str())
+                                        } else {
+                                            !d.insert(container_id.to_string())
+                                        }
+                                    });
+                                    // Only a container Sōzune would have served
+                                    // can have left routes behind: the others
+                                    // (one-off jobs, unlabelled services) stop
+                                    // with nothing to say.
+                                    if !already_off
+                                        && exposed(
+                                            actor.attributes.as_ref(),
+                                            self.config.expose_by_default,
+                                        )
+                                    {
+                                        warn!(
+                                            "container {} stopped but we never recorded what it served; its routes stay until sozune restarts",
+                                            container_id
+                                        );
+                                    } else {
+                                        debug!(
+                                            "container {} {}: nothing of it to take off",
+                                            container_id, action_str
+                                        );
+                                    }
                                     continue;
                                 };
+                                if action_str != "destroy"
+                                    && let Ok(mut departed) = self.departed.lock()
+                                {
+                                    departed.insert(container_id.to_string());
+                                }
+                                if !self.serves_anything(container_id, &container_ip) {
+                                    debug!(
+                                        "container {} {}: it served nothing",
+                                        container_id, action_str
+                                    );
+                                    continue;
+                                }
                                 let mut storage_write = match storage.write() {
                                     Ok(guard) => guard,
                                     Err(e) => {
@@ -816,6 +873,16 @@ impl DockerProvider {
         }
     }
 
+    /// Whether `container_id` has anything to take off: backends, or routes
+    /// without any (a redirect-only route still has to go).
+    fn serves_anything(&self, container_id: &str, backends: &[Backend]) -> bool {
+        !backends.is_empty()
+            || self
+                .declared
+                .lock()
+                .is_ok_and(|d| d.contains_key(container_id))
+    }
+
     fn forget(&self, container_id: &str) {
         if let Ok(mut declared) = self.declared.lock() {
             declared.remove(container_id);
@@ -1140,6 +1207,44 @@ fn merge_or_insert_entrypoint_btree(
     entrypoint.id = alt_key.clone();
     entrypoint.source = Some(source_label.to_string());
     dest.insert(alt_key, entrypoint);
+}
+
+/// Whether a container with these labels is one Sōzune serves: its
+/// `sozune.enable`, or the provider's `expose_by_default` without it.
+fn exposed(labels: Option<&HashMap<String, String>>, expose_by_default: bool) -> bool {
+    labels
+        .and_then(|l| l.get("sozune.enable"))
+        .map_or(expose_by_default, |v| v == "true")
+}
+
+#[cfg(test)]
+mod exposed_tests {
+    use super::exposed;
+    use std::collections::HashMap;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_unlabelled_container_is_not_exposed_by_default() {
+        assert!(!exposed(Some(&labels(&[("com.example", "x")])), false));
+        assert!(!exposed(None, false));
+    }
+
+    #[test]
+    fn sozune_enable_decides_whatever_the_default() {
+        assert!(exposed(Some(&labels(&[("sozune.enable", "true")])), false));
+        assert!(!exposed(Some(&labels(&[("sozune.enable", "false")])), true));
+    }
+
+    #[test]
+    fn expose_by_default_covers_unlabelled_containers() {
+        assert!(exposed(None, true));
+    }
 }
 
 #[cfg(test)]
