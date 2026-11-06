@@ -29,8 +29,7 @@ Images since 0.16 set `CONFIG_PATH` to this path. Earlier ones need the variable
 > Since 0.16
 
 ```bash
-git clone https://github.com/kemeter/sozune
-helm install sozune ./sozune/charts/sozune --namespace sozune --create-namespace
+helm install sozune oci://ghcr.io/kemeter/charts/sozune --namespace sozune --create-namespace
 ```
 
 See [Deploying Sōzune in-cluster](/documentation/providers/kubernetes#deploying-sōzune-in-cluster) for its values.
