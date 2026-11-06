@@ -2,6 +2,6 @@
 # new stable release cannot change what lints or compiles until it is bumped
 # here. Keep the `rust:` tag in the Dockerfile on the same version.
 [toolchain]
-channel = "1.98.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

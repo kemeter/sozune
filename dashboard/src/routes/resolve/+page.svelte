@@ -76,9 +76,8 @@
     if (request.headers.trim()) params.set('run', '0');
     const query = params.toString();
     void goto(`${window.location.pathname}${query ? `?${query}` : ''}`, {
-      replaceState: true,
-      keepFocus: true,
-      noScroll: true
+      replace: true,
+      reset: false
     });
   }
 

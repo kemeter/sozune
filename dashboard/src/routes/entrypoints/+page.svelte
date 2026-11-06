@@ -63,7 +63,7 @@
 
     const next = url.pathname + (params.toString() ? `?${params}` : '');
     if (next !== url.pathname + url.search) {
-      void goto(next, { replaceState: true, keepFocus: true, noScroll: true });
+      void goto(next, { replace: true, reset: false });
     }
   }
 
