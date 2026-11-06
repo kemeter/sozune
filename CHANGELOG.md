@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Observability
+
+- Failed OTLP exports are now logged — when the collector is unreachable or rejects a batch, the export error is logged at `error`. It used to be dropped by the default log filter, so a wrong `tracing.endpoint` went unnoticed.
+
 ### Plugins
 
 - Instance reuse — a plugin declaration takes `reuse_instances`, the number of idle guest instances kept and reused across requests, so a guest can cache what it builds from its config instead of rebuilding it on every request. `0`, the default, keeps a fresh instance per request. See [Instance reuse](documentation/middleware/wasm-plugins.md#instance-reuse-reuse_instances).

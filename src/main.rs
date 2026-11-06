@@ -83,6 +83,9 @@ const DEFAULT_LOG_DIRECTIVES: &[&str] = &[
     "h2=warn",
     "kube=warn",
     "tower=warn",
+    "opentelemetry=warn",
+    "opentelemetry_sdk=warn",
+    "opentelemetry_otlp=warn",
 ];
 
 fn log_env_filter() -> tracing_subscriber::EnvFilter {
@@ -660,6 +663,12 @@ mod log_filter_tests {
         let d = directives(None);
         assert!(d.contains(&"access=info".to_string()), "{d:?}");
         assert!(d.contains(&"sozune=info".to_string()), "{d:?}");
+    }
+
+    #[test]
+    fn failed_otlp_exports_are_logged_by_default() {
+        let d = directives(None);
+        assert!(d.contains(&"opentelemetry_sdk=warn".to_string()), "{d:?}");
     }
 
     #[test]
