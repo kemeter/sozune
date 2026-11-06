@@ -40,7 +40,7 @@ futures-util = "0.3"
 notify = "8.2.0"
 instant-acme = "0.8"
 cheti = "0.1.1"
-http-wasm-host = { git = "https://github.com/kemeter/http-wasm", rev = "18e7f22d6441639210680db161776da1446a1db5" }
+http-wasm-host = { git = "https://github.com/kemeter/http-wasm", rev = "477ed1374c1dd422ef47a8ecf116e46d74d06fc9" }
 rcgen = { version = "0.14", features = ["pem"] }
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
