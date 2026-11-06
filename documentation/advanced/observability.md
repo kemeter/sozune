@@ -171,18 +171,18 @@ If `time() - sozune_proxy_last_poll_seconds` grows past ~30 s, the worker is no 
 
 > Since 0.17
 
-Sōzune can also **push** its metrics over **OTLP/gRPC** to an OpenTelemetry collector (the OTel Collector, Grafana Alloy, Datadog Agent, …), for setups that collect over OTLP rather than scraping. It is independent of the `/metrics` listener: enable either, or both. Disabled by default — no exporter, nothing recorded.
+Sōzune can also **push** its metrics over **OTLP** to an OpenTelemetry collector (the OTel Collector, Grafana Alloy, Datadog Agent, …), for setups that collect over OTLP rather than scraping. It is independent of the `/metrics` listener: enable either, or both. Disabled by default — no exporter, nothing recorded.
 
 ```yaml
 metrics:
   otlp:
     enabled: true
-    endpoint: "http://127.0.0.1:4317"   # OTLP/gRPC collector
+    endpoint: "http://127.0.0.1:4317"   # OTLP collector
     service_name: "sozune"               # service.name on every metric
     push_interval: 10                    # seconds between two pushes
 ```
 
-Every field has an environment override: `SOZUNE_METRICS_OTLP_ENABLED`, `SOZUNE_METRICS_OTLP_ENDPOINT`, `SOZUNE_METRICS_OTLP_SERVICE_NAME`, `SOZUNE_METRICS_OTLP_PUSH_INTERVAL` (env wins over YAML).
+Every field has an environment override: `SOZUNE_METRICS_OTLP_ENABLED`, `SOZUNE_METRICS_OTLP_ENDPOINT`, `SOZUNE_METRICS_OTLP_SERVICE_NAME`, `SOZUNE_METRICS_OTLP_PUSH_INTERVAL` (env wins over YAML). The transport, headers and TLS are set as for tracing, see [Collector connection](#collector-connection).
 
 The series are the ones `/metrics` serves, under the same names, so a collector that forwards them to Prometheus feeds the same dashboards:
 
@@ -212,14 +212,14 @@ The dashboard JSON, Prometheus scrape config, Tempo config, and Grafana provisio
 
 ## Distributed tracing (OpenTelemetry)
 
-Beyond metrics, Sōzune can emit a **trace span per proxied request** and export it over **OTLP/gRPC** to a collector (Jaeger, Grafana Tempo, Zipkin via OTel, …). Disabled by default — no spans, no exporter, zero overhead.
+Beyond metrics, Sōzune can emit a **trace span per proxied request** and export it over **OTLP** to a collector (Jaeger, Grafana Tempo, Zipkin via OTel, …). Disabled by default — no spans, no exporter, zero overhead.
 
 ### Enable it
 
 ```yaml
 tracing:
   enabled: true
-  endpoint: "http://127.0.0.1:4317"   # OTLP/gRPC collector
+  endpoint: "http://127.0.0.1:4317"   # OTLP collector
   service_name: "sozune"               # service.name on every span
   sampler: "parent_based_always_on"    # see below
 ```
@@ -250,6 +250,40 @@ Like the latency histogram and access log, only requests that traverse the Sōzu
 ### Try it with the demo stack
 
 `compose.metrics.yaml` includes Tempo. With it up, set `tracing.enabled: true` and `tracing.endpoint: http://127.0.0.1:4317`, send a request through Sōzune, then open Grafana → Explore → Tempo and search recent traces.
+
+## Collector connection
+
+> Since 0.17
+
+`tracing` and `metrics.otlp` reach their collector the same way, and take the same settings, each for its own export:
+
+```yaml
+tracing:
+  enabled: true
+  endpoint: "https://otlp.example.com"
+  protocol: http                        # grpc (default) or http
+  headers:                              # sent with every export
+    x-api-key: "change-me"
+  resource_attributes:                  # added next to service.name
+    deployment.environment: prod
+  tls:
+    ca: /etc/sozune/otlp-ca.pem         # optional, on top of the system roots
+    cert: /etc/sozune/otlp-client.pem   # optional client certificate (mTLS)
+    key: /etc/sozune/otlp-client.key
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `protocol` | `grpc` | `grpc` sends to the collector's gRPC port (4317). `http` sends protobuf over HTTP (4318). |
+| `endpoint` | `http://127.0.0.1:4317` | With `http`, the default is `http://127.0.0.1:4318`, and an endpoint without a path gets the signal's (`/v1/traces`, `/v1/metrics`). An endpoint with a path is used as is. |
+| `headers` | `{}` | Headers of every export, typically the API key of a hosted collector. To keep a key out of the config file, set it with `SOZUNE_TRACING_HEADERS` / `SOZUNE_METRICS_OTLP_HEADERS` instead. |
+| `resource_attributes` | `{}` | Resource attributes next to `service.name`, e.g. `deployment.environment`, `service.version`. `service_name` wins over a `service.name` set here. |
+| `tls.ca` | — | CA trusted for an `https://` endpoint, in addition to the system and public roots. |
+| `tls.cert`, `tls.key` | — | Client certificate and its key, set together, for a collector that requires mTLS. |
+
+An `https://` endpoint is always reached over TLS; the `tls` settings on an `http://` endpoint are refused at startup. Environment overrides take the field's name after the export's prefix, `SOZUNE_TRACING_` or `SOZUNE_METRICS_OTLP_`: `…PROTOCOL`, `…HEADERS` and `…RESOURCE_ATTRIBUTES` (both `key=value,key2=value2`, values URL-decoded as in `OTEL_EXPORTER_OTLP_HEADERS`, so `%2C` is a comma), `…TLS_CA`, `…TLS_CERT`, `…TLS_KEY`.
+
+An exporter that can't be built (unreadable certificate, invalid header) is logged at startup and that export is turned off; Sōzune keeps serving traffic.
 
 ## What it does not do
 
