@@ -352,7 +352,7 @@ async fn sozune_is_running(cfg: &AppConfig) -> bool {
     let Some(api) = local_api_url(&cfg.api.listen_address) else {
         return false;
     };
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = crate::util::http_client::builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()
     else {

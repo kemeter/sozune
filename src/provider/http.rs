@@ -1,5 +1,6 @@
 use crate::config::HttpProviderConfig;
 use crate::model::Entrypoint;
+use anyhow::Context as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -16,7 +17,10 @@ impl HttpProvider {
     }
 
     async fn fetch_entrypoints(&self) -> anyhow::Result<BTreeMap<String, Entrypoint>> {
-        let mut request = reqwest::Client::new().get(&self.config.url);
+        let mut request = crate::util::http_client::builder()
+            .build()
+            .context("Failed to build the HTTP provider client")?
+            .get(&self.config.url);
         if !self.config.auth_header.is_empty() && !self.config.auth_value.is_empty() {
             request = request.header(&self.config.auth_header, &self.config.auth_value);
         }

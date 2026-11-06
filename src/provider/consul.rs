@@ -95,7 +95,7 @@ impl LabelSource for ConsulProvider {
 
 impl ConsulProvider {
     pub fn new(config: ConsulConfig) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http_client::builder()
             .build()
             .context("Failed to build Consul HTTP client")?;
         Ok(Self { config, client })

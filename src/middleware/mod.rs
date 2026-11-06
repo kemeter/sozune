@@ -42,7 +42,7 @@ use sozu_lib::router::DomainRule;
 /// Build the shared HTTP client used by forward-auth middlewares. Same config
 /// as before: short timeout, no redirect following.
 pub fn build_forward_auth_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::util::http_client::builder()
         .timeout(std::time::Duration::from_secs(forward_auth::TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
         .build()

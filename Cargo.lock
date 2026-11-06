@@ -4152,6 +4152,7 @@ dependencies = [
  "base64 0.23.1",
  "bollard",
  "brotli",
+ "bytes",
  "cheti",
  "clap",
  "flate2",
@@ -4160,6 +4161,7 @@ dependencies = [
  "http-body-util",
  "http-wasm-host",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "instant-acme",
  "ipnet",
@@ -4177,6 +4179,7 @@ dependencies = [
  "reqwest",
  "rust-embed",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4197,6 +4200,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-root-certs",
  "zstd 0.14.3",
 ]
 

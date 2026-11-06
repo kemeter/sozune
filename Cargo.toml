@@ -55,6 +55,14 @@ flate2 = "1"
 brotli = "9"
 zstd = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Already in the tree through reqwest; declared directly so an HTTP client can
+# fall back to the bundled Mozilla roots when the system has no CA certificate.
+rustls-native-certs = "0.8"
+webpki-root-certs = "1"
+# Already in the tree through instant-acme; declared directly to give the ACME
+# client the bundled roots when the system has no CA certificate.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs", "tls12"] }
+bytes = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }

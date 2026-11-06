@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 
 ### Reliability
 
+- Hosts without CA certificates — on a system with no CA certificate installed (a minimal image without `ca-certificates`), Sōzune panicked at startup, and ACME, the HTTP, Ring, Nomad and Consul providers, forward auth and plugins could not build their HTTP client. It now starts, logs a warning once, and trusts the bundled Mozilla roots for outgoing HTTPS instead.
 - A Docker or Podman container that crashed at start, or carried no `sozune` labels, logged `stopped but we never recorded what it served` each time it stopped, twice per stop, though it served nothing. A container crashing in a loop filled the log with it. Such a stop is now logged at `debug`, and the warning, for a container Sōzune serves that it never saw start, comes once per stop.
 
 ## [0.16.0] - 2026-11-06
