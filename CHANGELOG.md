@@ -6,7 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Observability
 
-- Failed OTLP exports are now logged — when the collector is unreachable or rejects a batch, the export error is logged at `error`. It used to be dropped by the default log filter, so a wrong `tracing.endpoint` went unnoticed.
+- OTLP metrics export — push the metrics served on `/metrics` to an OpenTelemetry collector over OTLP/gRPC, alongside or instead of a Prometheus scrape. Enable with `metrics.otlp.enabled` and `metrics.otlp.endpoint`; `metrics.otlp.service_name` and `metrics.otlp.push_interval` (seconds, default `10`) tune it. Disabled by default. See [OTLP metrics export](documentation/advanced/observability.md#otlp-metrics-export).
+- Failed OTLP exports are now logged — when the collector is unreachable or rejects a batch, the export error is logged at `error`, for traces as for metrics. It used to be dropped by the default log filter, so a wrong `tracing.endpoint` went unnoticed.
 
 ### Plugins
 

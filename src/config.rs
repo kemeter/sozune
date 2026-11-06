@@ -1100,6 +1100,10 @@ pub struct MetricsConfig {
         deserialize_with = "deserialize_metrics_listen_address_with_env"
     )]
     pub listen_address: String,
+    /// Push metrics to an OpenTelemetry collector over OTLP, independently of
+    /// the `/metrics` listener above. Off by default.
+    #[serde(default)]
+    pub otlp: OtlpMetricsConfig,
 }
 
 impl Default for MetricsConfig {
@@ -1107,8 +1111,42 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             listen_address: default_metrics_listen_address(),
+            otlp: OtlpMetricsConfig::default(),
         }
     }
+}
+
+/// OTLP metrics export. When `enabled`, the metrics served on `/metrics` are
+/// also pushed every `push_interval` seconds over OTLP/gRPC to a collector.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct OtlpMetricsConfig {
+    /// Master switch. Off by default — no meter provider, no exporter.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/gRPC collector endpoint, e.g. `http://collector:4317`.
+    #[serde(default = "default_tracing_endpoint")]
+    pub endpoint: String,
+    /// `service.name` reported on every metric.
+    #[serde(default = "default_tracing_service_name")]
+    pub service_name: String,
+    /// Seconds between two pushes.
+    #[serde(default = "default_otlp_push_interval")]
+    pub push_interval: u64,
+}
+
+impl Default for OtlpMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_tracing_endpoint(),
+            service_name: default_tracing_service_name(),
+            push_interval: default_otlp_push_interval(),
+        }
+    }
+}
+
+fn default_otlp_push_interval() -> u64 {
+    10
 }
 
 fn default_metrics_listen_address() -> String {
@@ -2199,6 +2237,20 @@ impl MetricsConfig {
         }
         if let Some(v) = env_string("SOZUNE_METRICS_LISTEN_ADDRESS") {
             self.listen_address = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_METRICS_OTLP_ENABLED") {
+            self.otlp.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_METRICS_OTLP_ENDPOINT") {
+            self.otlp.endpoint = v;
+        }
+        if let Some(v) = env_string("SOZUNE_METRICS_OTLP_SERVICE_NAME") {
+            self.otlp.service_name = v;
+        }
+        if let Some(v) =
+            env_string("SOZUNE_METRICS_OTLP_PUSH_INTERVAL").and_then(|v| v.parse().ok())
+        {
+            self.otlp.push_interval = v;
         }
     }
 }

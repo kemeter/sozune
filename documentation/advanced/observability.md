@@ -2,7 +2,7 @@
 
 > Since 0.14
 
-Sōzune exposes a Prometheus-compatible `/metrics` endpoint so any Prometheus scraper (or Grafana, VictoriaMetrics, Mimir, etc.) can ingest its state. A reference Grafana stack ships with the repo.
+Sōzune exposes a Prometheus-compatible `/metrics` endpoint so any Prometheus scraper (or Grafana, VictoriaMetrics, Mimir, etc.) can ingest its state, and can push the same metrics to an OpenTelemetry collector over OTLP. A reference Grafana stack ships with the repo.
 
 ## The `/metrics` endpoint
 
@@ -166,6 +166,31 @@ rate(sozune_proxy_metric{key="http_requests"}[1m])
 Sōzune polls workers every 5 s; Prometheus typically scrapes every 5–15 s. Worst case the value you see in Grafana is ~10 s old. That's acceptable for the gauges and counters we expose; if you need lower latency, raise the poll frequency in code or run a sidecar that scrapes the Sōzu command-channel directly.
 
 If `time() - sozune_proxy_last_poll_seconds` grows past ~30 s, the worker is no longer responding. Check Sōzune logs for `metrics: failed to write QueryMetrics`.
+
+## OTLP metrics export
+
+> Since 0.17
+
+Sōzune can also **push** its metrics over **OTLP/gRPC** to an OpenTelemetry collector (the OTel Collector, Grafana Alloy, Datadog Agent, …), for setups that collect over OTLP rather than scraping. It is independent of the `/metrics` listener: enable either, or both. Disabled by default — no exporter, nothing recorded.
+
+```yaml
+metrics:
+  otlp:
+    enabled: true
+    endpoint: "http://127.0.0.1:4317"   # OTLP/gRPC collector
+    service_name: "sozune"               # service.name on every metric
+    push_interval: 10                    # seconds between two pushes
+```
+
+Every field has an environment override: `SOZUNE_METRICS_OTLP_ENABLED`, `SOZUNE_METRICS_OTLP_ENDPOINT`, `SOZUNE_METRICS_OTLP_SERVICE_NAME`, `SOZUNE_METRICS_OTLP_PUSH_INTERVAL` (env wins over YAML).
+
+The series are the ones `/metrics` serves, under the same names, so a collector that forwards them to Prometheus feeds the same dashboards:
+
+- the gauges (`sozune_entrypoints`, `sozune_backends`, `sozune_diagnostics`, `sozune_proxy_metric`, …), read from the live state at each push;
+- `sozune_middleware_request_duration_seconds`, a histogram with the same bucket bounds as the Prometheus one;
+- `sozune_middleware_requests_total`, a counter by status `class`.
+
+The histogram is only sent once a request has gone through the middleware layer; the counter is sent from the first push, every class at zero. If the collector is unreachable, Sōzune logs the failed push and keeps serving traffic; the next push carries the up-to-date values.
 
 ## Reference Grafana stack
 

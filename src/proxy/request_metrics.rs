@@ -13,8 +13,10 @@
 //! with `Ordering::Relaxed` — exact cross-bucket consistency is not required
 //! for monitoring, and avoiding a lock keeps the proxy path cheap.
 
-use std::sync::Arc;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Histogram};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Cumulative upper bounds, in seconds, for the latency histogram. Chosen to
@@ -44,6 +46,18 @@ pub struct RequestMetrics {
     /// Per-status-class response counters: index 0 = 1xx, 1 = 2xx, 2 = 3xx,
     /// 3 = 4xx, 4 = 5xx, 5 = other (status < 100 or > 599, shouldn't happen).
     status_classes: [AtomicU64; 6],
+    /// OTLP instruments, set once when `metrics.otlp` is enabled. Unset (the
+    /// default) costs one atomic load per request.
+    otel: OnceLock<OtelInstruments>,
+}
+
+/// OpenTelemetry mirrors of the latency histogram and the status-class
+/// counter, recorded on the request path so the OTLP export carries real
+/// histogram data instead of a re-derived one.
+#[derive(Debug)]
+pub struct OtelInstruments {
+    pub duration: Histogram<f64>,
+    pub requests: Counter<u64>,
 }
 
 /// Labels for the six status-class counters, aligned with
@@ -72,6 +86,7 @@ impl Default for RequestMetrics {
             count: AtomicU64::new(0),
             sum_millis: AtomicU64::new(0),
             status_classes: Default::default(),
+            otel: OnceLock::new(),
         }
     }
 }
@@ -92,7 +107,19 @@ impl RequestMetrics {
         // Saturating millis: a single request over ~584M years would overflow.
         self.sum_millis
             .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
-        self.status_classes[status_class_index(status)].fetch_add(1, Ordering::Relaxed);
+        let class = status_class_index(status);
+        self.status_classes[class].fetch_add(1, Ordering::Relaxed);
+        if let Some(otel) = self.otel.get() {
+            otel.duration.record(secs, &[]);
+            otel.requests
+                .add(1, &[KeyValue::new("class", STATUS_CLASS_LABELS[class])]);
+        }
+    }
+
+    /// Start mirroring every recorded request into the given OTLP
+    /// instruments. Only the first call has an effect.
+    pub fn attach_otel(&self, instruments: OtelInstruments) {
+        let _ = self.otel.set(instruments);
     }
 
     /// Read a consistent-enough snapshot for rendering. Values are read with

@@ -21,6 +21,7 @@ mod diagnostics;
 mod error_pages;
 mod labels;
 mod manual_certs;
+mod metrics_otel;
 mod middleware;
 mod model;
 mod provider;
@@ -410,6 +411,26 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
         live_routes,
         file_certificates,
     };
+    // OTLP metrics push. The guard lives until `serve` returns so the last
+    // batch is flushed on shutdown; a bad endpoint only disables the export.
+    let _otlp_metrics_guard = if config.metrics.otlp.enabled {
+        match metrics_otel::start(&config.metrics.otlp, &api_state) {
+            Ok(guard) => {
+                info!(
+                    "OTLP metrics enabled, exporting to {}",
+                    config.metrics.otlp.endpoint
+                );
+                Some(guard)
+            }
+            Err(e) => {
+                error!("metrics: failed to initialise OTLP exporter, continuing without it: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Dedicated `/metrics` listener — independent of the API, so metrics can be
     // scraped without enabling/exposing the admin API. Reuses the same state and
     // handler; clone the state before `api_task` moves the original.
