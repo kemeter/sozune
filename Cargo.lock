@@ -4149,7 +4149,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bollard",
  "brotli",
  "cheti",
