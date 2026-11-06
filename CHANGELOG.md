@@ -14,6 +14,10 @@ All notable changes to this project will be documented in this file.
 
 - Helm chart published — each release now pushes the chart to `oci://ghcr.io/kemeter/charts/sozune`, numbered as the release (`--version 0.16.0`), so `helm install sozune oci://ghcr.io/kemeter/charts/sozune` works without cloning the repository. See [Installation](documentation/getting-started/installation.md#kubernetes-helm).
 
+### Reliability
+
+- A Docker or Podman container that crashed at start, or carried no `sozune` labels, logged `stopped but we never recorded what it served` each time it stopped, twice per stop, though it served nothing. A container crashing in a loop filled the log with it. Such a stop is now logged at `debug`, and the warning, for a container Sōzune serves that it never saw start, comes once per stop.
+
 ## [0.16.0] - 2026-11-06
 
 ### Upgrade notes
