@@ -663,6 +663,9 @@ impl AcmeManager {
         provider: Box<dyn cheti::DnsProvider>,
     ) -> anyhow::Result<(String, String)> {
         Dns01Solver::new(provider)
+            .on_cleanup_error(|name, e| {
+                warn!("ACME: failed to remove the DNS-01 record for {name}: {e}");
+            })
             .solve_and_finalize(order)
             .await
             .map_err(|e| anyhow::anyhow!("DNS-01 challenge failed: {e}"))
@@ -675,6 +678,9 @@ impl AcmeManager {
     /// one that listener answers with.
     async fn solve_tls_alpn01(&self, order: Order) -> anyhow::Result<(String, String)> {
         TlsAlpn01Solver::new(self.tls_alpn.clone())
+            .on_cleanup_error(|name, e| {
+                warn!("ACME: failed to remove the TLS-ALPN-01 certificate for {name}: {e}");
+            })
             .solve_and_finalize(order)
             .await
             .map_err(|e| anyhow::anyhow!("TLS-ALPN-01 challenge failed: {e}"))
