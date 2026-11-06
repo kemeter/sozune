@@ -52,7 +52,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 zstd = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 url = "2"
