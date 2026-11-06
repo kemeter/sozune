@@ -91,9 +91,37 @@ jobs:
             dist/sozune-${{ env.RELEASE_TAG }}-linux-amd64.tar.gz
             dist/sozune-${{ env.RELEASE_TAG }}-linux-amd64.tar.gz.sha256
 
+  chart:
+    runs-on: ubuntu-latest
+    # The chart runs the image of its release: published once it exists.
+    needs: [docker]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Package and push the chart
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+          CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          mkdir -p dist
+          # One chart per release, numbered as the release and running its image.
+          helm package charts/sozune --destination dist \
+            --version "$RELEASE_TAG" --app-version "$RELEASE_TAG"
+          helm push dist/sozune-*.tgz "$CHARTS"
+
   release:
     runs-on: ubuntu-latest
-    needs: [docker, binary]
+    needs: [docker, binary, chart]
     permissions:
       contents: write
     steps:

@@ -175,10 +175,10 @@ With `publish_service`, the Ingresses get the addresses that Service's load bala
 
 > Since 0.16
 
-The chart in [`charts/sozune`](https://github.com/kemeter/sozune/tree/main/charts/sozune) deploys Sōzune with its `ServiceAccount`, RBAC, config and a `LoadBalancer` Service:
+The chart, published with each release at `oci://ghcr.io/kemeter/charts/sozune` under the release's number (source in [`charts/sozune`](https://github.com/kemeter/sozune/tree/main/charts/sozune)), deploys Sōzune with its `ServiceAccount`, RBAC, config and a `LoadBalancer` Service:
 
 ```bash
-helm install sozune ./charts/sozune --namespace sozune --create-namespace
+helm install sozune oci://ghcr.io/kemeter/charts/sozune --namespace sozune --create-namespace
 ```
 
 | Value | Default | What it does |
@@ -191,7 +191,7 @@ helm install sozune ./charts/sozune --namespace sozune --create-namespace
 | `service.extraPorts` | `[]` | More Service ports for TCP and UDP listeners, and HTTP and HTTPS listeners on their own port (`proxy.tcp`, `proxy.udp`, `proxy.gateway_ports`): `{name, port, targetPort, protocol}`. |
 | `service.type` | `LoadBalancer` | With `LoadBalancer` and `service.publishAddress`, the Ingresses Sōzune serves get the Service's address in their status ([Ingress status](#ingress-status)). |
 | `persistence.enabled` | `false` | Keeps the ACME certificates (`/etc/sozune/certs`) on a `PersistentVolumeClaim` instead of an `emptyDir`. Turn it on with ACME. |
-| `image.tag` | `edge` | The Sōzune image, from `ghcr.io/kemeter/sozune`. The chart relies on features of the next release: until it is out, it runs `edge`, the current state of `main`, pulled on every start and scheduled on `amd64` nodes (`nodeSelector`), the only architecture it is built for. |
+| `image.tag` | `""` | The Sōzune image, from `ghcr.io/kemeter/sozune`. Empty runs the chart's `appVersion`, the release it comes with (`linux/amd64` and `linux/arm64`). |
 | `replicaCount` | `1` | Pods. Must stay `1` with ACME: each pod keeps its own challenge tokens. With ACME or `persistence.enabled`, an upgrade stops the old pod before starting the new one. |
 
 The pod runs as the image's `nonroot` user with a read-only root filesystem, which is why Sōzune listens on `8080` / `8443` and the Service maps `80` / `443` to them.

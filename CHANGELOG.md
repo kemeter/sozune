@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Distribution
+
+- Helm chart published — each release now pushes the chart to `oci://ghcr.io/kemeter/charts/sozune`, numbered as the release (`--version 0.16.0`), so `helm install sozune oci://ghcr.io/kemeter/charts/sozune` works without cloning the repository. See [Installation](documentation/getting-started/installation.md#kubernetes-helm).
+
 ## [0.16.0] - 2026-11-06
 
 ### Upgrade notes
