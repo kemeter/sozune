@@ -585,7 +585,7 @@ fn random_u64() -> u64 {
     };
     // Advanced atomically, so concurrent requests never share a draw.
     let previous = STATE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(next(x)))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(next(x)))
         .unwrap_or_default();
     next(previous)
 }

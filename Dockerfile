@@ -12,7 +12,7 @@ RUN bun run build
 # Same version as rust-toolchain.toml: bump both together. 1.96 and later
 # 1.95.0 SIGSEGVd in thin-LTO codegen on this dependency set, so check that a
 # release build still completes before bumping.
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:1.99.1-bookworm AS builder
 # protobuf-compiler: sozu's build.rs runs protoc to generate command.rs.
 # rustfmt: that same build.rs calls prost_build with .format(true), which shells
 # out to rustfmt — absent from the base image, so the generated module is never
