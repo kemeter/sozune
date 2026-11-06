@@ -17,7 +17,6 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "@types/prismjs": "^1.26.6",
-    "babel-plugin-react-compiler": "1.0.0"
+    "@types/prismjs": "^1.26.6"
   }
 }
