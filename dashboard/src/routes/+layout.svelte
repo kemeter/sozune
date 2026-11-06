@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../app.css';
-  import { page } from '$app/stores';
-  import { base } from '$app/paths';
+  import { page } from '$app/state';
+  import { resolve } from '$app/paths';
   import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { clearAuth, identity, isAuthenticated } from '$lib/auth';
@@ -18,7 +18,7 @@
     saveTheme(theme);
   }
 
-  // Paths from the dashboard root, prefixed with `base` when rendered: a
+  // Paths from the dashboard root, resolved against the base when rendered: a
   // `./` link would resolve against the current page, so from
   // /entrypoints/<id> it pointed under /entrypoints/.
   const nav = [
@@ -30,7 +30,7 @@
     { path: '/health', label: 'Health', icon: 'pulse' },
     { path: '/config', label: 'Config', icon: 'sliders' },
     { path: '/settings', label: 'Settings', icon: 'gear' }
-  ];
+  ] as const;
 
   /** Number of error+warn diagnostics; shown as a badge on the Diagnostics
    *  nav entry. Polled here so any page benefits from it without each page
@@ -42,11 +42,11 @@
   let poll: ReturnType<typeof setInterval> | null = null;
 
   function isActive(path: string): boolean {
-    const current = $page.url.pathname.replace(/\/$/, '');
+    const current = page.url.pathname.replace(/\/$/, '');
     return current === path || current.startsWith(path + '/');
   }
 
-  let onLoginPage = $derived($page.url.pathname.endsWith('/login'));
+  let onLoginPage = $derived(page.url.pathname.endsWith('/login'));
 
   // Badge and version are polled while the shell is shown, from the first
   // page after sign-in on: the layout is mounted once, often on /login. The
@@ -98,7 +98,7 @@
     applyTheme(theme);
 
     if (!onLoginPage && !isAuthenticated()) {
-      goto(`${base}/login`);
+      goto(resolve('/login'));
       return;
     }
   });
@@ -109,7 +109,7 @@
 
   function logout() {
     clearAuth();
-    goto(`${base}/login`);
+    goto(resolve('/login'));
   }
 </script>
 
@@ -118,7 +118,7 @@
 {:else}
   <div class="shell">
     <aside class="sidebar">
-      <a class="brand" href={`${base}/`} aria-label="Sōzune dashboard home">
+      <a class="brand" href={resolve('/')} aria-label="Sōzune dashboard home">
         <svg
           class="logo"
           viewBox="0 0 256 256"
@@ -141,7 +141,7 @@
 
       <nav>
         {#each nav as item}
-          <a href={`${base}${item.path}`} class="nav-item" class:active={isActive(item.path)}>
+          <a href={resolve(item.path)} class="nav-item" class:active={isActive(item.path)}>
             <span class="nav-icon" data-icon={item.icon}>
               {#if item.icon === 'grid'}
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>

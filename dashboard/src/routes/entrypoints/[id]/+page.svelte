@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import { getEntrypoint, backendKey, type Backend, type Entrypoint } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
@@ -68,7 +68,7 @@
   let lastRefresh = $state<Date | null>(null);
   let poll: ReturnType<typeof setInterval> | null = null;
 
-  const id = $derived($page.params.id ?? '');
+  const id = $derived(page.params.id ?? '');
 
   function isBackendDown(ep: Entrypoint, backend: Backend): boolean {
     const key = backendKey(backend);
