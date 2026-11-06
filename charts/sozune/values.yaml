@@ -1,10 +1,8 @@
 image:
   repository: ghcr.io/kemeter/sozune
-  # `edge` is the current state of main, which this chart needs until 0.16.0
-  # is released (`linux/amd64` only). Empty uses the chart's appVersion.
-  tag: edge
-  # `edge` moves with main: pulled again on every start.
-  pullPolicy: Always
+  # Empty uses the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 
@@ -106,8 +104,6 @@ persistence:
   storageClass: ""
   accessModes: ["ReadWriteOnce"]
 
-# `edge` is published for linux/amd64 only.
-nodeSelector:
-  kubernetes.io/arch: amd64
+nodeSelector: {}
 tolerations: []
 affinity: {}
