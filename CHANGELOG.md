@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Plugins
+
+- Instance reuse — a plugin declaration takes `reuse_instances`, the number of idle guest instances kept and reused across requests, so a guest can cache what it builds from its config instead of rebuilding it on every request. `0`, the default, keeps a fresh instance per request. See [Instance reuse](documentation/middleware/wasm-plugins.md#instance-reuse-reuse_instances).
+- Plugin timeouts — an invocation reaching its timeout now interrupts only itself. It used to interrupt the other requests running through the same plugin at that moment.
+- Clock and randomness for guests — plugins can read the wall-clock time (`get_time_unix_nanos`) and draw secure random bytes (`get_random`). See [Clock and randomness](documentation/middleware/wasm-plugins.md#clock-and-randomness).
+
 ### Distribution
 
 - Helm chart published — each release now pushes the chart to `oci://ghcr.io/kemeter/charts/sozune`, numbered as the release (`--version 0.16.0`), so `helm install sozune oci://ghcr.io/kemeter/charts/sozune` works without cloning the repository. See [Installation](documentation/getting-started/installation.md#kubernetes-helm).
