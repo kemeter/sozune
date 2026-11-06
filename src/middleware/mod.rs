@@ -818,7 +818,10 @@ pub fn build_plugin_registry(
                 continue;
             }
         };
-        let limits = http_wasm_host::Limits::default();
+        let settings = wasm::GuestSettings {
+            limits: http_wasm_host::Limits::default(),
+            reuse_instances: cfg.reuse_instances,
+        };
 
         // A plugin opts into the outbound-HTTP extension when it declares
         // operator `allowed_hosts` OR `outbound_host_keys` (per-route tenant
@@ -830,14 +833,14 @@ pub fn build_plugin_registry(
             wasm::WasmMiddleware::from_bytes_with_network(
                 &wasm_bytes,
                 cfg.config.clone(),
-                limits,
+                settings,
                 client.clone(),
                 handle.clone(),
                 cfg.allowed_hosts.clone(),
                 cfg.outbound_host_keys.clone(),
             )
         } else {
-            wasm::WasmMiddleware::from_bytes(&wasm_bytes, cfg.config.clone(), limits)
+            wasm::WasmMiddleware::from_bytes(&wasm_bytes, cfg.config.clone(), settings)
         };
 
         match built {
@@ -845,10 +848,11 @@ pub fn build_plugin_registry(
                 let policy =
                     wasm::PluginPolicy::new(&cfg.skip_paths, &cfg.skip_methods, cfg.fail_open);
                 info!(
-                    "Loaded WASM plugin '{}' from {} (fail_open={}, skip_paths={}, skip_methods={})",
+                    "Loaded WASM plugin '{}' from {} (fail_open={}, reuse_instances={}, skip_paths={}, skip_methods={})",
                     name,
                     cfg.path,
                     cfg.fail_open,
+                    cfg.reuse_instances,
                     cfg.skip_paths.len(),
                     cfg.skip_methods.len(),
                 );

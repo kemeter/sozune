@@ -508,7 +508,7 @@ struct NetIngredients {
     /// The compiled `.wasm` bytes, kept so a per-route derivation can rebuild a
     /// guest bound to an extended allow-list. Shared (`Arc`) to keep clones cheap.
     wasm: Arc<Vec<u8>>,
-    limits: Limits,
+    settings: GuestSettings,
     /// The outbound client, already wired with the [`GuardedResolver`].
     client: reqwest::Client,
     handle: tokio::runtime::Handle,
@@ -621,15 +621,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 impl WasmMiddleware {
-    /// Compile a guest from `.wasm` bytes with the given per-invocation limits
-    /// and guest configuration.
+    /// Compile a guest from `.wasm` bytes with the given runtime settings and
+    /// guest configuration.
     pub fn from_bytes(
         wasm: &[u8],
         config: serde_json::Value,
-        limits: Limits,
+        settings: GuestSettings,
     ) -> anyhow::Result<Self> {
-        let plugin = Plugin::from_bytes(wasm, limits)
-            .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?;
+        let plugin = compile_plugin(wasm, settings)?;
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
@@ -676,7 +675,7 @@ impl WasmMiddleware {
                 &merged,
             );
 
-            match build_network_plugin(&net.wasm, net.limits, &net.client, &net.handle, allowed) {
+            match build_network_plugin(&net.wasm, net.settings, &net.client, &net.handle, allowed) {
                 Ok(plugin) => {
                     return Self {
                         name: self.name,
@@ -718,13 +717,14 @@ impl WasmMiddleware {
     pub fn from_bytes_with_network(
         wasm: &[u8],
         config: serde_json::Value,
-        limits: Limits,
+        settings: GuestSettings,
         client: reqwest::Client,
         handle: tokio::runtime::Handle,
         operator_hosts: Vec<String>,
         outbound_host_keys: Vec<String>,
     ) -> anyhow::Result<Self> {
-        let plugin = build_network_plugin(wasm, limits, &client, &handle, operator_hosts.clone())?;
+        let plugin =
+            build_network_plugin(wasm, settings, &client, &handle, operator_hosts.clone())?;
         Ok(Self {
             name: "wasm",
             plugin: Arc::new(plugin),
@@ -732,7 +732,7 @@ impl WasmMiddleware {
             config_value: config,
             net: Some(NetIngredients {
                 wasm: Arc::new(wasm.to_vec()),
-                limits,
+                settings,
                 client,
                 handle,
                 operator_hosts,
@@ -823,7 +823,7 @@ fn derive_route_allow_list(
 /// instance and for a per-route rebuild with an extended allow-list.
 fn build_network_plugin(
     wasm: &[u8],
-    limits: Limits,
+    settings: GuestSettings,
     client: &reqwest::Client,
     handle: &tokio::runtime::Handle,
     allowed_hosts: Vec<String>,
@@ -839,10 +839,26 @@ fn build_network_plugin(
         allowed_hosts,
         EVENT_QUEUE_SIZE,
     ));
-    Ok(Plugin::from_bytes(wasm, limits)
-        .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?
+    Ok(compile_plugin(wasm, settings)?
         .with_fetcher(fetcher)
         .with_sink(sink))
+}
+
+/// Runtime settings for a compiled guest, from the operator's plugin config.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GuestSettings {
+    /// Per-invocation timeout and memory cap.
+    pub limits: Limits,
+    /// Idle guest instances kept for reuse across requests (0 = a fresh
+    /// instance per call). See [`crate::config::PluginConfig::reuse_instances`].
+    pub reuse_instances: usize,
+}
+
+/// Compile a guest with `settings` applied.
+fn compile_plugin(wasm: &[u8], settings: GuestSettings) -> anyhow::Result<Plugin> {
+    Ok(Plugin::from_bytes(wasm, settings.limits)
+        .map_err(|e| anyhow::anyhow!("failed to load wasm plugin: {e}"))?
+        .with_instance_reuse(settings.reuse_instances))
 }
 
 /// Recursively merge `overlay` into `base`. When both sides are JSON objects,
