@@ -144,6 +144,16 @@ pub struct PluginConfig {
     /// error then returns `502` and the request never reaches the backend.
     #[serde(default = "default_plugin_fail_open")]
     pub fail_open: bool,
+    /// How many idle guest instances to keep and reuse across requests.
+    /// `0` (the default) runs every request in a fresh instance: nothing
+    /// survives between requests. A positive value lets a guest keep state —
+    /// typically a cache built from its config (a compiled ruleset, a routing
+    /// table) — instead of rebuilding it on every request. Only enable it for a
+    /// guest written to tolerate state left by earlier requests, including
+    /// requests of other routes sharing the plugin. An instance whose call
+    /// fails is discarded.
+    #[serde(default)]
+    pub reuse_instances: usize,
 }
 
 fn default_plugin_fail_open() -> bool {
@@ -2957,5 +2967,17 @@ https:
         }
         // Unknown value must not silently flip the format.
         assert_eq!(cfg.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn plugin_reuse_instances_defaults_to_fresh_instances() {
+        let plain: PluginConfig =
+            serde_json::from_value(serde_json::json!({ "path": "/p.wasm" })).unwrap();
+        assert_eq!(plain.reuse_instances, 0);
+
+        let reused: PluginConfig =
+            serde_json::from_value(serde_json::json!({ "path": "/p.wasm", "reuse_instances": 8 }))
+                .unwrap();
+        assert_eq!(reused.reuse_instances, 8);
     }
 }

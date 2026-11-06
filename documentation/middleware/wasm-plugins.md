@@ -107,7 +107,26 @@ WASM plugins run after the native request-phase middlewares (IP allow-list, head
 
 ## Limits
 
-Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched.
+Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. The timeout is per invocation: one that runs out interrupts only itself, never other requests running through the same plugin. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched.
+
+## Instance reuse (`reuse_instances`)
+
+By default each request runs in a fresh guest instance, so nothing survives between requests. A plugin that builds something expensive from its config — a compiled ruleset, a routing table — rebuilds it on every request. `reuse_instances` keeps up to that many idle instances alive and reuses them, so the guest can cache what it built:
+
+```yaml
+plugins:
+  redirects:
+    path: /plugins/redirects.wasm
+    reuse_instances: 8
+```
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `reuse_instances` | `0` | Idle guest instances kept for reuse. `0` gives every request a fresh instance. A positive value lets the guest keep state between requests. Only enable it for a plugin written for it: the guest sees what earlier requests left, including those of other routes using the same plugin with a different config. An instance whose call fails is discarded. |
+
+## Clock and randomness
+
+A guest compiled to `wasm32-unknown-unknown` has no clock and no entropy source. Sōzune provides two non-standard host functions in the `http_handler` module: `get_time_unix_nanos() -> i64` (wall-clock time, nanoseconds since the Unix epoch) and `get_random(buf, len) -> i32` (fills `len` bytes with cryptographically secure random bytes; returns `1`, or `0` on failure).
 
 ## Execution policy (`skip_paths`, `skip_methods`, `fail_open`)
 
