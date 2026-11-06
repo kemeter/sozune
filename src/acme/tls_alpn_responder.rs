@@ -71,10 +71,12 @@ impl ChallengeResponder for TlsAlpnResponder {
     }
 
     async fn cleanup(&self, domain: &str) -> Result<(), DnsError> {
-        if let Ok(mut certs) = self.certs.write() {
-            certs.remove(&domain.to_ascii_lowercase());
-            debug!("TLS-ALPN-01 challenge certificate removed for {domain}");
-        }
+        let mut certs = self
+            .certs
+            .write()
+            .map_err(|e| DnsError::Other(format!("challenge cert store poisoned: {e}")))?;
+        certs.remove(&domain.to_ascii_lowercase());
+        debug!("TLS-ALPN-01 challenge certificate removed for {domain}");
         Ok(())
     }
 }
@@ -194,5 +196,17 @@ mod tests {
 
         responder.cleanup("app.example.com").await.unwrap();
         assert!(responder.certs.read().unwrap().is_empty());
+    }
+    /// A cleanup that cannot reach the store says so, for it to be logged.
+    #[tokio::test]
+    async fn a_cleanup_that_cannot_reach_the_store_fails() {
+        let responder = TlsAlpnResponder::new();
+        let certs = responder.certs.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = certs.write().unwrap();
+            panic!("poison the store");
+        })
+        .join();
+        assert!(responder.cleanup("app.example.com").await.is_err());
     }
 }

@@ -129,6 +129,7 @@ See [UPGRADE.md](UPGRADE.md#upgrade-to-016) for what to change.
 
 ### TLS / ACME
 
+- Failed ACME challenge cleanups are logged — a DNS-01 record or a TLS-ALPN-01 challenge certificate Sōzune fails to remove once the challenge is over is now reported with a warning naming the domain and the error. Such failures used to go unnoticed, leaving stale records at the DNS provider.
 - Client certificates (mutual TLS) — `proxy.https.tls.client_auth` asks HTTPS clients for a certificate (`mode: optional` or `required`) and accepts only those chaining to its `ca_files`, with revocation checked against `crl_files`. Listener-wide; the backend is not told which certificate was presented. With `mode: required`, a `tls=true` route redirects its plain HTTP requests to HTTPS instead of serving them without a certificate. An unreadable CA or CRL, or an expired CRL, fails startup. `GET /config` and the dashboard show the mode and files. `sozune route`, `POST /routes/resolve` and the dashboard's route tester report an `https` request without a certificate as failing its handshake when one is `required` (`--client-cert`, `client_certificate`, or the tester's checkbox, for a client that presents one). See [Client certificates](documentation/tls/overview.md#client-certificates-mutual-tls).
 
 ## [0.15.0] - 2026-10-10
