@@ -4071,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "sozune"
-version = "0.16.0-dev"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
