@@ -68,37 +68,37 @@ fn wants_json(headers: &HeaderMap) -> bool {
 /// the live `AppState`. Both renderers (Prometheus text and JSON) read from
 /// this struct so the two formats can never drift on values.
 #[derive(Debug, Serialize)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     #[serde(rename = "static")]
-    static_metrics: StaticMetrics,
-    proxy: ProxyMetrics,
+    pub(crate) static_metrics: StaticMetrics,
+    pub(crate) proxy: ProxyMetrics,
 }
 
 #[derive(Debug, Serialize)]
-struct StaticMetrics {
-    entrypoints: usize,
-    entrypoints_by_protocol: HashMap<&'static str, usize>,
-    entrypoints_tls: usize,
-    backends: usize,
-    backends_unhealthy: usize,
-    diagnostics: DiagnosticsCounts,
-    acme_enabled: bool,
+pub(crate) struct StaticMetrics {
+    pub(crate) entrypoints: usize,
+    pub(crate) entrypoints_by_protocol: HashMap<&'static str, usize>,
+    pub(crate) entrypoints_tls: usize,
+    pub(crate) backends: usize,
+    pub(crate) backends_unhealthy: usize,
+    pub(crate) diagnostics: DiagnosticsCounts,
+    pub(crate) acme_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct DiagnosticsCounts {
-    error: usize,
-    warn: usize,
-    info: usize,
+pub(crate) struct DiagnosticsCounts {
+    pub(crate) error: usize,
+    pub(crate) warn: usize,
+    pub(crate) info: usize,
 }
 
 #[derive(Debug, Serialize)]
-struct ProxyMetrics {
+pub(crate) struct ProxyMetrics {
     /// Unix timestamp (seconds) of the last successful Sōzu worker poll.
     /// `0` if no poll has ever succeeded.
-    last_poll_seconds: u64,
+    pub(crate) last_poll_seconds: u64,
     /// Per-key proxy counters/gauges as reported by Sōzu workers.
-    metrics: HashMap<String, i128>,
+    pub(crate) metrics: HashMap<String, i128>,
     /// Latency histogram for requests served through the Sōzune middleware
     /// layer (measured by Sōzune itself, not polled from Sōzu). Middleware-less
     /// routes are served directly by Sōzu and not counted here. Additive
@@ -124,7 +124,7 @@ struct RequestDurationMetrics {
 }
 
 impl Snapshot {
-    fn collect(state: &AppState) -> Self {
+    pub(crate) fn collect(state: &AppState) -> Self {
         let (entrypoints_total, backends_total, tls_total, by_protocol) = match state.storage.read()
         {
             Ok(guard) => {
@@ -432,7 +432,7 @@ fn write_gauge(out: &mut String, name: &str, help: &str, value: usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ApiUser;
     use crate::model::{Backend, Entrypoint, EntrypointConfig, LoadBalancer, Protocol};
@@ -441,7 +441,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use tokio::sync::mpsc;
 
-    fn empty_state() -> AppState {
+    pub(crate) fn empty_state() -> AppState {
         let (reload_tx, _) = mpsc::channel::<()>(1);
         AppState {
             storage: Arc::new(RwLock::new(BTreeMap::new())),

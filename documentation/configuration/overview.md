@@ -57,7 +57,7 @@ middleware:
 | `proxy` | Sōzu listeners and runtime tuning. Required. |
 | `middleware` | Internal middleware proxy port. |
 | `dashboard` | Web dashboard listener. Off by default. See [Dashboard](/documentation/configuration/dashboard). (since 0.11) |
-| `metrics` | Dedicated Prometheus `/metrics` listener, independent of the API. Off by default. See [Observability](../advanced/observability.md#the-metrics-endpoint). (since 0.14) |
+| `metrics` | Dedicated Prometheus `/metrics` listener, independent of the API, and OTLP metrics export. Both off by default. See [Observability](../advanced/observability.md#the-metrics-endpoint). (since 0.14) |
 | `log` | Log output format (`text` or `json`). (since 0.14) |
 | `tracing` | OpenTelemetry distributed tracing (OTLP export). Off by default. See [Observability](../advanced/observability.md#distributed-tracing-opentelemetry). (since 0.14) |
 | `plugins` | WASM plugins, declared by name. See [WASM plugins](/documentation/middleware/wasm-plugins). (since 0.14) |
@@ -138,6 +138,10 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 |---|---|---|
 | `metrics.enabled` | `false` | Enables the dedicated `/metrics` listener (`SOZUNE_METRICS_ENABLED`) |
 | `metrics.listen_address` | `127.0.0.1:3039` | Bind address (`SOZUNE_METRICS_LISTEN_ADDRESS`); keep on loopback or restrict with an ACL |
+| `metrics.otlp.enabled` | `false` | Pushes the metrics over OTLP/gRPC to a collector, independently of the listener. See [OTLP metrics export](/documentation/advanced/observability#otlp-metrics-export). (since 0.17) |
+| `metrics.otlp.endpoint` | `http://127.0.0.1:4317` | OTLP/gRPC collector |
+| `metrics.otlp.service_name` | `sozune` | `service.name` of every metric |
+| `metrics.otlp.push_interval` | `10` | Seconds between two pushes |
 
 ## Proxy
 
@@ -231,6 +235,10 @@ The fields below can be set through an environment variable, which wins over the
 | `dashboard.listen_address` | `SOZUNE_DASHBOARD_LISTEN_ADDRESS` (since 0.11) |
 | `metrics.enabled` | `SOZUNE_METRICS_ENABLED` (since 0.14) |
 | `metrics.listen_address` | `SOZUNE_METRICS_LISTEN_ADDRESS` (since 0.14) |
+| `metrics.otlp.enabled` | `SOZUNE_METRICS_OTLP_ENABLED` (since 0.17) |
+| `metrics.otlp.endpoint` | `SOZUNE_METRICS_OTLP_ENDPOINT` (since 0.17) |
+| `metrics.otlp.service_name` | `SOZUNE_METRICS_OTLP_SERVICE_NAME` (since 0.17) |
+| `metrics.otlp.push_interval` | `SOZUNE_METRICS_OTLP_PUSH_INTERVAL` (since 0.17) |
 | `providers.docker.enabled` | `SOZUNE_PROVIDER_DOCKER_ENABLED` |
 | `providers.docker.endpoint` | `SOZUNE_PROVIDER_DOCKER_ENDPOINT` |
 | `providers.docker.expose_by_default` | `SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT` |

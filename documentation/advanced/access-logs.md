@@ -78,7 +78,8 @@ Sōzune starts from these levels:
 
 ```
 sozune=info, access=info, bollard=warn, hyper=warn, hyper_util=warn, rustls=warn,
-sozu_lib=warn, sozu_command_lib=warn, mio=warn, h2=warn, kube=warn, tower=warn
+sozu_lib=warn, sozu_command_lib=warn, mio=warn, h2=warn, kube=warn, tower=warn,
+opentelemetry=warn, opentelemetry_sdk=warn, opentelemetry_otlp=warn
 ```
 
 Every other target logs only errors. The access log is on: one line per request the middleware handles, errors included.
