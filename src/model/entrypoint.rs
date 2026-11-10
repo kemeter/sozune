@@ -267,6 +267,19 @@ pub struct EntrypointConfig {
     /// answers their preflight requests and marks the responses they get.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<CorsConfig>,
+    /// Path the backend receives instead of the request's, the query kept
+    /// (Traefik's `replacePath`). Applied by the middleware, after Sōzu's
+    /// `strip_prefix` / `add_prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_path: Option<String>,
+    /// Rewrite of the path the backend receives, when the regex matches it
+    /// (Traefik's `replacePathRegex`). Applied after `replace_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_path_regex: Option<RegexReplacement>,
+    /// Redirect of the requests whose URL matches the regex, to that URL
+    /// rewritten (Traefik's `redirectRegex`). Others go on to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_regex: Option<RedirectRegex>,
     /// The header conditions of the routes this one outranks on its listener
     /// and could share a request with. Never configured: the proxy derives it
     /// from the whole route table before applying it.
@@ -586,6 +599,33 @@ pub enum RedirectScheme {
     UseSame,
     UseHttp,
     UseHttps,
+}
+
+/// A regex and what replaces its matches, `$1` / `${name}` standing for its
+/// groups.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct RegexReplacement {
+    pub regex: String,
+    pub replacement: String,
+}
+
+/// Whether `path` can replace a request's path: it starts with `/` and holds
+/// no query, fragment, space or control character.
+pub fn valid_replace_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains(['?', '#'])
+        && path.parse::<axum::http::uri::PathAndQuery>().is_ok()
+}
+
+/// A redirect of the requests whose URL (`scheme://host/path?query`) matches
+/// `regex`, to the URL with its matches replaced by `replacement`.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct RedirectRegex {
+    pub regex: String,
+    pub replacement: String,
+    /// `301` / `308` instead of `302` / `307`.
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 /// Transparent URL rewrite, mapped from the Gateway API `urlRewrite` filter.

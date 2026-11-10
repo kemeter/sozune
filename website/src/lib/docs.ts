@@ -91,6 +91,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'in-flight-req',
     'redirects',
     'strip-prefix',
+    'replace-path',
     'compress',
     'backend-timeout',
     'retry',

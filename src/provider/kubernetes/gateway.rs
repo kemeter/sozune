@@ -6640,6 +6640,9 @@ fn rule_to_entrypoints(
                     failing_shares,
                     cors: cors.clone(),
                     outranked_headers: Vec::new(),
+                    replace_path: None,
+                    replace_path_regex: None,
+                    redirect_regex: None,
                 },
                 source: Some(id),
                 candidates: Vec::new(),
@@ -8111,6 +8114,9 @@ fn tls_entrypoint_defaults() -> EntrypointConfig {
         failing_shares: None,
         cors: None,
         outranked_headers: Vec::new(),
+        replace_path: None,
+        replace_path_regex: None,
+        redirect_regex: None,
         ip_allow_list: Vec::new(),
     }
 }

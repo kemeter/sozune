@@ -98,12 +98,15 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.headers.both.<name>` | [Custom headers](/documentation/middleware/headers) — both directions (since 0.11) |
 | `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/middleware/strip-prefix) (since 0.6) |
 | `sozune.http.<svc>.addPrefix` | [Add prefix](/documentation/middleware/add-prefix) (since 0.14) |
+| `sozune.http.<svc>.replacePath` | [Replace path](/documentation/middleware/replace-path) — path the backend receives (since 0.17) |
+| `sozune.http.<svc>.replacePathRegex.regex` / `.replacement` | [Replace path](/documentation/middleware/replace-path#replacepathregex) — rewrite where the regex matches (since 0.17) |
 | `sozune.http.<svc>.httpsRedirect` | [Redirects](/documentation/middleware/redirects) (since 0.6) |
 | `sozune.http.<svc>.httpsRedirectPort` | [Redirects](/documentation/middleware/redirects) (since 0.11) |
 | `sozune.http.<svc>.redirect` | [Redirects](/documentation/middleware/redirects#redirect-policy) (since 0.11) |
 | `sozune.http.<svc>.redirectScheme` | [Redirects](/documentation/middleware/redirects) (since 0.11) |
 | `sozune.http.<svc>.redirectTemplate` | [Redirects](/documentation/middleware/redirects) (since 0.11) |
 | `sozune.http.<svc>.redirectHost` | [Redirects](/documentation/middleware/redirects#redirecthost) — permanent redirect to another host (since 0.16) |
+| `sozune.http.<svc>.redirectRegex.regex` / `.replacement` / `.permanent` | [Redirects](/documentation/middleware/redirects#redirectregex) — redirect the URLs a regex matches (since 0.17) |
 | `sozune.http.<svc>.wwwAuthenticate` | [Basic auth](/documentation/middleware/auth) (since 0.11) |
 | `sozune.http.<svc>.ratelimit.average` | [Rate limit](/documentation/middleware/rate-limit) (since 0.9) |
 | `sozune.http.<svc>.ratelimit.burst` | [Rate limit](/documentation/middleware/rate-limit) (since 0.9) |

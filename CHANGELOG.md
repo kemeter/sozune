@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Middleware
+
+- `replacePath` and `replacePathRegex` — change the path the backend receives: replace it whole, or rewrite where a regex matches (`replacePathRegex.regex` + `replacePathRegex.replacement`, `$1` for its groups). The query is kept and the original path is sent in `X-Replaced-Path`, as Traefik's middlewares of these names do. See [Replace path](documentation/middleware/replace-path.md).
+- `redirectRegex` — redirect the requests whose URL matches a regex to that URL rewritten (`redirectRegex.regex`, `.replacement`, `.permanent`); the others go on to the backend. See [Redirects](documentation/middleware/redirects.md#redirectregex).
 ### Observability
 
 - OTLP metrics export — push the metrics served on `/metrics` to an OpenTelemetry collector over OTLP/gRPC, alongside or instead of a Prometheus scrape. Enable with `metrics.otlp.enabled` and `metrics.otlp.endpoint`; `metrics.otlp.service_name` and `metrics.otlp.push_interval` (seconds, default `10`) tune it. Disabled by default. See [OTLP metrics export](documentation/advanced/observability.md#otlp-metrics-export).

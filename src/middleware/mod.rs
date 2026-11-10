@@ -13,6 +13,7 @@ mod proxy;
 pub mod rate_limit;
 mod redirect;
 pub(crate) mod request_match;
+mod rewrite;
 pub mod tunnels;
 mod wasm;
 
@@ -155,7 +156,8 @@ pub const ROUTE_HEADER: &str = "sozune-route";
 
 /// The scheme of the listener a request came in on, which the frontends of a
 /// route whose redirect the middleware answers set (see
-/// [`answers_redirect`]).
+/// [`answers_redirect`]), or that redirects by regex. Taken off the request
+/// before the backend.
 pub const SCHEME_HEADER: &str = "sozune-scheme";
 
 /// The routes one hostname carries, each with the path it was declared with.
@@ -967,6 +969,10 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || answers_redirect(config)
         // And a CORS policy.
         || config.cors.is_some()
+        // And the rewrites and redirects by regex.
+        || config.replace_path.is_some()
+        || config.replace_path_regex.is_some()
+        || config.redirect_regex.is_some()
 }
 
 /// Whether the middleware answers the route's redirect instead of Sōzu: see
@@ -1072,6 +1078,16 @@ pub fn build_middleware_route(
         }
     }
 
+    // A redirect by regex answers before forward auth: the request is sent
+    // elsewhere. Basic auth, which Sōzu checks, still comes first.
+    if let Some(redirect) = config
+        .redirect_regex
+        .as_ref()
+        .and_then(|r| rewrite::RedirectRegexMiddleware::new(r, cluster_id))
+    {
+        middlewares.push(Arc::new(redirect));
+    }
+
     if let Some(cfg) = config.forward_auth.as_ref() {
         middlewares.push(Arc::new(ForwardAuthMiddleware::new(
             cfg.clone(),
@@ -1106,6 +1122,16 @@ pub fn build_middleware_route(
             },
             None => warn!("entrypoint references unknown plugin '{}', skipping", name),
         }
+    }
+
+    // The path is rewritten last: every step before sees the path the
+    // client sent, the backend the rewritten one.
+    if let Some(replace) = rewrite::ReplacePathMiddleware::new(
+        config.replace_path.as_deref(),
+        config.replace_path_regex.as_ref(),
+        cluster_id,
+    ) {
+        middlewares.push(Arc::new(replace));
     }
 
     if config.compress {
