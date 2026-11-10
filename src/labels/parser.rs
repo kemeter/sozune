@@ -5,7 +5,7 @@ use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
     auth, core, error_pages, forward_auth, headers, host, in_flight_req, ip_allow_list, methods,
-    path, plugin_config, plugins, ratelimit, redirect, request_match,
+    path, plugin_config, plugins, ratelimit, redirect, request_match, rewrite,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol, RedirectPolicy};
@@ -279,6 +279,9 @@ fn build_entrypoint(
     }
     let match_client_ip = request_match::parse_match_client_ip(labels, &prefix);
     let ip_allow_list = ip_allow_list::parse_ip_allow_list(labels, &prefix);
+    let replace_path = rewrite::parse_replace_path(labels, &prefix, diagnostics);
+    let replace_path_regex = rewrite::parse_replace_path_regex(labels, &prefix, diagnostics);
+    let redirect_regex = rewrite::parse_redirect_regex(labels, &prefix, diagnostics);
 
     let protocol_enum = match protocol {
         "http" => Protocol::Http,
@@ -403,6 +406,9 @@ fn build_entrypoint(
             failing_shares: None,
             cors: None,
             outranked_headers: Vec::new(),
+            replace_path,
+            replace_path_regex,
+            redirect_regex,
         },
         source: None,
         candidates: Vec::new(),
@@ -567,6 +573,9 @@ fn build_l4_entrypoint(
             failing_shares: None,
             cors: None,
             outranked_headers: Vec::new(),
+            replace_path: None,
+            replace_path_regex: None,
+            redirect_regex: None,
             ip_allow_list: Vec::new(),
         },
         source: None,

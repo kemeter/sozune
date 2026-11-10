@@ -108,6 +108,9 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 |---|---|
 | `stripprefix.prefixes=/api` on a router with ``PathPrefix(`/api`)`` | `path=/api` + `stripPrefix=true`. `stripPrefix` removes the route's own `path`: a router that strips a prefix it does not match on has no equivalent. |
 | `addprefix.prefix=/foo` | `addPrefix=/foo` |
+| `replacepath.path=/foo` | `replacePath=/foo` (since 0.17) |
+| `replacepathregex.regex` / `replacepathregex.replacement` | `replacePathRegex.regex` / `replacePathRegex.replacement` (since 0.17). They apply after `stripPrefix` and `addPrefix`, whatever the order of a Traefik chain. |
+| `redirectregex.regex` / `.replacement` / `.permanent` | `redirectRegex.regex` / `.replacement` / `.permanent` (since 0.17) |
 | `headers.customrequestheaders.X-Foo=bar` | `headers.X-Foo=bar` |
 | `headers.customresponseheaders.X-Foo=bar` | `headers.response.X-Foo=bar` |
 | Empty header value (removes the header) | Same: `headers.X-Foo=` |
@@ -125,7 +128,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `errors.status` + `errors.service` | No equivalent for errors returned by the backend. `errorPages.<status>=<html>` only replaces the errors Sōzune answers itself (no route, backend down…), with an inline page. |
 | Traefik plugins | [WASM plugins](/documentation/middleware/wasm-plugins). Traefik's Yaegi plugins do not run as is. |
 
-Not available yet: `chain`, `digestauth`, `buffering`, `redirectregex`, `replacepath`, `replacepathregex` and weighted services. A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A weighted split between two versions is written with a `weight` on the containers of one service instead: see [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing).
+Not available yet: `chain`, `digestauth`, `buffering` and weighted services. A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A weighted split between two versions is written with a `weight` on the containers of one service instead: see [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing).
 
 ## TCP
 

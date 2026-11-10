@@ -80,6 +80,13 @@ pub enum DiagnosticCode {
     /// A `redirectHost` label is not a plain hostname, or the route's
     /// `redirect` is not `permanent`. The label is ignored.
     W031InvalidRedirectHost,
+    /// A `replacePath` label is not a path, or the `replacePathRegex` labels
+    /// are incomplete, their regex does not compile or their replacement is
+    /// empty. The rewrite is ignored.
+    W032InvalidReplacePath,
+    /// The `redirectRegex` labels are incomplete, their regex does not
+    /// compile or `permanent` is not a boolean. The redirect is ignored.
+    W033InvalidRedirectRegex,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -126,6 +133,8 @@ impl DiagnosticCode {
             DiagnosticCode::W029UnknownAcmeResolver => "W029",
             DiagnosticCode::W030BackendTimeoutBeyondListener => "W030",
             DiagnosticCode::W031InvalidRedirectHost => "W031",
+            DiagnosticCode::W032InvalidReplacePath => "W032",
+            DiagnosticCode::W033InvalidRedirectRegex => "W033",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -182,6 +191,8 @@ impl DiagnosticCode {
             DiagnosticCode::W029UnknownAcmeResolver,
             DiagnosticCode::W030BackendTimeoutBeyondListener,
             DiagnosticCode::W031InvalidRedirectHost,
+            DiagnosticCode::W032InvalidReplacePath,
+            DiagnosticCode::W033InvalidRedirectRegex,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

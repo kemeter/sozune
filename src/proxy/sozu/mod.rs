@@ -2671,7 +2671,7 @@ pub(crate) fn build_http_frontends(
         // listener rather than taken from the client's `X-Forwarded-Proto`.
         let with_scheme = |scheme: &str| {
             let mut headers = frontend_headers.clone();
-            if answers_redirect {
+            if answers_redirect || entrypoint.config.redirect_regex.is_some() {
                 headers.extend(build_frontend_headers(&[HeaderConfig {
                     name: middleware::SCHEME_HEADER.to_string(),
                     value: scheme.to_string(),
@@ -5883,6 +5883,9 @@ mod tests {
                 failing_shares: None,
                 cors: None,
                 outranked_headers: Vec::new(),
+                replace_path: None,
+                replace_path_regex: None,
+                redirect_regex: None,
             },
             candidates: Vec::new(),
         }
@@ -6144,6 +6147,10 @@ mod tests {
         let mut moved = new.clone();
         moved.backends = vec![Backend::new("10.0.0.2", 80)];
         assert!(!is_outranked_only_change(&old, &moved));
+        // A rewrite added with it puts the route behind the middleware.
+        let mut rewritten = new.clone();
+        rewritten.config.replace_path = Some("/fixed".into());
+        assert!(!is_outranked_only_change(&old, &rewritten));
 
         // A copy of every kind of condition is one Sōzu takes.
         let copies = copied_conditions(&Entrypoint {
@@ -6175,6 +6182,39 @@ mod tests {
         assert_eq!(
             build_acme_twins(&new, 80).len(),
             new.config.hostnames.len() + 1
+        );
+    }
+
+    /// A redirect by regex matches the scheme of the listener, not the one
+    /// a client claims in `X-Forwarded-Proto`.
+    #[test]
+    fn a_regex_redirect_learns_the_scheme_from_its_listener() {
+        let mut ep = base_ep(vec![Backend::new("10.0.0.1", 80)]);
+        ep.config.tls = true;
+        ep.config.redirect_regex = Some(crate::model::RedirectRegex {
+            regex: "^http://(.*)".into(),
+            replacement: "https://$1".into(),
+            permanent: true,
+        });
+        let fronts =
+            build_http_frontends("http_web", &ep, 80, SocketAddress::new_v4(0, 0, 0, 0, 443));
+        let schemes: Vec<Vec<String>> = fronts
+            .iter()
+            .map(|(_, front)| {
+                front
+                    .headers
+                    .iter()
+                    .filter(|h| h.key == middleware::SCHEME_HEADER)
+                    .map(|h| h.val.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            schemes,
+            vec![
+                vec![String::new(), "http".to_string()],
+                vec![String::new(), "https".to_string()],
+            ]
         );
     }
 

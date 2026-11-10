@@ -229,6 +229,9 @@ pub async fn handle_proxy(
                 return response.into_response();
             }
 
+            // The listener's scheme was for the middleware's redirects alone.
+            req.headers_mut().remove(super::SCHEME_HEADER);
+
             // The share of requests that falls to a backend which cannot take
             // them is answered with its error.
             let failing = match route.failing_shares.as_ref().and_then(|s| s.next()) {

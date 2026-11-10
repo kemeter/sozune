@@ -381,6 +381,26 @@ const ENTRIES: &[Entry] = &[
         ),
     },
     Entry {
+        code: "W032",
+        title: "Invalid path replacement",
+        cause: "A `replacePath` label is not a path (it does not start with `/`, or holds a query, a space or a control character), or the `replacePathRegex` labels are incomplete: a `regex` without a `replacement` or the reverse, a regex that does not compile, or an empty replacement.",
+        effect: "The rewrite is ignored: the backend receives the request's path unchanged.",
+        fix: "Set `replacePath` to a path such as `/api/v2`, or both `replacePathRegex.regex` and a non-empty `replacePathRegex.replacement`.",
+        example: Some(
+            "sozune.http.app.replacePathRegex.regex=^/foo/(.*)\nsozune.http.app.replacePathRegex.replacement=/bar/$1",
+        ),
+    },
+    Entry {
+        code: "W033",
+        title: "Invalid redirect regex",
+        cause: "The `redirectRegex` labels are incomplete (a `regex` without a `replacement`, or `permanent` alone), the regex does not compile, or `permanent` is neither `true` nor `false`.",
+        effect: "The redirect is ignored: every request goes on to the backend.",
+        fix: "Set both `redirectRegex.regex` and `redirectRegex.replacement`, and `redirectRegex.permanent` to `true` or `false` if you set it.",
+        example: Some(
+            "sozune.http.app.redirectRegex.regex=^https?://old\\.example\\.com/(.*)\nsozune.http.app.redirectRegex.replacement=https://www.example.com/$1",
+        ),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

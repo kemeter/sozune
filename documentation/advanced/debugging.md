@@ -71,7 +71,7 @@ Configured backends:
 
 ## Configuration validation at boot
 
-`SOZUNE_DEBUG` only affects runtime responses. For diagnostics that surface at config-load time (typos in Docker labels, missing required fields, unknown protocols), use `sozune validate`. Both paths share the same diagnostic codes (`E001` … `W031`, `I001` …), so what `validate` reports cannot drift from what the proxy actually does.
+`SOZUNE_DEBUG` only affects runtime responses. For diagnostics that surface at config-load time (typos in Docker labels, missing required fields, unknown protocols), use `sozune validate`. Both paths share the same diagnostic codes (`E001` … `W033`, `I001` …), so what `validate` reports cannot drift from what the proxy actually does.
 
 Run `sozune explain <CODE>` for the cause, effect, fix and a copyable example of any code `validate` reports (since 0.13).
 

@@ -2,7 +2,7 @@
 
 > Since 0.6
 
-Sōzune exposes a few flavors of HTTP redirect. Those set by labels are all handled natively by Sōzu (no extra hop, no middleware overhead).
+Sōzune exposes a few flavors of HTTP redirect. Those set by labels are handled natively by Sōzu (no extra hop, no middleware overhead), except `redirectRegex`, which the Sōzune middleware answers.
 
 | Goal | Label |
 |---|---|
@@ -12,6 +12,7 @@ Sōzune exposes a few flavors of HTTP redirect. Those set by labels are all hand
 | Force a specific scheme on the redirect target | `redirectScheme=use_http\|use_https\|use_same` (since 0.11) |
 | Customise the `Location` header template | `redirectTemplate` (since 0.11) |
 | Redirect to another host, path and query kept | `redirectHost` (since 0.16) |
+| Redirect the URLs a regex matches | `redirectRegex.*` (since 0.17) |
 
 ## HTTPS redirect
 
@@ -90,6 +91,33 @@ labels:
 
 `redirectHost` implies `redirect=permanent`, and the route needs no `port`: it never reaches a backend. The value is a bare hostname, without scheme, port or path; anything else, or a `redirect` set to `forward`, `unauthorized` or `close`, emits `W031` and the label is ignored. Without `redirectScheme`, the redirect keeps the request's scheme. With `stripPrefix` or `addPrefix`, the path in `Location` is rewritten the same way: `path=/blog` + `stripPrefix=true` sends `old.example.com/blog/post` to `www.example.com/post`.
 
+## `redirectRegex`
+
+> Since 0.17
+
+Redirect the requests whose URL matches a regular expression, to that URL rewritten: Traefik's `redirectRegex` middleware. The other requests of the route go on to its backend.
+
+```yaml
+labels:
+  - "sozune.http.app.host=example.com,www.example.com"
+  - "sozune.http.app.port=8080"
+  - "sozune.http.app.redirectRegex.regex=^https?://example\\.com/(.*)"
+  - "sozune.http.app.redirectRegex.replacement=https://www.example.com/$${1}"
+  - "sozune.http.app.redirectRegex.permanent=true"
+```
+
+`http://example.com/docs?page=2` answers `301` with `Location: https://www.example.com/docs?page=2`, while the requests to `www.example.com` reach the backend.
+
+| Label | Default | Description |
+|---|---|---|
+| `redirectRegex.regex` | — | Matched against the whole URL: `scheme://host[:port]/path?query`. The scheme is the one the client used, the host and port those of its `Host` header. |
+| `redirectRegex.replacement` | — | The `Location`, the regex's matches replaced: `$1`, `${1}` and `${name}` stand for its groups. |
+| `redirectRegex.permanent` | `false` | `true` answers `301` (`308` for a method other than `GET`), `false` answers `302` (`307` otherwise). `307` and `308` keep the method and body. |
+
+The regex and the replacement are both needed, the regex must compile and `permanent` be `true` or `false`: otherwise `W033` and the redirect is ignored. A replacement that gives back the request's own URL does not redirect, so a loose regex cannot loop. In Docker Compose, write `$$` for each `$`, and escape a dot in the regex as `\\.` within double quotes.
+
+The regex sees the path after `stripPrefix` and `addPrefix`, which Sōzu applies first. On a route that `redirect=permanent`, `unauthorized` or `close` answers, Sōzu answers before `redirectRegex` is reached. With `auth.basic`, which Sōzu checks first, only authenticated requests are redirected; `redirectRegex` comes before `forwardAuth`. On the REST API, YAML and HTTP providers, the field is `redirect_regex`: `{ "regex": "…", "replacement": "…", "permanent": false }`.
+
 ## `redirectScheme`
 
 > Since 0.11
@@ -123,7 +151,7 @@ The default template (when `redirectTemplate` is unset) produces a standard `Loc
 
 ## Behaviour
 
-- Redirects set by labels are applied by Sōzu, not by a Sōzune middleware. There is no extra processing cost. A Gateway API `requestRedirect` with a status Sōzu has no answer for (`303`, `307`), or to a fixed path, is answered by the Sōzune middleware instead: see [Gateway API](/documentation/providers/kubernetes#gateway-api-httproute).
+- Redirects set by labels are applied by Sōzu, not by a Sōzune middleware, except `redirectRegex`. There is no extra processing cost. A Gateway API `requestRedirect` with a status Sōzu has no answer for (`303`, `307`), or to a fixed path, is answered by the Sōzune middleware instead: see [Gateway API](/documentation/providers/kubernetes#gateway-api-httproute).
 - A `tls=true` route gets a frontend on both the HTTP and the HTTPS listener, which is what `httpsRedirect` needs: one to redirect from, one to serve the redirected request. Without `tls=true`, the HTTPS listener has no rule for the host and the redirected request is not served (`W016`).
 
 ## REST / YAML surface
