@@ -327,7 +327,7 @@ pub fn bare_host(entry: &str) -> String {
 /// against DNS rebinding. `operator_hosts` are bare hostnames exempt from the
 /// internal-address check (the operator is trusted to target internal services).
 pub fn build_outbound_client(operator_hosts: Vec<String>) -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::util::http_client::builder()
         .timeout(std::time::Duration::from_secs(
             super::forward_auth::TIMEOUT_SECS,
         ))

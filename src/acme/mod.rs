@@ -1191,8 +1191,30 @@ fn account_builder(server_url: &str) -> anyhow::Result<instant_acme::AccountBuil
             warn!("ACME: trusting test CA from SOZUNE_ACME_TEST_CA=`{path}` — not for production");
             Ok(builder)
         }
+        _ if crate::util::http_client::system_store_is_empty() => {
+            Ok(Account::builder_with_http(Box::new(bundled_roots_client())))
+        }
         _ => Ok(Account::builder()?),
     }
+}
+
+/// The ACME HTTP client of a host without CA certificates, trusting the
+/// bundled Mozilla roots. Same transport as instant-acme's own client.
+fn bundled_roots_client() -> hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    instant_acme::BodyWrapper<bytes::Bytes>,
+> {
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(crate::util::http_client::bundled_root_store())
+        .with_no_client_auth();
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(connector)
 }
 
 /// Let's Encrypt's production directory, the default ACME server.

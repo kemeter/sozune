@@ -84,7 +84,7 @@ async fn ask(args: &RouteArgs, config_path: &str) -> Result<(Resolution, String)
         "client_ip": args.client_ip,
         "client_certificate": args.client_cert,
     });
-    let client = reqwest::Client::builder()
+    let client = crate::util::http_client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("cannot build the HTTP client: {e}"))?;

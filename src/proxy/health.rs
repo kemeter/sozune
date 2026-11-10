@@ -142,7 +142,7 @@ impl HealthChecker {
             timeout,
             unhealthy_backends: Arc::new(RwLock::new(HashMap::new())),
             probes: std::sync::Mutex::new(HashMap::new()),
-            http_client: reqwest::Client::builder()
+            http_client: crate::util::http_client::builder()
                 .timeout(timeout)
                 // Health checks judge the backend's own response; do not chase
                 // redirects to some other server.

@@ -83,7 +83,7 @@ impl LabelSource for NomadProvider {
 
 impl NomadProvider {
     pub fn new(config: NomadConfig) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http_client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .context("Failed to build Nomad HTTP client")?;
