@@ -24,6 +24,7 @@ mod manual_certs;
 mod metrics_otel;
 mod middleware;
 mod model;
+mod otlp;
 mod provider;
 mod proxy;
 mod tracing_otel;
@@ -157,7 +158,7 @@ fn init_tracing(
             registry.with(otel_layer).init();
             info!(
                 "Distributed tracing enabled, exporting OTLP to {}",
-                tracing_cfg.endpoint
+                tracing_cfg.endpoint()
             );
             Some(guard)
         }
@@ -418,7 +419,7 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
             Ok(guard) => {
                 info!(
                     "OTLP metrics enabled, exporting to {}",
-                    config.metrics.otlp.endpoint
+                    config.metrics.otlp.endpoint()
                 );
                 Some(guard)
             }

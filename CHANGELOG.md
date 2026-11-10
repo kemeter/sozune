@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Observability
 
 - OTLP metrics export — push the metrics served on `/metrics` to an OpenTelemetry collector over OTLP/gRPC, alongside or instead of a Prometheus scrape. Enable with `metrics.otlp.enabled` and `metrics.otlp.endpoint`; `metrics.otlp.service_name` and `metrics.otlp.push_interval` (seconds, default `10`) tune it. Disabled by default. See [OTLP metrics export](documentation/advanced/observability.md#otlp-metrics-export).
+- OTLP collector connection — `tracing` and `metrics.otlp` take a `protocol` (`grpc`, the default, or `http`), `headers` sent with every export (an API key for a hosted collector), `resource_attributes` added next to `service.name`, and `tls` (`ca`, client `cert` and `key`) for an `https://` endpoint. See [Collector connection](documentation/advanced/observability.md#collector-connection).
 - Failed OTLP exports are now logged — when the collector is unreachable or rejects a batch, the export error is logged at `error`, for traces as for metrics. It used to be dropped by the default log filter, so a wrong `tracing.endpoint` went unnoticed.
 
 ### Plugins

@@ -32,7 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-blocking-client", "tls-aws-lc", "tls-roots", "tls-webpki-roots", "trace", "metrics"] }
 tracing-opentelemetry = "0.34"
 signal-hook = "0.4"
 signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
@@ -54,7 +54,7 @@ tower-http = { version = "0.7", features = ["cors"] }
 flate2 = "1"
 brotli = "9"
 zstd = "0.14"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 # Already in the tree through reqwest; declared directly so an HTTP client can
 # fall back to the bundled Mozilla roots when the system has no CA certificate.
 rustls-native-certs = "0.8"

@@ -113,6 +113,16 @@ pub mod http_client {
         }
     }
 
+    /// Same as [`builder`], for a blocking client.
+    pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
+        let builder = reqwest::blocking::Client::builder();
+        if system_store_is_empty() {
+            builder.tls_certs_only(bundled_roots())
+        } else {
+            builder
+        }
+    }
+
     /// Whether the system has no CA certificate. Read once and logged once:
     /// clients are built at startup and on reloads.
     pub fn system_store_is_empty() -> bool {

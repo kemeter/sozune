@@ -1,6 +1,6 @@
 //! OpenTelemetry distributed-tracing pipeline.
 //!
-//! When `tracing.enabled`, this builds an OTLP/gRPC span exporter, wires it
+//! When `tracing.enabled`, this builds an OTLP span exporter (gRPC or HTTP), wires it
 //! into an [`SdkTracerProvider`] with a configurable sampler, installs the W3C
 //! `TraceContextPropagator` as the global propagator, and returns a
 //! `tracing_subscriber` layer that turns every `tracing` span into an
@@ -14,8 +14,6 @@
 
 use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig as _;
-use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing::error;
@@ -134,14 +132,8 @@ where
     // `traceparent`, inject outgoing).
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(cfg.endpoint.clone())
-        .build()?;
-
-    let resource = Resource::builder()
-        .with_service_name(cfg.service_name.clone())
-        .build();
+    let exporter = crate::otlp::span_exporter(&cfg.endpoint(), &cfg.exporter)?;
+    let resource = crate::otlp::resource(&cfg.service_name, &cfg.exporter);
 
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)

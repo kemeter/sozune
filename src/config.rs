@@ -38,9 +38,11 @@ pub struct TracingConfig {
     /// Master switch. Off by default — no spans, no exporter, zero overhead.
     #[serde(default)]
     pub enabled: bool,
-    /// OTLP/gRPC collector endpoint, e.g. `http://collector:4317`.
-    #[serde(default = "default_tracing_endpoint")]
-    pub endpoint: String,
+    /// OTLP collector endpoint, e.g. `http://collector:4317` (gRPC) or
+    /// `http://collector:4318` (HTTP). Unset, the local collector's port of
+    /// the protocol; read it with `endpoint()`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// `service.name` reported on every span.
     #[serde(default = "default_tracing_service_name")]
     pub service_name: String,
@@ -50,21 +52,89 @@ pub struct TracingConfig {
     /// `always_off` force the decision.
     #[serde(default = "default_tracing_sampler")]
     pub sampler: String,
+    /// Transport, headers, TLS and resource attributes of the export.
+    #[serde(flatten)]
+    pub exporter: OtlpExporterConfig,
 }
 
 impl Default for TracingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: default_tracing_endpoint(),
+            endpoint: None,
             service_name: default_tracing_service_name(),
             sampler: default_tracing_sampler(),
+            exporter: OtlpExporterConfig::default(),
         }
     }
 }
 
-fn default_tracing_endpoint() -> String {
-    "http://127.0.0.1:4317".to_string()
+/// How an OTLP export reaches its collector, shared by `tracing` and
+/// `metrics.otlp`.
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct OtlpExporterConfig {
+    /// `grpc` (default) or `http` (protobuf over HTTP).
+    #[serde(default)]
+    pub protocol: OtlpProtocol,
+    /// Headers sent with every export, e.g. an API key for a hosted collector.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Attributes added to the resource next to `service.name`, e.g.
+    /// `deployment.environment`.
+    #[serde(default)]
+    pub resource_attributes: BTreeMap<String, String>,
+    /// TLS toward an `https://` endpoint.
+    #[serde(default)]
+    pub tls: OtlpTlsConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OtlpProtocol {
+    #[default]
+    Grpc,
+    Http,
+}
+
+/// TLS toward the collector. The system and public roots are always trusted;
+/// `ca` adds one.
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct OtlpTlsConfig {
+    /// PEM file of the CA that signed the collector's certificate.
+    #[serde(default)]
+    pub ca: Option<String>,
+    /// PEM client certificate, for a collector that requires mTLS. Needs `key`.
+    #[serde(default)]
+    pub cert: Option<String>,
+    /// PEM private key of `cert`.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl TracingConfig {
+    /// The collector endpoint, the protocol's default when unset.
+    pub fn endpoint(&self) -> String {
+        self.exporter.endpoint_or_default(self.endpoint.as_deref())
+    }
+}
+
+impl OtlpMetricsConfig {
+    /// The collector endpoint, the protocol's default when unset.
+    pub fn endpoint(&self) -> String {
+        self.exporter.endpoint_or_default(self.endpoint.as_deref())
+    }
+}
+
+impl OtlpExporterConfig {
+    /// `configured`, or the local collector's port of the protocol: 4317 for
+    /// gRPC, 4318 for HTTP.
+    pub fn endpoint_or_default(&self, configured: Option<&str>) -> String {
+        match (configured, self.protocol) {
+            (Some(endpoint), _) => endpoint.to_string(),
+            (None, OtlpProtocol::Grpc) => "http://127.0.0.1:4317".to_string(),
+            (None, OtlpProtocol::Http) => "http://127.0.0.1:4318".to_string(),
+        }
+    }
 }
 
 fn default_tracing_service_name() -> String {
@@ -1117,30 +1187,36 @@ impl Default for MetricsConfig {
 }
 
 /// OTLP metrics export. When `enabled`, the metrics served on `/metrics` are
-/// also pushed every `push_interval` seconds over OTLP/gRPC to a collector.
+/// also pushed every `push_interval` seconds over OTLP to a collector.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct OtlpMetricsConfig {
     /// Master switch. Off by default — no meter provider, no exporter.
     #[serde(default)]
     pub enabled: bool,
-    /// OTLP/gRPC collector endpoint, e.g. `http://collector:4317`.
-    #[serde(default = "default_tracing_endpoint")]
-    pub endpoint: String,
+    /// OTLP collector endpoint, e.g. `http://collector:4317` (gRPC) or
+    /// `http://collector:4318` (HTTP). Unset, the local collector's port of
+    /// the protocol; read it with `endpoint()`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// `service.name` reported on every metric.
     #[serde(default = "default_tracing_service_name")]
     pub service_name: String,
     /// Seconds between two pushes.
     #[serde(default = "default_otlp_push_interval")]
     pub push_interval: u64,
+    /// Transport, headers, TLS and resource attributes of the export.
+    #[serde(flatten)]
+    pub exporter: OtlpExporterConfig,
 }
 
 impl Default for OtlpMetricsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: default_tracing_endpoint(),
+            endpoint: None,
             service_name: default_tracing_service_name(),
             push_interval: default_otlp_push_interval(),
+            exporter: OtlpExporterConfig::default(),
         }
     }
 }
@@ -2208,7 +2284,7 @@ impl TracingConfig {
             self.enabled = v;
         }
         if let Some(v) = env_string("SOZUNE_TRACING_ENDPOINT") {
-            self.endpoint = v;
+            self.endpoint = Some(v);
         }
         if let Some(v) = env_string("SOZUNE_TRACING_SERVICE_NAME") {
             self.service_name = v;
@@ -2216,7 +2292,58 @@ impl TracingConfig {
         if let Some(v) = env_string("SOZUNE_TRACING_SAMPLER") {
             self.sampler = v;
         }
+        self.exporter.apply_env_overrides("SOZUNE_TRACING");
     }
+}
+
+impl OtlpExporterConfig {
+    /// Overrides from `<prefix>_PROTOCOL`, `<prefix>_HEADERS`,
+    /// `<prefix>_RESOURCE_ATTRIBUTES` and `<prefix>_TLS_CA|CERT|KEY`. Headers
+    /// and attributes are `key=value` pairs separated by commas, as in
+    /// `OTEL_EXPORTER_OTLP_HEADERS`.
+    fn apply_env_overrides(&mut self, prefix: &str) {
+        if let Some(v) = env_string(&format!("{prefix}_PROTOCOL")) {
+            match v.to_lowercase().as_str() {
+                "grpc" => self.protocol = OtlpProtocol::Grpc,
+                "http" => self.protocol = OtlpProtocol::Http,
+                other => {
+                    eprintln!("ignoring {prefix}_PROTOCOL={other}: expected grpc or http");
+                }
+            }
+        }
+        if let Some(v) = env_string(&format!("{prefix}_HEADERS")) {
+            self.headers = parse_key_value_list(&v);
+        }
+        if let Some(v) = env_string(&format!("{prefix}_RESOURCE_ATTRIBUTES")) {
+            self.resource_attributes = parse_key_value_list(&v);
+        }
+        if let Some(v) = env_string(&format!("{prefix}_TLS_CA")) {
+            self.tls.ca = Some(v);
+        }
+        if let Some(v) = env_string(&format!("{prefix}_TLS_CERT")) {
+            self.tls.cert = Some(v);
+        }
+        if let Some(v) = env_string(&format!("{prefix}_TLS_KEY")) {
+            self.tls.key = Some(v);
+        }
+    }
+}
+
+/// Parse `key1=value1,key2=value2`, as `OTEL_EXPORTER_OTLP_HEADERS`: values
+/// are URL-decoded, so `%2C` puts a comma in one. Entries without `=` or with
+/// an empty key are skipped; keys and values are trimmed.
+fn parse_key_value_list(raw: &str) -> BTreeMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = percent_encoding::percent_decode_str(value.trim()).decode_utf8_lossy();
+            Some((key.to_string(), value.into_owned()))
+        })
+        .collect()
 }
 
 impl DashboardConfig {
@@ -2242,7 +2369,7 @@ impl MetricsConfig {
             self.otlp.enabled = v;
         }
         if let Some(v) = env_string("SOZUNE_METRICS_OTLP_ENDPOINT") {
-            self.otlp.endpoint = v;
+            self.otlp.endpoint = Some(v);
         }
         if let Some(v) = env_string("SOZUNE_METRICS_OTLP_SERVICE_NAME") {
             self.otlp.service_name = v;
@@ -2252,6 +2379,9 @@ impl MetricsConfig {
         {
             self.otlp.push_interval = v;
         }
+        self.otlp
+            .exporter
+            .apply_env_overrides("SOZUNE_METRICS_OTLP");
     }
 }
 
@@ -2504,6 +2634,102 @@ proxy:
 
         assert!(config.metrics.enabled, "env enables the metrics listener");
         assert_eq!(config.metrics.listen_address, "0.0.0.0:9100");
+    }
+
+    #[test]
+    fn otlp_exporter_settings_parse_on_tracing_and_metrics() {
+        let yaml = r#"
+api:
+  users: []
+providers: {}
+proxy:
+  http:
+    listen_address: 80
+  https:
+    listen_address: 443
+tracing:
+  enabled: true
+  endpoint: "https://otlp.example.com"
+  protocol: http
+  headers:
+    x-api-key: secret
+  resource_attributes:
+    deployment.environment: prod
+  tls:
+    ca: /etc/sozune/ca.pem
+metrics:
+  otlp:
+    enabled: true
+    protocol: grpc
+    headers:
+      authorization: "Bearer t"
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let tracing = &config.tracing.exporter;
+        assert_eq!(tracing.protocol, OtlpProtocol::Http);
+        assert_eq!(tracing.headers["x-api-key"], "secret");
+        assert_eq!(
+            tracing.resource_attributes["deployment.environment"],
+            "prod"
+        );
+        assert_eq!(tracing.tls.ca.as_deref(), Some("/etc/sozune/ca.pem"));
+        assert_eq!(config.tracing.sampler, default_tracing_sampler());
+        let metrics = &config.metrics.otlp.exporter;
+        assert_eq!(metrics.protocol, OtlpProtocol::Grpc);
+        assert_eq!(metrics.headers["authorization"], "Bearer t");
+    }
+
+    #[test]
+    fn otlp_exporter_settings_come_from_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            ("SOZUNE_METRICS_OTLP_PROTOCOL", "http"),
+            (
+                "SOZUNE_METRICS_OTLP_HEADERS",
+                "x-api-key=secret, dd-site = eu",
+            ),
+            (
+                "SOZUNE_METRICS_OTLP_RESOURCE_ATTRIBUTES",
+                "deployment.environment=prod",
+            ),
+            ("SOZUNE_METRICS_OTLP_TLS_CA", "/ca.pem"),
+        ]);
+        let mut config = AppConfig::default();
+        config.apply_env_overrides();
+        let exporter = &config.metrics.otlp.exporter;
+        assert_eq!(exporter.protocol, OtlpProtocol::Http);
+        assert_eq!(exporter.headers["x-api-key"], "secret");
+        assert_eq!(exporter.headers["dd-site"], "eu");
+        assert_eq!(
+            exporter.resource_attributes["deployment.environment"],
+            "prod"
+        );
+        assert_eq!(exporter.tls.ca.as_deref(), Some("/ca.pem"));
+    }
+
+    #[test]
+    fn otlp_endpoint_defaults_to_the_protocol_port() {
+        let mut cfg = TracingConfig::default();
+        assert_eq!(cfg.endpoint(), "http://127.0.0.1:4317");
+        cfg.exporter.protocol = OtlpProtocol::Http;
+        assert_eq!(cfg.endpoint(), "http://127.0.0.1:4318");
+        // An endpoint set explicitly is kept, even on the other protocol's port.
+        cfg.endpoint = Some("http://127.0.0.1:4317".to_string());
+        assert_eq!(cfg.endpoint(), "http://127.0.0.1:4317");
+    }
+
+    #[test]
+    fn key_value_list_skips_malformed_entries() {
+        let parsed = parse_key_value_list("a=1,novalue,=x, b = 2 ,c=x=y,d=Bearer%20t%2Cu");
+        assert_eq!(
+            parsed,
+            BTreeMap::from([
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "x=y".to_string()),
+                ("d".to_string(), "Bearer t,u".to_string()),
+            ])
+        );
     }
 
     #[test]

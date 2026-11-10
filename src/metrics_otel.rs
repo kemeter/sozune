@@ -1,7 +1,7 @@
 //! OpenTelemetry metrics export.
 //!
-//! When `metrics.otlp.enabled`, this builds an OTLP/gRPC metric exporter
-//! behind a [`PeriodicReader`] and registers the same series `/metrics`
+//! When `metrics.otlp.enabled`, this builds an OTLP metric exporter (gRPC or
+//! HTTP) behind a [`PeriodicReader`] and registers the same series `/metrics`
 //! serves:
 //!
 //! - gauges read from the live state at each push (entrypoints, backends,
@@ -19,8 +19,6 @@ use std::time::{Duration, Instant};
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Meter, MeterProvider as _};
-use opentelemetry_otlp::WithExportConfig as _;
-use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tracing::error;
 
@@ -47,18 +45,13 @@ impl Drop for MetricsGuard {
 /// Returns `Err` if the exporter can't be built, so the caller can carry on
 /// without OTLP metrics rather than crash.
 pub fn start(cfg: &OtlpMetricsConfig, state: &AppState) -> anyhow::Result<MetricsGuard> {
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(cfg.endpoint.clone())
-        .build()?;
+    let exporter = crate::otlp::metric_exporter(&cfg.endpoint(), &cfg.exporter)?;
 
     let reader = PeriodicReader::builder(exporter)
         .with_interval(Duration::from_secs(cfg.push_interval.max(1)))
         .build();
 
-    let resource = Resource::builder()
-        .with_service_name(cfg.service_name.clone())
-        .build();
+    let resource = crate::otlp::resource(&cfg.service_name, &cfg.exporter);
 
     let provider = SdkMeterProvider::builder()
         .with_reader(reader)

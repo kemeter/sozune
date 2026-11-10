@@ -138,10 +138,11 @@ scrape metrics without enabling the admin API. When the API is also enabled,
 |---|---|---|
 | `metrics.enabled` | `false` | Enables the dedicated `/metrics` listener (`SOZUNE_METRICS_ENABLED`) |
 | `metrics.listen_address` | `127.0.0.1:3039` | Bind address (`SOZUNE_METRICS_LISTEN_ADDRESS`); keep on loopback or restrict with an ACL |
-| `metrics.otlp.enabled` | `false` | Pushes the metrics over OTLP/gRPC to a collector, independently of the listener. See [OTLP metrics export](/documentation/advanced/observability#otlp-metrics-export). (since 0.17) |
-| `metrics.otlp.endpoint` | `http://127.0.0.1:4317` | OTLP/gRPC collector |
+| `metrics.otlp.enabled` | `false` | Pushes the metrics over OTLP to a collector, independently of the listener. See [OTLP metrics export](/documentation/advanced/observability#otlp-metrics-export). (since 0.17) |
+| `metrics.otlp.endpoint` | `http://127.0.0.1:4317` | OTLP collector; `http://127.0.0.1:4318` by default with `protocol: http` |
 | `metrics.otlp.service_name` | `sozune` | `service.name` of every metric |
 | `metrics.otlp.push_interval` | `10` | Seconds between two pushes |
+| `metrics.otlp.protocol`, `.headers`, `.resource_attributes`, `.tls` | — | How the export reaches the collector, as for `tracing`. See [Collector connection](/documentation/advanced/observability#collector-connection). (since 0.17) |
 
 ## Proxy
 
@@ -197,10 +198,15 @@ The verbosity is set with `RUST_LOG`, see [Configuring log verbosity](/documenta
 
 | Field | Default | Description |
 |---|---|---|
-| `tracing.enabled` | `false` | Exports a span per proxied request over OTLP/gRPC |
-| `tracing.endpoint` | `http://127.0.0.1:4317` | OTLP/gRPC collector |
+| `tracing.enabled` | `false` | Exports a span per proxied request over OTLP |
+| `tracing.endpoint` | `http://127.0.0.1:4317` | OTLP collector; `http://127.0.0.1:4318` by default with `protocol: http` |
 | `tracing.service_name` | `sozune` | `service.name` of every span |
 | `tracing.sampler` | `parent_based_always_on` | See [Sampling](/documentation/advanced/observability#sampling) |
+| `tracing.protocol` | `grpc` | `grpc` or `http` (protobuf over HTTP). See [Collector connection](/documentation/advanced/observability#collector-connection). (since 0.17) |
+| `tracing.headers` | `{}` | Headers sent with every export, e.g. an API key (since 0.17) |
+| `tracing.resource_attributes` | `{}` | Attributes added next to `service.name`, e.g. `deployment.environment` (since 0.17) |
+| `tracing.tls.ca` | — | PEM CA trusted for an `https://` endpoint, on top of the system and public roots (since 0.17) |
+| `tracing.tls.cert` / `tracing.tls.key` | — | PEM client certificate and key, for a collector that requires mTLS (since 0.17) |
 
 ## ACME
 
@@ -239,6 +245,10 @@ The fields below can be set through an environment variable, which wins over the
 | `metrics.otlp.endpoint` | `SOZUNE_METRICS_OTLP_ENDPOINT` (since 0.17) |
 | `metrics.otlp.service_name` | `SOZUNE_METRICS_OTLP_SERVICE_NAME` (since 0.17) |
 | `metrics.otlp.push_interval` | `SOZUNE_METRICS_OTLP_PUSH_INTERVAL` (since 0.17) |
+| `metrics.otlp.protocol` | `SOZUNE_METRICS_OTLP_PROTOCOL` (since 0.17) |
+| `metrics.otlp.headers` | `SOZUNE_METRICS_OTLP_HEADERS` (`key=value,key2=value2`, since 0.17) |
+| `metrics.otlp.resource_attributes` | `SOZUNE_METRICS_OTLP_RESOURCE_ATTRIBUTES` (`key=value,…`, since 0.17) |
+| `metrics.otlp.tls.ca` / `.cert` / `.key` | `SOZUNE_METRICS_OTLP_TLS_CA` / `_CERT` / `_KEY` (since 0.17) |
 | `providers.docker.enabled` | `SOZUNE_PROVIDER_DOCKER_ENABLED` |
 | `providers.docker.endpoint` | `SOZUNE_PROVIDER_DOCKER_ENDPOINT` |
 | `providers.docker.expose_by_default` | `SOZUNE_PROVIDER_DOCKER_EXPOSE_BY_DEFAULT` |
@@ -292,6 +302,10 @@ The fields below can be set through an environment variable, which wins over the
 | `tracing.endpoint` | `SOZUNE_TRACING_ENDPOINT` (since 0.14) |
 | `tracing.service_name` | `SOZUNE_TRACING_SERVICE_NAME` (since 0.14) |
 | `tracing.sampler` | `SOZUNE_TRACING_SAMPLER` (since 0.14) |
+| `tracing.protocol` | `SOZUNE_TRACING_PROTOCOL` (since 0.17) |
+| `tracing.headers` | `SOZUNE_TRACING_HEADERS` (`key=value,key2=value2`, since 0.17) |
+| `tracing.resource_attributes` | `SOZUNE_TRACING_RESOURCE_ATTRIBUTES` (`key=value,…`, since 0.17) |
+| `tracing.tls.ca` / `.cert` / `.key` | `SOZUNE_TRACING_TLS_CA` / `_CERT` / `_KEY` (since 0.17) |
 
 Booleans accept `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`.
 
