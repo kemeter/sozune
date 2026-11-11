@@ -1,7 +1,7 @@
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{
-    CircuitBreakerConfig, EntrypointAcmeConfig, HealthCheckConfig, LoadBalancer, RetryConfig,
-    SniRejection,
+    CircuitBreakerConfig, EntrypointAcmeConfig, GrpcHealthCheck, HealthCheckConfig, LoadBalancer,
+    RetryConfig, SniRejection,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -180,13 +180,17 @@ pub fn parse_acme(labels: &HashMap<String, String>, prefix: &str) -> Option<Entr
 
 /// Parse the health-check labels (`<prefix>healthCheck.*`):
 ///
-/// - `path` — enables the HTTP probe. A leading `/` is added if missing.
-/// - `status` — exact status code the HTTP probe accepts; any 2xx/3xx without.
-/// - `timeout` — per-probe timeout, in milliseconds.
-/// - `interval` — milliseconds between two probes.
-/// - `port` — port the probe dials instead of the backend's.
-/// - `headers.<Name>` — request header of the HTTP probe.
-/// - `unhealthyThreshold` / `healthyThreshold` — consecutive failures before
+/// - `path`: enables the HTTP probe. A leading `/` is added if missing.
+/// - `status`: exact status code the HTTP probe accepts; any 2xx/3xx without.
+/// - `timeout`: per-probe timeout, in milliseconds.
+/// - `interval`: milliseconds between two probes.
+/// - `port`: port the probe dials instead of the backend's.
+/// - `headers.<Name>`: request header of the HTTP probe (metadata of the
+///   gRPC one).
+/// - `mode`: `http` (the default) or `grpc`: call the gRPC health service
+///   instead of `GET <path>`.
+/// - `service`: the gRPC service whose health is asked, with `mode=grpc`.
+/// - `unhealthyThreshold` / `healthyThreshold`: consecutive failures before
 ///   the backend is unhealthy, successes before it is healthy again.
 ///
 /// An invalid value emits `W021` and is dropped, so the check keeps its
@@ -217,13 +221,53 @@ pub fn parse_health_check(
             );
         };
 
-    let path = value("path").map(|raw| {
+    let mut path = value("path").map(|raw| {
         if raw.starts_with('/') {
             raw.to_string()
         } else {
             format!("/{raw}")
         }
     });
+
+    let grpc = match value("mode").map(str::to_ascii_lowercase).as_deref() {
+        None | Some("http") => None,
+        Some("grpc") => Some(GrpcHealthCheck {
+            service: value("service").unwrap_or_default().to_string(),
+        }),
+        Some(_) => {
+            invalid(
+                diagnostics,
+                "mode",
+                value("mode").unwrap_or_default(),
+                "healthCheck.mode is neither http nor grpc; probing over HTTP",
+                "use http (the default) or grpc",
+            );
+            None
+        }
+    };
+    if grpc.is_none()
+        && let Some(raw) = value("service")
+    {
+        invalid(
+            diagnostics,
+            "service",
+            raw,
+            "healthCheck.service needs healthCheck.mode=grpc; ignoring it",
+            "set healthCheck.mode=grpc to ask the gRPC health service",
+        );
+    }
+    if grpc.is_some()
+        && let Some(raw) = value("path")
+    {
+        invalid(
+            diagnostics,
+            "path",
+            raw,
+            "healthCheck.path is not used by the gRPC probe; ignoring it",
+            "drop healthCheck.path, or healthCheck.service to name the gRPC service",
+        );
+        path = None;
+    }
 
     let status = value("status").and_then(|raw| match raw.parse::<u16>() {
         Ok(code) if (100..=599).contains(&code) => Some(code),
@@ -317,7 +361,17 @@ pub fn parse_health_check(
         }
     }
 
-    if path.is_none() {
+    if grpc.is_some() {
+        if let Some(raw) = value("status") {
+            invalid(
+                diagnostics,
+                "status",
+                raw,
+                "healthCheck.status is not used by the gRPC probe: it wants SERVING",
+                "drop healthCheck.status",
+            );
+        }
+    } else if path.is_none() {
         if let Some(raw) = value("status") {
             invalid(
                 diagnostics,
@@ -341,6 +395,7 @@ pub fn parse_health_check(
     }
 
     let configured = path.is_some()
+        || grpc.is_some()
         || timeout_ms.is_some()
         || interval_ms.is_some()
         || port.is_some()
@@ -355,6 +410,7 @@ pub fn parse_health_check(
         headers,
         unhealthy_threshold,
         healthy_threshold,
+        grpc,
     })
 }
 
@@ -867,6 +923,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hc.path.as_deref(), Some("/health"));
+    }
+
+    #[test]
+    fn health_check_mode_grpc_asks_the_service() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.api.healthCheck.mode", "gRPC"),
+                ("sozune.http.api.healthCheck.service", "greeter.Greeter"),
+                (
+                    "sozune.http.api.healthCheck.headers.Authorization",
+                    "Bearer x",
+                ),
+            ]),
+            "sozune.http.api.",
+            &mut d,
+        )
+        .unwrap();
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(hc.grpc.unwrap().service, "greeter.Greeter");
+        assert!(hc.path.is_none());
+        // The headers are the call's metadata.
+        assert_eq!(hc.headers["Authorization"], "Bearer x");
+    }
+
+    #[test]
+    fn health_check_grpc_drops_path_and_status() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.api.healthCheck.mode", "grpc"),
+                ("sozune.http.api.healthCheck.path", "/health"),
+                ("sozune.http.api.healthCheck.status", "200"),
+            ]),
+            "sozune.http.api.",
+            &mut d,
+        )
+        .unwrap();
+        assert_eq!(hc.grpc.unwrap().service, "");
+        assert!(hc.path.is_none());
+        assert!(hc.status.is_none());
+        assert_eq!(d.len(), 2);
+        assert!(
+            d.iter()
+                .all(|d| d.code == DiagnosticCode::W021InvalidHealthCheck)
+        );
+    }
+
+    #[test]
+    fn health_check_service_needs_mode_grpc() {
+        let mut d = Vec::new();
+        let hc = parse_health_check(
+            &labels(&[
+                ("sozune.http.api.healthCheck.path", "/health"),
+                ("sozune.http.api.healthCheck.service", "greeter"),
+                ("sozune.http.api.healthCheck.mode", "tcp"),
+            ]),
+            "sozune.http.api.",
+            &mut d,
+        )
+        .unwrap();
+        assert!(hc.grpc.is_none());
+        assert_eq!(hc.path.as_deref(), Some("/health"));
+        let fields: Vec<_> = d.iter().filter_map(|d| d.label.as_deref()).collect();
+        assert!(
+            fields.contains(&"sozune.http.api.healthCheck.mode"),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&"sozune.http.api.healthCheck.service"),
+            "{fields:?}"
+        );
     }
 
     #[test]

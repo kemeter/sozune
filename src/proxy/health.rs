@@ -29,12 +29,16 @@ pub fn probe_key(backend: &Backend, health_check: Option<&HealthCheckConfig>, h2
     }
 }
 
-/// The client of the HTTP probes of backends that speak h2c: HTTP/2 in
-/// cleartext with prior knowledge, which they expect of every request.
+/// The client of the probes sent over h2c, HTTP/2 in cleartext with prior
+/// knowledge: the HTTP probes of backends that speak it, and the gRPC ones.
 type H2cClient = hyper_util::client::legacy::Client<
     hyper_util::client::legacy::connect::HttpConnector,
-    http_body_util::Empty<bytes::Bytes>,
+    http_body_util::Full<bytes::Bytes>,
 >;
+
+/// The largest gRPC health answer read: a `HealthCheckResponse` is a few
+/// bytes.
+const MAX_GRPC_HEALTH_ANSWER: usize = 64 * 1024;
 
 /// Map of [`probe_key`]s to the reason the probe marked the backend down. Shared
 /// between [`HealthChecker`] and the API layer so `GET /entrypoints` can return
@@ -297,6 +301,11 @@ impl HealthChecker {
         match &probe.health_check {
             Some(
                 hc @ HealthCheckConfig {
+                    grpc: Some(grpc), ..
+                },
+            ) => self.probe_grpc(&probe.addr, &grpc.service, hc).await,
+            Some(
+                hc @ HealthCheckConfig {
                     path: Some(path), ..
                 },
             ) => self.probe_http(&probe.addr, path, hc, probe.h2c).await,
@@ -393,6 +402,103 @@ impl HealthChecker {
         ))
     }
 
+    /// gRPC probe: `grpc.health.v1.Health/Check` for `service`, over h2c.
+    /// Healthy when the call succeeds and answers `SERVING`.
+    async fn probe_grpc(
+        &self,
+        addr: &str,
+        service: &str,
+        hc: &HealthCheckConfig,
+    ) -> Result<(), UnhealthyReason> {
+        let now = now_epoch_secs();
+        let timeout = hc
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout);
+        let target = if service.is_empty() {
+            format!("gRPC health of {addr}")
+        } else {
+            format!("gRPC health of `{service}` on {addr}")
+        };
+        let call = async {
+            let mut req =
+                axum::http::Request::post(format!("http://{addr}/grpc.health.v1.Health/Check"))
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers");
+            for (name, value) in &hc.headers {
+                req = req.header(name, value);
+            }
+            let req = req
+                .body(http_body_util::Full::new(grpc_health_request(service)))
+                .map_err(|e| (UnhealthyKind::HttpError, format!("{target}: {e}")))?;
+            let resp = self
+                .h2c_client
+                .request(req)
+                .await
+                .map_err(|e| (UnhealthyKind::HttpError, format!("{target}: {e}")))?;
+            let (parts, body) = resp.into_parts();
+            if !parts.status.is_success() {
+                return Err((
+                    UnhealthyKind::BadStatus,
+                    format!("{target} answered HTTP {}", parts.status.as_u16()),
+                ));
+            }
+            use http_body_util::BodyExt;
+            let collected = http_body_util::Limited::new(body, MAX_GRPC_HEALTH_ANSWER)
+                .collect()
+                .await
+                .map_err(|e| (UnhealthyKind::HttpError, format!("{target}: {e}")))?;
+            // A call that fails at once answers its status in the headers
+            // (trailers-only); otherwise it comes in the trailers.
+            let grpc_status = collected
+                .trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .or_else(|| parts.headers.get("grpc-status"))
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u32>().ok());
+            match grpc_status {
+                Some(0) => {}
+                Some(code) => {
+                    return Err((
+                        UnhealthyKind::BadStatus,
+                        format!("{target} failed: {}", grpc_code_name(code)),
+                    ));
+                }
+                None => {
+                    return Err((
+                        UnhealthyKind::HttpError,
+                        format!("{target}: the answer has no grpc-status, is it a gRPC server?"),
+                    ));
+                }
+            }
+            match grpc_health_status(&collected.to_bytes()) {
+                Some(1) => Ok(()),
+                status => Err((
+                    UnhealthyKind::BadStatus,
+                    format!(
+                        "{target} is {}, expected SERVING",
+                        serving_status_name(status)
+                    ),
+                )),
+            }
+        };
+        match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(())) => {
+                debug!("{} passed", target);
+                Ok(())
+            }
+            Ok(Err((kind, message))) => {
+                debug!("{}", message);
+                Err(UnhealthyReason::new(kind, message, now))
+            }
+            Err(_) => Err(UnhealthyReason::new(
+                UnhealthyKind::Timeout,
+                format!("{target} timed out after {timeout:?}"),
+                now,
+            )),
+        }
+    }
+
     /// The status `GET url` answers over HTTP/1.1.
     async fn get_http1(
         &self,
@@ -425,7 +531,7 @@ impl HealthChecker {
             req = req.header(name, value);
         }
         let req = req
-            .body(http_body_util::Empty::new())
+            .body(http_body_util::Full::default())
             .map_err(|e| (UnhealthyKind::HttpError, format!("health check {url}: {e}")))?;
         match tokio::time::timeout(timeout, self.h2c_client.request(req)).await {
             Ok(Ok(resp)) => Ok(resp.status().as_u16()),
@@ -436,6 +542,107 @@ impl HealthChecker {
             )),
         }
     }
+}
+
+/// The framed `HealthCheckRequest { service }` of a gRPC health call: no
+/// compression flag, the message length, then the protobuf message, whose
+/// field 1 is the service name (left out when empty).
+fn grpc_health_request(service: &str) -> bytes::Bytes {
+    let mut message = Vec::new();
+    if !service.is_empty() {
+        message.push(0x0a);
+        put_varint(&mut message, service.len() as u64);
+        message.extend_from_slice(service.as_bytes());
+    }
+    let mut frame = Vec::with_capacity(5 + message.len());
+    frame.push(0);
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&message);
+    frame.into()
+}
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// Reads a varint at the start of `bytes`: its value and its length.
+fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for (i, byte) in bytes.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// The `status` of the framed `HealthCheckResponse` in `body`, `None` when
+/// it is not one. An absent field is `UNKNOWN` (0), as protobuf defaults it.
+fn grpc_health_status(body: &[u8]) -> Option<u64> {
+    let (&compressed, rest) = body.split_first()?;
+    if compressed != 0 || rest.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(rest[..4].try_into().ok()?) as usize;
+    let mut message = rest.get(4..4 + len)?;
+    let mut status = 0;
+    while !message.is_empty() {
+        let (tag, n) = read_varint(message)?;
+        message = &message[n..];
+        match (tag >> 3, tag & 7) {
+            (field, 0) => {
+                let (value, n) = read_varint(message)?;
+                message = &message[n..];
+                if field == 1 {
+                    status = value;
+                }
+            }
+            (_, 2) => {
+                let (len, n) = read_varint(message)?;
+                message = message.get(n + len as usize..)?;
+            }
+            (_, 1) => message = message.get(8..)?,
+            (_, 5) => message = message.get(4..)?,
+            _ => return None,
+        }
+    }
+    Some(status)
+}
+
+fn serving_status_name(status: Option<u64>) -> String {
+    match status {
+        Some(0) => "UNKNOWN".to_string(),
+        Some(1) => "SERVING".to_string(),
+        Some(2) => "NOT_SERVING".to_string(),
+        Some(3) => "SERVICE_UNKNOWN".to_string(),
+        Some(other) => format!("status {other}"),
+        None => "an answer that is not a HealthCheckResponse".to_string(),
+    }
+}
+
+/// How a failed gRPC call is named in the reason: the health service a
+/// server lacks answers `UNIMPLEMENTED`, an unknown service `NOT_FOUND`.
+fn grpc_code_name(code: u32) -> String {
+    let (name, hint) = match code {
+        1 => ("CANCELLED", ""),
+        2 => ("UNKNOWN", ""),
+        3 => ("INVALID_ARGUMENT", ""),
+        4 => ("DEADLINE_EXCEEDED", ""),
+        5 => ("NOT_FOUND", ": the server does not know this service"),
+        7 => ("PERMISSION_DENIED", ""),
+        8 => ("RESOURCE_EXHAUSTED", ""),
+        12 => ("UNIMPLEMENTED", ": the server has no gRPC health service"),
+        13 => ("INTERNAL", ""),
+        14 => ("UNAVAILABLE", ""),
+        16 => ("UNAUTHENTICATED", ""),
+        _ => return format!("grpc-status {code}"),
+    };
+    format!("{name} (grpc-status {code}){hint}")
 }
 
 /// A backend to probe, with the health-check parameters resolved from its
@@ -570,6 +777,7 @@ mod tests {
             headers: BTreeMap::new(),
             unhealthy_threshold: None,
             healthy_threshold: None,
+            grpc: None,
         }
     }
 
@@ -925,6 +1133,173 @@ mod tests {
         let mut http1 = h2c_probe(&addr, None);
         http1.h2c = false;
         assert!(checker.probe_backend(&http1).await.is_err());
+    }
+
+    /// The framed `HealthCheckResponse { status }`.
+    fn health_answer(status: u8) -> bytes::Bytes {
+        bytes::Bytes::from(vec![0, 0, 0, 0, 2, 0x08, status])
+    }
+
+    /// Spawn a gRPC health server over h2c. It answers `SERVING` for
+    /// `serving`, `NOT_SERVING` for `down`, `NOT_FOUND` for any other
+    /// service, and `UNIMPLEMENTED` (trailers-only) without `x-probe`.
+    async fn spawn_grpc_health() -> String {
+        use http_body_util::BodyExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |req: hyper::Request<hyper::body::Incoming>| async move {
+                            assert_eq!(req.uri().path(), "/grpc.health.v1.Health/Check");
+                            assert_eq!(req.headers()["content-type"], "application/grpc");
+                            let probed = req.headers().contains_key("x-probe");
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let service = std::str::from_utf8(body.get(7..).unwrap_or_default())
+                                .unwrap()
+                                .to_string();
+                            let (code, status) = match service.as_str() {
+                                _ if !probed => (12, None),
+                                "" | "serving" => (0, Some(1)),
+                                "down" => (0, Some(2)),
+                                _ => (5, None),
+                            };
+                            let frames: Vec<
+                                Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+                            > = match status {
+                                Some(status) => vec![
+                                    Ok(hyper::body::Frame::data(health_answer(status))),
+                                    Ok(hyper::body::Frame::trailers({
+                                        let mut t = axum::http::HeaderMap::new();
+                                        t.insert("grpc-status", code.to_string().parse().unwrap());
+                                        t
+                                    })),
+                                ],
+                                None => Vec::new(),
+                            };
+                            let mut resp = hyper::Response::new(http_body_util::StreamBody::new(
+                                futures_util::stream::iter(frames),
+                            ));
+                            resp.headers_mut()
+                                .insert("content-type", "application/grpc".parse().unwrap());
+                            if status.is_none() {
+                                resp.headers_mut()
+                                    .insert("grpc-status", code.to_string().parse().unwrap());
+                            }
+                            Ok::<_, std::convert::Infallible>(resp)
+                        },
+                    );
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn grpc_probe(addr: &str, service: &str) -> BackendProbe {
+        let mut check = hc("/ignored", None);
+        check.path = None;
+        check.headers.insert("x-probe".into(), "1".into());
+        check.grpc = Some(crate::model::GrpcHealthCheck {
+            service: service.to_string(),
+        });
+        BackendProbe {
+            addr: addr.to_string(),
+            health_check: Some(check),
+            h2c: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_serving_grpc_backend_is_healthy() {
+        let addr = spawn_grpc_health().await;
+        let checker = checker();
+        assert!(checker.probe_backend(&grpc_probe(&addr, "")).await.is_ok());
+        assert!(
+            checker
+                .probe_backend(&grpc_probe(&addr, "serving"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grpc_service_not_serving_is_unhealthy() {
+        let addr = spawn_grpc_health().await;
+        let reason = checker()
+            .probe_backend(&grpc_probe(&addr, "down"))
+            .await
+            .expect_err("NOT_SERVING is unhealthy");
+        assert_eq!(reason.kind, UnhealthyKind::BadStatus);
+        assert!(reason.message.contains("NOT_SERVING"), "{}", reason.message);
+    }
+
+    #[tokio::test]
+    async fn a_failed_grpc_health_call_names_its_status() {
+        let addr = spawn_grpc_health().await;
+        let checker = checker();
+        let unknown = checker
+            .probe_backend(&grpc_probe(&addr, "missing"))
+            .await
+            .expect_err("an unknown service is unhealthy");
+        assert!(unknown.message.contains("NOT_FOUND"), "{}", unknown.message);
+
+        // Without the check's metadata, the server answers trailers-only.
+        let mut bare = grpc_probe(&addr, "");
+        bare.health_check.as_mut().unwrap().headers.clear();
+        let unimplemented = checker
+            .probe_backend(&bare)
+            .await
+            .expect_err("UNIMPLEMENTED is unhealthy");
+        assert_eq!(unimplemented.kind, UnhealthyKind::BadStatus);
+        assert!(
+            unimplemented.message.contains("no gRPC health service"),
+            "{}",
+            unimplemented.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http_server_fails_the_grpc_check() {
+        let addr = spawn_h2c(200).await;
+        let reason = checker()
+            .probe_backend(&grpc_probe(&addr, ""))
+            .await
+            .expect_err("a plain HTTP answer is not a gRPC one");
+        assert_eq!(reason.kind, UnhealthyKind::HttpError);
+    }
+
+    #[test]
+    fn the_health_request_carries_the_service() {
+        assert_eq!(&grpc_health_request("")[..], &[0, 0, 0, 0, 0]);
+        assert_eq!(
+            &grpc_health_request("a.B")[..],
+            &[0, 0, 0, 0, 5, 0x0a, 3, b'a', b'.', b'B']
+        );
+    }
+
+    #[test]
+    fn the_health_answer_is_decoded() {
+        assert_eq!(grpc_health_status(&health_answer(1)), Some(1));
+        assert_eq!(grpc_health_status(&health_answer(2)), Some(2));
+        // An empty message is the default status, UNKNOWN.
+        assert_eq!(grpc_health_status(&[0, 0, 0, 0, 0]), Some(0));
+        // Unknown fields are skipped.
+        assert_eq!(
+            grpc_health_status(&[0, 0, 0, 0, 5, 0x12, 1, b'x', 0x08, 1]),
+            Some(1)
+        );
+        assert_eq!(grpc_health_status(&[]), None);
+        assert_eq!(grpc_health_status(&[1, 0, 0, 0, 2, 0x08, 1]), None);
+        assert_eq!(grpc_health_status(&[0, 0, 0, 0, 9, 0x08]), None);
     }
 
     #[tokio::test]

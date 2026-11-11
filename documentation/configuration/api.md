@@ -556,7 +556,8 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
   "port": null,                         // probe port; null = the backend's
   "headers": { "Authorization": "***" },// HTTP probe headers; values masked in responses
   "unhealthy_threshold": null,          // failures in a row before out of rotation; default 1
-  "healthy_threshold": null             // successes in a row before back; default 1
+  "healthy_threshold": null,            // successes in a row before back; default 1
+  "grpc": null                          // { "service": "" }: call grpc.health.v1.Health/Check instead
 }
 ```
 

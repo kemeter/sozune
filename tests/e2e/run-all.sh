@@ -528,6 +528,28 @@ services:
       - "sozune.http.grpc.host=$HOST_GRPC"
       - "sozune.http.grpc.port=9000"
       - "sozune.http.grpc.scheme=h2c"
+      - "sozune.http.grpchcnone.host=$HOST_GRPC_HC_NONE"
+      - "sozune.http.grpchcnone.port=9000"
+      - "sozune.http.grpchcnone.scheme=h2c"
+      - "sozune.http.grpchcnone.healthCheck.mode=grpc"
+      - "sozune.http.grpchcnone.healthCheck.interval=1000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  # etcd serves the gRPC health service on its client port: SERVING
+  # (42-grpc-health-checks.sh). grpcbin above has none (UNIMPLEMENTED).
+  svc-etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    command:
+      - etcd
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.grpchc.host=$HOST_GRPC_HC"
+      - "sozune.http.grpchc.port=2379"
+      - "sozune.http.grpchc.scheme=h2c"
+      - "sozune.http.grpchc.healthCheck.mode=grpc"
+      - "sozune.http.grpchc.healthCheck.interval=1000"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   svc-mirrored:

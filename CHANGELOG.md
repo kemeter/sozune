@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 ### Routing
 
 - h2c backends: `scheme=h2c` reaches a route's backends over HTTP/2 in cleartext, as gRPC servers expect, on every label provider and as a Kubernetes Ingress annotation (`h2c_backends` in static config and the API). It holds through the middleware, and the route's HTTP health check is sent over h2c too. See [gRPC and h2c backends](documentation/routing/grpc.md).
+- gRPC health checks: `healthCheck.mode=grpc` probes a backend with the gRPC health protocol (`grpc.health.v1.Health/Check` over h2c, for the server or the `healthCheck.service` named), as Traefik's health check mode of that name does. The backend stays in rotation while it answers `SERVING`. See [gRPC health checks](documentation/advanced/health-checks.md#grpc-health-checks).
 
 ### Observability
 

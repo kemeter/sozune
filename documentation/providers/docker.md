@@ -84,6 +84,8 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.healthCheck.unhealthyThreshold` | [Health checks](/documentation/advanced/health-checks#settings) — failed probes in a row before a backend leaves (since 0.16) |
 | `sozune.http.<svc>.healthCheck.healthyThreshold` | [Health checks](/documentation/advanced/health-checks#settings) — successful probes in a row before it comes back (since 0.16) |
 | `sozune.http.<svc>.healthCheck.headers.<name>` | [Health checks](/documentation/advanced/health-checks#http-health-checks) — a header the probe sends (since 0.16) |
+| `sozune.http.<svc>.healthCheck.mode` | [Health checks](/documentation/advanced/health-checks#grpc-health-checks): `grpc` calls the gRPC health service instead of `GET <path>` (since 0.17) |
+| `sozune.http.<svc>.healthCheck.service` | [Health checks](/documentation/advanced/health-checks#grpc-health-checks): the gRPC service whose health is asked (since 0.17) |
 
 ## Middleware
 
