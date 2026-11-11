@@ -130,6 +130,13 @@ pub async fn handle_proxy(
 
     // Kept for the route's CORS policy, which marks whatever answers it.
     let origin = req.headers().get(axum::http::header::ORIGIN).cloned();
+    // And for the page that replaces the route's errors, which can be told
+    // the request it answers.
+    let request_method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| path.clone(), |pq| pq.as_str().to_string());
 
     // The route the request matched, whose response edits apply to whatever
     // answers it.
@@ -796,6 +803,14 @@ pub async fn handle_proxy(
 
     let mut response = fut.instrument(span).await;
     if let Some(route) = matched.get() {
+        // The page goes in first, so that the edits and CORS mark it too.
+        if let Some(errors) = route.errors.as_ref()
+            && errors.replaces(response.status())
+        {
+            response = errors
+                .replace(&request_method, &path_and_query, response)
+                .await;
+        }
         route.edit_response(&mut response);
         if let Some(cors) = route.cors.as_ref() {
             cors.mark_response(origin.as_ref(), &mut response);
@@ -1589,7 +1604,7 @@ fn record_outcome(
     Body::new(StreamBody::new(frames))
 }
 
-/// The outcome a response body still owes its route's circuit breaker.
+/// The nutcome a response body still owes its route's circuit breaker.
 struct BreakerOutcome {
     breaker: Option<std::sync::Arc<super::circuit_breaker::CircuitBreaker>>,
     failed: bool,
@@ -2297,5 +2312,61 @@ mod retry_tests {
                 .unwrap()
                 .replays()
         );
+    }
+
+    fn with_error_page(status: &[&str]) -> EntrypointConfig {
+        EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            errors: Some(crate::model::BackendErrorsConfig {
+                status: status.iter().map(|s| s.to_string()).collect(),
+                page: Some("<h1>down</h1>".into()),
+                url: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn text_of(response: Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A route listing the backend's status serves its page instead, with
+    /// that status.
+    #[tokio::test]
+    async fn the_error_page_replaces_a_backend_error() {
+        let (port, _) = backend(1, 503).await;
+        let response = respond_through(with_error_page(&["500-599"]), port, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(text_of(response).await, "<h1>down</h1>");
+    }
+
+    /// A status the route does not list passes through.
+    #[tokio::test]
+    async fn the_error_page_leaves_other_statuses() {
+        let (port, _) = backend(0, 503).await;
+        let response = respond_through(with_error_page(&["500-599"]), port, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(text_of(response).await, "<h1>down</h1>");
+
+        let (port, _) = backend(1, 503).await;
+        let response = respond_through(with_error_page(&["404"]), port, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(text_of(response).await, "<h1>down</h1>");
+    }
+
+    /// The middleware's own answer for a backend it cannot reach is
+    /// replaced too.
+    #[tokio::test]
+    async fn the_error_page_replaces_an_unreachable_backend() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let response = respond_through(with_error_page(&["502"]), port, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(text_of(response).await, "<h1>down</h1>");
     }
 }

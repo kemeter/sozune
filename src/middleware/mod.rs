@@ -1,3 +1,4 @@
+mod backend_errors;
 pub mod chain;
 pub mod circuit_breaker;
 mod compress;
@@ -29,6 +30,7 @@ use crate::model::{
     MatchCondition,
 };
 use crate::proxy::sozu::{header_predicate, routes_on_query};
+use backend_errors::BackendErrors;
 use chain::Middleware;
 use compress::CompressMiddleware;
 use fixed_answer::FixedAnswerMiddleware;
@@ -235,6 +237,10 @@ pub struct MiddlewareRoute {
     /// The route's CORS policy, which marks every response to an origin it
     /// allows, whatever gave it: the backend, a middleware or an error.
     pub cors: Option<Arc<cors::CorsMiddleware>>,
+    /// The page that replaces the route's error responses, whatever gave
+    /// them: the backend, the middleware failing to reach it, or one of its
+    /// steps.
+    pub errors: Option<Arc<BackendErrors>>,
 }
 
 /// One of a route's mirrors: its backends, how to pick one, and which
@@ -973,6 +979,8 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || config.replace_path.is_some()
         || config.replace_path_regex.is_some()
         || config.redirect_regex.is_some()
+        // And the pages that replace its errors.
+        || config.errors.is_some()
 }
 
 /// Whether the middleware answers the route's redirect instead of Sōzu: see
@@ -1192,6 +1200,11 @@ pub fn build_middleware_route(
             .failing_shares
             .map(|s| WeightedRoundRobin::new(&[s.forwarded, s.invalid, s.unavailable])),
         cors,
+        errors: config
+            .errors
+            .as_ref()
+            .and_then(|errors| BackendErrors::new(errors, forward_auth_client.clone()))
+            .map(Arc::new),
     })
 }
 
@@ -1348,6 +1361,7 @@ mod route_key_tests {
             h2c: false,
             retry_backoff: None,
             circuit_breaker: None,
+            errors: None,
             middlewares: Vec::new(),
             rewrite_host: None,
             mirrors: Vec::new(),
@@ -1697,6 +1711,7 @@ mod route_key_tests {
             h2c: false,
             retry_backoff: None,
             circuit_breaker: None,
+            errors: None,
             middlewares: Vec::new(),
             rewrite_host: None,
             mirrors: Vec::new(),

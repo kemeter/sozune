@@ -84,5 +84,60 @@ The label key is `errorPages.<code>`. Inline bodies only — `file://` is refuse
 
 - The body is sent verbatim. Sōzune does not template inline bodies, but `%REQUEST_ID`, `%ROUTE` and `%DURATION` placeholders in a full HTTP/1.1 response are substituted by Sōzu at response time.
 - When no `error_pages` entry matches the status code, Sōzu's built-in default templates are served.
-- Only the answers Sōzu makes itself are replaced. A response from the backend passes through as it is, and so does one the Sōzune middleware makes (a `429` from the rate limit, a `403` from the IP allow-list, a `503` from an open circuit breaker, or the `502`/`504` it answers for a backend it could not reach on a route with a `backendTimeout`, retries, forward auth…): to Sōzu it is the backend's answer.
+- Only the answers Sōzu makes itself are replaced. A response from the backend passes through as it is, and so does one the Sōzune middleware makes (a `429` from the rate limit, a `403` from the IP allow-list, a `503` from an open circuit breaker, or the `502`/`504` it answers for a backend it could not reach on a route with a `backendTimeout`, retries, forward auth…): to Sōzu it is the backend's answer. To replace those, see [Backend errors](#backend-errors) below.
 - An empty value (`errorPages.503=`) is treated as "preserve current" and does not overwrite an inherited template — matches Sōzu's own semantics.
+
+## Backend errors
+
+> Since 0.17
+
+`errorPages` covers the errors Sōzu answers itself. To replace the errors a route answers, use `errors.*`: the status the backend returns, the `502`/`504` the middleware answers when it cannot reach the backend, or the refusal of one of the route's steps (a `429` from the rate limit, a `403` from the IP allow-list…). This is the counterpart of Traefik's `errors` middleware.
+
+```yaml
+labels:
+  - "sozune.http.<svc>.errors.status=500-599,404"
+  - "sozune.http.<svc>.errors.page=<html><body><h1>Something went wrong</h1></body></html>"
+```
+
+| Label | Meaning |
+|---|---|
+| `errors.status` | The statuses replaced, comma-separated: codes (`404`) and inclusive ranges (`500-599`), from `400` to `599`. Required. |
+| `errors.page` | The page served instead, inline. |
+| `errors.url` | Where the page is fetched from, with `{status}` replaced by the status and `{url}` by the request's path and query, percent-encoded. When the fetch fails (no `2xx` within 5 seconds, or a page over 1 MiB), `errors.page` is served if set, else the original response. |
+
+At least one of `errors.page` and `errors.url` is needed. The replaced response keeps its status and its headers (`Retry-After`, `Set-Cookie`, `WWW-Authenticate`…), and gets the page's `Content-Type` (`text/html; charset=utf-8` for an inline page) and `Content-Length`. A `HEAD` request gets the headers only. The route's response header edits and CORS policy apply to the page too.
+
+```yaml
+labels:
+  - "sozune.http.<svc>.errors.status=502-504"
+  - "sozune.http.<svc>.errors.url=http://error-pages.internal/{status}.html?from={url}"
+  - "sozune.http.<svc>.errors.page=<html><body>Service unavailable</body></html>"
+```
+
+A route with `errors.*` goes through the Sōzune middleware. A missing or invalid `errors.status`, or neither a page nor a URL, emits `W034` and the route's errors pass through. As for `errorPages`, provider labels refuse a `file://` page (`W034`); the static YAML and the API accept one:
+
+```yaml
+entrypoints:
+  - id: myapp
+    name: myapp
+    protocol: Http
+    backends:
+      - address: "172.20.0.4"
+        port: 8080
+    config:
+      hostnames: [app.example.com]
+      tls: false
+      strip_prefix: false
+      priority: 0
+      errors:
+        status: ["500-599", "404"]
+        page: "file:///etc/sozune/templates/error.html"
+```
+
+| Provider | Supported | How |
+|---|---|---|
+| Docker / Swarm / Podman | yes | `sozune.http.<svc>.errors.*` labels |
+| Nomad | yes | same labels, declared as Nomad tags |
+| Kubernetes (Service) | yes | `sozune.http.<svc>.errors.*` annotations |
+| HTTP provider, YAML config file, REST API | yes | `errors` map on the entrypoint |
+| Kubernetes (Ingress, Gateway API) | no | |

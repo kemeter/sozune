@@ -1009,6 +1009,10 @@ async fn run_middleware(
     if entrypoint.config.circuit_breaker.is_some() {
         pipeline.push(step("circuit-breaker", StepVerdict::Applies, None));
     }
+    if let Some(errors) = entrypoint.config.errors.as_ref() {
+        let detail = format!("replaces {} with its page", errors.status.join(", "));
+        pipeline.push(step("errors", StepVerdict::Applies, Some(&detail)));
+    }
     Ok(stopped.unwrap_or_else(|| MiddlewareResult::Continue(route.cluster_id.clone())))
 }
 
@@ -1793,6 +1797,30 @@ mod tests {
         assert_eq!(
             retry.detail.as_deref(),
             Some("3 attempts, on 500, 503, 100 ms apart")
+        );
+    }
+
+    /// The errors step names the statuses it replaces.
+    #[tokio::test]
+    async fn the_errors_step_names_its_statuses() {
+        let routes = vec![route(
+            "web",
+            &["app.example.com"],
+            serde_json::json!({
+                "errors": { "status": ["500-599", "404"], "page": "<h1>down</h1>" }
+            }),
+        )];
+
+        let resolution = resolve_in(routes, get("http://app.example.com/")).await;
+
+        let errors = resolution
+            .pipeline
+            .iter()
+            .find(|s| s.name == "errors")
+            .expect("an errors step");
+        assert_eq!(
+            errors.detail.as_deref(),
+            Some("replaces 500-599, 404 with its page")
         );
     }
 

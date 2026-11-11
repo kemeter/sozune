@@ -4,8 +4,9 @@ use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
-    auth, core, error_pages, forward_auth, headers, host, in_flight_req, ip_allow_list, methods,
-    path, plugin_config, plugins, ratelimit, redirect, request_match, rewrite,
+    auth, backend_errors, core, error_pages, forward_auth, headers, host, in_flight_req,
+    ip_allow_list, methods, path, plugin_config, plugins, ratelimit, redirect, request_match,
+    rewrite,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol, RedirectPolicy};
@@ -234,6 +235,7 @@ fn build_entrypoint(
     let weight = core::parse_weight(labels, &prefix, diagnostics);
     let retry = core::parse_retry(labels, &prefix, diagnostics);
     let circuit_breaker = core::parse_circuit_breaker(labels, &prefix, diagnostics);
+    let errors = backend_errors::parse_backend_errors(labels, &prefix, diagnostics);
     let rate_limit = ratelimit::parse_rate_limit(labels, &prefix, diagnostics);
     let in_flight_req = in_flight_req::parse_in_flight_req(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
@@ -383,6 +385,7 @@ fn build_entrypoint(
             load_balancer,
             retry,
             circuit_breaker,
+            errors,
             rate_limit,
             in_flight_req,
             sticky_session,
@@ -552,6 +555,7 @@ fn build_l4_entrypoint(
             load_balancer,
             retry: None,
             circuit_breaker: None,
+            errors: None,
             rate_limit: None,
             in_flight_req: None,
             sticky_session: false,

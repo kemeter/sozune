@@ -401,6 +401,16 @@ const ENTRIES: &[Entry] = &[
         ),
     },
     Entry {
+        code: "W034",
+        title: "Invalid errors pages",
+        cause: "The `errors.*` labels of a route are unusable: `errors.status` is missing or lists something other than codes and ranges from 400 to 599, neither `errors.page` nor `errors.url` is set, or `errors.page` is a `file://` path.",
+        effect: "The route's error responses are not replaced. A `file://` page is dropped, and the route still uses `errors.url` if it has one.",
+        fix: "List the statuses and give an inline page or a URL to fetch it from. Keep on-disk pages in static config.",
+        example: Some(
+            "sozune.http.web.errors.status=500-599,404\nsozune.http.web.errors.page=<h1>Something went wrong</h1>",
+        ),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

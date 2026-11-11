@@ -476,6 +476,26 @@ services:
 
   # svc-mirror-shadow gets a copy of each request of svc-mirrored, and logs
   # its request line.
+  # whoami: `POST /health` with a status sets what `GET /health` answers.
+  # Its errors are replaced by a page of the route's (40-backend-error-pages.sh).
+  svc-backend-errors:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.backenderrors.host=$HOST_BACKEND_ERRORS"
+      - "sozune.http.backenderrors.errors.status=500-599,404"
+      - "sozune.http.backenderrors.errors.page=<html>sozune backend error page</html>"
+      - "sozune.http.backenderrorsurl.host=$HOST_BACKEND_ERRORS_URL"
+      - "sozune.http.backenderrorsurl.errors.status=503"
+      - "sozune.http.backenderrorsurl.errors.url=http://127.0.0.1:$ERROR_PAGES_HOST_PORT/{status}?from={url}"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  # Serves the pages of backenderrorsurl: whoami echoes the request line.
+  svc-error-pages-server:
+    image: traefik/whoami
+    ports:
+      - "127.0.0.1:$ERROR_PAGES_HOST_PORT:80"
+
   svc-mirrored:
     image: traefik/whoami
     labels:

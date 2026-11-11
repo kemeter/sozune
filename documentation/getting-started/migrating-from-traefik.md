@@ -125,7 +125,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `compress=true` | `compress=true` |
 | `retry.attempts` | `retry.attempts` |
 | `circuitbreaker.expression` | `circuitBreaker.threshold`, `circuitBreaker.minRequests`, `circuitBreaker.cooldown`. Sōzune trips on an error rate, not on an expression: see [Circuit breaker](/documentation/middleware/circuit-breaker). |
-| `errors.status` + `errors.service` | No equivalent for errors returned by the backend. `errorPages.<status>=<html>` only replaces the errors Sōzune answers itself (no route, backend down…), with an inline page. |
+| `errors.status` + `errors.service` + `errors.query` | `errors.status`, and `errors.url` for the service and query together (`http://error-pages/{status}.html?from={url}`), or `errors.page` for an inline page: see [Backend errors](/documentation/middleware/error-pages#backend-errors). |
 | Traefik plugins | [WASM plugins](/documentation/middleware/wasm-plugins). Traefik's Yaegi plugins do not run as is. |
 
 Not available yet: `chain`, `digestauth`, `buffering` and weighted services. A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A weighted split between two versions is written with a `weight` on the containers of one service instead: see [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing).
