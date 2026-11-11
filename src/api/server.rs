@@ -87,7 +87,11 @@ fn entrypoint_payload(
         .backends
         .iter()
         .filter_map(|b| {
-            let key = crate::proxy::health::probe_key(b, entrypoint.config.health_check.as_ref());
+            let key = crate::proxy::health::probe_key(
+                b,
+                entrypoint.config.health_check.as_ref(),
+                entrypoint.config.h2c_backends,
+            );
             unhealthy.get(&key).map(|reason| {
                 serde_json::json!({
                     "address": b.to_string(),

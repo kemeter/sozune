@@ -183,6 +183,7 @@ mod tests {
                 ("sozune.compress", "true"),
                 ("sozune.headers.X-Frame-Options", "DENY"),
                 ("sozune.ratelimit.average", "10"),
+                ("sozune.scheme", "h2c"),
             ]),
             "ingress:default/web",
         );
@@ -190,6 +191,7 @@ mod tests {
         let settings = settings.unwrap();
         assert!(settings.forwards);
         assert!(settings.config.compress);
+        assert!(settings.config.h2c_backends);
         assert_eq!(settings.config.headers[0].name, "X-Frame-Options");
         assert!(settings.config.rate_limit.is_some());
     }

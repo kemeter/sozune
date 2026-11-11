@@ -411,6 +411,14 @@ const ENTRIES: &[Entry] = &[
         ),
     },
     Entry {
+        code: "W035",
+        title: "Invalid backend scheme",
+        cause: "The `scheme` label of an HTTP route is neither `http` nor `h2c`. TLS to the backends (`https`) is not supported.",
+        effect: "The label is ignored: the backends are reached over HTTP/1.1.",
+        fix: "Set `scheme=h2c` for backends that speak HTTP/2 in cleartext, such as gRPC servers, or drop the label.",
+        example: Some("sozune.http.api.scheme=h2c"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

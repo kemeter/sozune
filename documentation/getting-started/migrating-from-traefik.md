@@ -90,6 +90,7 @@ A rule that mixes `||` across different matcher types has no single-route equiva
 |---|---|
 | `services.<s>.loadbalancer.server.port` | `port` |
 | `services.<s>.loadbalancer.sticky.cookie=true` | `stickySession=true` |
+| `services.<s>.loadbalancer.server.scheme=h2c` | `scheme=h2c` ([gRPC and h2c backends](/documentation/routing/grpc), since 0.17). `https` has no equivalent. |
 | `services.<s>.loadbalancer.healthcheck.path` | `healthCheck.path`. A backend that fails it leaves the rotation, unless every backend of the route does (since 0.16). See [Health checks](/documentation/advanced/health-checks). |
 | `services.<s>.loadbalancer.healthcheck.timeout=2s` | `healthCheck.timeout=2000` (milliseconds) |
 | `services.<s>.loadbalancer.healthcheck.interval=5s` | `healthCheck.interval=5000` (milliseconds) (since 0.16) |

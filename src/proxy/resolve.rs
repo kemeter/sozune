@@ -1093,6 +1093,7 @@ fn backend_states(
             .get(&crate::proxy::health::probe_key(
                 backend,
                 entrypoint.config.health_check.as_ref(),
+                entrypoint.config.h2c_backends,
             ))
             .map(|r| r.message.clone());
         BackendState {
