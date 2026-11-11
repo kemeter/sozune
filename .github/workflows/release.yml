@@ -109,8 +109,12 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
+      # From the protobuf GitHub releases: the Ubuntu mirrors are not always
+      # reachable from the runners.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
 
