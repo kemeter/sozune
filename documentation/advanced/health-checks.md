@@ -81,7 +81,7 @@ A backend that stops answering is also left out without one, from the requests i
 ## What it does not do
 
 - **No status ranges.** `healthCheck.status` accepts one exact code; without it, any `2xx`/`3xx` is healthy.
-- **No gRPC / custom method / HTTPS** on the HTTP probe yet — it is a plain-HTTP `GET`.
+- **No gRPC health protocol / custom method / HTTPS** on the HTTP probe yet: it is a plain `GET`, sent over h2c when the route's backends speak it ([`scheme=h2c`](/documentation/routing/grpc), since 0.17).
 
 ## Combined with Docker
 

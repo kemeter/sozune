@@ -490,6 +490,7 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
     "rate_limit": null,                 // see below
     "sticky_session": false,
     "compress": false,                  // zstd/br/gzip negotiated via Accept-Encoding
+    "h2c_backends": false,              // reach the backends over h2c, as gRPC servers expect
     "entrypoint": null,                 // TCP or UDP listener name (required for protocol=Tcp and Udp)
     "methods": [],                      // ["GET", "POST", ...]; empty = any method
     "health_check": null,               // see below

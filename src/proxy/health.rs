@@ -13,16 +13,28 @@ use crate::model::{Backend, Entrypoint, HealthCheckConfig, Protocol};
 /// check of the route that probes it. Two routes that share a backend but
 /// check it differently get a probe and a verdict each, so one route's check
 /// never takes the backend out of the other. It can hold the check's header
-/// values: it is never logged nor shown.
-pub fn probe_key(backend: &Backend, health_check: Option<&HealthCheckConfig>) -> String {
+/// values: it is never logged nor shown. An HTTP check of backends that
+/// speak h2c is sent over h2c, so it is keyed apart too.
+pub fn probe_key(backend: &Backend, health_check: Option<&HealthCheckConfig>, h2c: bool) -> String {
     match health_check {
         None => backend.to_string(),
-        Some(hc) => format!(
-            "{backend} {}",
-            serde_json::to_string(hc).unwrap_or_default()
-        ),
+        Some(hc) => {
+            let check = serde_json::to_string(hc).unwrap_or_default();
+            if h2c && hc.path.is_some() {
+                format!("{backend} h2c {check}")
+            } else {
+                format!("{backend} {check}")
+            }
+        }
     }
 }
+
+/// The client of the HTTP probes of backends that speak h2c: HTTP/2 in
+/// cleartext with prior knowledge, which they expect of every request.
+type H2cClient = hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    http_body_util::Empty<bytes::Bytes>,
+>;
 
 /// Map of [`probe_key`]s to the reason the probe marked the backend down. Shared
 /// between [`HealthChecker`] and the API layer so `GET /entrypoints` can return
@@ -127,6 +139,8 @@ pub struct HealthChecker {
     /// Client used for HTTP health probes. Built once; the TCP probe path does
     /// not use it.
     http_client: reqwest::Client,
+    /// Client used for the HTTP probes of backends that speak h2c.
+    h2c_client: H2cClient,
 }
 
 impl HealthChecker {
@@ -149,6 +163,11 @@ impl HealthChecker {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            h2c_client: hyper_util::client::legacy::Client::builder(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .http2_only(true)
+            .build_http(),
         }
     }
 
@@ -255,15 +274,17 @@ impl HealthChecker {
                 continue;
             }
             let health_check = entrypoint.config.health_check.as_ref();
+            let h2c = entrypoint.config.h2c_backends;
             for backend in &entrypoint.backends {
                 backends
-                    .entry(probe_key(backend, health_check))
+                    .entry(probe_key(backend, health_check, h2c))
                     .or_insert_with(|| BackendProbe {
                         addr: match health_check.and_then(|hc| hc.port) {
                             Some(port) => format!("{}:{port}", backend.address),
                             None => backend.to_string(),
                         },
                         health_check: health_check.cloned(),
+                        h2c,
                     });
             }
         }
@@ -278,7 +299,7 @@ impl HealthChecker {
                 hc @ HealthCheckConfig {
                     path: Some(path), ..
                 },
-            ) => self.probe_http(&probe.addr, path, hc).await,
+            ) => self.probe_http(&probe.addr, path, hc, probe.h2c).await,
             Some(hc) => {
                 let timeout = hc
                     .timeout_ms
@@ -319,63 +340,100 @@ impl HealthChecker {
         }
     }
 
-    /// HTTP probe: `GET http://<addr><path>`. Healthy when the status is
-    /// accepted — exactly `hc.status` when set, else any 2xx/3xx.
+    /// HTTP probe: `GET http://<addr><path>`, over h2c when the backends
+    /// speak it. Healthy when the status is accepted: exactly `hc.status`
+    /// when set, else any 2xx/3xx.
     async fn probe_http(
         &self,
         addr: &str,
         path: &str,
         hc: &HealthCheckConfig,
+        h2c: bool,
     ) -> Result<(), UnhealthyReason> {
         let now = now_epoch_secs();
         let url = format!("http://{addr}{path}");
+        // The check's own timeout overrides the default when set.
+        let timeout = hc
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout);
 
-        // Per-check timeout overrides the client's global default when set.
-        let mut req = self.http_client.get(&url);
-        if let Some(ms) = hc.timeout_ms {
-            req = req.timeout(Duration::from_millis(ms));
+        let status = if h2c {
+            self.get_h2c(&url, hc, timeout).await
+        } else {
+            self.get_http1(&url, hc, timeout).await
+        };
+        let code = match status {
+            Ok(code) => code,
+            Err((kind, message)) => {
+                debug!("HTTP health check failed for {}: {}", url, message);
+                return Err(UnhealthyReason::new(kind, message, now));
+            }
+        };
+        let accepted = match hc.status {
+            Some(want) => code == want,
+            None => (200..400).contains(&code),
+        };
+        if accepted {
+            debug!("HTTP health check passed for {} ({})", url, code);
+            return Ok(());
         }
+        let expected = match hc.status {
+            Some(want) => want.to_string(),
+            None => "2xx/3xx".to_string(),
+        };
+        debug!(
+            "HTTP health check rejected for {}: status {} (expected {})",
+            url, code, expected
+        );
+        Err(UnhealthyReason::new(
+            UnhealthyKind::BadStatus,
+            format!("health check {url} returned {code}, expected {expected}"),
+            now,
+        ))
+    }
+
+    /// The status `GET url` answers over HTTP/1.1.
+    async fn get_http1(
+        &self,
+        url: &str,
+        hc: &HealthCheckConfig,
+        timeout: Duration,
+    ) -> Result<u16, (UnhealthyKind, String)> {
+        let mut req = self.http_client.get(url).timeout(timeout);
         for (name, value) in &hc.headers {
             req = req.header(name, value);
         }
-
         match req.send().await {
-            Ok(resp) => {
-                let code = resp.status().as_u16();
-                let accepted = match hc.status {
-                    Some(want) => code == want,
-                    None => (200..400).contains(&code),
-                };
-                if accepted {
-                    debug!("HTTP health check passed for {} ({})", url, code);
-                    Ok(())
-                } else {
-                    let expected = match hc.status {
-                        Some(want) => want.to_string(),
-                        None => "2xx/3xx".to_string(),
-                    };
-                    debug!(
-                        "HTTP health check rejected for {}: status {} (expected {})",
-                        url, code, expected
-                    );
-                    Err(UnhealthyReason::new(
-                        UnhealthyKind::BadStatus,
-                        format!("health check {url} returned {code}, expected {expected}"),
-                        now,
-                    ))
-                }
-            }
-            Err(e) => {
-                // reqwest surfaces timeouts distinctly; map them to Timeout so
-                // operators see the same classification as the TCP path.
-                let kind = if e.is_timeout() {
-                    UnhealthyKind::Timeout
-                } else {
-                    UnhealthyKind::HttpError
-                };
-                debug!("HTTP health check failed for {}: {}", url, e);
-                Err(UnhealthyReason::new(kind, e.to_string(), now))
-            }
+            Ok(resp) => Ok(resp.status().as_u16()),
+            // reqwest surfaces timeouts distinctly; map them to Timeout so
+            // operators see the same classification as the TCP path.
+            Err(e) if e.is_timeout() => Err((UnhealthyKind::Timeout, e.to_string())),
+            Err(e) => Err((UnhealthyKind::HttpError, e.to_string())),
+        }
+    }
+
+    /// The status `GET url` answers over h2c.
+    async fn get_h2c(
+        &self,
+        url: &str,
+        hc: &HealthCheckConfig,
+        timeout: Duration,
+    ) -> Result<u16, (UnhealthyKind, String)> {
+        let mut req = axum::http::Request::get(url);
+        for (name, value) in &hc.headers {
+            req = req.header(name, value);
+        }
+        let req = req
+            .body(http_body_util::Empty::new())
+            .map_err(|e| (UnhealthyKind::HttpError, format!("health check {url}: {e}")))?;
+        match tokio::time::timeout(timeout, self.h2c_client.request(req)).await {
+            Ok(Ok(resp)) => Ok(resp.status().as_u16()),
+            Ok(Err(e)) => Err((UnhealthyKind::HttpError, format!("h2c {url}: {e}"))),
+            Err(_) => Err((
+                UnhealthyKind::Timeout,
+                format!("h2c {url} timed out after {timeout:?}"),
+            )),
         }
     }
 }
@@ -387,6 +445,8 @@ struct BackendProbe {
     /// The address the probe dials: the backend's, with the check's port.
     addr: String,
     health_check: Option<HealthCheckConfig>,
+    /// Whether the backend speaks h2c, which an HTTP check is sent over.
+    h2c: bool,
 }
 
 impl BackendProbe {
@@ -488,6 +548,7 @@ mod tests {
         BackendProbe {
             addr: addr.to_string(),
             health_check: None,
+            h2c: false,
         }
     }
 
@@ -495,6 +556,7 @@ mod tests {
         BackendProbe {
             addr: addr.to_string(),
             health_check: Some(hc),
+            h2c: false,
         }
     }
 
@@ -737,10 +799,22 @@ mod tests {
         let probes = checker.collect_backends();
 
         assert_eq!(probes.len(), 2);
-        let strict = probe_key(&backend, Some(&hc("/health", Some(200))));
+        let strict = probe_key(&backend, Some(&hc("/health", Some(200))), false);
         assert!(probes[&strict].health_check.is_some());
-        assert!(probes[&probe_key(&backend, None)].health_check.is_none());
-        assert_ne!(strict, probe_key(&backend, Some(&hc("/health", None))));
+        assert!(
+            probes[&probe_key(&backend, None, false)]
+                .health_check
+                .is_none()
+        );
+        assert_ne!(
+            strict,
+            probe_key(&backend, Some(&hc("/health", None)), false)
+        );
+        // Sent over h2c, the same check is another probe.
+        assert_ne!(
+            strict,
+            probe_key(&backend, Some(&hc("/health", Some(200))), true)
+        );
     }
 
     #[tokio::test]
@@ -786,6 +860,80 @@ mod tests {
     fn checker() -> HealthChecker {
         let (reload_tx, _rx) = mpsc::channel(64);
         HealthChecker::new(Arc::new(RwLock::new(BTreeMap::new())), reload_tx)
+    }
+
+    /// Spawn an HTTP/2-only server (h2c with prior knowledge) that answers
+    /// every request with `status`, the way gRPC servers only take HTTP/2.
+    async fn spawn_h2c(status: u16) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
+                        let _: &hyper::body::Incoming = req.body();
+                        let code = if req.version() == axum::http::Version::HTTP_2
+                            && req.headers().get("x-probe").is_some()
+                        {
+                            status
+                        } else {
+                            400
+                        };
+                        let mut resp =
+                            hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new());
+                        *resp.status_mut() = axum::http::StatusCode::from_u16(code).unwrap();
+                        async move { Ok::<_, std::convert::Infallible>(resp) }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn h2c_probe(addr: &str, status: Option<u16>) -> BackendProbe {
+        let mut check = hc("/health", status);
+        check.headers.insert("x-probe".into(), "1".into());
+        BackendProbe {
+            addr: addr.to_string(),
+            health_check: Some(check),
+            h2c: true,
+        }
+    }
+
+    /// Backends that speak h2c are checked over h2c, with the check's
+    /// headers: an HTTP/1.1 request would not reach them.
+    #[tokio::test]
+    async fn an_h2c_backend_is_checked_over_h2c() {
+        let addr = spawn_h2c(204).await;
+        let checker = checker();
+        assert!(checker.probe_backend(&h2c_probe(&addr, None)).await.is_ok());
+
+        let reason = checker
+            .probe_backend(&h2c_probe(&addr, Some(200)))
+            .await
+            .expect_err("204 is not the 200 the check expects");
+        assert_eq!(reason.kind, UnhealthyKind::BadStatus);
+
+        let mut http1 = h2c_probe(&addr, None);
+        http1.h2c = false;
+        assert!(checker.probe_backend(&http1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_h2c_backend_is_an_http_error() {
+        let reason = checker()
+            .probe_backend(&h2c_probe("127.0.0.1:19998", None))
+            .await
+            .expect_err("nothing listens there");
+        assert_eq!(reason.kind, UnhealthyKind::HttpError);
     }
 
     #[tokio::test]

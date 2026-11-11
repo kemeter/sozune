@@ -240,6 +240,7 @@ fn build_entrypoint(
     let in_flight_req = in_flight_req::parse_in_flight_req(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
+    let h2c_backends = core::parse_scheme(labels, &prefix, diagnostics);
     let acme = core::parse_acme(labels, &prefix);
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
     let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
@@ -390,7 +391,7 @@ fn build_entrypoint(
             in_flight_req,
             sticky_session,
             compress,
-            h2c_backends: false,
+            h2c_backends,
             entrypoint: None,
             sni: None,
             terminate_tls: false,
@@ -612,6 +613,23 @@ mod tests {
             name: name.into(),
             ip: Some(ip.into()),
         }
+    }
+
+    #[test]
+    fn scheme_h2c_reaches_the_backends_over_h2c() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.api.host", "grpc.example.com"),
+                ("sozune.http.api.scheme", "h2c"),
+                ("sozune.http.web.host", "app.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        assert!(r.entrypoints["http_api"].config.h2c_backends);
+        assert!(!r.entrypoints["http_web"].config.h2c_backends);
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 
     #[test]

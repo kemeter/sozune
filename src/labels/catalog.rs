@@ -34,6 +34,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "httpsRedirectPort",
     "stickySession",
     "compress",
+    "scheme",
     "path",
     "prefix",
     "pathRegex",

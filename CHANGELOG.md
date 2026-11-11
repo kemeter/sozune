@@ -8,6 +8,12 @@ All notable changes to this project will be documented in this file.
 
 - `replacePath` and `replacePathRegex` — change the path the backend receives: replace it whole, or rewrite where a regex matches (`replacePathRegex.regex` + `replacePathRegex.replacement`, `$1` for its groups). The query is kept and the original path is sent in `X-Replaced-Path`, as Traefik's middlewares of these names do. See [Replace path](documentation/middleware/replace-path.md).
 - `redirectRegex` — redirect the requests whose URL matches a regex to that URL rewritten (`redirectRegex.regex`, `.replacement`, `.permanent`); the others go on to the backend. See [Redirects](documentation/middleware/redirects.md#redirectregex).
+- Backend error pages: `errors.status`, `errors.page` and `errors.url` replace the error responses a route's backend returns (and the `502`/`504` of an unreachable one) with the route's own page, keeping the status, as Traefik's errors middleware does. The page is inline or fetched from `errors.url`, with `{status}` and `{url}` replaced. See [Backend errors](documentation/middleware/error-pages.md#backend-errors).
+
+### Routing
+
+- h2c backends: `scheme=h2c` reaches a route's backends over HTTP/2 in cleartext, as gRPC servers expect, on every label provider and as a Kubernetes Ingress annotation (`h2c_backends` in static config and the API). It holds through the middleware, and the route's HTTP health check is sent over h2c too. See [gRPC and h2c backends](documentation/routing/grpc.md).
+
 ### Observability
 
 - OTLP metrics export — push the metrics served on `/metrics` to an OpenTelemetry collector over OTLP/gRPC, alongside or instead of a Prometheus scrape. Enable with `metrics.otlp.enabled` and `metrics.otlp.endpoint`; `metrics.otlp.service_name` and `metrics.otlp.push_interval` (seconds, default `10`) tune it. Disabled by default. See [OTLP metrics export](documentation/advanced/observability.md#otlp-metrics-export).

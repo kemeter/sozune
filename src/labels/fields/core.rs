@@ -128,6 +128,42 @@ pub fn parse_bool(labels: &HashMap<String, String>, key: &str) -> bool {
     labels.get(key).is_some_and(|v| v == "true")
 }
 
+/// Parse `<prefix>scheme`, the protocol the route's backends speak: `http`
+/// (HTTP/1.1, the default) or `h2c` (HTTP/2 in cleartext with prior
+/// knowledge, as gRPC servers expect). Returns whether it is `h2c`; any
+/// other value emits `W035` and keeps HTTP/1.1.
+pub fn parse_scheme(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let key = format!("{prefix}scheme");
+    let Some(raw) = labels.get(&key).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "http" => false,
+        "h2c" => true,
+        _ => {
+            let hint = if raw.eq_ignore_ascii_case("https") {
+                "TLS to the backends is not supported: use http or h2c"
+            } else {
+                "use http (the default) or h2c"
+            };
+            diagnostics.push(
+                Diagnostic::new(
+                    DiagnosticCode::W035InvalidScheme,
+                    "scheme is neither http nor h2c, the backends are reached over HTTP/1.1",
+                )
+                .with_label(&key)
+                .with_value(raw)
+                .with_hint(hint),
+            );
+            false
+        }
+    }
+}
+
 /// Parse `<prefix>acme.resolver`, the named ACME resolver that issues the
 /// route's certificates. Absent or blank leaves the route on HTTP-01 through
 /// `challenge_port`. Whether the name is declared is checked against the
@@ -761,6 +797,42 @@ mod tests {
         assert!(!parse_bool(&l, "c"));
         assert!(!parse_bool(&l, "d"));
         assert!(!parse_bool(&l, "missing"));
+    }
+
+    #[test]
+    fn scheme_defaults_to_http() {
+        let mut diags = Vec::new();
+        assert!(!parse_scheme(&labels(&[]), "sozune.http.app.", &mut diags));
+        assert!(!parse_scheme(
+            &labels(&[("sozune.http.app.scheme", "http")]),
+            "sozune.http.app.",
+            &mut diags
+        ));
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn scheme_h2c_is_case_insensitive() {
+        let mut diags = Vec::new();
+        assert!(parse_scheme(
+            &labels(&[("sozune.http.app.scheme", " H2C ")]),
+            "sozune.http.app.",
+            &mut diags
+        ));
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn scheme_https_emits_w035_and_keeps_http() {
+        let mut diags = Vec::new();
+        assert!(!parse_scheme(
+            &labels(&[("sozune.http.app.scheme", "https")]),
+            "sozune.http.app.",
+            &mut diags
+        ));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, DiagnosticCode::W035InvalidScheme);
+        assert_eq!(diags[0].value.as_deref(), Some("https"));
     }
 
     #[test]

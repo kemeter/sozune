@@ -1513,7 +1513,11 @@ pub(crate) fn without_unhealthy_backends(
         let down = evicted_backends(entrypoint, unhealthy);
         if down.is_empty() {
             if entrypoint.backends.iter().any(|b| {
-                unhealthy.contains_key(&probe_key(b, entrypoint.config.health_check.as_ref()))
+                unhealthy.contains_key(&probe_key(
+                    b,
+                    entrypoint.config.health_check.as_ref(),
+                    entrypoint.config.h2c_backends,
+                ))
             }) {
                 warn!(
                     "every backend of route `{}` is failing its health check; keeping them all",
@@ -1539,7 +1543,11 @@ pub(crate) fn evicted_backends(entrypoint: &Entrypoint, unhealthy: &UnhealthyMap
         .backends
         .iter()
         .filter(|backend| {
-            unhealthy.contains_key(&probe_key(backend, entrypoint.config.health_check.as_ref()))
+            unhealthy.contains_key(&probe_key(
+                backend,
+                entrypoint.config.health_check.as_ref(),
+                entrypoint.config.h2c_backends,
+            ))
         })
         .cloned()
         .collect();

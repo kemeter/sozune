@@ -496,6 +496,40 @@ services:
     ports:
       - "127.0.0.1:$ERROR_PAGES_HOST_PORT:80"
 
+  # An nginx that speaks HTTP/1.1 and h2c, and answers its protocol: its
+  # /health is only healthy over HTTP/2. Routes with scheme=h2c reach it
+  # over h2c (41-h2c-backends.sh).
+  svc-h2c:
+    image: nginx:1.27-alpine
+    configs:
+      - source: h2c-nginx
+        target: /etc/nginx/conf.d/default.conf
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.h2c.host=$HOST_H2C"
+      - "sozune.http.h2c.scheme=h2c"
+      - "sozune.http.h2cmw.host=$HOST_H2C_MW"
+      - "sozune.http.h2cmw.scheme=h2c"
+      - "sozune.http.h2cmw.headers.X-Through=middleware"
+      - "sozune.http.h2ccheck.host=$HOST_H2C_CHECK"
+      - "sozune.http.h2ccheck.scheme=h2c"
+      - "sozune.http.h2ccheck.healthCheck.path=/health"
+      - "sozune.http.h2ccheck.healthCheck.interval=1000"
+      - "sozune.http.h2ccheckhttp1.host=$HOST_H2C_CHECK_HTTP1"
+      - "sozune.http.h2ccheckhttp1.healthCheck.path=/health"
+      - "sozune.http.h2ccheckhttp1.healthCheck.interval=1000"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  # A gRPC server (h2c on 9000), called through Sōzune by grpcurl.
+  svc-grpc:
+    image: moul/grpcbin:latest
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.grpc.host=$HOST_GRPC"
+      - "sozune.http.grpc.port=9000"
+      - "sozune.http.grpc.scheme=h2c"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   svc-mirrored:
     image: traefik/whoami
     labels:
@@ -812,6 +846,19 @@ services:
       - "sozune.tcp.snihttps.port=9000"
       - "sozune.tcp.snihttps.sni=https.sni.test"
       - "sozune.network=${COMPOSE_PROJECT}_default"
+
+configs:
+  h2c-nginx:
+    content: |
+      server {
+          listen 80;
+          http2 on;
+          location = /health {
+              if (\$\$server_protocol = HTTP/2.0) { return 204; }
+              return 505;
+          }
+          location / { return 200 "\$\$server_protocol \$\$request_uri\n"; }
+      }
 EOF
 
 # -- Start backends --

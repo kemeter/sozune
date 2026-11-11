@@ -91,6 +91,9 @@ pub enum DiagnosticCode {
     /// error statuses, no page to serve, or a `file://` page. The route's
     /// errors are not replaced (or the file page is dropped).
     W034InvalidBackendErrors,
+    /// A `scheme` label is neither `http` nor `h2c`. The backends are
+    /// reached over HTTP/1.1.
+    W035InvalidScheme,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -140,6 +143,7 @@ impl DiagnosticCode {
             DiagnosticCode::W032InvalidReplacePath => "W032",
             DiagnosticCode::W033InvalidRedirectRegex => "W033",
             DiagnosticCode::W034InvalidBackendErrors => "W034",
+            DiagnosticCode::W035InvalidScheme => "W035",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -199,6 +203,7 @@ impl DiagnosticCode {
             DiagnosticCode::W032InvalidReplacePath,
             DiagnosticCode::W033InvalidRedirectRegex,
             DiagnosticCode::W034InvalidBackendErrors,
+            DiagnosticCode::W035InvalidScheme,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]
