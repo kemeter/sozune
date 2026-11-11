@@ -155,6 +155,11 @@ pub struct EntrypointConfig {
     /// short-circuited with `503` until it recovers. `None` (default) disables.
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Replaces the error responses of the route (the backend's, or the
+    /// middleware's when it cannot reach it) with a page of its own, like
+    /// Traefik's `errors` middleware. `None` (default) passes them through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors: Option<BackendErrorsConfig>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
     /// Maximum number of concurrent in-flight requests per client IP for this
@@ -520,6 +525,60 @@ pub struct CircuitBreakerConfig {
     pub min_requests: u32,
     /// Seconds the breaker stays open before probing again.
     pub cooldown_secs: u64,
+}
+
+/// The error responses a route replaces, and what with: the page fetched
+/// from `url` when set, else `page`. Configured by `errors.*` labels or the
+/// `errors` map of an entrypoint.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
+pub struct BackendErrorsConfig {
+    /// The error statuses replaced, each a code (`404`) or an inclusive range
+    /// (`500-599`), from `400` to `599`.
+    pub status: Vec<String>,
+    /// The body served instead. Inline, or a `file://` path in static config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+    /// Where the page is fetched from, with `{status}` replaced by the status
+    /// and `{url}` by the request's path and query. `page`, when set, is
+    /// served when the fetch fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl BackendErrorsConfig {
+    /// `status` as inclusive ranges. Errs on the first entry that is not an
+    /// error status (`400` to `599`) or a range of them.
+    pub fn status_ranges(&self) -> Result<Vec<std::ops::RangeInclusive<u16>>, String> {
+        self.status
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let code = |s: &str| {
+                    s.trim()
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|c| (400..=599).contains(c))
+                        .ok_or_else(|| {
+                            format!(
+                                "'{entry}' is not an error status (400 to 599) or a range of them"
+                            )
+                        })
+                };
+                match entry.split_once('-') {
+                    Some((from, to)) => {
+                        let (from, to) = (code(from)?, code(to)?);
+                        if from > to {
+                            return Err(format!("'{entry}' ends before it starts"));
+                        }
+                        Ok(from..=to)
+                    }
+                    None => code(entry).map(|c| c..=c),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Selects which ACME resolver (from `acme.resolvers`) issues certs for this

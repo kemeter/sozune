@@ -5860,6 +5860,7 @@ mod tests {
                 health_check: None,
                 retry: None,
                 circuit_breaker: None,
+                errors: None,
                 rate_limit: None,
                 in_flight_req: None,
                 load_balancer: Default::default(),

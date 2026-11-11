@@ -118,6 +118,9 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.circuitBreaker.threshold` | [Circuit breaker](/documentation/middleware/circuit-breaker) — failure ratio that trips it (since 0.14) |
 | `sozune.http.<svc>.circuitBreaker.minRequests` | [Circuit breaker](/documentation/middleware/circuit-breaker) — requests before the ratio counts (since 0.14) |
 | `sozune.http.<svc>.circuitBreaker.cooldown` | [Circuit breaker](/documentation/middleware/circuit-breaker) — seconds open before probing again (since 0.14) |
+| `sozune.http.<svc>.errors.status` | [Backend errors](/documentation/middleware/error-pages#backend-errors): statuses the route's page replaces, e.g. `500-599,404` (since 0.17) |
+| `sozune.http.<svc>.errors.page` | [Backend errors](/documentation/middleware/error-pages#backend-errors): inline page served instead (since 0.17) |
+| `sozune.http.<svc>.errors.url` | [Backend errors](/documentation/middleware/error-pages#backend-errors): where the page is fetched from, `{status}` and `{url}` replaced (since 0.17) |
 | `sozune.http.<svc>.errorPages.<code>` | [Error pages](/documentation/middleware/error-pages) — inline body for that status (since 0.14) |
 | `sozune.http.<svc>.plugins` | [WASM plugins](/documentation/middleware/wasm-plugins) — comma-separated plugin names, run in order (since 0.14) |
 | `sozune.http.<svc>.plugins.<name>.<key>` | [WASM plugins](/documentation/middleware/wasm-plugins#per-route-config) — per-route plugin config (since 0.14) |

@@ -1421,6 +1421,7 @@ pub(super) mod merge_tests {
                 load_balancer: LoadBalancer::default(),
                 retry: None,
                 circuit_breaker: None,
+                errors: None,
                 rate_limit: None,
                 in_flight_req: None,
                 sticky_session: false,

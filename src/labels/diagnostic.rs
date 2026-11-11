@@ -87,6 +87,10 @@ pub enum DiagnosticCode {
     /// The `redirectRegex` labels are incomplete, their regex does not
     /// compile or `permanent` is not a boolean. The redirect is ignored.
     W033InvalidRedirectRegex,
+    /// An `errors.*` label set is unusable: `errors.status` missing or not
+    /// error statuses, no page to serve, or a `file://` page. The route's
+    /// errors are not replaced (or the file page is dropped).
+    W034InvalidBackendErrors,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -135,6 +139,7 @@ impl DiagnosticCode {
             DiagnosticCode::W031InvalidRedirectHost => "W031",
             DiagnosticCode::W032InvalidReplacePath => "W032",
             DiagnosticCode::W033InvalidRedirectRegex => "W033",
+            DiagnosticCode::W034InvalidBackendErrors => "W034",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -193,6 +198,7 @@ impl DiagnosticCode {
             DiagnosticCode::W031InvalidRedirectHost,
             DiagnosticCode::W032InvalidReplacePath,
             DiagnosticCode::W033InvalidRedirectRegex,
+            DiagnosticCode::W034InvalidBackendErrors,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

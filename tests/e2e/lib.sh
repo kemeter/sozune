@@ -21,6 +21,8 @@ TCP_DENY_PORT=15559
 TCP_FLOOD_PORT=15560
 TCP_SNI_PORT=15561
 TCP_SHARED_PORT=15562
+# Host side of the pages server the backend error pages are fetched from.
+ERROR_PAGES_HOST_PORT=15563
 # Host side of Authelia's port mapping, where sozune reaches the verify
 # endpoint. Overridable when something else on the host already holds 9091.
 AUTHELIA_HOST_PORT="${AUTHELIA_HOST_PORT:-9091}"
@@ -60,6 +62,8 @@ HOST_WASM="wasm.func-test.localhost"
 HOST_AUTHELIA="authelia.func-test.localhost"
 HOST_UNKNOWN_404="nope.func-test.localhost"
 HOST_ERRORPAGES="errorpages.func-test.localhost"
+HOST_BACKEND_ERRORS="backenderrors.func-test.localhost"
+HOST_BACKEND_ERRORS_URL="backenderrors-url.func-test.localhost"
 HOST_MATCH="match.func-test.localhost"
 HOST_CANARY="canary.func-test.localhost"
 HOST_MATCH_REGEX="matchregex.func-test.localhost"
