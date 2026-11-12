@@ -74,9 +74,19 @@ fi
 # -- Config files --
 log "Generating test config files..."
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=func-test.localhost" \
-    -addext "subjectAltName=DNS:*.func-test.localhost" \
-    -keyout "$TLS_CERT_DIR/privkey.pem" -out "$TLS_CERT_DIR/fullchain.pem" >/dev/null 2>&1
+# A test CA signs the server certificate: recent curl and OpenSSL refuse a
+# self-signed certificate that is its own CA as the server's. fullchain.pem
+# holds both, and the tests trust it with --cacert.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=func-test CA" \
+    -keyout "$TLS_CERT_DIR/ca.key" -out "$TLS_CERT_DIR/ca.pem" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -subj "/CN=func-test.localhost" \
+    -keyout "$TLS_CERT_DIR/privkey.pem" -out "$TLS_CERT_DIR/server.csr" >/dev/null 2>&1
+printf 'subjectAltName=DNS:*.func-test.localhost\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' \
+    > "$TLS_CERT_DIR/server.ext"
+openssl x509 -req -in "$TLS_CERT_DIR/server.csr" -CA "$TLS_CERT_DIR/ca.pem" \
+    -CAkey "$TLS_CERT_DIR/ca.key" -CAcreateserial -days 1 -extfile "$TLS_CERT_DIR/server.ext" \
+    -out "$TLS_CERT_DIR/server.pem" >/dev/null 2>&1
+cat "$TLS_CERT_DIR/server.pem" "$TLS_CERT_DIR/ca.pem" > "$TLS_CERT_DIR/fullchain.pem"
 
 cat > "$CONFIG_FILE" <<EOF
 providers:
