@@ -587,6 +587,18 @@ services:
       - "sozune.http.corstraefik.headers.accessControlAllowMethods=GET"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # Buffering (48-buffering.sh): bufferreq takes request bodies of at most
+  # 1000 bytes, bufferresp answers of at most 50 (whoami's are longer).
+  svc-buffer:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.bufferreq.host=$HOST_BUFFER_REQ"
+      - "sozune.http.bufferreq.buffering.maxRequestBodyBytes=1000"
+      - "sozune.http.bufferresp.host=$HOST_BUFFER_RESP"
+      - "sozune.http.bufferresp.buffering.maxResponseBodyBytes=50"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   # etcd serves the gRPC health service on its client port: SERVING
   # (42-grpc-health-checks.sh). grpcbin above has none (UNIMPLEMENTED).
   svc-etcd:

@@ -100,6 +100,25 @@ pub fn bad_request(reason: &str, detail: &str) -> Response<Body> {
     )
 }
 
+/// 413 Content Too Large: the request body is past the route's buffering
+/// limit.
+pub fn request_too_large(limit: u64) -> Response<Body> {
+    diag_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request-too-large",
+        format!("sozune: the request body is larger than the route's {limit} bytes.\n"),
+    )
+}
+
+/// 500: the backend's response body is past the route's buffering limit.
+pub fn response_too_large(limit: u64) -> Response<Body> {
+    diag_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "response-too-large",
+        format!("sozune: the backend's response is larger than the route's {limit} bytes.\n"),
+    )
+}
+
 /// 429 Too Many Requests — rate limit triggered.
 pub fn rate_limited(host: &str) -> Response<Body> {
     diag_response(

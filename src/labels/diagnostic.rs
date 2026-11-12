@@ -98,6 +98,10 @@ pub enum DiagnosticCode {
     /// `allowCredentials` that does not parse, an origin regex, or a policy
     /// with no origin. That part, or the whole policy, is dropped.
     W036InvalidCors,
+    /// A `buffering.*` label is unusable: a size that is not a positive
+    /// number of bytes, or a Traefik option Sōzune has no use for. That
+    /// option is dropped.
+    W037InvalidBuffering,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -149,6 +153,7 @@ impl DiagnosticCode {
             DiagnosticCode::W034InvalidBackendErrors => "W034",
             DiagnosticCode::W035InvalidScheme => "W035",
             DiagnosticCode::W036InvalidCors => "W036",
+            DiagnosticCode::W037InvalidBuffering => "W037",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -210,6 +215,7 @@ impl DiagnosticCode {
             DiagnosticCode::W034InvalidBackendErrors,
             DiagnosticCode::W035InvalidScheme,
             DiagnosticCode::W036InvalidCors,
+            DiagnosticCode::W037InvalidBuffering,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

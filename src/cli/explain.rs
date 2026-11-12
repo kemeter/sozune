@@ -429,6 +429,14 @@ const ENTRIES: &[Entry] = &[
         ),
     },
     Entry {
+        code: "W037",
+        title: "Invalid buffering label",
+        cause: "A `buffering.*` label is unusable: `maxRequestBodyBytes` or `maxResponseBodyBytes` is not a positive number of bytes, or the label is one of Traefik's that Sōzune has no use for: `retryExpression` (use `retry.*`), or `memRequestBodyBytes` / `memResponseBodyBytes` (Sōzune keeps the body in memory, up to the max).",
+        effect: "The label is dropped. Without a max, that body is not buffered.",
+        fix: "Give the largest body to accept, in bytes.",
+        example: Some("sozune.http.upload.buffering.maxRequestBodyBytes=10485760"),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

@@ -218,6 +218,10 @@ pub struct MiddlewareRoute {
     pub h2c: bool,
     /// Whether gRPC-Web calls are translated into gRPC (`grpc_web`).
     pub grpc_web: bool,
+    /// The request body is read whole first, up to this many bytes.
+    pub max_request_body: Option<u64>,
+    /// The response body is read whole first, up to this many bytes.
+    pub max_response_body: Option<u64>,
     /// Wait before each retry.
     pub retry_backoff: Option<std::time::Duration>,
     /// Per-route circuit breaker, shared across requests so its state persists.
@@ -981,6 +985,8 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || config.cors.is_some()
         // And gRPC-Web, translated by the middleware.
         || config.grpc_web.is_some()
+        // And buffering.
+        || config.buffering.is_some()
         // And the rewrites and redirects by regex.
         || config.replace_path.is_some()
         || config.replace_path_regex.is_some()
@@ -1190,6 +1196,14 @@ pub fn build_middleware_route(
             .unwrap_or_default(),
         h2c: config.h2c_backends || config.grpc_web.is_some(),
         grpc_web: config.grpc_web.is_some(),
+        max_request_body: config
+            .buffering
+            .as_ref()
+            .and_then(|b| b.max_request_body_bytes),
+        max_response_body: config
+            .buffering
+            .as_ref()
+            .and_then(|b| b.max_response_body_bytes),
         retry_backoff: config
             .retry
             .as_ref()
@@ -1364,6 +1378,8 @@ mod route_key_tests {
             retry_codes: Vec::new(),
             h2c: false,
             grpc_web: false,
+            max_request_body: None,
+            max_response_body: None,
             retry_backoff: None,
             circuit_breaker: None,
             errors: None,
@@ -1715,6 +1731,8 @@ mod route_key_tests {
             retry_codes: Vec::new(),
             h2c: false,
             grpc_web: false,
+            max_request_body: None,
+            max_response_body: None,
             retry_backoff: None,
             circuit_breaker: None,
             errors: None,

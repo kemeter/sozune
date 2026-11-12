@@ -446,8 +446,34 @@ pub async fn handle_proxy(
             // server answered the last one, and waiting for the end of it
             // would hold the call. Streamed, it still goes on to the next
             // backend when an attempt read none of it.
-            let keeps = replays && !super::grpc::is_call(&parts.headers);
-            let request_body = if keeps || hyper::body::Body::is_end_stream(&body) {
+            let grpc_call = super::grpc::is_call(&parts.headers);
+            let keeps = replays && !grpc_call;
+            // A route that buffers reads the request whole first, within
+            // its limit: the backend gets it at once, never a larger one. A
+            // gRPC call streams, and is not.
+            let buffers = route.max_request_body.filter(|_| !grpc_call);
+            let request_body = if let Some(limit) = buffers {
+                match read_whole(body, &parts.headers, limit).await {
+                    Ok(Some(bytes)) => Ok(RequestBody::Replayable(bytes)),
+                    Ok(None) => {
+                        let resp = diag::request_too_large(limit).into_response();
+                        state
+                            .request_metrics
+                            .record(start.elapsed(), resp.status().as_u16());
+                        access_log(
+                            &source_ip,
+                            &method,
+                            &host,
+                            &path,
+                            resp.status().as_u16(),
+                            start.elapsed(),
+                            "middleware",
+                        );
+                        return resp;
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if keeps || hyper::body::Body::is_end_stream(&body) {
                 // An empty body costs nothing to keep: any backend the plan
                 // holds can be tried.
                 replayable(body, &parts.headers, REPLAY_BODY_LIMIT).await
@@ -738,6 +764,46 @@ pub async fn handle_proxy(
                     );
                     return resp;
                 }
+            };
+
+            // A route that buffers reads the response whole first, within its
+            // limit: the client gets it at once, never a larger one. A gRPC
+            // answer streams, and is not.
+            let backend_response = match route.max_response_body {
+                Some(limit)
+                    if !super::grpc::is_call(backend_response.headers())
+                        && backend_response.status() != StatusCode::SWITCHING_PROTOCOLS =>
+                {
+                    let (parts, body) = backend_response.into_parts();
+                    let read = match read_whole(body, &parts.headers, limit).await {
+                        Ok(Some(bytes)) => Ok(Response::from_parts(parts, Body::from(bytes))),
+                        Ok(None) => Err(diag::response_too_large(limit).into_response()),
+                        Err(e) if super::timed_out(&e) => {
+                            Err(diag::backend_timeout(&target_uri, timeout).into_response())
+                        }
+                        Err(e) => Err(diag::forwarding_failed("response-body", &e.to_string())
+                            .into_response()),
+                    };
+                    match read {
+                        Ok(response) => response,
+                        Err(resp) => {
+                            state
+                                .request_metrics
+                                .record(start.elapsed(), resp.status().as_u16());
+                            access_log(
+                                &source_ip,
+                                &method,
+                                &host,
+                                &path,
+                                resp.status().as_u16(),
+                                start.elapsed(),
+                                "backend",
+                            );
+                            return resp;
+                        }
+                    }
+                }
+                _ => backend_response,
             };
 
             // Response phase: run the middleware stack in reverse (onion model). This is
@@ -1278,6 +1344,33 @@ impl RequestBody {
             Self::Streamed(_) => None,
         }
     }
+}
+
+/// `body` read whole, when it holds at most `limit` bytes: `None` for a
+/// larger one, told by its `headers`' `Content-Length` before anything is
+/// read, or else once the bytes read pass it.
+async fn read_whole(
+    mut body: Body,
+    headers: &axum::http::HeaderMap,
+    limit: u64,
+) -> Result<Option<axum::body::Bytes>, axum::Error> {
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit) {
+        return Ok(None);
+    }
+    let mut read: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            if read.len() as u64 + data.len() as u64 > limit {
+                return Ok(None);
+            }
+            read.extend_from_slice(&data);
+        }
+    }
+    Ok(Some(read.into()))
 }
 
 /// A streamed request body lent to an attempt. Dropped before any of it
@@ -2424,6 +2517,122 @@ mod retry_tests {
             "application/grpc-web+proto"
         );
         assert_eq!(response.headers()["grpc-status"], "14");
+    }
+
+    fn buffering(request: Option<u64>, response: Option<u64>) -> EntrypointConfig {
+        EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            buffering: Some(crate::model::BufferingConfig {
+                max_request_body_bytes: request,
+                max_response_body_bytes: response,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `size` bytes in 64 KiB chunks, with no length: as it comes from a
+    /// client streaming it.
+    fn chunked(size: usize) -> Body {
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![b'a'; size]
+            .chunks(64 * 1024)
+            .map(|c| Ok(axum::body::Bytes::copy_from_slice(c)))
+            .collect();
+        Body::from_stream(futures_util::stream::iter(chunks))
+    }
+
+    /// A request within the route's limit reaches the backend whole; a
+    /// larger one is answered 413, the backend never asked.
+    #[tokio::test]
+    async fn a_request_past_the_limit_is_too_large() {
+        let (port, read) = reading_backend(0, 200).await;
+        assert_eq!(
+            send_through(buffering(Some(1000), None), port, chunked(1000)).await,
+            200
+        );
+        assert_eq!(
+            send_through(buffering(Some(1000), None), port, chunked(1001)).await,
+            413
+        );
+        // A length past it is answered before anything is read.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "retry.test")
+            .header("content-length", "5000")
+            .body(Body::from(vec![b'a'; 5000]))
+            .unwrap();
+        let response = request_through(buffering(Some(1000), None), port, request).await;
+        assert_eq!(response.status(), 413);
+        assert_eq!(
+            response.headers()["x-sozune-diagnostic"],
+            "request-too-large"
+        );
+        assert_eq!(*read.lock().unwrap(), [1000]);
+    }
+
+    /// A request read whole is sent again on a retry, past the 1 MiB the
+    /// route keeps otherwise.
+    #[tokio::test]
+    async fn a_buffered_request_is_sent_again_on_a_retry() {
+        let size = REPLAY_BODY_LIMIT * 2;
+        let (port, read) = reading_backend(1, 503).await;
+        let config = EntrypointConfig {
+            retry: Some(on(&[503], 2)),
+            ..buffering(Some(size as u64 + 1), None)
+        };
+        assert_eq!(send_through(config, port, chunked(size)).await, 200);
+        assert_eq!(*read.lock().unwrap(), [size, size]);
+    }
+
+    /// A backend answering a body of `size` bytes.
+    async fn answering(size: usize) -> u16 {
+        let app = axum::Router::new().fallback(move || async move { chunked(size) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        port
+    }
+
+    /// A response within the route's limit reaches the client whole; a
+    /// larger one is answered 500.
+    #[tokio::test]
+    async fn a_response_past_the_limit_is_an_error() {
+        let port = answering(1000).await;
+        let response = respond_through(buffering(None, Some(1000)), port, Body::empty()).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .len(),
+            1000
+        );
+
+        let port = answering(1001).await;
+        let response = respond_through(buffering(None, Some(1000)), port, Body::empty()).await;
+        assert_eq!(response.status(), 500);
+        assert_eq!(
+            response.headers()["x-sozune-diagnostic"],
+            "response-too-large"
+        );
+    }
+
+    /// A gRPC call on a route that buffers still streams: it is not read
+    /// whole first.
+    #[tokio::test]
+    async fn a_grpc_call_is_not_buffered() {
+        let port = first_part_backend().await;
+        let (request, _open) = open_stream("application/grpc", b"message");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            request_through(buffering(Some(1 << 20), Some(1 << 20)), port, request),
+        )
+        .await
+        .expect("the call is held until the client ends its stream");
+        assert_eq!(response.status(), 200);
     }
 
     /// A slow upload is the client's time: the backend timeout counts from

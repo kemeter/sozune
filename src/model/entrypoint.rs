@@ -276,6 +276,10 @@ pub struct EntrypointConfig {
     /// and their answers back (Traefik's `grpcWeb`). Reached over h2c.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grpc_web: Option<GrpcWebConfig>,
+    /// Read the request, the response, or both, whole before passing them
+    /// on, within a size (Traefik's `buffering`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffering: Option<BufferingConfig>,
     /// Path the backend receives instead of the request's, the query kept
     /// (Traefik's `replacePath`). Applied by the middleware, after Sōzu's
     /// `strip_prefix` / `add_prefix`.
@@ -302,6 +306,19 @@ pub struct EntrypointConfig {
 pub struct OutrankedHeaders {
     pub conditions: Vec<MatchCondition>,
     pub hostnames: Vec<String>,
+}
+
+/// A route's buffering: what it reads whole before passing it on.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
+pub struct BufferingConfig {
+    /// The request body is read whole before the backend gets it, up to
+    /// this many bytes: a larger one is answered `413`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_body_bytes: Option<u64>,
+    /// The response body is read whole before the client gets it, up to
+    /// this many bytes: a larger one is answered `500`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_body_bytes: Option<u64>,
 }
 
 /// A route's gRPC-Web translation.
