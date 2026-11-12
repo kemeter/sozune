@@ -219,7 +219,7 @@ See [ACME / Let's Encrypt](/documentation/tls/acme).
 
 > Since 0.6
 
-The fields below can be set through an environment variable, which wins over the YAML value. Lists and maps (`api.users`, `proxy.tcp`, `proxy.trusted_proxies`, `acme.resolvers`, `plugins`…) and the fields not listed have no environment variable.
+The fields below can be set through an environment variable, which wins over the YAML value. Lists and maps (`api.users`, `proxy.tcp`, `proxy.trusted_proxies`, `acme.resolvers`, `plugins`…) and the fields not listed have no environment variable. `sozune validate`, `sozune doctor` and `sozune route` read the same variables, so they check the configuration `sozune` runs with (since 0.17).
 
 | Field | Env var |
 |---|---|

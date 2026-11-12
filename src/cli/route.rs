@@ -138,13 +138,9 @@ async fn api_url(args: &RouteArgs, config_path: &str) -> Result<String, String> 
     }
     // Only a missing file falls back to defaults, as for `serve`: a file that
     // exists but cannot be read would point the command at the wrong API.
-    let mut config = match tokio::fs::read_to_string(config_path).await {
-        Ok(content) => crate::config_load::parse_yaml(std::path::Path::new(config_path), &content)
-            .map_err(|e| format!("cannot read `{config_path}`: {e}"))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::config::AppConfig::default(),
-        Err(e) => return Err(format!("cannot read `{config_path}`: {e}")),
-    };
-    config.apply_env_overrides();
+    let config = crate::config_load::load(config_path)
+        .await
+        .map_err(|e| format!("cannot read `{config_path}`: {e}"))?;
     if !config.api.enabled {
         return Err(
             "the API is disabled in the config; `sozune route` asks the running instance \

@@ -25,6 +25,10 @@ All notable changes to this project will be documented in this file.
 
 - etcd and Redis providers: routes read from the keys of an etcd v3 or Redis store (Valkey too). Under `sozune/<service>/`, `labels/<label>` keys hold the labels a container would carry and `servers/<name>` keys its backends (`ip[:port]`); the tree is read every `poll_interval` seconds and a reload happens when its routes change. etcd takes a user and TLS with a client certificate, Redis an ACL user, a database and `rediss://`. `sozune validate` and `sozune doctor` cover them. See [Key-value providers](documentation/providers/key-value.md).
 
+### CLI
+
+- `sozune validate` and `sozune doctor` read the `SOZUNE_*` environment variables, as `sozune` does: a provider enabled or pointed elsewhere by a variable was not checked, or checked against the file's settings. See [Environment variable overrides](documentation/configuration/overview.md#environment-variable-overrides).
+
 ### Dashboard
 
 - The *← Entrypoints* link of a route's page led to the overview; it leads to the entrypoints list. Found by the dashboard's new functional tests (Playwright, `bun run test:e2e`).

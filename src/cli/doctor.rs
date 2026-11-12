@@ -67,7 +67,12 @@ pub async fn run(args: DoctorArgs, config_path: &str) -> i32 {
 
     // 1. Config file
     let config = match check_config(config_path, &mut results).await {
-        Some(c) => c,
+        // The providers and listeners checked are the ones `sozune` runs
+        // with, the SOZUNE_* variables included.
+        Some(mut c) => {
+            c.apply_env_overrides();
+            c
+        }
         None => {
             print_results(&results);
             return exit_code(&results);
