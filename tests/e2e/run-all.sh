@@ -340,7 +340,7 @@ services:
       - "sozune.enable=true"
       - "sozune.http.svcinflight.host=$HOST_INFLIGHT"
       - "sozune.http.svcinflight.inFlightReq=2"
-      # Generous backend timeout so the slow `?wait=` probe requests below
+      # Generous backend timeout so the slow "?wait=" probe requests below
       # actually hold their in-flight slots instead of being cut at the 2s
       # default — otherwise the slots free before the over-limit probe lands.
       - "sozune.http.svcinflight.backendTimeout=10000"
@@ -486,7 +486,7 @@ services:
 
   # svc-mirror-shadow gets a copy of each request of svc-mirrored, and logs
   # its request line.
-  # whoami: `POST /health` with a status sets what `GET /health` answers.
+  # whoami: "POST /health" with a status sets what "GET /health" answers.
   # Its errors are replaced by a page of the route's (40-backend-error-pages.sh).
   svc-backend-errors:
     image: traefik/whoami
