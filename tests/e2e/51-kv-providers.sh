@@ -98,13 +98,12 @@ docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" exec -T svc-valkey \
     valkey-cli SET sozune/kvvalkey/labels/sozune.http.kvvalkey.host "$HOST_KV_VALKEY" >/dev/null
 docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" exec -T svc-valkey \
     valkey-cli SET sozune/kvvalkey/servers/a "$KV_A:80" >/dev/null
-# The suite's config with a Redis provider on Valkey: `validate` reads the
-# file only, not the SOZUNE_PROVIDER_* variables sozune runs with.
-VALKEY_CONFIG=$(mktemp -t sozune-valkey-XXXXXX.yaml)
-sed "s|^providers:\$|providers:\n  redis:\n    enabled: true\n    endpoint: \"redis://$VALKEY_IP:6379\"|" \
-    "$CONFIG_FILE" > "$VALKEY_CONFIG"
-validate_out=$(CONFIG_PATH="$VALKEY_CONFIG" "$SOZUNE_BIN" validate --provider redis 2>&1 || true)
-rm -f "$VALKEY_CONFIG"
+# The suite's config has no Redis provider: `validate` reads it from the
+# SOZUNE_PROVIDER_* variables, as sozune does.
+validate_out=$(CONFIG_PATH="$CONFIG_FILE" \
+    SOZUNE_PROVIDER_REDIS_ENABLED=true \
+    SOZUNE_PROVIDER_REDIS_ENDPOINT="redis://$VALKEY_IP:6379" \
+    "$SOZUNE_BIN" validate --provider redis 2>&1 || true)
 if grep -q "$HOST_KV_VALKEY" <<<"$validate_out" && grep -q "$KV_A" <<<"$validate_out"; then
     pass "Valkey: the Redis provider reads a route from Valkey"
 else

@@ -50,7 +50,7 @@ impl SeverityFilter {
 }
 
 pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
-    let config = load_config(config_path).await?;
+    let config = crate::config_load::load(config_path).await?;
     crate::labels::middlewares::set_shared(config.middlewares.clone());
     let candidates = collect_candidates(&config, args.provider.as_deref()).await?;
     let mut report = build_report(candidates);
@@ -135,16 +135,6 @@ fn global_acme_lint(
         .flat_map(|c| c.entrypoints.values())
         .collect();
     crate::labels::lint::lint_acme_without_tls(acme_on, &all_eps)
-}
-
-async fn load_config(config_path: &str) -> anyhow::Result<AppConfig> {
-    if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
-        return Ok(AppConfig::default());
-    }
-    let content = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("could not read config file at {config_path}: {e}"))?;
-    crate::config_load::parse_yaml(std::path::Path::new(config_path), &content)
 }
 
 async fn collect_candidates(
