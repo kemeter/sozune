@@ -1,7 +1,7 @@
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::model::{
-    CircuitBreakerConfig, EntrypointAcmeConfig, GrpcHealthCheck, HealthCheckConfig, LoadBalancer,
-    RetryConfig, SniRejection,
+    CircuitBreakerConfig, EntrypointAcmeConfig, GrpcHealthCheck, GrpcWebConfig, HealthCheckConfig,
+    LoadBalancer, RetryConfig, SniRejection,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -126,6 +126,34 @@ pub fn parse_backend_timeout(
 /// semantics.
 pub fn parse_bool(labels: &HashMap<String, String>, key: &str) -> bool {
     labels.get(key).is_some_and(|v| v == "true")
+}
+
+/// Parse `<prefix>grpcWeb` and `<prefix>grpcWeb.allowOrigins`: translate
+/// the gRPC-Web calls of browsers into gRPC. `grpcWeb=true` turns it on for
+/// pages of the route's own origin; `grpcWeb.allowOrigins` (a comma list,
+/// `*` for any) turns it on for pages of those origins too. An explicit
+/// `grpcWeb=false` turns it off whatever the origins.
+pub fn parse_grpc_web(labels: &HashMap<String, String>, prefix: &str) -> Option<GrpcWebConfig> {
+    let key = format!("{prefix}grpcWeb");
+    let allow_origins: Vec<String> = labels
+        .get(&format!("{key}.allowOrigins"))
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let switch = labels
+        .get(&key)
+        .map(|v| v.trim().eq_ignore_ascii_case("true"));
+    match switch {
+        Some(false) => None,
+        Some(true) => Some(GrpcWebConfig { allow_origins }),
+        None if !allow_origins.is_empty() => Some(GrpcWebConfig { allow_origins }),
+        None => None,
+    }
 }
 
 /// Parse `<prefix>scheme`, the protocol the route's backends speak: `http`

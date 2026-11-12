@@ -131,7 +131,14 @@ pub async fn handle_proxy(
     // Kept for the route's CORS policy, which marks whatever answers it.
     let origin = req.headers().get(axum::http::header::ORIGIN).cloned();
     // A gRPC call gets the middleware's own answers in gRPC form.
-    let grpc = super::grpc::is_call(req.headers());
+    // A gRPC-Web call is one too, in the form its answers take.
+    let web = super::grpc_web::Kind::of(req.headers());
+    let grpc = super::grpc::is_call(req.headers()) || web.is_some();
+    let answer_type = web.as_ref().map_or_else(
+        || axum::http::HeaderValue::from_static("application/grpc"),
+        super::grpc_web::Kind::web_type,
+    );
+    let web_call = web.clone();
     // And for the page that replaces the route's errors, which can be told
     // the request it answers.
     let request_method = req.method().clone();
@@ -194,8 +201,14 @@ pub async fn handle_proxy(
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),
-            grpc: super::grpc::is_call(req.headers()),
+            grpc,
         };
+        // A gRPC-Web call the route translates goes on as gRPC.
+        if route.grpc_web
+            && let Some(kind) = web_call.as_ref()
+        {
+            req = super::grpc_web::into_grpc(req, kind);
+        }
 
         // The whole request's deadline, from its arrival: the middleware
         // stack, the client's body, every attempt and the response body all
@@ -817,15 +830,22 @@ pub async fn handle_proxy(
     if grpc {
         // A gRPC client reads the outcome in the gRPC status, and gets no
         // error page: a page is for a browser.
-        response = if response
+        let relayed = response
             .extensions()
             .get::<super::grpc::Relayed>()
-            .is_some()
-        {
+            .is_some();
+        response = if relayed {
             super::grpc::ends_with_status(response)
         } else {
-            super::grpc::answer(response)
+            super::grpc::answer(response, answer_type)
         };
+        // The backend's gRPC answer, back to the gRPC-Web the call came in.
+        if relayed
+            && let (Some(kind), Some(route)) = (web.as_ref(), matched.get())
+            && route.grpc_web
+        {
+            response = super::grpc_web::from_grpc(response, kind);
+        }
     }
     if let Some(route) = matched.get() {
         // The page goes in first, so that the edits and CORS mark it too.
@@ -2317,6 +2337,93 @@ mod retry_tests {
         let trailers = collected.trailers().cloned().expect("a status in trailers");
         assert_eq!(trailers["grpc-status"], "4");
         assert_eq!(collected.to_bytes(), "message");
+    }
+
+    fn grpc_web_route() -> EntrypointConfig {
+        EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            grpc_web: Some(crate::model::GrpcWebConfig::default()),
+            ..Default::default()
+        }
+    }
+
+    /// A gRPC-Web call of `body`.
+    fn grpc_web_call(body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/hello.HelloService/SayHello")
+            .header("host", "retry.test")
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// A gRPC-Web call reaches the backend as gRPC over h2c, and its answer
+    /// comes back as gRPC-Web, the trailers as the last message.
+    #[tokio::test]
+    async fn a_grpc_web_call_is_translated_both_ways() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let saw = seen.clone();
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            let saw = saw.clone();
+            async move {
+                let headers = request.headers();
+                *saw.lock().unwrap() = Some((
+                    request.version(),
+                    headers["content-type"].clone(),
+                    headers.get("te").cloned(),
+                ));
+                let mut trailers = axum::http::HeaderMap::new();
+                trailers.insert("grpc-status", axum::http::HeaderValue::from_static("0"));
+                let frames = [
+                    Ok::<_, axum::Error>(hyper::body::Frame::data(axum::body::Bytes::from_static(
+                        b"\0\0\0\0\x02hi",
+                    ))),
+                    Ok(hyper::body::Frame::trailers(trailers)),
+                ];
+                Response::builder()
+                    .header("content-type", "application/grpc+proto")
+                    .body(Body::new(http_body_util::StreamBody::new(
+                        futures_util::stream::iter(frames),
+                    )))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let call = grpc_web_call(b"\0\0\0\0\x01a".to_vec());
+        let response = request_through(grpc_web_route(), port, call).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/grpc-web+proto"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let mut expected = b"\0\0\0\0\x02hi".to_vec();
+        expected.extend_from_slice(b"\x80\0\0\0\x0fgrpc-status:0\r\n");
+        assert_eq!(body.as_ref(), expected);
+
+        let (version, content_type, te) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(version, axum::http::Version::HTTP_2);
+        assert_eq!(content_type, "application/grpc+proto");
+        assert_eq!(te.unwrap(), "trailers");
+    }
+
+    /// A gRPC-Web call the middleware answers itself gets the error in
+    /// gRPC-Web form.
+    #[tokio::test]
+    async fn a_grpc_web_call_gets_the_error_in_grpc_web_form() {
+        let dead = closed_port().await;
+        let response = request_through(grpc_web_route(), dead, grpc_web_call(Vec::new())).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/grpc-web+proto"
+        );
+        assert_eq!(response.headers()["grpc-status"], "14");
     }
 
     /// A slow upload is the client's time: the backend timeout counts from

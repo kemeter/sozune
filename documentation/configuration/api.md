@@ -498,7 +498,7 @@ The canonical shape of an entrypoint as returned by `GET /entrypoints`, `GET /en
     // Other optional fields: https_only, rewrite_host, rewrite_path, rewrite_port, rewrite,
     // request_timeout, retry, circuit_breaker, in_flight_req, sni, acme, plugins, plugin_config,
     // error_pages, errors, ip_allow_list, match_headers, match_query, match_client_ip, mirrors, cors,
-    // replace_path, replace_path_regex, redirect_regex
+    // replace_path, replace_path_regex, redirect_regex, grpc_web ({"allow_origins": [...]})
   },
   "unhealthy_backends": [],             // only on GET responses (array of objects, see "GET /entrypoints")
   "diagnostics": []                     // only on GET responses

@@ -1391,6 +1391,7 @@ pub(super) mod merge_tests {
             name: "svc".into(),
             protocol: Protocol::Http,
             config: EntrypointConfig {
+                grpc_web: None,
                 terminate_tls: false,
                 hostnames: vec![host.into()],
                 path: path.map(|p| PathConfig {

@@ -97,8 +97,41 @@ A call the backend answered that fails mid-way ends with a status in its trailer
 
 The answers Sōzu gives itself, before the middleware or on a route without it (no route for the host, no backend, a backend timeout), stay HTTP errors: Sōzu cannot answer `200`. gRPC clients read those with the same mapping (`503` gives `UNAVAILABLE`, `404` `UNIMPLEMENTED`), with an `unexpected HTTP status code` message.
 
+## gRPC-Web
+
+> Since 0.17
+
+Browsers cannot speak gRPC: they cannot read HTTP trailers, where gRPC puts a call's status. A web page calls through [gRPC-Web](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md) instead (grpc-web, Connect, and other browser clients), over HTTP/1.1 or HTTP/2. `grpcWeb` makes Sōzune translate those calls into gRPC for the backends, and their answers back, as Traefik's `grpcWeb` middleware and Envoy's `grpc_web` filter do. The backend is a plain gRPC server.
+
+```yaml
+labels:
+  - "sozune.http.greeter.host=api.example.com"
+  - "sozune.http.greeter.port=50051"
+  - "sozune.http.greeter.grpcWeb.allowOrigins=https://app.example.com"
+```
+
+| Label | Description |
+|---|---|
+| `grpcWeb` | `true` translates the gRPC-Web calls of the pages of the route's own origin. |
+| `grpcWeb.allowOrigins` | The other origins whose pages may call the route, comma separated, `*` for any. It turns `grpcWeb` on. An explicit `grpcWeb=false` turns it off whatever the origins. |
+
+- **The backends are reached over h2c**, whatever `scheme` says: gRPC needs HTTP/2.
+- **A call is told by its content type**, `application/grpc-web` or `application/grpc-web-text` (base64), with `+proto` or another format kept for the backend. A plain gRPC client can keep calling the same route: its calls go through as they are.
+- **The answer's trailers** (its `grpc-status` and `grpc-message`) come as the last message of its body, as gRPC-Web clients read them. An answer of the `-text` kind is base64 too.
+- **Errors**: when the middleware answers a gRPC-Web call itself, it answers in gRPC-Web form, the status in the headers (see [Errors](#errors)).
+- **CORS**: with `allowOrigins`, the route answers the preflight requests of those origins, letting them send `POST` with `content-type`, `x-grpc-web`, `x-user-agent` and `grpc-timeout`, and read `grpc-status` and `grpc-message`. A route's own CORS policy (`cors` in the API or static config, or a Gateway API [`cors` filter](/documentation/providers/kubernetes#httproute-filters)) is kept and completed.
+
+In static YAML and through the [API](/documentation/configuration/api), set `grpc_web` in the route's `config`, with `h2c_backends: true`:
+
+```yaml
+config:
+  hostnames: ["api.example.com"]
+  h2c_backends: true
+  grpc_web:
+    allow_origins: ["https://app.example.com"]
+```
+
 ## What it does not do
 
 - **No TLS to the backends.** `scheme=https` is refused (`W035`).
 - **Sōzu's own errors stay in HTTP form.** See [Errors](#errors).
-- **No gRPC-Web.**

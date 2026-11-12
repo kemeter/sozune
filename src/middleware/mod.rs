@@ -7,6 +7,7 @@ mod diag;
 mod fixed_answer;
 mod forward_auth;
 mod grpc;
+mod grpc_web;
 mod h2c;
 pub mod in_flight_req;
 pub mod ip_allow_list;
@@ -213,8 +214,10 @@ pub struct MiddlewareRoute {
     pub retry_attempts: u32,
     /// Response statuses retried too, within `retry_attempts`.
     pub retry_codes: Vec<u16>,
-    /// Whether the backends speak h2c (`h2c_backends`).
+    /// Whether the backends speak h2c (`h2c_backends`, or `grpc_web`).
     pub h2c: bool,
+    /// Whether gRPC-Web calls are translated into gRPC (`grpc_web`).
+    pub grpc_web: bool,
     /// Wait before each retry.
     pub retry_backoff: Option<std::time::Duration>,
     /// Per-route circuit breaker, shared across requests so its state persists.
@@ -976,6 +979,8 @@ pub fn needs_middleware(entrypoint: &Entrypoint) -> bool {
         || answers_redirect(config)
         // And a CORS policy.
         || config.cors.is_some()
+        // And gRPC-Web, translated by the middleware.
+        || config.grpc_web.is_some()
         // And the rewrites and redirects by regex.
         || config.replace_path.is_some()
         || config.replace_path_regex.is_some()
@@ -1065,10 +1070,7 @@ pub fn build_middleware_route(
 
     // CORS answers the preflight requests it allows before anything else
     // does: they carry no credentials for auth to check.
-    let cors = config
-        .cors
-        .as_ref()
-        .map(|cors| Arc::new(cors::CorsMiddleware::new(cors)));
+    let cors = grpc_web::cors(config).map(|cors| Arc::new(cors::CorsMiddleware::new(&cors)));
     if let Some(cors) = cors.as_ref() {
         middlewares.push(Arc::clone(cors) as Arc<dyn Middleware>);
     }
@@ -1186,7 +1188,8 @@ pub fn build_middleware_route(
             .as_ref()
             .map(|r| r.codes.clone())
             .unwrap_or_default(),
-        h2c: config.h2c_backends,
+        h2c: config.h2c_backends || config.grpc_web.is_some(),
+        grpc_web: config.grpc_web.is_some(),
         retry_backoff: config
             .retry
             .as_ref()
@@ -1360,6 +1363,7 @@ mod route_key_tests {
             retry_attempts: 1,
             retry_codes: Vec::new(),
             h2c: false,
+            grpc_web: false,
             retry_backoff: None,
             circuit_breaker: None,
             errors: None,
@@ -1710,6 +1714,7 @@ mod route_key_tests {
             retry_attempts: 1,
             retry_codes: Vec::new(),
             h2c: false,
+            grpc_web: false,
             retry_backoff: None,
             circuit_breaker: None,
             errors: None,
