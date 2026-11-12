@@ -88,6 +88,7 @@ const PAGE_ORDER: Record<string, string[]> = {
   middleware: [
     'auth',
     'headers',
+    'cors',
     'rate-limit',
     'in-flight-req',
     'redirects',

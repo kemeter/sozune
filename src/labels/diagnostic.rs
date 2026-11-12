@@ -94,6 +94,10 @@ pub enum DiagnosticCode {
     /// A `scheme` label is neither `http` nor `h2c`. The backends are
     /// reached over HTTP/1.1.
     W035InvalidScheme,
+    /// A CORS label is unusable: an origin that is not one, a `maxAge` or
+    /// `allowCredentials` that does not parse, an origin regex, or a policy
+    /// with no origin. That part, or the whole policy, is dropped.
+    W036InvalidCors,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -144,6 +148,7 @@ impl DiagnosticCode {
             DiagnosticCode::W033InvalidRedirectRegex => "W033",
             DiagnosticCode::W034InvalidBackendErrors => "W034",
             DiagnosticCode::W035InvalidScheme => "W035",
+            DiagnosticCode::W036InvalidCors => "W036",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -204,6 +209,7 @@ impl DiagnosticCode {
             DiagnosticCode::W033InvalidRedirectRegex,
             DiagnosticCode::W034InvalidBackendErrors,
             DiagnosticCode::W035InvalidScheme,
+            DiagnosticCode::W036InvalidCors,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

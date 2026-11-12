@@ -115,6 +115,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `redirectregex.regex` / `.replacement` / `.permanent` | `redirectRegex.regex` / `.replacement` / `.permanent` (since 0.17) |
 | `headers.customrequestheaders.X-Foo=bar` | `headers.X-Foo=bar` |
 | `headers.customresponseheaders.X-Foo=bar` | `headers.response.X-Foo=bar` |
+| `headers.accessControlAllowOriginList`, `accessControlAllowMethods`, `accessControlAllowHeaders`, `accessControlExposeHeaders`, `accessControlAllowCredentials`, `accessControlMaxAge` | The same labels, or `cors.allowOrigins`, `cors.allowMethods`… ([CORS](/documentation/middleware/cors), since 0.17). `accessControlAllowOriginListRegex` has no equivalent: list the origins, `https://*.example.com` for the names below a domain. |
 | Empty header value (removes the header) | Same: `headers.X-Foo=` |
 | `basicauth.users=user:$$apr1$$...` | `auth.basic=user:<sha256-hex>`. Sōzune does not read htpasswd hashes: [rehash each password](/documentation/middleware/auth) in SHA-256. |
 | `basicauth.realm` | `wwwAuthenticate` |

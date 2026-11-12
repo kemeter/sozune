@@ -2,7 +2,7 @@ mod backend_errors;
 pub mod chain;
 pub mod circuit_breaker;
 mod compress;
-mod cors;
+pub(crate) mod cors;
 mod diag;
 mod fixed_answer;
 mod forward_auth;

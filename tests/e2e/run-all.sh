@@ -570,6 +570,23 @@ services:
       - "sozune.http.grpcwebdown.grpcWeb=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # CORS from labels (47-cors-labels.sh): Sōzune's names on cors, Traefik's
+  # headers.accessControl* ones on corstraefik.
+  svc-cors:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.cors.host=$HOST_CORS"
+      - "sozune.http.cors.cors.allowOrigins=https://app.example"
+      - "sozune.http.cors.cors.allowMethods=GET,POST"
+      - "sozune.http.cors.cors.allowHeaders=x-request-id"
+      - "sozune.http.cors.cors.exposeHeaders=x-total-count"
+      - "sozune.http.cors.cors.maxAge=600"
+      - "sozune.http.corstraefik.host=$HOST_CORS_TRAEFIK"
+      - "sozune.http.corstraefik.headers.accessControlAllowOriginList=https://app.example"
+      - "sozune.http.corstraefik.headers.accessControlAllowMethods=GET"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   # etcd serves the gRPC health service on its client port: SERVING
   # (42-grpc-health-checks.sh). grpcbin above has none (UNIMPLEMENTED).
   svc-etcd:
