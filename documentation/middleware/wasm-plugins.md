@@ -107,7 +107,9 @@ WASM plugins run after the native request-phase middlewares (IP allow-list, head
 
 ## Limits
 
-Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. The timeout is per invocation: one that runs out interrupts only itself, never other requests running through the same plugin. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched.
+Each plugin invocation is bounded by a wall-clock timeout and a maximum linear memory, so a misbehaving guest can't hang or exhaust the proxy. The timeout is per invocation: one that runs out interrupts only itself, never other requests running through the same plugin. Request/response bodies are buffered up to 1 MiB for the guest; larger bodies are passed through untouched. A body's trailers are kept and sent on after it (since 0.17).
+
+A gRPC call (`content-type: application/grpc`) is never buffered: its messages stream for as long as the call lasts, and its status comes in the trailers. The guest still runs on it and sees its method, path, headers and response status, but no body, and the call's messages and trailers go through untouched (since 0.17).
 
 ## Instance reuse (`reuse_instances`)
 

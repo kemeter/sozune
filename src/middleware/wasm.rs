@@ -13,11 +13,12 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use http_wasm_host::{
     FetchRequest, FetchResponse, Fetcher, HeaderKind, Host, Limits, Next, Plugin, SendOutcome, Sink,
 };
+use hyper::body::Frame;
 use tracing::{error, warn};
 
 use super::chain::{Flow, Middleware, RequestCtx};
@@ -750,13 +751,13 @@ impl WasmMiddleware {
     /// Returns the state plus, for an oversize body, `Some(stream)` to forward
     /// verbatim (the guest saw no body); `None` means the body fit and the caller
     /// re-sends `state.req_body` (possibly mutated by the guest).
-    async fn snapshot_request(
-        &self,
-        ctx: &RequestCtx,
-        req: Request<Body>,
-    ) -> (HttpState, Option<Body>) {
+    async fn snapshot_request(&self, ctx: &RequestCtx, req: Request<Body>) -> (HttpState, Unread) {
         let (parts, body) = req.into_parts();
-        let (body_bytes, oversize_body) = buffer_or_stream(body).await;
+        let read = if ctx.grpc {
+            ReadBody::passthrough(body)
+        } else {
+            buffer_or_stream(body).await
+        };
         let state = HttpState {
             method: parts.method.to_string(),
             uri: parts
@@ -770,12 +771,16 @@ impl WasmMiddleware {
             config: self.config.clone(),
             req_headers: snapshot_headers(&parts.headers),
             resp_headers: Vec::new(),
-            req_body: body_bytes,
+            req_body: read.bytes,
             req_body_cursor: 0,
             resp_body: Vec::new(),
             resp_body_cursor: 0,
         };
-        (state, oversize_body)
+        let body = match read.passthrough {
+            Some(body) => Unread::Passthrough(body),
+            None => Unread::Trailers(read.trailers),
+        };
+        (state, body)
     }
 }
 
@@ -880,34 +885,105 @@ fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
     }
 }
 
+/// A body read for the guest.
+struct ReadBody {
+    /// What the guest sees: the whole body, or nothing when `passthrough`
+    /// streams it.
+    bytes: Vec<u8>,
+    /// The trailers that came after a body read whole, sent on after it.
+    trailers: Option<HeaderMap>,
+    /// The body streamed on untouched, trailers included, the guest seeing
+    /// none of it.
+    passthrough: Option<Body>,
+}
+
+impl ReadBody {
+    /// `body` streamed on unread.
+    fn passthrough(body: Body) -> Self {
+        Self {
+            bytes: Vec::new(),
+            trailers: None,
+            passthrough: Some(body),
+        }
+    }
+
+    fn whole(bytes: Vec<u8>, trailers: Option<HeaderMap>) -> Self {
+        Self {
+            bytes,
+            trailers,
+            passthrough: None,
+        }
+    }
+}
+
+/// What goes on after the guest saw the body: the body it did not read, or
+/// the trailers of the one it did.
+enum Unread {
+    Passthrough(Body),
+    Trailers(Option<HeaderMap>),
+}
+
+impl Unread {
+    /// The body to send on, with `bytes` as the one the guest read (and
+    /// may have rewritten).
+    fn body(self, bytes: Vec<u8>) -> Body {
+        match self {
+            Self::Passthrough(body) => body,
+            Self::Trailers(trailers) => resend(bytes, trailers),
+        }
+    }
+}
+
+/// `bytes` as a body, followed by `trailers` when there are some.
+fn resend(bytes: Vec<u8>, trailers: Option<HeaderMap>) -> Body {
+    use http_body_util::StreamBody;
+    match trailers {
+        None => Body::from(bytes),
+        Some(trailers) => {
+            let frames = [
+                Ok::<_, axum::Error>(Frame::data(axum::body::Bytes::from(bytes))),
+                Ok(Frame::trailers(trailers)),
+            ];
+            Body::new(StreamBody::new(futures_util::stream::iter(frames)))
+        }
+    }
+}
+
 /// Read an axum body, buffering it for the guest only while it fits in
-/// [`MAX_BUFFERED_BODY`]. Returns `(buffered, oversize_body)`:
+/// [`MAX_BUFFERED_BODY`]:
 ///
 /// - **Fits (or empty / read error):** the whole body is collected into
-///   `buffered` (the guest reads/rewrites it) and `oversize_body` is `None` — the
-///   caller re-sends `buffered` (or the guest's mutated copy of it).
-/// - **Exceeds the limit:** `buffered` is empty (the guest sees no body) and
-///   `oversize_body` is `Some(body)` that streams the *entire* payload through
-///   untouched — the frames already read plus the unread remainder of the
-///   original stream. The caller forwards this body verbatim. Works for both
-///   `Content-Length` and chunked bodies: the decision comes from bytes actually
-///   read, not from a declared length.
+///   `bytes` (the guest reads/rewrites it), with its trailers, and
+///   `passthrough` is `None`: the caller sends `bytes` on (or the guest's
+///   rewritten copy of it), then the trailers.
+/// - **Exceeds the limit:** `bytes` is empty (the guest sees no body) and
+///   `passthrough` streams the *entire* payload through untouched: the
+///   frames already read plus the unread remainder of the original stream,
+///   trailers included. Works for both `Content-Length` and chunked bodies:
+///   the decision comes from bytes actually read, not from a declared
+///   length.
 ///
 /// On a read error mid-stream the bytes gathered so far are returned as the
-/// buffer (best effort) with `None`, matching the previous leniency without
-/// losing what was already read.
-async fn buffer_or_stream(mut body: Body) -> (Vec<u8>, Option<Body>) {
+/// buffer (best effort), matching the previous leniency without losing what
+/// was already read.
+async fn buffer_or_stream(mut body: Body) -> ReadBody {
     use axum::body::Bytes;
+    use http_body_util::{BodyStream, StreamBody};
 
     let mut buffered: Vec<u8> = Vec::new();
+    let mut trailers: Option<HeaderMap> = None;
 
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                let Ok(data) = frame.into_data() else {
-                    // Non-data frame (e.g. trailers) while still buffering — keep
-                    // reading; trailers on a buffered body are dropped as before.
-                    continue;
+                let data = match frame.into_data() {
+                    Ok(data) => data,
+                    Err(frame) => {
+                        if let Ok(more) = frame.into_trailers() {
+                            trailers.get_or_insert_with(HeaderMap::new).extend(more);
+                        }
+                        continue;
+                    }
                 };
                 buffered.extend_from_slice(&data);
                 if buffered.len() > MAX_BUFFERED_BODY {
@@ -918,13 +994,11 @@ async fn buffer_or_stream(mut body: Body) -> (Vec<u8>, Option<Body>) {
                          streamed untouched (guest sees no body)"
                     );
                     let head = Bytes::from(std::mem::take(&mut buffered));
-                    // Match the tail stream's item type (`Result<Bytes, axum::Error>`)
-                    // so the two can be chained into one body.
-                    let head_stream =
-                        futures_util::stream::once(async move { Ok::<_, axum::Error>(head) });
-                    let tail_stream = body.into_data_stream();
-                    let combined = futures_util::StreamExt::chain(head_stream, tail_stream);
-                    return (Vec::new(), Some(Body::from_stream(combined)));
+                    let head = futures_util::stream::once(async move {
+                        Ok::<_, axum::Error>(Frame::data(head))
+                    });
+                    let combined = futures_util::StreamExt::chain(head, BodyStream::new(body));
+                    return ReadBody::passthrough(Body::new(StreamBody::new(combined)));
                 }
             }
             Some(Err(e)) => {
@@ -933,16 +1007,16 @@ async fn buffer_or_stream(mut body: Body) -> (Vec<u8>, Option<Body>) {
                 if super::timed_out(&e) {
                     warn!("wasm middleware: body cut short by the route's timeout");
                     let failed = futures_util::stream::once(async move { Err::<Bytes, _>(e) });
-                    return (Vec::new(), Some(Body::from_stream(failed)));
+                    return ReadBody::passthrough(Body::from_stream(failed));
                 }
                 warn!("wasm middleware: failed to read body: {e}");
                 // Hand back whatever we have; the guest sees a (possibly partial)
                 // body and it is re-sent as-is.
-                return (std::mem::take(&mut buffered), None);
+                return ReadBody::whole(std::mem::take(&mut buffered), None);
             }
             None => {
                 // EOF within the limit: fully buffered.
-                return (std::mem::take(&mut buffered), None);
+                return ReadBody::whole(std::mem::take(&mut buffered), trailers);
             }
         }
     }
@@ -984,7 +1058,7 @@ impl Middleware for WasmMiddleware {
         // buffers it for the guest if it fits; otherwise it hands back a streaming
         // body that forwards the full payload untouched (guest sees no body).
         let taken = std::mem::replace(req, Request::new(Body::empty()));
-        let (mut state, oversize_body) = self.snapshot_request(ctx, taken).await;
+        let (mut state, unread) = self.snapshot_request(ctx, taken).await;
 
         let outcome = self.plugin.handle_request(&mut state);
 
@@ -1002,10 +1076,7 @@ impl Middleware for WasmMiddleware {
                 // Oversize: forward the streamed body verbatim (the guest never
                 // saw it). Otherwise re-send the buffered body, which the guest
                 // may have rewritten.
-                *req.body_mut() = match oversize_body {
-                    Some(body) => body,
-                    None => Body::from(state.req_body.clone()),
-                };
+                *req.body_mut() = unread.body(state.req_body.clone());
                 // A guest may stage response headers from the request phase;
                 // carry them to the response side via the shared context.
                 ctx.pending_response_headers.extend(state.resp_headers);
@@ -1019,10 +1090,7 @@ impl Middleware for WasmMiddleware {
                 // continue to the backend. fail_open=false is for a security
                 // plugin (WAF/bouncer) that must fail closed.
                 if self.policy.fail_open {
-                    *req.body_mut() = match oversize_body {
-                        Some(body) => body,
-                        None => Body::from(state.req_body.clone()),
-                    };
+                    *req.body_mut() = unread.body(state.req_body.clone());
                     return Flow::Continue;
                 }
                 Flow::ShortCircuit(
@@ -1043,29 +1111,40 @@ impl Middleware for WasmMiddleware {
         }
 
         let (parts, body) = resp.into_parts();
-        let (body_bytes, oversize_body) = buffer_or_stream(body).await;
+        // A gRPC answer is not read: its messages stream for as long as the
+        // call lasts, and its status comes in the trailers. The guest sees
+        // its status and headers, with no body.
+        let read = if ctx.grpc {
+            ReadBody::passthrough(body)
+        } else {
+            buffer_or_stream(body).await
+        };
 
         // Symmetric to the request side: an oversize response body is streamed
         // back to the client untouched rather than collected and dropped. The
         // guest's `handle_response` is skipped for it (it would see no body), but
         // the client still gets the full payload. Response headers the guest
         // staged in the request phase are still applied so they're not lost.
-        if let Some(stream_body) = oversize_body {
-            let mut headers = parts.headers;
-            for (name, value) in &ctx.pending_response_headers {
-                if let (Ok(n), Ok(v)) = (
-                    HeaderName::try_from(name.as_str()),
-                    HeaderValue::from_str(value),
-                ) {
-                    headers.insert(n, v);
+        let (body_bytes, unread) = match read.passthrough {
+            Some(body) if ctx.grpc => (Vec::new(), Unread::Passthrough(body)),
+            Some(stream_body) => {
+                let mut headers = parts.headers;
+                for (name, value) in &ctx.pending_response_headers {
+                    if let (Ok(n), Ok(v)) = (
+                        HeaderName::try_from(name.as_str()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        headers.insert(n, v);
+                    }
                 }
+                let mut rebuilt = Response::new(stream_body);
+                *rebuilt.status_mut() = parts.status;
+                *rebuilt.version_mut() = parts.version;
+                *rebuilt.headers_mut() = headers;
+                return rebuilt;
             }
-            let mut rebuilt = Response::new(stream_body);
-            *rebuilt.status_mut() = parts.status;
-            *rebuilt.version_mut() = parts.version;
-            *rebuilt.headers_mut() = headers;
-            return rebuilt;
-        }
+            None => (read.bytes, Unread::Trailers(read.trailers)),
+        };
 
         // Start from the backend's response headers, then merge any headers the
         // guest staged during the request phase. The guest can still read and
@@ -1090,7 +1169,7 @@ impl Middleware for WasmMiddleware {
         if let Err(e) = self.plugin.handle_response(&mut state, 0, false) {
             error!("wasm middleware '{}' response phase failed: {e}", self.name);
             // On failure, pass the original response through unchanged.
-            let mut rebuilt = Response::new(Body::from(state.resp_body));
+            let mut rebuilt = Response::new(unread.body(state.resp_body));
             *rebuilt.status_mut() = parts.status;
             *rebuilt.headers_mut() = parts.headers;
             return rebuilt;
@@ -1102,7 +1181,7 @@ impl Middleware for WasmMiddleware {
             apply_headers(map, &state.resp_headers);
         }
         builder
-            .body(Body::from(state.resp_body))
+            .body(unread.body(state.resp_body))
             .unwrap_or_else(|_| Response::new(Body::empty()))
     }
 }
@@ -1180,7 +1259,11 @@ mod tests {
     async fn buffer_or_stream_buffers_when_it_fits() {
         // A small body is fully buffered (the guest can read it) and no
         // oversize stream is produced.
-        let (buffered, oversize) = buffer_or_stream(Body::from("hello world")).await;
+        let ReadBody {
+            bytes: buffered,
+            passthrough: oversize,
+            ..
+        } = buffer_or_stream(Body::from("hello world")).await;
         assert_eq!(buffered, b"hello world");
         assert!(oversize.is_none());
     }
@@ -1196,14 +1279,22 @@ mod tests {
                 "past the route's timeout",
             )),
         ]);
-        let (buffered, rest) = buffer_or_stream(Body::from_stream(cut)).await;
+        let ReadBody {
+            bytes: buffered,
+            passthrough: rest,
+            ..
+        } = buffer_or_stream(Body::from_stream(cut)).await;
         assert!(buffered.is_empty());
         assert!(rest.expect("an error body").collect().await.is_err());
     }
 
     #[tokio::test]
     async fn buffer_or_stream_handles_empty_body() {
-        let (buffered, oversize) = buffer_or_stream(Body::empty()).await;
+        let ReadBody {
+            bytes: buffered,
+            passthrough: oversize,
+            ..
+        } = buffer_or_stream(Body::empty()).await;
         assert!(buffered.is_empty());
         assert!(oversize.is_none());
     }
@@ -1216,11 +1307,72 @@ mod tests {
         // that holds for both Content-Length and chunked bodies.
         let size = MAX_BUFFERED_BODY + 1024;
         let payload = vec![b'x'; size];
-        let (buffered, oversize) = buffer_or_stream(Body::from(payload.clone())).await;
+        let ReadBody {
+            bytes: buffered,
+            passthrough: oversize,
+            ..
+        } = buffer_or_stream(Body::from(payload.clone())).await;
         assert!(buffered.is_empty(), "guest must not see an oversize body");
         let streamed = drain(oversize.expect("oversize body should be streamed")).await;
         assert_eq!(streamed.len(), size, "streamed body must be complete");
         assert_eq!(streamed, payload, "streamed bytes must match exactly");
+    }
+
+    /// A body of `data` followed by `trailers`.
+    fn with_trailers(
+        data: impl Into<axum::body::Bytes>,
+        trailers: &[(&'static str, &'static str)],
+    ) -> Body {
+        let mut map = HeaderMap::new();
+        for (name, value) in trailers {
+            map.insert(*name, HeaderValue::from_static(value));
+        }
+        let frames = [
+            Ok::<_, axum::Error>(Frame::data(data.into())),
+            Ok(Frame::trailers(map)),
+        ];
+        Body::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+            frames,
+        )))
+    }
+
+    /// The trailers a body ends with.
+    async fn trailers_of(body: Body) -> Option<HeaderMap> {
+        body.collect().await.unwrap().trailers().cloned()
+    }
+
+    /// The trailers of a body read whole go on after it: a gRPC status
+    /// comes in them.
+    #[tokio::test]
+    async fn the_trailers_of_a_buffered_body_are_sent_on() {
+        let read = buffer_or_stream(with_trailers(&b"hello"[..], &[("grpc-status", "0")])).await;
+        assert_eq!(read.bytes, b"hello");
+        assert!(read.passthrough.is_none());
+        let body = Unread::Trailers(read.trailers).body(read.bytes);
+        let collected = body.collect().await.unwrap();
+        assert_eq!(collected.trailers().unwrap()["grpc-status"], "0");
+        assert_eq!(collected.to_bytes(), "hello");
+    }
+
+    /// A body over the limit is streamed on with its trailers.
+    #[tokio::test]
+    async fn an_oversize_body_keeps_its_trailers() {
+        let payload = vec![b'x'; MAX_BUFFERED_BODY + 1];
+        let read = buffer_or_stream(with_trailers(payload, &[("grpc-status", "0")])).await;
+        assert!(read.bytes.is_empty());
+        let trailers = trailers_of(read.passthrough.expect("streamed")).await;
+        assert_eq!(trailers.unwrap()["grpc-status"], "0");
+    }
+
+    /// A body not read for the guest goes on as it came, trailers included.
+    #[tokio::test]
+    async fn a_body_passed_through_is_untouched() {
+        let read = ReadBody::passthrough(with_trailers(&b"message"[..], &[("grpc-status", "14")]));
+        let unread = Unread::Passthrough(read.passthrough.unwrap());
+        // What the guest wrote is not sent: it never saw the body.
+        let collected = unread.body(b"rewritten".to_vec()).collect().await.unwrap();
+        assert_eq!(collected.trailers().unwrap()["grpc-status"], "14");
+        assert_eq!(collected.to_bytes(), "message");
     }
 
     #[test]

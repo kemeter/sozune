@@ -243,6 +243,7 @@ mod tests {
             client_encoding: Some(Encoding::Gzip),
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),
+            grpc: false,
         };
         let cut = futures_util::stream::iter([Err::<axum::body::Bytes, _>(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

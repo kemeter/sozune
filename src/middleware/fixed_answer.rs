@@ -39,6 +39,7 @@ mod tests {
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),
+            grpc: false,
         };
         let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
         match FixedAnswerMiddleware(FixedAnswer::InvalidBackends)
