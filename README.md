@@ -111,7 +111,11 @@ The image runs as a non-root user: `group_add` lets it open the Docker socket, a
 
 ## Contributing
 
-Pull requests welcome.
+Pull requests welcome. The test suites:
+
+- `cargo test --bin sozune`: unit tests.
+- `bash tests/e2e/run-all.sh`: end-to-end tests against Docker containers (`E2E_HTTP_PORT`, `E2E_HTTPS_PORT` and `E2E_API_PORT` move its ports).
+- `cd dashboard && bun run test:e2e`: the dashboard's functional tests with Playwright, against a Sōzune it builds and starts (`bunx playwright install chromium` first).
 
 ## License
 

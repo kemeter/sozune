@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import { getEntrypoint, backendKey, type Backend, type Entrypoint } from '$lib/api';
   import { isAuthenticated } from '$lib/auth';
 
@@ -134,7 +135,7 @@
 
 <header class="page-header">
   <div>
-    <a href="/" class="back">← Entrypoints</a>
+    <a href={resolve('/entrypoints')} class="back">← Entrypoints</a>
     <h1>{entrypoint?.name ?? id}</h1>
     <p class="subtitle mono">{id}</p>
   </div>

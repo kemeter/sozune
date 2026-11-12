@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 - gRPC-Web: `grpcWeb=true` or `grpcWeb.allowOrigins` translates the gRPC-Web calls of browsers (binary or `-text`) into gRPC for the backends, over h2c, and their answers back, the trailers as the last message, as Traefik's `grpcWeb` middleware does. `allowOrigins` answers the preflight requests of those origins with the headers gRPC-Web needs. `grpc_web` in static config and the API. See [gRPC-Web](documentation/routing/grpc.md#grpc-web).
 - Service weights: `serviceWeight` is the weight of a container's service as a whole (its Compose or Swarm service, its Nomad, Consul or Ring service), shared by its replicas, so a split between two versions holds whatever their replica counts. `weight` stays a container's own. See [Service weights](documentation/routing/load-balancing.md#service-weights).
 
+### Dashboard
+
+- The *← Entrypoints* link of a route's page led to the overview; it leads to the entrypoints list. Found by the dashboard's new functional tests (Playwright, `bun run test:e2e`).
+
 ### Observability
 
 - OTLP metrics export — push the metrics served on `/metrics` to an OpenTelemetry collector over OTLP/gRPC, alongside or instead of a Prometheus scrape. Enable with `metrics.otlp.enabled` and `metrics.otlp.endpoint`; `metrics.otlp.service_name` and `metrics.otlp.push_interval` (seconds, default `10`) tune it. Disabled by default. See [OTLP metrics export](documentation/advanced/observability.md#otlp-metrics-export).

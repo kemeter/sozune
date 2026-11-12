@@ -36,8 +36,8 @@
         listEntrypoints(),
         listProviders(),
         listDiagnostics(),
-        // `/config` is admin-only; read-only viewers will 403 here. Treat
-        // failure as "no config" rather than as a page-wide error.
+        // `/config` failing (an older API without it) is "no config"
+        // rather than a page-wide error.
         getConfig().catch(() => null),
         // `/metrics` is unauthenticated and may take a worker-poll cycle to
         // populate the proxy section. Failure or empty proxy → we just hide
