@@ -551,6 +551,17 @@ services:
       - "sozune.http.grpcwasm.port=9000"
       - "sozune.http.grpcwasm.scheme=h2c"
       - "sozune.http.grpcwasm.plugins=headerguest"
+      # Nothing listens on 9999: the middleware (there for the retry)
+      # answers the call itself.
+      - "sozune.http.grpcdown.host=$HOST_GRPC_DOWN"
+      - "sozune.http.grpcdown.port=9999"
+      - "sozune.http.grpcdown.scheme=h2c"
+      - "sozune.http.grpcdown.retry.attempts=2"
+      - "sozune.http.grpclimited.host=$HOST_GRPC_LIMITED"
+      - "sozune.http.grpclimited.port=9000"
+      - "sozune.http.grpclimited.scheme=h2c"
+      - "sozune.http.grpclimited.ratelimit.average=1"
+      - "sozune.http.grpclimited.ratelimit.burst=2"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   # etcd serves the gRPC health service on its client port: SERVING
