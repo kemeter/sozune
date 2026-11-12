@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend_errors;
 pub mod core;
+pub mod cors;
 pub mod error_pages;
 pub mod forward_auth;
 pub mod headers;

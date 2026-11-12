@@ -98,6 +98,7 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.headers.<name>` | [Custom headers](/documentation/middleware/headers) — request-side by default (since 0.6) |
 | `sozune.http.<svc>.headers.response.<name>` | [Custom headers](/documentation/middleware/headers) — response-side (since 0.11) |
 | `sozune.http.<svc>.headers.both.<name>` | [Custom headers](/documentation/middleware/headers) — both directions (since 0.11) |
+| `sozune.http.<svc>.cors.allowOrigins` | [CORS](/documentation/middleware/cors): the origins whose pages may call the route; with `cors.allowMethods`, `cors.allowHeaders`, `cors.exposeHeaders`, `cors.allowCredentials`, `cors.maxAge` (since 0.17) |
 | `sozune.http.<svc>.stripPrefix` | [Strip prefix](/documentation/middleware/strip-prefix) (since 0.6) |
 | `sozune.http.<svc>.addPrefix` | [Add prefix](/documentation/middleware/add-prefix) (since 0.14) |
 | `sozune.http.<svc>.replacePath` | [Replace path](/documentation/middleware/replace-path) — path the backend receives (since 0.17) |

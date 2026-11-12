@@ -37,6 +37,12 @@ enum AllowedOrigin {
     },
 }
 
+/// Whether `entry` is an origin `allowOrigins` takes: `*`,
+/// `scheme://host[:port]`, or one with a `*` or `*.` host.
+pub(crate) fn is_origin(entry: &str) -> bool {
+    AllowedOrigin::parse(entry.trim()).is_some()
+}
+
 impl AllowedOrigin {
     fn parse(entry: &str) -> Option<Self> {
         if entry == "*" {

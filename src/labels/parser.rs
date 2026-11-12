@@ -4,7 +4,7 @@ use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
-    auth, backend_errors, core, error_pages, forward_auth, headers, host, in_flight_req,
+    auth, backend_errors, core, cors, error_pages, forward_auth, headers, host, in_flight_req,
     ip_allow_list, methods, path, plugin_config, plugins, ratelimit, redirect, request_match,
     rewrite,
 };
@@ -247,6 +247,7 @@ fn build_entrypoint(
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
     let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
+    let cors = cors::parse_cors(labels, &prefix, diagnostics);
     let methods = methods::parse_methods(labels, &prefix, diagnostics);
     let plugins = plugins::parse_plugins(labels, &prefix);
     let plugin_config = plugin_config::parse_plugin_config(labels, &prefix, diagnostics);
@@ -411,7 +412,7 @@ fn build_entrypoint(
             mirrors: Vec::new(),
             mirror_of: None,
             failing_shares: None,
-            cors: None,
+            cors,
             outranked_headers: Vec::new(),
             replace_path,
             replace_path_regex,
@@ -667,6 +668,42 @@ mod tests {
         let off = &r.entrypoints["http_off"].config;
         assert!(off.grpc_web.is_none());
         assert!(!off.h2c_backends);
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
+    }
+
+    #[test]
+    fn cors_labels_give_the_route_a_policy_not_headers() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.api.host", "api.example.com"),
+                (
+                    "sozune.http.api.cors.allowOrigins",
+                    "https://app.example.com",
+                ),
+                ("sozune.http.legacy.host", "legacy.example.com"),
+                (
+                    "sozune.http.legacy.headers.accessControlAllowOriginList",
+                    "https://app.example.com",
+                ),
+                ("sozune.http.legacy.headers.X-Frame-Options", "DENY"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let api = &r.entrypoints["http_api"].config;
+        assert_eq!(
+            api.cors.as_ref().unwrap().allow_origins,
+            ["https://app.example.com"]
+        );
+        let legacy = &r.entrypoints["http_legacy"].config;
+        assert_eq!(
+            legacy.cors.as_ref().unwrap().allow_origins,
+            ["https://app.example.com"]
+        );
+        // Traefik's option is no header to send.
+        let names: Vec<&str> = legacy.headers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["X-Frame-Options"]);
         assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 

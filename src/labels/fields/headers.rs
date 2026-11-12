@@ -44,6 +44,12 @@ pub fn parse_headers(
         };
         let value = &labels[key];
 
+        // Traefik's CORS options live among its headers: they are a policy,
+        // read by the CORS labels, not headers to send.
+        if super::cors::is_traefik_option(remainder) {
+            continue;
+        }
+
         let (direction, header_name) = if let Some(name) = remainder.strip_prefix("response.") {
             (HeaderDirection::Response, name)
         } else if let Some(name) = remainder.strip_prefix("both.") {

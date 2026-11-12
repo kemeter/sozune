@@ -185,6 +185,7 @@ mod tests {
                 ("sozune.ratelimit.average", "10"),
                 ("sozune.scheme", "h2c"),
                 ("sozune.grpcWeb.allowOrigins", "https://app.example"),
+                ("sozune.cors.allowOrigins", "https://app.example"),
             ]),
             "ingress:default/web",
         );
@@ -194,6 +195,7 @@ mod tests {
         assert!(settings.config.compress);
         assert!(settings.config.h2c_backends);
         assert!(settings.config.grpc_web.is_some());
+        assert!(settings.config.cors.is_some());
         assert_eq!(settings.config.headers[0].name, "X-Frame-Options");
         assert!(settings.config.rate_limit.is_some());
     }

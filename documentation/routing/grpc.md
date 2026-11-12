@@ -119,7 +119,7 @@ labels:
 - **A call is told by its content type**, `application/grpc-web` or `application/grpc-web-text` (base64), with `+proto` or another format kept for the backend. A plain gRPC client can keep calling the same route: its calls go through as they are.
 - **The answer's trailers** (its `grpc-status` and `grpc-message`) come as the last message of its body, as gRPC-Web clients read them. An answer of the `-text` kind is base64 too.
 - **Errors**: when the middleware answers a gRPC-Web call itself, it answers in gRPC-Web form, the status in the headers (see [Errors](#errors)).
-- **CORS**: with `allowOrigins`, the route answers the preflight requests of those origins, letting them send `POST` with `content-type`, `x-grpc-web`, `x-user-agent` and `grpc-timeout`, and read `grpc-status` and `grpc-message`. A route's own CORS policy (`cors` in the API or static config, or a Gateway API [`cors` filter](/documentation/providers/kubernetes#httproute-filters)) is kept and completed.
+- **CORS**: with `allowOrigins`, the route answers the preflight requests of those origins, letting them send `POST` with `content-type`, `x-grpc-web`, `x-user-agent` and `grpc-timeout`, and read `grpc-status` and `grpc-message`. A route's own [CORS policy](/documentation/middleware/cors) is kept and completed.
 
 In static YAML and through the [API](/documentation/configuration/api), set `grpc_web` in the route's `config`, with `h2c_backends: true`:
 

@@ -419,6 +419,16 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.http.api.scheme=h2c"),
     },
     Entry {
+        code: "W036",
+        title: "Invalid CORS label",
+        cause: "A `cors.*` label, or a Traefik `headers.accessControl*` one, is unusable: an origin that is not `scheme://host[:port]`, `*` or `https://*.example.com`, a `maxAge` that is not a number of seconds, an `allowCredentials` that is neither `true` nor `false`, an origin regex (`accessControlAllowOriginListRegex`), or a policy that allows no origin.",
+        effect: "The value is dropped; a policy left with no origin is dropped whole, and the route answers no preflight.",
+        fix: "List the origins pages call from, with their scheme. A `*.` host stands for the names below it, in place of a regex.",
+        example: Some(
+            "sozune.http.api.cors.allowOrigins=https://app.example.com,https://*.example.org",
+        ),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",
