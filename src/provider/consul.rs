@@ -61,7 +61,7 @@ impl ConsulProvider {
                 };
                 if let Some(existing) = entrypoints.get_mut(&key) {
                     existing.add_candidates(&entrypoint.candidates);
-                    if !existing.backends.contains(&backend) {
+                    if !existing.backends.iter().any(|b| b.same_address(&backend)) {
                         existing.backends.push(backend);
                     }
                 } else {
@@ -69,6 +69,10 @@ impl ConsulProvider {
                     entrypoints.insert(key, entrypoint);
                 }
             }
+        }
+        // The replicas of a workload share its weight.
+        for entrypoint in entrypoints.values_mut() {
+            crate::model::split_service_weights(&mut entrypoint.backends);
         }
         Ok(entrypoints)
     }

@@ -599,6 +599,30 @@ services:
       - "sozune.http.bufferresp.buffering.maxResponseBodyBytes=50"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # serviceWeight (49-service-weight.sh): two replicas of stable and one of
+  # canary, each service weighing 1: canary takes half, not a third.
+  svc-sw-stable:
+    image: traefik/whoami
+    environment:
+      - WHOAMI_NAME=stable
+    deploy:
+      replicas: 2
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.sw.host=$HOST_SERVICE_WEIGHT"
+      - "sozune.http.sw.serviceWeight=1"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  svc-sw-canary:
+    image: traefik/whoami
+    environment:
+      - WHOAMI_NAME=canary
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.sw.host=$HOST_SERVICE_WEIGHT"
+      - "sozune.http.sw.serviceWeight=1"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
   # etcd serves the gRPC health service on its client port: SERVING
   # (42-grpc-health-checks.sh). grpcbin above has none (UNIMPLEMENTED).
   svc-etcd:

@@ -1001,11 +1001,13 @@ fn merge_replica(existing: &mut Entrypoint, incoming: Entrypoint, same_provider:
         }
     }
     existing.add_candidates(&incoming.candidates);
+    // By address: a backend's weight changes as replicas come and go.
     for backend in incoming.backends {
-        if !existing.backends.contains(&backend) {
+        if !existing.backends.iter().any(|b| b.same_address(&backend)) {
             existing.backends.push(backend);
         }
     }
+    crate::model::split_service_weights(&mut existing.backends);
 }
 
 /// The route `current`, stored under `key`, as the containers `candidates`
@@ -1373,6 +1375,8 @@ fn drop_backends_of(
             .iter()
             .any(|d| d.address == b.address && d.port == b.port)
     });
+    // The replicas left share their workload's weight.
+    crate::model::split_service_weights(&mut entrypoint.backends);
     entrypoint.candidates.is_empty()
         || (entrypoint.backends.is_empty() && !entrypoint.answers_without_backend())
 }
@@ -1473,6 +1477,53 @@ pub(super) mod merge_tests {
         assert_eq!(map.len(), 1);
         let merged = &map["http_web"];
         assert_eq!(merged.backends.len(), 2);
+    }
+
+    /// Replicas of two Compose services sharing a route, each service's
+    /// weight shared by its replicas, as they come and go.
+    #[test]
+    fn a_service_weight_is_shared_as_replicas_come_and_go() {
+        let replica = |ip: &str, id: &str, workload: &str, weight: u32| Entrypoint {
+            candidates: vec![id.to_string()],
+            source: Some(crate::provider::DOCKER.to_string()),
+            backends: vec![Backend::new(ip, 80).with_share(Some(workload.into()), weight)],
+            ..ep("app.example.com", Some("/"), ip)
+        };
+        let mut storage: BTreeMap<String, Entrypoint> = BTreeMap::new();
+        for (ip, id, workload, weight) in [
+            ("10.0.0.1", "stable-1", "shop/stable", 90),
+            ("10.0.0.2", "stable-2", "shop/stable", 90),
+            ("10.0.0.3", "stable-3", "shop/stable", 90),
+            ("10.0.0.9", "canary-1", "shop/canary", 10),
+        ] {
+            merge_or_insert_entrypoint_btree(
+                &mut storage,
+                "http_web".into(),
+                replica(ip, id, workload, weight),
+                id,
+                crate::provider::DOCKER,
+            );
+        }
+        let weights = |storage: &BTreeMap<String, Entrypoint>| -> Vec<u32> {
+            storage["http_web"]
+                .backends
+                .iter()
+                .map(|b| b.weight)
+                .collect()
+        };
+        // 270 : 30, i.e. 90% / 10%.
+        assert_eq!(weights(&storage), [90, 90, 90, 30]);
+
+        // A stable replica leaves: the two left share the 90.
+        let departing = [Backend::new("10.0.0.3", 80)];
+        take_off(
+            &mut storage,
+            "stable-3",
+            &departing,
+            crate::provider::DOCKER,
+            &HashMap::new(),
+        );
+        assert_eq!(weights(&storage), [90, 90, 20]);
     }
 
     #[test]

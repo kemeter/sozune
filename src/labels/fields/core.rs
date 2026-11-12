@@ -523,7 +523,27 @@ pub fn parse_weight(
     prefix: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<u32> {
-    let key = format!("{prefix}weight");
+    parse_weight_label(labels, &format!("{prefix}weight"), diagnostics)
+}
+
+/// Parse `<prefix>serviceWeight`: the weight of the workload a backend is a
+/// replica of (its Compose or Swarm service, its Nomad, Consul or Ring
+/// service), shared by its replicas, rather than each one's own. Invalid as
+/// `weight` is (`W027`).
+pub fn parse_service_weight(
+    labels: &HashMap<String, String>,
+    prefix: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<u32> {
+    parse_weight_label(labels, &format!("{prefix}serviceWeight"), diagnostics)
+}
+
+fn parse_weight_label(
+    labels: &HashMap<String, String>,
+    key: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<u32> {
+    let key = key.to_string();
     let raw = labels
         .get(&key)
         .map(|s| s.trim())

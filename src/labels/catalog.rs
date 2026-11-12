@@ -36,6 +36,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "httpsRedirectPort",
     "stickySession",
     "compress",
+    "serviceWeight",
     "grpcWeb",
     "grpcWeb.allowOrigins",
     "cors.allowOrigins",

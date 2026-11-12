@@ -2100,6 +2100,7 @@ mod retry_tests {
         let backends: Vec<Backend> = ports
             .iter()
             .map(|&(port, weight)| Backend {
+                share: None,
                 address: "127.0.0.1".into(),
                 port,
                 weight,

@@ -112,7 +112,41 @@ Every algorithm honours the weight (since 0.16):
 - `random` draws in proportion to the weights, so the split is statistical.
 - `hrw` and `maglev` (UDP) give each backend a share of the flows in proportion to its weight.
 
-The weight belongs to a backend, not to a service: three replicas of `app-stable` labelled `weight=90` carry 270 shares between them.
+The weight belongs to a backend, not to a service: three replicas of `app-stable` labelled `weight=90` carry 270 shares between them. To weigh services rather than containers, use `serviceWeight`.
+
+### Service weights
+
+> Since 0.17
+
+`serviceWeight` is the weight of a container's service as a whole, shared by its replicas: the split between two versions holds whatever the number of replicas of each.
+
+```yaml
+services:
+  app-stable:
+    image: my-app:stable
+    deploy:
+      replicas: 3
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.app.host=app.example.com"
+      - "sozune.http.app.serviceWeight=90"
+
+  app-canary:
+    image: my-app:canary
+    labels:
+      - "sozune.enable=true"
+      - "sozune.http.app.host=app.example.com"
+      - "sozune.http.app.serviceWeight=10"
+```
+
+`app.example.com` goes 90% to `app-stable`, each of its 3 replicas taking 30%, and 10% to `app-canary`, as replicas start and stop. With `weight=90` instead, the 3 replicas would carry 270 shares against 10: 96% / 4%.
+
+- **The service** of a container is its Compose service (`com.docker.compose.project` and `com.docker.compose.service`, which Docker and Podman Compose set) or the Swarm service of its task, else the container alone. On Nomad, Consul and Ring, it is the service or deployment the instance belongs to.
+- `serviceWeight` wins over `weight` on the same container. A container with `weight` alone keeps its own weight next to the services: `weight=50` next to a service of `serviceWeight=100` gets a third.
+- A `serviceWeight` of `0` makes the service's replicas backups. A negative or non-integer value raises `W027`, as for `weight`.
+- The shares are exact: a service of weight `w` and `n` replicas gives each `w × L / n`, `L` being the least common multiple of the replica counts. The weights the [API](/documentation/configuration/api) shows for the route's backends are those.
+
+On Kubernetes, the Gateway API weighs a `backendRef` the same way: a Service's weight is shared by its pods.
 
 A weight of `0` makes the backend a **backup**: it takes no traffic while another backend can serve, and takes over when none can (since 0.16). A negative or non-integer value falls back to the default weight and raises a `W027` diagnostic.
 
