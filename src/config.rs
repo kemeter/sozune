@@ -370,11 +370,218 @@ impl ResolverConfig {
     }
 }
 
-/// DNS-01 provider configuration. Credentials are referenced by env var name,
-/// never inlined in YAML.
+/// A DNS-01 resolver's provider: a name cheti knows (`cloudflare`,
+/// `route53`, … or lego's name for it), which reads its credentials from
+/// its own environment variables, as Traefik's `provider:` does. `env`
+/// takes some of them from other variables instead: a second account's
+/// token. Credentials are never inlined in YAML.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderConfig {
+    pub name: String,
+    /// A provider variable → the variable it is read from. When set, the
+    /// provider reads these alone.
+    pub env: BTreeMap<String, String>,
+    /// A provider variable → its value, from the `type:` form, whose
+    /// RFC 2136 and OVH settings were values rather than variables.
+    pub values: BTreeMap<String, String>,
+    /// Written in the `type:` form.
+    pub legacy: bool,
+}
+
+impl ProviderConfig {
+    /// The provider `name`, reading its standard variables.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            env: BTreeMap::new(),
+            values: BTreeMap::new(),
+            legacy: false,
+        }
+    }
+
+    /// The value of provider variable `var`: from configuration, from the
+    /// variable `env` names for it (`<VAR>_FILE` from that one's `_FILE`),
+    /// or, without `env`, from the process's environment.
+    pub fn lookup(&self, var: &str) -> Option<String> {
+        if let Some(value) = self.values.get(var) {
+            return Some(value.clone());
+        }
+        if let Some(other) = self.env.get(var) {
+            return std::env::var(other).ok();
+        }
+        if let Some(other) = var
+            .strip_suffix("_FILE")
+            .and_then(|base| self.env.get(base))
+        {
+            return std::env::var(format!("{other}_FILE")).ok();
+        }
+        // With `env` (or the `type:` form), the provider reads what it
+        // names alone: a variable left unset is not taken from another
+        // account's under cheti's or lego's default name.
+        if self.env.is_empty() && self.values.is_empty() {
+            return std::env::var(var).ok();
+        }
+        None
+    }
+
+    /// The variables the configuration names for the provider to read, in
+    /// order: none when it reads its standard ones.
+    pub fn named_variables(&self) -> Vec<String> {
+        self.env.values().cloned().collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Named {
+            name: String,
+            #[serde(default)]
+            env: BTreeMap<String, String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Named(Named),
+            Legacy(LegacyProviderConfig),
+        }
+        let config = match Raw::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "expected a DNS provider name (`provider: cloudflare`), or `name:` with an optional `env:` map",
+            )
+        })? {
+            Raw::Name(name) => ProviderConfig::named(name),
+            Raw::Named(Named { name, env }) => ProviderConfig {
+                env,
+                ..ProviderConfig::named(name)
+            },
+            Raw::Legacy(legacy) => legacy.into(),
+        };
+        let known = cheti::providers::NAMES;
+        let lego = ["gandiv5", "pdns", "gcloud"];
+        let lower = config.name.to_ascii_lowercase();
+        if !known.contains(&lower.as_str()) && !lego.contains(&lower.as_str()) {
+            return Err(serde::de::Error::custom(format!(
+                "unknown DNS provider `{}`: expected one of {}",
+                config.name,
+                known.join(", ")
+            )));
+        }
+        Ok(config)
+    }
+}
+
+impl From<LegacyProviderConfig> for ProviderConfig {
+    fn from(legacy: LegacyProviderConfig) -> Self {
+        use LegacyProviderConfig as L;
+        let env = |pairs: &[(&str, &String)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(var, from)| (var.to_string(), (*from).clone()))
+                .collect()
+        };
+        let (name, env, values) = match &legacy {
+            L::Cloudflare { api_token_env } => (
+                "cloudflare",
+                env(&[("CLOUDFLARE_API_TOKEN", api_token_env)]),
+                BTreeMap::new(),
+            ),
+            L::Ovh {
+                endpoint,
+                application_key_env,
+                application_secret_env,
+                consumer_key_env,
+            } => (
+                "ovh",
+                env(&[
+                    ("OVH_APPLICATION_KEY", application_key_env),
+                    ("OVH_APPLICATION_SECRET", application_secret_env),
+                    ("OVH_CONSUMER_KEY", consumer_key_env),
+                ]),
+                BTreeMap::from([("OVH_ENDPOINT".to_string(), endpoint.clone())]),
+            ),
+            L::Gandi {
+                personal_access_token_env,
+            } => (
+                "gandi",
+                env(&[("GANDIV5_PERSONAL_ACCESS_TOKEN", personal_access_token_env)]),
+                BTreeMap::new(),
+            ),
+            L::Scaleway { secret_key_env } => (
+                "scaleway",
+                env(&[("SCW_SECRET_KEY", secret_key_env)]),
+                BTreeMap::new(),
+            ),
+            L::Desec { token_env } => {
+                ("desec", env(&[("DESEC_TOKEN", token_env)]), BTreeMap::new())
+            }
+            L::DigitalOcean { token_env } => (
+                "digitalocean",
+                env(&[("DIGITALOCEAN_TOKEN", token_env)]),
+                BTreeMap::new(),
+            ),
+            L::Hetzner { api_token_env } => (
+                "hetzner",
+                env(&[("HETZNER_API_TOKEN", api_token_env)]),
+                BTreeMap::new(),
+            ),
+            L::Infomaniak { access_token_env } => (
+                "infomaniak",
+                env(&[("INFOMANIAK_ACCESS_TOKEN", access_token_env)]),
+                BTreeMap::new(),
+            ),
+            L::Porkbun {
+                api_key_env,
+                secret_api_key_env,
+            } => (
+                "porkbun",
+                env(&[
+                    ("PORKBUN_API_KEY", api_key_env),
+                    ("PORKBUN_SECRET_API_KEY", secret_api_key_env),
+                ]),
+                BTreeMap::new(),
+            ),
+            L::Rfc2136 {
+                nameserver,
+                tsig_key,
+                tsig_secret_env,
+                tsig_algorithm,
+                zone,
+            } => {
+                let mut values = BTreeMap::from([
+                    ("RFC2136_NAMESERVER".to_string(), nameserver.clone()),
+                    ("RFC2136_TSIG_KEY".to_string(), tsig_key.clone()),
+                ]);
+                if let Some(algorithm) = tsig_algorithm {
+                    values.insert("RFC2136_TSIG_ALGORITHM".to_string(), algorithm.clone());
+                }
+                if let Some(zone) = zone {
+                    values.insert("RFC2136_ZONE".to_string(), zone.clone());
+                }
+                (
+                    "rfc2136",
+                    env(&[("RFC2136_TSIG_SECRET", tsig_secret_env)]),
+                    values,
+                )
+            }
+        };
+        ProviderConfig {
+            name: name.to_string(),
+            env,
+            values,
+            legacy: true,
+        }
+    }
+}
+
+/// The `type:` form of a DNS-01 provider, before 0.17: each credential's
+/// variable named in the config. Still read, as the [`ProviderConfig`] it
+/// stands for.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum ProviderConfig {
+pub enum LegacyProviderConfig {
     Cloudflare {
         api_token_env: String,
     },

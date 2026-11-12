@@ -25,6 +25,10 @@ All notable changes to this project will be documented in this file.
 
 - The *← Entrypoints* link of a route's page led to the overview; it leads to the entrypoints list. Found by the dashboard's new functional tests (Playwright, `bun run test:e2e`).
 
+### TLS / ACME
+
+- DNS-01 providers by name: `provider: route53` picks a provider as Traefik's `dnsChallenge.provider` does, its credentials read from its own environment variables (lego's names accepted too, so a Traefik setup's variables work), each also from the file its `<VAR>_FILE` variable names. Every provider of [cheti](https://github.com/kemeter/cheti) is available: Route53, Google Cloud DNS (`gcloud`), PowerDNS (`pdns`) and Bunny join the ten there were. `env` reads a resolver's variables under names of your own, for several accounts of one provider. The `type:` form still works and is logged as deprecated: see [UPGRADE.md](UPGRADE.md#upgrade-to-017) and [Providers](documentation/tls/acme.md#providers).
+
 ### Observability
 
 - OTLP metrics export — push the metrics served on `/metrics` to an OpenTelemetry collector over OTLP/gRPC, alongside or instead of a Prometheus scrape. Enable with `metrics.otlp.enabled` and `metrics.otlp.endpoint`; `metrics.otlp.service_name` and `metrics.otlp.push_interval` (seconds, default `10`) tune it. Disabled by default. See [OTLP metrics export](documentation/advanced/observability.md#otlp-metrics-export).

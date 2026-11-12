@@ -1774,9 +1774,10 @@ mod tests {
 
     fn dns01(domains: &[&str]) -> ResolverConfig {
         ResolverConfig::Dns01 {
-            provider: crate::config::ProviderConfig::Gandi {
+            provider: crate::config::LegacyProviderConfig::Gandi {
                 personal_access_token_env: "X".to_string(),
-            },
+            }
+            .into(),
             domains: domains.iter().map(|s| s.to_string()).collect(),
             ca_server: None,
         }
@@ -1930,9 +1931,10 @@ mod tests {
     fn ca_server_override_is_read_from_resolver() {
         let staging = "https://acme-staging-v02.api.letsencrypt.org/directory";
         let resolver = ResolverConfig::Dns01 {
-            provider: crate::config::ProviderConfig::Gandi {
+            provider: crate::config::LegacyProviderConfig::Gandi {
                 personal_access_token_env: "X".to_string(),
-            },
+            }
+            .into(),
             domains: vec![],
             ca_server: Some(staging.to_string()),
         };

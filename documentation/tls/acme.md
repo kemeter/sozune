@@ -18,9 +18,7 @@ acme:
       challenge: http-01
     cloudflare-main:
       challenge: dns-01
-      provider:
-        type: cloudflare
-        api_token_env: CF_API_TOKEN
+      provider: cloudflare
     edge:
       challenge: tls-alpn-01
 ```
@@ -35,7 +33,7 @@ acme:
 | `tls_alpn_port` | `3040` | Loopback port the TLS-ALPN-01 responder binds. Only used when a `tls-alpn-01` resolver is configured; never exposed directly. (since 0.15) |
 | `resolvers` | `{}` | Named challenge resolvers (`http-01`, `dns-01` with a provider, or `tls-alpn-01`). Entrypoints reference one by name. (since 0.14) |
 
-`enabled`, `email`, `certs_dir`, `staging` and `challenge_port` are overridable through `SOZUNE_ACME_ENABLED`, `SOZUNE_ACME_EMAIL`, `SOZUNE_ACME_CERTS_DIR`, `SOZUNE_ACME_STAGING` and `SOZUNE_ACME_CHALLENGE_PORT`; `tls_alpn_port` and `resolvers` are set in YAML only. Provider credentials are always read from environment variables — never inlined in YAML.
+`enabled`, `email`, `certs_dir`, `staging` and `challenge_port` are overridable through `SOZUNE_ACME_ENABLED`, `SOZUNE_ACME_EMAIL`, `SOZUNE_ACME_CERTS_DIR`, `SOZUNE_ACME_STAGING` and `SOZUNE_ACME_CHALLENGE_PORT`; `tls_alpn_port` and `resolvers` are set in YAML only. Provider credentials are always read from environment variables (or files they name), never inlined in YAML: see [Providers](#providers).
 
 ## DNS-01 and wildcards
 
@@ -51,9 +49,7 @@ acme:
   resolvers:
     cloudflare-main:
       challenge: dns-01
-      provider:
-        type: cloudflare
-        api_token_env: CF_API_TOKEN
+      provider: cloudflare
 ```
 
 ```yaml
@@ -68,7 +64,7 @@ acme:
 
 With labels (Docker, Podman, Swarm, Nomad, Consul, Ring, or annotations on a Kubernetes Service), the same binding is `sozune.http.<svc>.acme.resolver=cloudflare-main`.
 
-Set `CF_API_TOKEN=...` in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
+Set `CLOUDFLARE_API_TOKEN=...` (or lego's `CF_DNS_API_TOKEN`, as a Traefik setup has it) in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
 
 ### Wildcard without an entrypoint (`domains`)
 
@@ -82,9 +78,7 @@ acme:
   resolvers:
     cloudflare-main:
       challenge: dns-01
-      provider:
-        type: cloudflare
-        api_token_env: CF_API_TOKEN
+      provider: cloudflare
       domains:
         - "*.example.com"
 ```
@@ -93,22 +87,52 @@ Sōzune provisions each entry in `domains` on its own — no entrypoint required
 
 `domains` is only valid on a `dns-01` resolver (wildcards always need DNS-01). It composes with the per-entrypoint `acme.resolver` binding: a resolver can both manage its own `domains` and be referenced by entrypoints. If the same hostname is claimed by a resolver's `domains` and an entrypoint, the resolver binding wins and only one certificate is issued.
 
-**Supported providers:**
+### Providers
 
-| Provider | `type` value | Required env vars | Optional fields |
-|---|---|---|---|
-| Cloudflare | `cloudflare` | `api_token_env` | — |
-| OVH | `ovh` | `application_key_env`, `application_secret_env`, `consumer_key_env` | `endpoint`: `ovh-eu` (default), `ovh-ca` or `ovh-us` |
-| Gandi | `gandi` | `personal_access_token_env` | — |
-| Scaleway | `scaleway` | `secret_key_env` | — |
-| deSEC | `desec` | `token_env` | — (since 0.15) |
-| DigitalOcean | `digitalocean` | `token_env` | — (since 0.15) |
-| Hetzner | `hetzner` | `api_token_env` | — (since 0.15) |
-| Infomaniak | `infomaniak` | `access_token_env` | — (since 0.15) |
-| Porkbun | `porkbun` | `api_key_env`, `secret_api_key_env` | — (since 0.15) |
-| RFC 2136 | `rfc2136` | `tsig_secret_env` | `tsig_algorithm`, `zone` (see below) (since 0.15) |
+> Since 0.17 (by name); since 0.14
 
-DigitalOcean, Hetzner, Infomaniak and Porkbun are tested against the documented APIs but not yet against live accounts: [report](https://github.com/kemeter/sozune/issues) anything that goes wrong. Porkbun only accepts API calls for a domain whose "API Access" is turned on in its domain settings.
+A resolver's `provider` is a name, as Traefik's `dnsChallenge.provider` is: the provider reads its credentials from its own environment variables, the names [cheti](https://github.com/kemeter/cheti) gives them or, where they differ, lego's, so a Traefik setup's variables work as they are.
+
+| `provider` | lego's name | Environment variables (lego's, where they differ) |
+|---|---|---|
+| `bunny` | | `BUNNY_API_KEY` |
+| `cloudflare` | | `CLOUDFLARE_API_TOKEN` (`CF_DNS_API_TOKEN`, `CLOUDFLARE_DNS_API_TOKEN`) |
+| `desec` | | `DESEC_TOKEN` |
+| `digitalocean` | | `DIGITALOCEAN_TOKEN` (`DO_AUTH_TOKEN`) |
+| `gandi` | `gandiv5` | `GANDIV5_PERSONAL_ACCESS_TOKEN` |
+| `google_cloud_dns` | `gcloud` | `GOOGLE_APPLICATION_CREDENTIALS`, a service account key file (`GCE_SERVICE_ACCOUNT_FILE`, or `GCE_SERVICE_ACCOUNT` for the key itself; `GCE_PROJECT`) |
+| `hetzner` | | `HETZNER_API_TOKEN` |
+| `infomaniak` | | `INFOMANIAK_ACCESS_TOKEN` |
+| `ovh` | | `OVH_APPLICATION_KEY`, `OVH_APPLICATION_SECRET`, `OVH_CONSUMER_KEY`, optional `OVH_ENDPOINT` (`ovh-eu`, the default, `ovh-ca`, `ovh-us`, `kimsufi-eu`, `kimsufi-ca`, `soyoustart-eu`, `soyoustart-ca`) |
+| `porkbun` | | `PORKBUN_API_KEY`, `PORKBUN_SECRET_API_KEY` |
+| `powerdns` | `pdns` | `POWERDNS_API_URL`, `POWERDNS_API_KEY`, optional `POWERDNS_SERVER_ID` (`PDNS_API_URL`, `PDNS_API_KEY`, `PDNS_SERVER_NAME`) |
+| `rfc2136` | | `RFC2136_NAMESERVER`, `RFC2136_TSIG_KEY`, `RFC2136_TSIG_SECRET`, optional `RFC2136_TSIG_ALGORITHM` and `RFC2136_ZONE` (see below) |
+| `route53` | | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` |
+| `scaleway` | | `SCW_SECRET_KEY` (`SCALEWAY_API_TOKEN`) |
+
+Bunny, Google Cloud DNS, PowerDNS and Route53 since 0.17; deSEC, DigitalOcean, Hetzner, Infomaniak, Porkbun and RFC 2136 since 0.15. Bunny, DigitalOcean, Google Cloud DNS, Hetzner, Infomaniak, Porkbun, PowerDNS and Route53 are tested against the documented APIs but not yet against live accounts: [report](https://github.com/kemeter/sozune/issues) anything that goes wrong. Porkbun only accepts API calls for a domain whose "API Access" is turned on in its domain settings.
+
+**Secrets in files.** Every variable may be read from a file instead: `CLOUDFLARE_API_TOKEN_FILE=/run/secrets/cloudflare` reads the token from that file, its trailing newline dropped, as Docker and Kubernetes secrets are mounted.
+
+**Several accounts.** Two resolvers of the same provider, on two accounts, cannot both read its standard variables. `env` reads them from variables of your own naming instead:
+
+```yaml
+acme:
+  resolvers:
+    shop:
+      challenge: dns-01
+      provider: cloudflare
+    blog:
+      challenge: dns-01
+      provider:
+        name: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: BLOG_CF_TOKEN
+```
+
+`blog` reads its token from `BLOG_CF_TOKEN` (or the file `BLOG_CF_TOKEN_FILE` names). With `env`, a resolver reads only the variables it lists: one left unset is an error naming it, never taken from the provider's standard variable, which may hold another account's credentials.
+
+**The `type:` form**, before 0.17, still works and is logged as deprecated at startup (and by `sozune doctor`): `provider: { type: cloudflare, api_token_env: CF_API_TOKEN }` reads the same token as `provider: { name: cloudflare, env: { CLOUDFLARE_API_TOKEN: CF_API_TOKEN } }`. See [UPGRADE.md](https://github.com/kemeter/sozune/blob/main/UPGRADE.md) for each provider's fields.
 
 **RFC 2136 (self-hosted DNS).** For an authoritative server you run yourself (BIND, Knot DNS, PowerDNS), records are written through TSIG-signed dynamic updates, with no vendor API (since 0.15):
 
@@ -117,19 +141,21 @@ acme:
   resolvers:
     bind:
       challenge: dns-01
-      provider:
-        type: rfc2136
-        nameserver: ns1.example.com:53   # port 53 when omitted
-        tsig_key: acme-update            # key name, as declared on the server
-        tsig_secret_env: TSIG_SECRET     # base64 secret
-        tsig_algorithm: hmac-sha256      # or hmac-sha384, hmac-sha512 (default hmac-sha256)
-        zone: example.com                # optional
+      provider: rfc2136
       domains: ["*.example.com"]
 ```
 
-The server must accept TXT updates under the zone for that key (`update-policy` on BIND). Without `zone`, the zone is found with an SOA lookup through the system resolver, which cannot see a private or split-horizon zone: set `zone` for those.
+```bash
+RFC2136_NAMESERVER=ns1.example.com:53   # port 53 when omitted
+RFC2136_TSIG_KEY=acme-update            # key name, as declared on the server
+RFC2136_TSIG_SECRET=...                 # base64 secret
+RFC2136_TSIG_ALGORITHM=hmac-sha256      # or hmac-sha384, hmac-sha512 (default hmac-sha256)
+RFC2136_ZONE=example.com                # optional
+```
 
-**Checked at startup.** Each DNS-01 resolver is built once when Sōzune starts. One whose env var is not set or whose fields are invalid (an unknown OVH `endpoint`, a bad `tsig_algorithm`…) is logged as an error naming the problem; Sōzune still starts, and only the certificates ordered through that resolver fail. [`sozune doctor`](/documentation/advanced/debugging) runs the same check. (since 0.15)
+The server must accept TXT updates under the zone for that key (`update-policy` on BIND). Without `RFC2136_ZONE`, the zone is found with an SOA lookup through the system resolver, which cannot see a private or split-horizon zone: set it for those.
+
+**Checked at startup.** Each DNS-01 resolver is built once when Sōzune starts. One whose variables are not set or invalid (an unknown `OVH_ENDPOINT`, a bad `RFC2136_TSIG_ALGORITHM`…) is logged as an error naming the problem; Sōzune still starts, and only the certificates ordered through that resolver fail. [`sozune doctor`](/documentation/advanced/debugging) runs the same check. (since 0.15)
 
 **Entrypoint without a resolver:** if `tls: true` is set but no `acme.resolver` is defined, Sōzune falls back to the legacy HTTP-01 flow on `challenge_port` (the behaviour before resolvers existed). This keeps existing deployments working unchanged.
 
@@ -148,11 +174,11 @@ acme:
   resolvers:
     le-prod:
       challenge: dns-01
-      provider: { type: gandi, personal_access_token_env: GANDI_PAT }
+      provider: gandi
       domains: ["*.example.com"]
     le-staging:
       challenge: dns-01
-      provider: { type: gandi, personal_access_token_env: GANDI_PAT }
+      provider: gandi
       ca_server: "https://acme-staging-v02.api.letsencrypt.org/directory"
       domains: ["*.test.example.com"]
 ```

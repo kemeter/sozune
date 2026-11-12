@@ -356,7 +356,7 @@ Sample response:
 
 **Never exposed:**
 - `api.users` — neither the names nor the password hashes. Even hashed credentials enable offline brute-force attacks.
-- DNS-01 resolver secrets — only the *names* of the env vars referenced by ACME resolvers travel (`required_env`, as configured); their values stay on the process.
+- DNS-01 resolver secrets: only the *names* of the env vars a resolver's config names travel (`required_env`, its `env` map, empty when it reads its provider's standard variables); their values stay on the process.
 - HTTP provider credentials — the URL's user name, password and query string are replaced by `***`, and `auth_value` is left out.
 - Private key paths of the TLS certificate files — only the certificate file is listed.
 

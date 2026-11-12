@@ -498,6 +498,9 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
                 }
 
                 info!("Starting ACME certificate manager");
+                for warning in acme::resolver::deprecated_providers(&acme_config) {
+                    warn!("{warning}");
+                }
 
                 let challenges = Arc::new(RwLock::new(HashMap::new()));
 
