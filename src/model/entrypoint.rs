@@ -38,8 +38,10 @@ impl Entrypoint {
 }
 
 /// One backend instance: an address (IP or hostname), the port it listens
-/// on, and an optional load-balancing weight (defaults to 100).
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Hash)]
+/// on, and an optional load-balancing weight (defaults to 100). Two backends
+/// are equal by what they serve: their `share`, how their weight was worked
+/// out, does not count.
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Backend {
     pub address: String,
     pub port: u16,
@@ -49,6 +51,104 @@ pub struct Backend {
     /// it gives, on top of the route's: Gateway API's backendRef filters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<HeaderConfig>,
+    /// The weight its labels declared, which `weight` is worked out from
+    /// once the replicas of its route are known: see
+    /// [`split_service_weights`]. Labels only.
+    #[serde(skip)]
+    pub share: Option<Share>,
+}
+
+/// The weight a backend's labels declared.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Share {
+    /// The workload it is a replica of when the weight is that workload's
+    /// as a whole (`serviceWeight`): shared by its replicas. `None` for a
+    /// weight of its own.
+    pub workload: Option<String>,
+    pub weight: u32,
+}
+
+/// The weights of `backends`, from what their labels declared: a backend's
+/// own weight as it is, a workload's (`serviceWeight`) shared by the
+/// backends of that workload. A workload of `n` replicas and weight `w`
+/// gives each `w × L / n`, `L` being the least common multiple of the
+/// replica counts, so every workload's share is exact; a backend of its own
+/// weight `w` gets `w × L`. The weights are scaled down, a backend keeping at
+/// least 1, when they would pass what Sōzu takes. A weight of 0 stays 0: a
+/// backup. Backends that declared nothing are left as they are.
+pub fn split_service_weights(backends: &mut [Backend]) {
+    if !backends
+        .iter()
+        .any(|b| b.share.as_ref().is_some_and(|s| s.workload.is_some()))
+    {
+        // Each weight is its own: as declared.
+        for backend in backends.iter_mut() {
+            if let Some(share) = &backend.share {
+                backend.weight = share.weight;
+            }
+        }
+        return;
+    }
+    let replicas = |workload: &str| {
+        backends
+            .iter()
+            .filter(|b| {
+                b.share
+                    .as_ref()
+                    .and_then(|s| s.workload.as_deref())
+                    .is_some_and(|w| w == workload)
+            })
+            .count() as u128
+    };
+    let counts: Vec<u128> = backends
+        .iter()
+        .map(
+            |b| match b.share.as_ref().and_then(|s| s.workload.as_deref()) {
+                Some(workload) => replicas(workload),
+                None => 1,
+            },
+        )
+        .collect();
+    /// Past it, the shares are scaled to it instead, exact to within one.
+    const MAX_MULTIPLE: u128 = 1 << 20;
+    // A backup's count changes nothing: it gets 0.
+    let declared = |b: &Backend| b.share.as_ref().map_or(b.weight, |s| s.weight);
+    let multiple = counts
+        .iter()
+        .zip(backends.iter())
+        .filter(|(_, b)| declared(b) > 0)
+        .map(|(n, _)| n)
+        .try_fold(1u128, |l, &n| {
+            let l = l / gcd(l, n) * n;
+            (l <= MAX_MULTIPLE).then_some(l)
+        })
+        .unwrap_or(MAX_MULTIPLE);
+    let mut weights: Vec<u128> = backends
+        .iter()
+        .zip(&counts)
+        .map(|(b, &n)| {
+            let declared = declared(b) as u128;
+            if declared == 0 {
+                0
+            } else {
+                (declared * multiple / n).max(1)
+            }
+        })
+        .collect();
+    let largest = weights.iter().copied().max().unwrap_or(0);
+    let limit = i32::MAX as u128;
+    if largest > limit {
+        for w in weights.iter_mut().filter(|w| **w > 0) {
+            *w = (*w * limit / largest).max(1);
+        }
+    }
+    for (backend, weight) in backends.iter_mut().zip(weights) {
+        backend.weight = weight as u32;
+    }
+}
+
+fn gcd(a: u128, b: u128) -> u128 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 fn default_weight() -> u32 {
@@ -62,12 +162,45 @@ impl Backend {
             port,
             weight: default_weight(),
             headers: Vec::new(),
+            share: None,
         }
     }
 
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight;
         self
+    }
+
+    /// With the weight its labels declared, its own or `workload`'s.
+    pub fn with_share(mut self, workload: Option<String>, weight: u32) -> Self {
+        self.weight = weight;
+        self.share = Some(Share { workload, weight });
+        self
+    }
+
+    /// Whether it is `other`'s address and port, whatever their weights.
+    pub fn same_address(&self, other: &Backend) -> bool {
+        self.address == other.address && self.port == other.port
+    }
+}
+
+impl PartialEq for Backend {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.port == other.port
+            && self.weight == other.weight
+            && self.headers == other.headers
+    }
+}
+
+impl Eq for Backend {}
+
+impl std::hash::Hash for Backend {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+        self.port.hash(state);
+        self.weight.hash(state);
+        self.headers.hash(state);
     }
 }
 
@@ -850,4 +983,115 @@ pub fn validate_sni(raw: &str) -> Result<String, SniRejection> {
         return Err(SniRejection::EmptyLabel);
     }
     Ok(raw.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod service_weight_tests {
+    use super::*;
+
+    /// A backend at `ip` declaring `weight`, its own or `workload`'s.
+    fn declared(ip: &str, workload: Option<&str>, weight: u32) -> Backend {
+        Backend::new(ip, 80).with_share(workload.map(str::to_string), weight)
+    }
+
+    fn weights(backends: &[Backend]) -> Vec<u32> {
+        backends.iter().map(|b| b.weight).collect()
+    }
+
+    #[test]
+    fn own_weights_stay_as_declared() {
+        let mut backends = vec![declared("a", None, 90), declared("b", None, 10)];
+        split_service_weights(&mut backends);
+        assert_eq!(weights(&backends), [90, 10]);
+    }
+
+    /// Three stable replicas of weight 90 against one canary of 10: 90% /
+    /// 10%, not 270 / 10.
+    #[test]
+    fn a_workload_weight_is_shared_by_its_replicas() {
+        let mut backends = vec![
+            declared("s1", Some("stable"), 90),
+            declared("s2", Some("stable"), 90),
+            declared("s3", Some("stable"), 90),
+            declared("c1", Some("canary"), 10),
+        ];
+        split_service_weights(&mut backends);
+        assert_eq!(weights(&backends), [90, 90, 90, 30]);
+    }
+
+    /// A backend of its own weight next to a workload: each counts as
+    /// declared.
+    #[test]
+    fn own_and_workload_weights_mix() {
+        let mut backends = vec![
+            declared("a", None, 50),
+            declared("w1", Some("w"), 100),
+            declared("w2", Some("w"), 100),
+        ];
+        split_service_weights(&mut backends);
+        let w = weights(&backends);
+        // 50 against 100: the workload's replicas together weigh twice it.
+        assert_eq!(w[1] + w[2], 2 * w[0]);
+        assert_eq!(w[1], w[2]);
+    }
+
+    #[test]
+    fn a_workload_of_weight_zero_is_a_backup() {
+        let mut backends = vec![
+            declared("a", Some("main"), 100),
+            declared("b1", Some("spare"), 0),
+            declared("b2", Some("spare"), 0),
+        ];
+        split_service_weights(&mut backends);
+        assert_eq!(weights(&backends), [100, 0, 0]);
+    }
+
+    /// The weights are worked out from what was declared: again, or after
+    /// a replica left, they are what they should be.
+    #[test]
+    fn splitting_again_gives_the_same_weights() {
+        let mut backends = vec![
+            declared("s1", Some("stable"), 90),
+            declared("s2", Some("stable"), 90),
+            declared("c1", Some("canary"), 10),
+        ];
+        split_service_weights(&mut backends);
+        let first = weights(&backends);
+        split_service_weights(&mut backends);
+        assert_eq!(weights(&backends), first);
+        backends.remove(1);
+        split_service_weights(&mut backends);
+        assert_eq!(weights(&backends), [90, 10]);
+    }
+
+    /// Weights past what Sōzu takes are scaled down, a backend keeping at
+    /// least 1.
+    #[test]
+    fn large_weights_are_scaled_down() {
+        let mut backends: Vec<Backend> = (0..7)
+            .map(|i| declared(&format!("a{i}"), Some("a"), u32::MAX))
+            .chain((0..5).map(|i| declared(&format!("b{i}"), Some("b"), 1)))
+            .chain(std::iter::once(declared("c", None, 1)))
+            .collect();
+        split_service_weights(&mut backends);
+        assert!(backends.iter().all(|b| b.weight >= 1));
+        assert!(backends.iter().all(|b| b.weight <= i32::MAX as u32));
+    }
+
+    /// Backends with no declared weight (the API's, a provider's that has
+    /// no labels) are left alone.
+    #[test]
+    fn backends_that_declared_nothing_are_left_alone() {
+        let mut backends = vec![Backend::new("a", 80).with_weight(7)];
+        split_service_weights(&mut backends);
+        assert_eq!(weights(&backends), [7]);
+    }
+
+    #[test]
+    fn the_share_does_not_count_in_equality() {
+        assert_eq!(
+            declared("a", Some("w"), 100),
+            Backend::new("a", 80).with_weight(100)
+        );
+    }
 }

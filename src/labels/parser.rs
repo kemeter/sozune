@@ -61,11 +61,19 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
             &backend_ip,
             &mut diagnostics,
         ) {
-            crate::labels::lint::lint_entrypoint(
-                &entrypoint,
-                &format!("sozune.{protocol}.{service_name}."),
-                &mut diagnostics,
-            );
+            let prefix = format!("sozune.{protocol}.{service_name}.");
+            crate::labels::lint::lint_entrypoint(&entrypoint, &prefix, &mut diagnostics);
+            // The weight each backend declares, kept to work its weight out
+            // once the route's replicas are known: its own, or its
+            // workload's to share.
+            let service_weight =
+                core::parse_service_weight(&candidate.labels, &prefix, &mut diagnostics);
+            let mut entrypoint = entrypoint;
+            for backend in &mut entrypoint.backends {
+                let declared = service_weight.unwrap_or(backend.weight);
+                let workload = service_weight.map(|_| candidate.workload());
+                *backend = backend.clone().with_share(workload, declared);
+            }
             let key = format!("{protocol}_{service_name}");
             entrypoints.insert(
                 key,
@@ -873,6 +881,34 @@ mod tests {
             ep.backends,
             vec![Backend::new("172.18.0.4", 8080).with_weight(90)]
         );
+    }
+
+    #[test]
+    fn service_weight_is_the_workloads_to_share() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("com.docker.compose.project", "shop"),
+                ("com.docker.compose.service", "stable"),
+                ("sozune.http.web.host", "app.example.com"),
+                ("sozune.http.web.weight", "5"),
+                ("sozune.http.web.serviceWeight", "90"),
+                ("sozune.http.own.host", "own.example.com"),
+                ("sozune.http.own.weight", "5"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let web = &r.entrypoints["http_web"].backends[0];
+        // serviceWeight wins over weight.
+        assert_eq!(web.weight, 90);
+        let share = web.share.as_ref().unwrap();
+        assert_eq!(share.workload.as_deref(), Some("shop/stable"));
+        assert_eq!(share.weight, 90);
+        let own = &r.entrypoints["http_own"].backends[0];
+        assert_eq!(own.share.as_ref().unwrap().workload, None);
+        assert_eq!(own.weight, 5);
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 
     #[test]

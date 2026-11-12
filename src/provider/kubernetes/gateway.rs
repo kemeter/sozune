@@ -5230,6 +5230,7 @@ fn weigh_backend_refs(refs: Vec<ResolvedRef>) -> Option<Vec<Backend>> {
             .flat_map(|((_, r), weight)| {
                 let headers = r.headers;
                 r.pods.into_iter().map(move |(address, port)| Backend {
+                    share: None,
                     address,
                     port,
                     weight: weight as u32,
