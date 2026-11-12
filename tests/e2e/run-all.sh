@@ -721,6 +721,25 @@ services:
       - "sozune.http.svcclientipdeny.matchClientIP=10.0.0.0/8"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
+  # Key-value providers (51-kv-providers.sh): svc-etcd above and svc-redis
+  # hold routes whose servers are the two whoami below, which carry no
+  # label. svc-valkey is read by `sozune validate`.
+  svc-redis:
+    image: redis:7-alpine
+
+  svc-valkey:
+    image: valkey/valkey:8-alpine
+
+  svc-kv-a:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: kv-a
+
+  svc-kv-b:
+    image: traefik/whoami
+    environment:
+      WHOAMI_NAME: kv-b
+
   svc-weight-heavy:
     image: traefik/whoami
     environment:
@@ -997,7 +1016,23 @@ docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --wait --wait-time
 
 # -- Start sozune --
 log "Starting sozune (HTTP on :$HTTP_PORT, HTTPS on :$HTTPS_PORT)..."
-CONFIG_PATH="$CONFIG_FILE" RUST_LOG=sozune=debug "$SOZUNE_BIN" &
+# The key-value stores are reached at their container address, known once
+# they run.
+container_ip() {
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+        "$(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps -q "$1")"
+}
+ETCD_IP=$(container_ip svc-etcd)
+REDIS_IP=$(container_ip svc-redis)
+export ETCD_IP REDIS_IP
+CONFIG_PATH="$CONFIG_FILE" RUST_LOG=sozune=debug \
+    SOZUNE_PROVIDER_ETCD_ENABLED=true \
+    SOZUNE_PROVIDER_ETCD_ENDPOINT="http://$ETCD_IP:2379" \
+    SOZUNE_PROVIDER_ETCD_POLL_INTERVAL=1 \
+    SOZUNE_PROVIDER_REDIS_ENABLED=true \
+    SOZUNE_PROVIDER_REDIS_ENDPOINT="redis://$REDIS_IP:6379" \
+    SOZUNE_PROVIDER_REDIS_POLL_INTERVAL=1 \
+    "$SOZUNE_BIN" &
 SOZUNE_PID=$!
 sleep "$STARTUP_DELAY"
 

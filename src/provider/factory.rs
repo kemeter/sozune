@@ -8,6 +8,7 @@ use crate::provider::{
     docker::DockerProvider,
     http::HttpProvider,
     kubernetes::{KubernetesProvider, gateway, gateway_tls},
+    kv::{KvProvider, etcd::EtcdStore, redis::RedisStore},
     nomad::NomadProvider,
     podman::PodmanProvider,
     ring::RingProvider,
@@ -555,6 +556,60 @@ pub async fn start_services(
                 .await
             {
                 error!("Ring provider failed: {}", e);
+            }
+        });
+    }
+
+    // Start the etcd provider if enabled
+    if let Some(etcd_config) = &config.providers.etcd
+        && etcd_config.enabled
+    {
+        info!("Starting etcd provider");
+        let store = EtcdStore::new(etcd_config).context("Failed to create etcd provider")?;
+        let provider = KvProvider::new(
+            crate::provider::ETCD,
+            store,
+            &etcd_config.root_key,
+            etcd_config.poll_interval,
+            etcd_config.expose_by_default,
+        );
+        let storage = Arc::clone(&storage);
+        let reload_tx = reload_tx.clone();
+        let acme_notify = Arc::clone(&acme_notify);
+        let diagnostics = Arc::clone(&diagnostics);
+        tokio::spawn(async move {
+            if let Err(e) = provider
+                .start_polling(storage, reload_tx, acme_notify, diagnostics)
+                .await
+            {
+                error!("etcd provider failed: {}", e);
+            }
+        });
+    }
+
+    // Start the Redis provider if enabled
+    if let Some(redis_config) = &config.providers.redis
+        && redis_config.enabled
+    {
+        info!("Starting Redis provider");
+        let store = RedisStore::new(redis_config).context("Failed to create Redis provider")?;
+        let provider = KvProvider::new(
+            crate::provider::REDIS,
+            store,
+            &redis_config.root_key,
+            redis_config.poll_interval,
+            redis_config.expose_by_default,
+        );
+        let storage = Arc::clone(&storage);
+        let reload_tx = reload_tx.clone();
+        let acme_notify = Arc::clone(&acme_notify);
+        let diagnostics = Arc::clone(&diagnostics);
+        tokio::spawn(async move {
+            if let Err(e) = provider
+                .start_polling(storage, reload_tx, acme_notify, diagnostics)
+                .await
+            {
+                error!("Redis provider failed: {}", e);
             }
         });
     }

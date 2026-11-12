@@ -290,6 +290,8 @@ export interface ConfigView {
     nomad?: { enabled: boolean } | null;
     consul?: { enabled: boolean } | null;
     ring?: { enabled: boolean } | null;
+    etcd?: { enabled: boolean } | null;
+    redis?: { enabled: boolean } | null;
     config_file?: { enabled: boolean; path: string; watch: boolean } | null;
     http?: { enabled: boolean; url: string; poll_interval: number } | null;
   };

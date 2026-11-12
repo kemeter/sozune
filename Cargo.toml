@@ -54,6 +54,8 @@ tower-http = { version = "0.7", features = ["cors"] }
 flate2 = "1"
 brotli = "9"
 zstd = "0.14"
+# Client of the Redis provider: tokio, and rustls for `rediss://`.
+redis = { version = "1.8", default-features = false, features = ["tokio-comp", "tokio-rustls-comp"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 # Already in the tree through reqwest; declared directly so an HTTP client can
 # fall back to the bundled Mozilla roots when the system has no CA certificate.

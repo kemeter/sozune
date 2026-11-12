@@ -646,6 +646,16 @@ async fn check_providers(cfg: &AppConfig, results: &mut Vec<CheckResult>) {
     {
         check_http_endpoint(results, "ring", "Ring endpoint", &r.endpoint).await;
     }
+    if let Some(e) = &cfg.providers.etcd
+        && e.enabled
+    {
+        check_http_endpoint(results, "etcd", "etcd endpoint", &e.endpoint).await;
+    }
+    if let Some(r) = &cfg.providers.redis
+        && r.enabled
+    {
+        check_http_endpoint(results, "redis", "Redis endpoint", &r.endpoint).await;
+    }
     if let Some(k) = &cfg.providers.kubernetes
         && k.enabled
     {
@@ -822,7 +832,12 @@ fn endpoint_address(endpoint: &str) -> Option<(String, u16)> {
     if host.is_empty() {
         return None;
     }
-    Some((host, parsed.port_or_known_default()?))
+    let port = match parsed.scheme() {
+        // Not a scheme the url crate knows the port of.
+        "redis" | "rediss" => parsed.port().unwrap_or(6379),
+        _ => parsed.port_or_known_default()?,
+    };
+    Some((host, port))
 }
 
 /// Only root is reported here: without it, a privileged port that cannot be

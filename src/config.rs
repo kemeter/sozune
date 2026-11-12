@@ -129,7 +129,7 @@ pub struct OtlpExporterConfig {
     pub resource_attributes: BTreeMap<String, String>,
     /// TLS toward an `https://` endpoint.
     #[serde(default)]
-    pub tls: OtlpTlsConfig,
+    pub tls: ClientTlsFiles,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -140,14 +140,14 @@ pub enum OtlpProtocol {
     Http,
 }
 
-/// TLS toward the collector. The system and public roots are always trusted;
-/// `ca` adds one.
+/// TLS toward a server Sōzune connects to (an OTLP collector, etcd). The
+/// system and public roots are always trusted; `ca` adds one.
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
-pub struct OtlpTlsConfig {
-    /// PEM file of the CA that signed the collector's certificate.
+pub struct ClientTlsFiles {
+    /// PEM file of the CA that signed the server's certificate.
     #[serde(default)]
     pub ca: Option<String>,
-    /// PEM client certificate, for a collector that requires mTLS. Needs `key`.
+    /// PEM client certificate, for a server that requires mTLS. Needs `key`.
     #[serde(default)]
     pub cert: Option<String>,
     /// PEM private key of `cert`.
@@ -646,6 +646,8 @@ pub struct ProvidersConfig {
     pub nomad: Option<NomadConfig>,
     pub consul: Option<ConsulConfig>,
     pub ring: Option<RingConfig>,
+    pub etcd: Option<EtcdConfig>,
+    pub redis: Option<RedisConfig>,
     pub config_file: Option<ConfigFileConfig>,
     pub http: Option<HttpProviderConfig>,
 }
@@ -808,6 +810,117 @@ impl Default for RingConfig {
             token: String::new(),
             poll_interval: default_ring_poll_interval(),
             expose_by_default: false,
+        }
+    }
+}
+
+/// etcd provider configuration. Reads routes from the keys under `root_key`
+/// through etcd's v3 JSON API.
+#[derive(Deserialize, Debug, Clone)]
+pub struct EtcdConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// etcd client URL (e.g. `http://127.0.0.1:2379`).
+    #[serde(default = "default_etcd_endpoint")]
+    pub endpoint: String,
+    /// Prefix of the keys Sōzune reads, without a trailing `/`.
+    #[serde(default = "default_kv_root_key")]
+    pub root_key: String,
+    /// User of etcd's authentication, with `password`.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// CA and client certificate, for an `https://` endpoint.
+    #[serde(default)]
+    pub tls: ClientTlsFiles,
+    /// Polling interval, in seconds.
+    #[serde(default = "default_kv_poll_interval")]
+    pub poll_interval: u64,
+    /// Route every service of the tree without `sozune.enable=true`.
+    #[serde(default = "default_kv_expose_by_default")]
+    pub expose_by_default: bool,
+}
+
+/// Redis provider configuration. Reads routes from the string keys under
+/// `root_key`.
+#[derive(Deserialize, Debug, Clone)]
+pub struct RedisConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Redis URL: `redis://host:port/db`, or `rediss://` for TLS.
+    #[serde(default = "default_redis_endpoint")]
+    pub endpoint: String,
+    /// Prefix of the keys Sōzune reads, without a trailing `/`.
+    #[serde(default = "default_kv_root_key")]
+    pub root_key: String,
+    /// ACL user; empty logs in as `default` when a password is set.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Database number, overriding the one of the URL.
+    #[serde(default)]
+    pub db: Option<i64>,
+    /// CA and client certificate, for a `rediss://` endpoint.
+    #[serde(default)]
+    pub tls: ClientTlsFiles,
+    /// Polling interval, in seconds.
+    #[serde(default = "default_kv_poll_interval")]
+    pub poll_interval: u64,
+    /// Route every service of the tree without `sozune.enable=true`.
+    #[serde(default = "default_kv_expose_by_default")]
+    pub expose_by_default: bool,
+}
+
+fn default_etcd_endpoint() -> String {
+    "http://127.0.0.1:2379".to_string()
+}
+
+fn default_redis_endpoint() -> String {
+    "redis://127.0.0.1:6379".to_string()
+}
+
+fn default_kv_root_key() -> String {
+    "sozune".to_string()
+}
+
+fn default_kv_poll_interval() -> u64 {
+    5
+}
+
+/// Keys are only written to be routed, so they need no opt-in.
+fn default_kv_expose_by_default() -> bool {
+    true
+}
+
+impl Default for EtcdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_etcd_endpoint(),
+            root_key: default_kv_root_key(),
+            username: String::new(),
+            password: String::new(),
+            tls: ClientTlsFiles::default(),
+            poll_interval: default_kv_poll_interval(),
+            expose_by_default: default_kv_expose_by_default(),
+        }
+    }
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_redis_endpoint(),
+            root_key: default_kv_root_key(),
+            username: String::new(),
+            password: String::new(),
+            db: None,
+            tls: ClientTlsFiles::default(),
+            poll_interval: default_kv_poll_interval(),
+            expose_by_default: default_kv_expose_by_default(),
         }
     }
 }
@@ -2269,6 +2382,41 @@ impl ProvidersConfig {
                 .apply_env_overrides();
         }
 
+        let etcd_env = [
+            "ENABLED",
+            "ENDPOINT",
+            "ROOT_KEY",
+            "USERNAME",
+            "PASSWORD",
+            "POLL_INTERVAL",
+            "EXPOSE_BY_DEFAULT",
+        ]
+        .iter()
+        .any(|v| std::env::var(format!("SOZUNE_PROVIDER_ETCD_{v}")).is_ok());
+        if etcd_env || self.etcd.is_some() {
+            self.etcd
+                .get_or_insert_with(EtcdConfig::default)
+                .apply_env_overrides();
+        }
+
+        let redis_env = [
+            "ENABLED",
+            "ENDPOINT",
+            "ROOT_KEY",
+            "USERNAME",
+            "PASSWORD",
+            "DB",
+            "POLL_INTERVAL",
+            "EXPOSE_BY_DEFAULT",
+        ]
+        .iter()
+        .any(|v| std::env::var(format!("SOZUNE_PROVIDER_REDIS_{v}")).is_ok());
+        if redis_env || self.redis.is_some() {
+            self.redis
+                .get_or_insert_with(RedisConfig::default)
+                .apply_env_overrides();
+        }
+
         let config_file_env = std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_ENABLED").is_ok()
             || std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_PATH").is_ok()
             || std::env::var("SOZUNE_PROVIDER_CONFIG_FILE_WATCH").is_ok();
@@ -2410,6 +2558,61 @@ impl RingConfig {
             self.poll_interval = v;
         }
         if let Some(v) = env_bool("SOZUNE_PROVIDER_RING_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
+    }
+}
+
+impl EtcdConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_ETCD_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_ETCD_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_ETCD_ROOT_KEY") {
+            self.root_key = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_ETCD_USERNAME") {
+            self.username = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_ETCD_PASSWORD") {
+            self.password = v;
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_ETCD_POLL_INTERVAL") {
+            self.poll_interval = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_ETCD_EXPOSE_BY_DEFAULT") {
+            self.expose_by_default = v;
+        }
+    }
+}
+
+impl RedisConfig {
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_REDIS_ENABLED") {
+            self.enabled = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_REDIS_ENDPOINT") {
+            self.endpoint = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_REDIS_ROOT_KEY") {
+            self.root_key = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_REDIS_USERNAME") {
+            self.username = v;
+        }
+        if let Some(v) = env_string("SOZUNE_PROVIDER_REDIS_PASSWORD") {
+            self.password = v;
+        }
+        if let Some(v) = env_parse::<i64>("SOZUNE_PROVIDER_REDIS_DB") {
+            self.db = Some(v);
+        }
+        if let Some(v) = env_parse::<u64>("SOZUNE_PROVIDER_REDIS_POLL_INTERVAL") {
+            self.poll_interval = v;
+        }
+        if let Some(v) = env_bool("SOZUNE_PROVIDER_REDIS_EXPOSE_BY_DEFAULT") {
             self.expose_by_default = v;
         }
     }

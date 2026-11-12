@@ -743,6 +743,11 @@ fn provider_state(p: &crate::config::ProvidersConfig, name: &str) -> (bool, bool
             p.consul.as_ref().is_some_and(|c| c.enabled),
         ),
         crate::provider::RING => (p.ring.is_some(), p.ring.as_ref().is_some_and(|c| c.enabled)),
+        crate::provider::ETCD => (p.etcd.is_some(), p.etcd.as_ref().is_some_and(|c| c.enabled)),
+        crate::provider::REDIS => (
+            p.redis.is_some(),
+            p.redis.as_ref().is_some_and(|c| c.enabled),
+        ),
         crate::provider::HTTP => (p.http.is_some(), p.http.as_ref().is_some_and(|c| c.enabled)),
         crate::provider::CONFIG => (
             p.config_file.is_some(),
@@ -1112,6 +1117,8 @@ kubernetes: { enabled: true }
 nomad: { enabled: true }
 consul: { enabled: true }
 ring: { enabled: true }
+etcd: { enabled: true }
+redis: { enabled: true }
 http: { enabled: true }
 config_file: { enabled: true }
 "#,

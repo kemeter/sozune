@@ -162,6 +162,8 @@ pub struct ProvidersView {
     pub nomad: Option<ToggleView>,
     pub consul: Option<ToggleView>,
     pub ring: Option<ToggleView>,
+    pub etcd: Option<ToggleView>,
+    pub redis: Option<ToggleView>,
     pub config_file: Option<ConfigFileView>,
     pub http: Option<HttpProviderView>,
 }
@@ -399,6 +401,8 @@ fn providers_view(p: &ProvidersConfig) -> ProvidersView {
         nomad: p.nomad.as_ref().map(|n| ToggleView { enabled: n.enabled }),
         consul: p.consul.as_ref().map(|c| ToggleView { enabled: c.enabled }),
         ring: p.ring.as_ref().map(|r| ToggleView { enabled: r.enabled }),
+        etcd: p.etcd.as_ref().map(|c| ToggleView { enabled: c.enabled }),
+        redis: p.redis.as_ref().map(|c| ToggleView { enabled: c.enabled }),
         config_file: p.config_file.as_ref().map(|f| ConfigFileView {
             enabled: f.enabled,
             path: f.path.clone(),
