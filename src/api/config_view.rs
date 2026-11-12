@@ -140,9 +140,10 @@ pub enum ResolverView {
         ca_server: Option<String>,
     },
     Dns01 {
-        provider: &'static str,
-        /// The env vars the resolver reads its credentials from, as named
-        /// in the config. Their values never travel.
+        provider: String,
+        /// The env vars the config names for the resolver to read its
+        /// credentials from: none when it reads its provider's standard
+        /// ones. Their values never travel.
         required_env: Vec<String>,
         domains: Vec<String>,
         ca_server: Option<String>,
@@ -354,7 +355,6 @@ fn acme_view(acme: &AcmeConfig) -> AcmeView {
 }
 
 fn resolver_view(r: &ResolverConfig) -> ResolverView {
-    use crate::config::ProviderConfig::*;
     match r {
         ResolverConfig::Http01 { ca_server } => ResolverView::Http01 {
             ca_server: ca_server.clone(),
@@ -363,46 +363,12 @@ fn resolver_view(r: &ResolverConfig) -> ResolverView {
             provider,
             domains,
             ca_server,
-        } => {
-            let (name, required_env): (&'static str, Vec<&String>) = match provider {
-                Cloudflare { api_token_env } => ("cloudflare", vec![api_token_env]),
-                Ovh {
-                    application_key_env,
-                    application_secret_env,
-                    consumer_key_env,
-                    ..
-                } => (
-                    "ovh",
-                    vec![
-                        application_key_env,
-                        application_secret_env,
-                        consumer_key_env,
-                    ],
-                ),
-                Gandi {
-                    personal_access_token_env,
-                } => ("gandi", vec![personal_access_token_env]),
-                Scaleway { secret_key_env } => ("scaleway", vec![secret_key_env]),
-                Desec { token_env } => ("desec", vec![token_env]),
-                DigitalOcean { token_env } => ("digitalocean", vec![token_env]),
-                Hetzner { api_token_env } => ("hetzner", vec![api_token_env]),
-                Infomaniak { access_token_env } => ("infomaniak", vec![access_token_env]),
-                Porkbun {
-                    api_key_env,
-                    secret_api_key_env,
-                } => ("porkbun", vec![api_key_env, secret_api_key_env]),
-                Rfc2136 {
-                    tsig_secret_env, ..
-                } => ("rfc2136", vec![tsig_secret_env]),
-            };
-            let required_env = required_env.into_iter().cloned().collect();
-            ResolverView::Dns01 {
-                provider: name,
-                required_env,
-                domains: domains.clone(),
-                ca_server: ca_server.clone(),
-            }
-        }
+        } => ResolverView::Dns01 {
+            provider: provider.name.clone(),
+            required_env: provider.named_variables(),
+            domains: domains.clone(),
+            ca_server: ca_server.clone(),
+        },
         ResolverConfig::TlsAlpn01 { ca_server } => ResolverView::TlsAlpn01 {
             ca_server: ca_server.clone(),
         },
@@ -653,10 +619,11 @@ mod tests {
     #[test]
     fn resolver_view_names_the_configured_env_vars() {
         let resolver = ResolverConfig::Dns01 {
-            provider: ProviderConfig::Porkbun {
+            provider: crate::config::LegacyProviderConfig::Porkbun {
                 api_key_env: "PB_KEY".into(),
                 secret_api_key_env: "PB_SECRET".into(),
-            },
+            }
+            .into(),
             domains: vec![],
             ca_server: None,
         };

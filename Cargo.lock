@@ -522,9 +522,9 @@ dependencies = [
 
 [[package]]
 name = "cheti"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5adc8dd56b64a6f15bb1fa35d98541d2972966e36bac9aa8a4c57f36ea2f48ec"
+checksum = "ad504d0d4d18eb179cf54b919c3c90c5a752c7e6db2019dd6c46fd9c7d643264"
 dependencies = [
  "async-trait",
  "data-encoding",

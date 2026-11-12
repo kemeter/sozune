@@ -520,6 +520,13 @@ fn check_resolvers(acme: &crate::config::AcmeConfig, results: &mut Vec<CheckResu
             None => results.push(CheckResult::ok("acme", title)),
         }
     }
+    for warning in crate::acme::resolver::deprecated_providers(acme) {
+        results.push(CheckResult::warn(
+            "acme",
+            "ACME resolver provider form",
+            warning,
+        ));
+    }
 }
 
 /// sozune creates `certs_dir` (and any missing parent) when it stores the
@@ -985,9 +992,10 @@ mod tests {
         acme.resolvers.insert(
             "cf".to_string(),
             crate::config::ResolverConfig::Dns01 {
-                provider: crate::config::ProviderConfig::Cloudflare {
+                provider: crate::config::LegacyProviderConfig::Cloudflare {
                     api_token_env: "SOZUNE_DOCTOR_TEST_UNSET_TOKEN".to_string(),
-                },
+                }
+                .into(),
                 domains: vec![],
                 ca_server: None,
             },
@@ -1000,7 +1008,9 @@ mod tests {
         let mut results = Vec::new();
         check_resolvers(&acme, &mut results);
 
-        assert_eq!(results.len(), 1);
+        // The failure, then the `type:` form it is written in, deprecated.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, Status::Warn);
         assert_eq!(results[0].status, Status::Fail);
         assert!(
             results[0]

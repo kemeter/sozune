@@ -2,6 +2,43 @@
 
 What to change when moving from one Sōzune version to the next. Only the steps that need action are listed here; [`CHANGELOG.md`](CHANGELOG.md) lists every change.
 
+## Upgrade to 0.17
+
+### DNS-01 providers: by name
+
+A DNS-01 resolver's `provider` is now a name, its credentials read from the provider's own environment variables (cheti's names, or lego's where they differ: the variables of a Traefik setup work as they are). The `type:` form still works, logged as deprecated at startup and by `sozune doctor`. To keep the variables you named, move them under `env`:
+
+```yaml
+# before
+provider:
+  type: cloudflare
+  api_token_env: CF_API_TOKEN
+# after: the standard variable…
+provider: cloudflare            # CLOUDFLARE_API_TOKEN, or lego's CF_DNS_API_TOKEN
+# …or yours
+provider:
+  name: cloudflare
+  env:
+    CLOUDFLARE_API_TOKEN: CF_API_TOKEN
+```
+
+| `type:` form | Variable it stands for |
+|---|---|
+| `cloudflare`: `api_token_env` | `CLOUDFLARE_API_TOKEN` |
+| `ovh`: `application_key_env`, `application_secret_env`, `consumer_key_env`, `endpoint` | `OVH_APPLICATION_KEY`, `OVH_APPLICATION_SECRET`, `OVH_CONSUMER_KEY`, `OVH_ENDPOINT` (a value, not a variable name) |
+| `gandi`: `personal_access_token_env` | `GANDIV5_PERSONAL_ACCESS_TOKEN` |
+| `scaleway`: `secret_key_env` | `SCW_SECRET_KEY` |
+| `desec`: `token_env` | `DESEC_TOKEN` |
+| `digitalocean`: `token_env` | `DIGITALOCEAN_TOKEN` |
+| `hetzner`: `api_token_env` | `HETZNER_API_TOKEN` |
+| `infomaniak`: `access_token_env` | `INFOMANIAK_ACCESS_TOKEN` |
+| `porkbun`: `api_key_env`, `secret_api_key_env` | `PORKBUN_API_KEY`, `PORKBUN_SECRET_API_KEY` |
+| `rfc2136`: `nameserver`, `tsig_key`, `tsig_secret_env`, `tsig_algorithm`, `zone` | `RFC2136_NAMESERVER`, `RFC2136_TSIG_KEY`, `RFC2136_TSIG_SECRET`, `RFC2136_TSIG_ALGORITHM`, `RFC2136_ZONE` (all values but the secret) |
+
+With `env`, a resolver reads only the variables it lists. The `required_env` of a DNS-01 resolver in `GET /config` lists the variables the config names, so it is empty for `provider: <name>` alone.
+
+See [Providers](documentation/tls/acme.md#providers) for every provider's variables, secrets read from files (`<VAR>_FILE`) and several accounts of one provider.
+
 ## Upgrade to 0.16
 
 ### Configuration file in the Docker image

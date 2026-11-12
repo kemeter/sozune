@@ -1,11 +1,6 @@
 //! Build cheti DNS providers from `AcmeConfig` resolver entries.
 
-use cheti::{
-    CloudflareConfig, CloudflareProvider, DesecConfig, DesecProvider, DigitalOceanConfig,
-    DigitalOceanProvider, DnsProvider, GandiConfig, GandiProvider, HetznerConfig, HetznerProvider,
-    InfomaniakConfig, InfomaniakProvider, OvhConfig, OvhProvider, PorkbunConfig, PorkbunProvider,
-    Rfc2136Config, Rfc2136Provider, ScalewayConfig, ScalewayProvider, TsigAlgorithm,
-};
+use cheti::DnsProvider;
 
 use crate::config::{AcmeConfig, ProviderConfig, ResolverConfig};
 
@@ -59,122 +54,49 @@ pub fn unusable_resolvers(acme: &AcmeConfig) -> Vec<(String, anyhow::Error)> {
     unusable
 }
 
+/// A warning for each DNS-01 resolver written in the `type:` form, sorted
+/// by resolver: it still works, as the `name:` and `env:` form it stands
+/// for.
+pub fn deprecated_providers(acme: &AcmeConfig) -> Vec<String> {
+    let mut warnings: Vec<String> = acme
+        .resolvers
+        .iter()
+        .filter_map(|(name, cfg)| match cfg {
+            ResolverConfig::Dns01 { provider, .. } if provider.legacy => Some(format!(
+                "acme.resolvers.{name}.provider is written in the `type:` form, deprecated since 0.17: write `provider: {}`, with an `env:` map for the variables named otherwise (see UPGRADE.md)",
+                provider.name
+            )),
+            _ => None,
+        })
+        .collect();
+    warnings.sort();
+    warnings
+}
+
+/// The provider `cfg` names, built by cheti from its variables: cheti's
+/// and lego's names for them, or those `cfg.env` names.
 fn build_provider(cfg: &ProviderConfig) -> anyhow::Result<Box<dyn DnsProvider>> {
-    match cfg {
-        ProviderConfig::Cloudflare { api_token_env } => {
-            let token = read_env(api_token_env)?;
-            let provider = CloudflareProvider::new(CloudflareConfig::new(token))
-                .map_err(|e| anyhow::anyhow!("build Cloudflare provider: {e}"))?;
-            Ok(Box::new(provider))
+    cheti::providers::from_env_with(&cfg.name, |var| cfg.lookup(var)).map_err(|e| {
+        // The variables the config names, rather than the provider's own
+        // names for them, are what to set.
+        let unset: Vec<&str> = cfg
+            .env
+            .values()
+            .filter(|var| {
+                std::env::var(var).is_err() && std::env::var(format!("{var}_FILE")).is_err()
+            })
+            .map(String::as_str)
+            .collect();
+        if unset.is_empty() {
+            anyhow::anyhow!("build {} provider: {e}", cfg.name)
+        } else {
+            anyhow::anyhow!(
+                "build {} provider: required environment variable `{}` is not set",
+                cfg.name,
+                unset.join("`, `")
+            )
         }
-        ProviderConfig::Ovh {
-            endpoint,
-            application_key_env,
-            application_secret_env,
-            consumer_key_env,
-        } => {
-            let api_base = ovh_api_base(endpoint)?;
-            let app_key = read_env(application_key_env)?;
-            let app_secret = read_env(application_secret_env)?;
-            let consumer_key = read_env(consumer_key_env)?;
-            let config = OvhConfig::new(app_key, app_secret, consumer_key)
-                .with_api_base(api_base)
-                .map_err(|e| anyhow::anyhow!("OVH endpoint `{endpoint}`: {e}"))?;
-            let provider =
-                OvhProvider::new(config).map_err(|e| anyhow::anyhow!("build OVH provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Gandi {
-            personal_access_token_env,
-        } => {
-            let pat = read_env(personal_access_token_env)?;
-            let provider = GandiProvider::new(GandiConfig::new(pat))
-                .map_err(|e| anyhow::anyhow!("build Gandi provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Scaleway { secret_key_env } => {
-            let key = read_env(secret_key_env)?;
-            let provider = ScalewayProvider::new(ScalewayConfig::new(key))
-                .map_err(|e| anyhow::anyhow!("build Scaleway provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Desec { token_env } => {
-            let token = read_env(token_env)?;
-            let provider = DesecProvider::new(DesecConfig::new(token))
-                .map_err(|e| anyhow::anyhow!("build deSEC provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::DigitalOcean { token_env } => {
-            let token = read_env(token_env)?;
-            let provider = DigitalOceanProvider::new(DigitalOceanConfig::new(token))
-                .map_err(|e| anyhow::anyhow!("build DigitalOcean provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Hetzner { api_token_env } => {
-            let token = read_env(api_token_env)?;
-            let provider = HetznerProvider::new(HetznerConfig::new(token))
-                .map_err(|e| anyhow::anyhow!("build Hetzner provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Infomaniak { access_token_env } => {
-            let token = read_env(access_token_env)?;
-            let provider = InfomaniakProvider::new(InfomaniakConfig::new(token))
-                .map_err(|e| anyhow::anyhow!("build Infomaniak provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Porkbun {
-            api_key_env,
-            secret_api_key_env,
-        } => {
-            let api_key = read_env(api_key_env)?;
-            let secret_api_key = read_env(secret_api_key_env)?;
-            let provider = PorkbunProvider::new(PorkbunConfig::new(api_key, secret_api_key))
-                .map_err(|e| anyhow::anyhow!("build Porkbun provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-        ProviderConfig::Rfc2136 {
-            nameserver,
-            tsig_key,
-            tsig_secret_env,
-            tsig_algorithm,
-            zone,
-        } => {
-            let secret = read_env(tsig_secret_env)?;
-            let mut config = Rfc2136Config::new(nameserver, tsig_key, secret);
-            if let Some(algorithm) = tsig_algorithm {
-                let algorithm: TsigAlgorithm = algorithm
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("RFC 2136 tsig_algorithm `{algorithm}`: {e}"))?;
-                config = config.with_algorithm(algorithm);
-            }
-            if let Some(zone) = zone {
-                config = config
-                    .with_zone(zone)
-                    .map_err(|e| anyhow::anyhow!("RFC 2136 zone `{zone}`: {e}"))?;
-            }
-            let provider = Rfc2136Provider::new(config)
-                .map_err(|e| anyhow::anyhow!("build RFC 2136 provider: {e}"))?;
-            Ok(Box::new(provider))
-        }
-    }
-}
-
-/// API base of an OVHcloud region, named as in OVH's own SDKs. Credentials
-/// belong to one region, so the wrong base fails every call.
-fn ovh_api_base(endpoint: &str) -> anyhow::Result<&'static str> {
-    match endpoint {
-        "ovh-eu" => Ok("https://eu.api.ovh.com/1.0"),
-        "ovh-ca" => Ok("https://ca.api.ovh.com/1.0"),
-        "ovh-us" => Ok("https://api.us.ovhcloud.com/1.0"),
-        other => {
-            anyhow::bail!("unknown OVH endpoint `{other}`: expected `ovh-eu`, `ovh-ca` or `ovh-us`")
-        }
-    }
-}
-
-fn read_env(name: &str) -> anyhow::Result<String> {
-    std::env::var(name)
-        .map_err(|_| anyhow::anyhow!("required environment variable `{}` is not set", name))
+    })
 }
 
 impl Resolver {
@@ -305,8 +227,73 @@ mod tests {
         acme
     }
 
+    fn built(yaml: &str) -> anyhow::Result<Option<Resolver>> {
+        build_resolver(Some("dns"), &dns01_from_yaml(yaml))
+    }
+
+    /// Every provider, by its name, its variables under names of the
+    /// config's.
     #[test]
-    fn every_new_provider_type_parses_and_builds() {
+    fn providers_build_by_name() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            ("TEST_DNS_TOKEN", "token"),
+            ("TEST_DNS_SECRET", "c2VjcmV0LWtleS1mb3ItdHNpZw=="),
+            ("TEST_DNS_URL", "https://pdns.example.com"),
+        ]);
+        for yaml in [
+            "name: cloudflare\nenv: { CLOUDFLARE_API_TOKEN: TEST_DNS_TOKEN }",
+            "name: route53\nenv: { AWS_ACCESS_KEY_ID: TEST_DNS_TOKEN, AWS_SECRET_ACCESS_KEY: TEST_DNS_SECRET }",
+            "name: bunny\nenv: { BUNNY_API_KEY: TEST_DNS_TOKEN }",
+            "name: pdns\nenv: { PDNS_API_URL: TEST_DNS_URL, PDNS_API_KEY: TEST_DNS_TOKEN }",
+            "name: scaleway\nenv: { SCW_SECRET_KEY: TEST_DNS_TOKEN }",
+            "name: gandiv5\nenv: { GANDIV5_PERSONAL_ACCESS_TOKEN: TEST_DNS_TOKEN }",
+        ] {
+            match built(yaml) {
+                Ok(Some(resolver)) => assert!(resolver.supports_wildcard(), "{yaml}"),
+                Ok(None) => panic!("no resolver for {yaml}"),
+                Err(e) => panic!("{yaml}: {e:#}"),
+            }
+        }
+    }
+
+    /// A name alone reads the provider's standard variables.
+    #[test]
+    fn a_name_alone_reads_the_standard_variables() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[("DESEC_TOKEN", "token")]);
+        assert!(built("desec").unwrap().is_some());
+    }
+
+    /// With `env`, a variable left unset is not taken under the provider's
+    /// standard name: that may be another account's.
+    #[test]
+    fn with_env_the_standard_names_are_not_read() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("TEST_DNS_UNSET") };
+        let _env = EnvGuard::new(&[("DESEC_TOKEN", "another-accounts-token")]);
+        let err = match built("name: desec\nenv: { DESEC_TOKEN: TEST_DNS_UNSET }") {
+            Ok(_) => panic!("expected an error for an unset variable"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("TEST_DNS_UNSET"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_provider_name_is_refused_with_the_known_ones() {
+        let err = serde_yaml::from_str::<ProviderConfig>("azure").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown DNS provider `azure`"),
+            "{message}"
+        );
+        assert!(message.contains("route53"), "{message}");
+    }
+
+    /// The `type:` form of before 0.17 still builds, each provider as it
+    /// did, and is told deprecated.
+    #[test]
+    fn the_type_form_still_builds() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new(&[
             ("TEST_DNS_TOKEN", "token"),
@@ -314,6 +301,10 @@ mod tests {
         ]);
 
         for yaml in [
+            "type: cloudflare\napi_token_env: TEST_DNS_TOKEN",
+            "type: ovh\napplication_key_env: TEST_DNS_TOKEN\napplication_secret_env: TEST_DNS_TOKEN\nconsumer_key_env: TEST_DNS_TOKEN\nendpoint: ovh-ca",
+            "type: gandi\npersonal_access_token_env: TEST_DNS_TOKEN",
+            "type: scaleway\nsecret_key_env: TEST_DNS_TOKEN",
             "type: desec\ntoken_env: TEST_DNS_TOKEN",
             "type: digitalocean\ntoken_env: TEST_DNS_TOKEN",
             "type: hetzner\napi_token_env: TEST_DNS_TOKEN",
@@ -326,69 +317,42 @@ mod tests {
             let resolver = match build_resolver(Some("dns"), &acme) {
                 Ok(Some(resolver)) => resolver,
                 Ok(None) => panic!("no resolver for {yaml}"),
-                Err(e) => panic!("{yaml}: {e}"),
+                Err(e) => panic!("{yaml}: {e:#}"),
             };
             assert!(resolver.supports_wildcard(), "{yaml}");
+            let warnings = deprecated_providers(&acme);
+            assert_eq!(warnings.len(), 1, "{yaml}");
+            assert!(
+                warnings[0].contains("acme.resolvers.dns.provider"),
+                "{yaml}"
+            );
         }
+        assert!(deprecated_providers(&dns01_from_yaml("desec")).is_empty());
     }
 
     #[test]
     fn rfc2136_rejects_an_unknown_algorithm() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new(&[("TEST_DNS_SECRET", "c2VjcmV0LWtleS1mb3ItdHNpZw==")]);
-        let acme = dns01_from_yaml(
+        let err = match built(
             "type: rfc2136\nnameserver: 192.0.2.53\ntsig_key: acme-update\ntsig_secret_env: TEST_DNS_SECRET\ntsig_algorithm: hmac-md5",
-        );
-
-        let err = match build_resolver(Some("dns"), &acme) {
+        ) {
             Ok(_) => panic!("expected an error for hmac-md5"),
             Err(e) => e,
         };
-
-        assert!(
-            err.to_string().contains("tsig_algorithm `hmac-md5`"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn ovh_endpoints_map_to_their_region() {
-        assert_eq!(
-            ovh_api_base("ovh-eu").unwrap(),
-            "https://eu.api.ovh.com/1.0"
-        );
-        assert_eq!(
-            ovh_api_base("ovh-ca").unwrap(),
-            "https://ca.api.ovh.com/1.0"
-        );
-        assert_eq!(
-            ovh_api_base("ovh-us").unwrap(),
-            "https://api.us.ovhcloud.com/1.0"
-        );
+        assert!(err.to_string().contains("hmac-md5"), "{err}");
     }
 
     #[test]
     fn unknown_ovh_endpoint_is_refused() {
-        let mut acme = empty_acme();
-        acme.resolvers.insert(
-            "ovh".to_string(),
-            ResolverConfig::Dns01 {
-                provider: ProviderConfig::Ovh {
-                    endpoint: "ovh-asia".to_string(),
-                    application_key_env: "TEST_OVH_KEY".to_string(),
-                    application_secret_env: "TEST_OVH_SECRET".to_string(),
-                    consumer_key_env: "TEST_OVH_CONSUMER".to_string(),
-                },
-                domains: vec![],
-                ca_server: None,
-            },
-        );
-
-        let err = match build_resolver(Some("ovh"), &acme) {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[("TEST_DNS_TOKEN", "token")]);
+        let err = match built(
+            "type: ovh\nendpoint: ovh-asia\napplication_key_env: TEST_DNS_TOKEN\napplication_secret_env: TEST_DNS_TOKEN\nconsumer_key_env: TEST_DNS_TOKEN",
+        ) {
             Ok(_) => panic!("expected an error for ovh-asia"),
             Err(e) => e,
         };
-
         assert!(
             err.to_string().contains("unknown OVH endpoint `ovh-asia`"),
             "{err}"
@@ -398,21 +362,8 @@ mod tests {
     #[test]
     fn dns01_resolver_fails_when_env_missing() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Ensure the var is absent for this test.
         unsafe { std::env::remove_var("TEST_CF_TOKEN_MISSING") };
-
-        let mut acme = empty_acme();
-        acme.resolvers.insert(
-            "cf".to_string(),
-            ResolverConfig::Dns01 {
-                provider: ProviderConfig::Cloudflare {
-                    api_token_env: "TEST_CF_TOKEN_MISSING".to_string(),
-                },
-                domains: vec![],
-                ca_server: None,
-            },
-        );
-        let err = match build_resolver(Some("cf"), &acme) {
+        let err = match built("type: cloudflare\napi_token_env: TEST_CF_TOKEN_MISSING") {
             Ok(_) => panic!("expected error when env var missing"),
             Err(e) => e,
         };
@@ -420,26 +371,5 @@ mod tests {
             err.to_string().contains("TEST_CF_TOKEN_MISSING"),
             "error should name the missing env var, got: {err}"
         );
-    }
-
-    #[test]
-    fn dns01_cloudflare_builds_when_env_present() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = EnvGuard::new(&[("TEST_CF_TOKEN_PRESENT", "dummy-token")]);
-
-        let mut acme = empty_acme();
-        acme.resolvers.insert(
-            "cf".to_string(),
-            ResolverConfig::Dns01 {
-                provider: ProviderConfig::Cloudflare {
-                    api_token_env: "TEST_CF_TOKEN_PRESENT".to_string(),
-                },
-                domains: vec![],
-                ca_server: None,
-            },
-        );
-        let resolver = build_resolver(Some("cf"), &acme).unwrap().unwrap();
-        assert!(resolver.supports_wildcard());
-        assert!(matches!(resolver, Resolver::Dns01(_)));
     }
 }
