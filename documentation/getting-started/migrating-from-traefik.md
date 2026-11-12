@@ -44,6 +44,7 @@ No rule language, no middleware names to keep in sync, no entrypoint to pick for
 | `traefik.enable=true` | `sozune.enable=true` |
 | `traefik.docker.network=<name>` | `sozune.network=<name>` |
 | `providers.docker.exposedByDefault` | `expose_by_default` on the provider. Traefik defaults to `true`, Sōzune to `false`: add `sozune.enable=true` to every container to expose. |
+| KV providers (etcd, Redis) | The [key-value providers](/documentation/providers/key-value) read Sōzune labels, not Traefik's dynamic configuration (`traefik/http/routers/<name>/rule`…). Write each service's labels and servers instead: a router whose rule is ``Host(`app.example.com`)`` becomes `sozune/<service>/labels/sozune.http.app.host = app.example.com`, and its `loadBalancer.servers[n].url` the `sozune/<service>/servers/<n>` keys. |
 
 ## Router rules
 

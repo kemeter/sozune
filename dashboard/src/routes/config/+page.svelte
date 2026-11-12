@@ -47,7 +47,9 @@
       ['Kubernetes', p.kubernetes],
       ['Nomad', p.nomad],
       ['Consul', p.consul],
-      ['Ring', p.ring]
+      ['Ring', p.ring],
+      ['etcd', p.etcd],
+      ['Redis', p.redis]
     ] as const) {
       if (v) rows.push({ name, enabled: v.enabled, details: [] });
     }

@@ -8,6 +8,7 @@ use crate::labels::source::LabelSource;
 use crate::labels::{self, Candidate};
 use crate::model::Entrypoint;
 use crate::provider::docker::DockerProvider;
+use crate::provider::kv::{KvProvider, KvStore, etcd::EtcdStore, redis::RedisStore};
 use crate::provider::nomad::NomadProvider;
 use crate::provider::podman::PodmanProvider;
 use crate::provider::ring::RingProvider;
@@ -221,7 +222,70 @@ async fn collect_candidates(
         }
     }
 
+    if want(crate::provider::ETCD)
+        && let Some(etcd_cfg) = &config.providers.etcd
+        && etcd_cfg.enabled
+    {
+        match EtcdStore::new(etcd_cfg) {
+            Ok(store) => {
+                let provider = KvProvider::new(
+                    crate::provider::ETCD,
+                    store,
+                    &etcd_cfg.root_key,
+                    etcd_cfg.poll_interval,
+                    etcd_cfg.expose_by_default,
+                );
+                collect_kv(&provider, &mut candidates, "providers.etcd.endpoint").await;
+            }
+            Err(e) => eprintln!(
+                "etcd: invalid configuration: {e}\n  → check providers.etcd in the config file"
+            ),
+        }
+    }
+
+    if want(crate::provider::REDIS)
+        && let Some(redis_cfg) = &config.providers.redis
+        && redis_cfg.enabled
+    {
+        match RedisStore::new(redis_cfg) {
+            Ok(store) => {
+                let provider = KvProvider::new(
+                    crate::provider::REDIS,
+                    store,
+                    &redis_cfg.root_key,
+                    redis_cfg.poll_interval,
+                    redis_cfg.expose_by_default,
+                );
+                collect_kv(&provider, &mut candidates, "providers.redis.endpoint").await;
+            }
+            Err(e) => eprintln!(
+                "redis: invalid configuration: {e}\n  → check providers.redis in the config file"
+            ),
+        }
+    }
+
     Ok(candidates)
+}
+
+/// The candidates of a key-value store, with the keys it holds that no
+/// service uses.
+async fn collect_kv<S: KvStore>(
+    provider: &KvProvider<S>,
+    candidates: &mut Vec<Candidate>,
+    endpoint_field: &str,
+) {
+    match provider.scan().await {
+        Ok((mut cs, ignored)) => {
+            for (key, reason) in ignored {
+                eprintln!("{}: ignoring key `{key}`: {reason}", provider.name());
+            }
+            candidates.append(&mut cs);
+        }
+        Err(e) => eprintln!(
+            "{}: could not read the keys: {e:#}\n  → check {endpoint_field} and that the store is reachable",
+            provider.name()
+        ),
+    }
 }
 
 fn build_report(candidates: Vec<Candidate>) -> ValidationReport {

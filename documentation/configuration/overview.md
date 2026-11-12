@@ -51,7 +51,7 @@ middleware:
 
 | Section | Purpose |
 |---|---|
-| `providers` | Sources for entrypoint discovery: Docker, Podman, Swarm, Kubernetes, Nomad, Consul, Ring, HTTP polling, or a YAML file. Required. |
+| `providers` | Sources for entrypoint discovery: Docker, Podman, Swarm, Kubernetes, Nomad, Consul, Ring, etcd, Redis, HTTP polling, or a YAML file. Required. |
 | `api` | REST API for live entrypoint management. Required, `{}` to leave it off. |
 | `acme` | ACME (Let's Encrypt) provisioning. |
 | `proxy` | Sōzu listeners and runtime tuning. Required. |
@@ -105,7 +105,7 @@ providers:
 | `config_file.path` | — | Path to the entrypoints file |
 | `config_file.watch` | `true` | Hot-reload on file change |
 
-The other providers have their own page: [Podman](/documentation/providers/podman) (since 0.12), [Kubernetes](/documentation/providers/kubernetes) (since 0.12), [Nomad](/documentation/providers/nomad) (since 0.12), [Consul](/documentation/providers/consul) (since 0.14) and [Ring](/documentation/providers/ring) (since 0.14).
+The other providers have their own page: [Podman](/documentation/providers/podman) (since 0.12), [Kubernetes](/documentation/providers/kubernetes) (since 0.12), [Nomad](/documentation/providers/nomad) (since 0.12), [Consul](/documentation/providers/consul) (since 0.14), [Ring](/documentation/providers/ring) (since 0.14), and [etcd and Redis](/documentation/providers/key-value) (since 0.17).
 
 ## API
 
@@ -284,6 +284,21 @@ The fields below can be set through an environment variable, which wins over the
 | `providers.ring.token` | `SOZUNE_PROVIDER_RING_TOKEN` (since 0.14) |
 | `providers.ring.poll_interval` | `SOZUNE_PROVIDER_RING_POLL_INTERVAL` (since 0.14) |
 | `providers.ring.expose_by_default` | `SOZUNE_PROVIDER_RING_EXPOSE_BY_DEFAULT` (since 0.14) |
+| `providers.etcd.enabled` | `SOZUNE_PROVIDER_ETCD_ENABLED` (since 0.17) |
+| `providers.etcd.endpoint` | `SOZUNE_PROVIDER_ETCD_ENDPOINT` (since 0.17) |
+| `providers.etcd.root_key` | `SOZUNE_PROVIDER_ETCD_ROOT_KEY` (since 0.17) |
+| `providers.etcd.username` | `SOZUNE_PROVIDER_ETCD_USERNAME` (since 0.17) |
+| `providers.etcd.password` | `SOZUNE_PROVIDER_ETCD_PASSWORD` (since 0.17) |
+| `providers.etcd.poll_interval` | `SOZUNE_PROVIDER_ETCD_POLL_INTERVAL` (since 0.17) |
+| `providers.etcd.expose_by_default` | `SOZUNE_PROVIDER_ETCD_EXPOSE_BY_DEFAULT` (since 0.17) |
+| `providers.redis.enabled` | `SOZUNE_PROVIDER_REDIS_ENABLED` (since 0.17) |
+| `providers.redis.endpoint` | `SOZUNE_PROVIDER_REDIS_ENDPOINT` (since 0.17) |
+| `providers.redis.root_key` | `SOZUNE_PROVIDER_REDIS_ROOT_KEY` (since 0.17) |
+| `providers.redis.username` | `SOZUNE_PROVIDER_REDIS_USERNAME` (since 0.17) |
+| `providers.redis.password` | `SOZUNE_PROVIDER_REDIS_PASSWORD` (since 0.17) |
+| `providers.redis.db` | `SOZUNE_PROVIDER_REDIS_DB` (since 0.17) |
+| `providers.redis.poll_interval` | `SOZUNE_PROVIDER_REDIS_POLL_INTERVAL` (since 0.17) |
+| `providers.redis.expose_by_default` | `SOZUNE_PROVIDER_REDIS_EXPOSE_BY_DEFAULT` (since 0.17) |
 | `providers.http.enabled` | `SOZUNE_PROVIDER_HTTP_ENABLED` (since 0.11) |
 | `providers.http.url` | `SOZUNE_PROVIDER_HTTP_URL` (since 0.11) |
 | `providers.http.poll_interval` | `SOZUNE_PROVIDER_HTTP_POLL_INTERVAL` (since 0.11) |

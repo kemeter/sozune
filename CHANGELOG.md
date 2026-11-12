@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
 - gRPC-Web: `grpcWeb=true` or `grpcWeb.allowOrigins` translates the gRPC-Web calls of browsers (binary or `-text`) into gRPC for the backends, over h2c, and their answers back, the trailers as the last message. `allowOrigins` answers the preflight requests of those origins with the headers gRPC-Web needs. `grpc_web` in static config and the API. See [gRPC-Web](documentation/routing/grpc.md#grpc-web).
 - Service weights: `serviceWeight` is the weight of a container's service as a whole (its Compose or Swarm service, its Nomad, Consul or Ring service), shared by its replicas, so a split between two versions holds whatever their replica counts. `weight` stays a container's own. See [Service weights](documentation/routing/load-balancing.md#service-weights).
 
+### Providers
+
+- etcd and Redis providers: routes read from the keys of an etcd v3 or Redis store (Valkey too). Under `sozune/<service>/`, `labels/<label>` keys hold the labels a container would carry and `servers/<name>` keys its backends (`ip[:port]`); the tree is read every `poll_interval` seconds and a reload happens when its routes change. etcd takes a user and TLS with a client certificate, Redis an ACL user, a database and `rediss://`. `sozune validate` and `sozune doctor` cover them. See [Key-value providers](documentation/providers/key-value.md).
+
 ### Dashboard
 
 - The *← Entrypoints* link of a route's page led to the overview; it leads to the entrypoints list. Found by the dashboard's new functional tests (Playwright, `bun run test:e2e`).

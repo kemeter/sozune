@@ -92,6 +92,44 @@ pub fn debug_enabled() -> bool {
     crate::config::env_bool("SOZUNE_DEBUG").unwrap_or(false)
 }
 
+/// The files of a client TLS setup: a CA to trust and a client certificate.
+pub mod client_tls {
+    use crate::config::ClientTlsFiles;
+    use anyhow::Context as _;
+
+    /// The client certificate and key, when both are set.
+    pub fn client_identity(tls: &ClientTlsFiles) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        match (&tls.cert, &tls.key) {
+            (Some(cert), Some(key)) => Ok(Some((read(cert, "tls.cert")?, read(key, "tls.key")?))),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("tls.cert and tls.key must be set together"),
+        }
+    }
+
+    fn read(path: &str, field: &str) -> anyhow::Result<Vec<u8>> {
+        std::fs::read(path).with_context(|| format!("could not read {field} at {path}"))
+    }
+
+    /// `tls.ca`, which must hold at least one certificate, all usable as trust
+    /// roots: the clients skip an invalid one silently, which would leave the
+    /// server's CA untrusted and every connection failing.
+    pub fn read_ca(path: &str) -> anyhow::Result<Vec<u8>> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let pem = read(path, "tls.ca")?;
+        let certs = CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("invalid PEM in tls.ca at {path}"))?;
+        if certs.is_empty() {
+            anyhow::bail!("tls.ca at {path} holds no PEM certificate");
+        }
+        let (_, ignored) = rustls::RootCertStore::empty().add_parsable_certificates(certs);
+        if ignored > 0 {
+            anyhow::bail!("tls.ca at {path} holds a certificate that is not a valid CA");
+        }
+        Ok(pem)
+    }
+}
+
 pub mod http_client {
     use std::sync::OnceLock;
 

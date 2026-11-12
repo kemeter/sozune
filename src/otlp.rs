@@ -15,7 +15,8 @@ use opentelemetry_otlp::tonic_types::transport::{Certificate, ClientTlsConfig, I
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 
-use crate::config::{OtlpExporterConfig, OtlpProtocol, OtlpTlsConfig};
+use crate::config::{ClientTlsFiles, OtlpExporterConfig, OtlpProtocol};
+use crate::util::client_tls::{client_identity, read_ca};
 
 /// Same per-export timeout as the OTLP exporters' default.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,7 +119,7 @@ fn http<B: WithExportConfig + WithHttpConfig>(
 
 /// TLS settings are only honoured on an `https://` endpoint; on a plain one
 /// they would be silently ignored and the export sent in the clear.
-fn check_tls_scheme(endpoint: &str, tls: &OtlpTlsConfig) -> anyhow::Result<()> {
+fn check_tls_scheme(endpoint: &str, tls: &ClientTlsFiles) -> anyhow::Result<()> {
     let tls_set = tls.ca.is_some() || tls.cert.is_some() || tls.key.is_some();
     if tls_set && !endpoint.starts_with("https://") {
         anyhow::bail!("OTLP TLS settings need an https:// endpoint, got {endpoint}");
@@ -160,7 +161,7 @@ fn header_map(
 
 /// TLS of a gRPC export: the system and web PKI roots plus `tls.ca`, and the client
 /// certificate when one is set.
-fn grpc_tls(tls: &OtlpTlsConfig) -> anyhow::Result<ClientTlsConfig> {
+fn grpc_tls(tls: &ClientTlsFiles) -> anyhow::Result<ClientTlsConfig> {
     let mut config = ClientTlsConfig::new().with_webpki_roots();
     // Tonic refuses to connect when asked for an empty system store (a minimal
     // image without CA certificates); the web PKI roots and `tls.ca` then
@@ -180,7 +181,7 @@ fn grpc_tls(tls: &OtlpTlsConfig) -> anyhow::Result<ClientTlsConfig> {
 /// The blocking HTTP client of an HTTP export, with `tls.ca` trusted and the
 /// client certificate when one is set. Built on its own thread: a blocking
 /// client must not be created inside the async runtime.
-fn http_client(tls: &OtlpTlsConfig) -> anyhow::Result<reqwest::blocking::Client> {
+fn http_client(tls: &ClientTlsFiles) -> anyhow::Result<reqwest::blocking::Client> {
     let ca = match &tls.ca {
         Some(path) => Some(read_ca(path)?),
         None => None,
@@ -204,38 +205,6 @@ fn http_client(tls: &OtlpTlsConfig) -> anyhow::Result<reqwest::blocking::Client>
     })
     .join()
     .map_err(|_| anyhow::anyhow!("building the OTLP HTTP client panicked"))?
-}
-
-/// The client certificate and key, when both are set.
-fn client_identity(tls: &OtlpTlsConfig) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    match (&tls.cert, &tls.key) {
-        (Some(cert), Some(key)) => Ok(Some((read(cert, "tls.cert")?, read(key, "tls.key")?))),
-        (None, None) => Ok(None),
-        _ => anyhow::bail!("OTLP tls.cert and tls.key must be set together"),
-    }
-}
-
-fn read(path: &str, field: &str) -> anyhow::Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("could not read {field} at {path}"))
-}
-
-/// `tls.ca`, which must hold at least one certificate, all usable as trust
-/// roots: the clients skip an invalid one silently, which would leave the
-/// collector's CA untrusted and every export failing.
-fn read_ca(path: &str) -> anyhow::Result<Vec<u8>> {
-    use rustls::pki_types::{CertificateDer, pem::PemObject};
-    let pem = read(path, "tls.ca")?;
-    let certs = CertificateDer::pem_slice_iter(&pem)
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("invalid PEM in tls.ca at {path}"))?;
-    if certs.is_empty() {
-        anyhow::bail!("tls.ca at {path} holds no PEM certificate");
-    }
-    let (_, ignored) = rustls::RootCertStore::empty().add_parsable_certificates(certs);
-    if ignored > 0 {
-        anyhow::bail!("tls.ca at {path} holds a certificate that is not a valid CA");
-    }
-    Ok(pem)
 }
 
 #[cfg(test)]
@@ -341,7 +310,7 @@ mod tests {
 
     #[test]
     fn cert_without_key_is_an_error() {
-        let tls = OtlpTlsConfig {
+        let tls = ClientTlsFiles {
             cert: Some("/nonexistent.pem".to_string()),
             ..Default::default()
         };
@@ -354,7 +323,7 @@ mod tests {
         for protocol in [OtlpProtocol::Grpc, OtlpProtocol::Http] {
             let cfg = OtlpExporterConfig {
                 protocol,
-                tls: OtlpTlsConfig {
+                tls: ClientTlsFiles {
                     ca: Some("/ca.pem".to_string()),
                     ..Default::default()
                 },
