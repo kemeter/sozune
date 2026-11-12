@@ -130,6 +130,8 @@ pub async fn handle_proxy(
 
     // Kept for the route's CORS policy, which marks whatever answers it.
     let origin = req.headers().get(axum::http::header::ORIGIN).cloned();
+    // A gRPC call gets the middleware's own answers in gRPC form.
+    let grpc = super::grpc::is_call(req.headers());
     // And for the page that replaces the route's errors, which can be told
     // the request it answers.
     let request_method = req.method().clone();
@@ -749,6 +751,7 @@ pub async fn handle_proxy(
             if let Some(index) = picked {
                 response.extensions_mut().insert(super::ServedBy(index));
             }
+            response.extensions_mut().insert(super::grpc::Relayed);
             let bounded =
                 request_deadline.is_some() || route.backend_timeout.is_some_and(|ms| ms > 0);
             match route.circuit_breaker.clone() {
@@ -811,9 +814,23 @@ pub async fn handle_proxy(
     };
 
     let mut response = fut.instrument(span).await;
+    if grpc {
+        // A gRPC client reads the outcome in the gRPC status, and gets no
+        // error page: a page is for a browser.
+        response = if response
+            .extensions()
+            .get::<super::grpc::Relayed>()
+            .is_some()
+        {
+            super::grpc::ends_with_status(response)
+        } else {
+            super::grpc::answer(response)
+        };
+    }
     if let Some(route) = matched.get() {
         // The page goes in first, so that the edits and CORS mark it too.
         if let Some(errors) = route.errors.as_ref()
+            && !grpc
             && errors.replaces(response.status())
         {
             response = errors
@@ -2221,6 +2238,85 @@ mod retry_tests {
         assert_eq!(lent.collect().await.unwrap().to_bytes(), "hello");
         assert!(!body.replays());
         assert!(body.take().is_none());
+    }
+
+    /// A request to `port` through a route of `config`, as a gRPC call
+    /// when `grpc`.
+    async fn call_through(config: EntrypointConfig, port: u16, grpc: bool) -> Response<Body> {
+        let content_type = if grpc {
+            "application/grpc"
+        } else {
+            "application/json"
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hello.HelloService/SayHello")
+            .header("host", "retry.test")
+            .header("content-type", content_type)
+            .body(Body::empty())
+            .unwrap();
+        request_through(config, port, request).await
+    }
+
+    /// A gRPC call no backend answers gets the middleware's error in gRPC
+    /// form; any other request the HTTP status.
+    #[tokio::test]
+    async fn a_grpc_call_gets_the_error_in_grpc_form() {
+        let dead = closed_port().await;
+        let response = call_through(retrying(&[], 2), dead, true).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "application/grpc");
+        assert_eq!(response.headers()["grpc-status"], "14");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "sozune: backend-unreachable (HTTP 502)"
+        );
+
+        let response = call_through(retrying(&[], 2), dead, false).await;
+        assert_eq!(response.status(), 502);
+        assert!(!response.headers().contains_key("grpc-status"));
+    }
+
+    /// A gRPC call the backend answers is relayed as it is, even when it
+    /// is an error: the backend's own status is the one that counts.
+    #[tokio::test]
+    async fn a_backend_answer_to_a_grpc_call_is_relayed() {
+        let (port, _) = backend(1, 503).await;
+        let response = call_through(retrying(&[], 1), port, true).await;
+        assert_eq!(response.status(), 503);
+        assert!(!response.headers().contains_key("grpc-status"));
+    }
+
+    /// A gRPC answer cut short by the route's backend timeout ends with
+    /// DEADLINE_EXCEEDED in its trailers.
+    #[tokio::test]
+    async fn a_grpc_answer_cut_short_ends_with_deadline_exceeded() {
+        use futures_util::StreamExt;
+        let app = axum::Router::new().fallback(|| async {
+            let frames = futures_util::stream::once(async {
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"message"))
+            })
+            .chain(futures_util::stream::pending());
+            Response::builder()
+                .header("content-type", "application/grpc")
+                .body(Body::from_stream(frames))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let config = EntrypointConfig {
+            hostnames: vec!["retry.test".into()],
+            backend_timeout: Some(300),
+            ..Default::default()
+        };
+        let response = call_through(config, port, true).await;
+        assert_eq!(response.status(), 200);
+        let collected = response.into_body().collect().await.unwrap();
+        let trailers = collected.trailers().cloned().expect("a status in trailers");
+        assert_eq!(trailers["grpc-status"], "4");
+        assert_eq!(collected.to_bytes(), "message");
     }
 
     /// A slow upload is the client's time: the backend timeout counts from

@@ -68,8 +68,37 @@ labels:
   - "sozune.http.greeter.healthCheck.mode=grpc"
 ```
 
+## Errors
+
+> Since 0.17
+
+When the Sōzune middleware (rate limit, auth, retry…) answers a gRPC call itself (a request with `content-type: application/grpc`), it answers the way a gRPC server would: HTTP `200`, `content-type: application/grpc`, no body, and the outcome in `grpc-status` and `grpc-message`. The message names the reason, as the `x-sozune-diagnostic` header does for an HTTP client:
+
+```
+ERROR:
+  Code: Unavailable
+  Message: sozune: backend-unreachable (HTTP 502)
+```
+
+| The middleware answers | `grpc-status` |
+|---|---|
+| No backend, circuit breaker open, backend unreachable (`502`, `503`) | `UNAVAILABLE` (14) |
+| Backend or request timeout (`504`) | `DEADLINE_EXCEEDED` (4) |
+| Rate limit, in-flight limit (`429`) | `RESOURCE_EXHAUSTED` (8) |
+| Basic or forward auth refused (`401`) | `UNAUTHENTICATED` (16) |
+| IP allow-list, forward auth forbidden (`403`) | `PERMISSION_DENIED` (7) |
+| No route matches the call (`404`) | `UNIMPLEMENTED` (12) |
+| Internal error (`400`, `500`) | `INTERNAL` (13) |
+| Any other error | `UNKNOWN` (2) |
+
+The codes follow the mapping gRPC clients apply to an HTTP status, except for a timeout and a limit: `DEADLINE_EXCEEDED` and `RESOURCE_EXHAUSTED` are not retried by a client's retry policy, where `UNAVAILABLE` is. A redirect, or an answer that already carries a `grpc-status` (a [WASM plugin](/documentation/middleware/wasm-plugins)'s), is left as it is, and a route's [error page](/documentation/middleware/error-pages#backend-errors) does not replace a gRPC answer.
+
+A call the backend answered that fails mid-way ends with a status in its trailers rather than a reset stream: `DEADLINE_EXCEEDED` when the route's [`backendTimeout`](/documentation/middleware/backend-timeout) or request timeout cuts it, `UNAVAILABLE` when the backend goes away.
+
+The answers Sōzu gives itself, before the middleware or on a route without it (no route for the host, no backend, a backend timeout), stay HTTP errors: Sōzu cannot answer `200`. gRPC clients read those with the same mapping (`503` gives `UNAVAILABLE`, `404` `UNIMPLEMENTED`), with an `unexpected HTTP status code` message.
+
 ## What it does not do
 
 - **No TLS to the backends.** `scheme=https` is refused (`W035`).
-- **Errors in HTTP form.** When Sōzune answers a call itself (no backend, timeout, rate limit, auth), the client gets an HTTP status, not a `grpc-status`.
+- **Sōzu's own errors stay in HTTP form.** See [Errors](#errors).
 - **No gRPC-Web.**
