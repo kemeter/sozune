@@ -425,12 +425,18 @@ pub async fn handle_proxy(
                 axum::http::Version::HTTP_11
             };
             let replays = attempts > 1 || !route.backups.is_empty();
-            let request_body = if replays || hyper::body::Body::is_end_stream(&body) {
+            // A gRPC call is never kept: it may stream its request for as
+            // long as it lasts, sending the next message only once the
+            // server answered the last one, and waiting for the end of it
+            // would hold the call. Streamed, it still goes on to the next
+            // backend when an attempt read none of it.
+            let keeps = replays && !super::grpc::is_call(&parts.headers);
+            let request_body = if keeps || hyper::body::Body::is_end_stream(&body) {
                 // An empty body costs nothing to keep: any backend the plan
                 // holds can be tried.
                 replayable(body, &parts.headers, REPLAY_BODY_LIMIT).await
             } else {
-                Ok(RequestBody::Streamed(Some(body)))
+                Ok(RequestBody::streamed(body))
             };
             let mut request_body = match request_body {
                 Ok(body) => body,
@@ -461,14 +467,16 @@ pub async fn handle_proxy(
             let copying: Vec<&super::MirrorTarget> =
                 route.mirrors.iter().filter(|m| m.copies_next()).collect();
             let mut streamed_copies = match &mut request_body {
-                RequestBody::Streamed(body) if !copying.is_empty() => match body.take() {
-                    Some(whole) => {
-                        let (primary, copies) = tee(whole, copying.len());
+                RequestBody::Streamed(home) if !copying.is_empty() => {
+                    match home.lock().ok().and_then(|mut body| {
+                        let (primary, copies) = tee(body.take()?, copying.len());
                         *body = Some(primary);
-                        copies.into_iter().map(Some).collect()
+                        Some(copies)
+                    }) {
+                        Some(copies) => copies.into_iter().map(Some).collect(),
+                        None => Vec::new(),
                     }
-                    None => Vec::new(),
-                },
+                }
                 _ => Vec::new(),
             };
             let replayed = request_body.bytes().cloned();
@@ -1184,29 +1192,45 @@ impl Drop for Copies {
 }
 
 /// A request body on its way to the backends: kept to be sent to each
-/// attempt, or streamed to the first one alone.
+/// attempt, or streamed to one of them.
 enum RequestBody {
     Replayable(axum::body::Bytes),
-    /// `None` once sent.
-    Streamed(Option<Body>),
+    /// Lent to an attempt, and back if the attempt let it go without
+    /// reading any of it: the next attempt can stream it then. Empty
+    /// while lent, or once read.
+    Streamed(std::sync::Arc<std::sync::Mutex<Option<Body>>>),
 }
 
 impl RequestBody {
+    fn streamed(body: Body) -> Self {
+        Self::Streamed(std::sync::Arc::new(std::sync::Mutex::new(Some(body))))
+    }
+
     /// The body for the next attempt, with what tells when it has been sent
     /// for a streamed one; `None` when it was streamed already.
     fn take(&mut self) -> Option<(Body, Option<BodySent>)> {
         match self {
             Self::Replayable(bytes) => Some((Body::from(bytes.clone()), None)),
-            Self::Streamed(body) => {
-                let (body, sent) = watch_end(body.take()?);
+            Self::Streamed(home) => {
+                let body = home.lock().ok()?.take()?;
+                let lent = Lent {
+                    inner: Some(body),
+                    home: home.clone(),
+                    read: false,
+                };
+                let (body, sent) = watch_end(Body::new(lent));
                 Some((body, Some(sent)))
             }
         }
     }
 
-    /// Whether another attempt can be sent the body.
+    /// Whether another attempt can be sent the body: it is kept, or the
+    /// attempt it was lent to read none of it.
     fn replays(&self) -> bool {
-        matches!(self, Self::Replayable(_))
+        match self {
+            Self::Replayable(_) => true,
+            Self::Streamed(home) => home.lock().is_ok_and(|body| body.is_some()),
+        }
     }
 
     /// The whole body, when it is kept.
@@ -1214,6 +1238,59 @@ impl RequestBody {
         match self {
             Self::Replayable(bytes) => Some(bytes),
             Self::Streamed(_) => None,
+        }
+    }
+}
+
+/// A streamed request body lent to an attempt. Dropped before any of it
+/// was read (the backend could not be reached, say), it goes back to the
+/// request, for the next attempt.
+struct Lent {
+    inner: Option<Body>,
+    home: std::sync::Arc<std::sync::Mutex<Option<Body>>>,
+    read: bool,
+}
+
+impl hyper::body::Body for Lent {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let Some(inner) = this.inner.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        let polled = std::pin::Pin::new(inner).poll_frame(cx);
+        if polled.is_ready() {
+            this.read = true;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(hyper::body::Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.as_ref().map_or_else(
+            || hyper::body::SizeHint::with_exact(0),
+            hyper::body::Body::size_hint,
+        )
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        if self.read {
+            return;
+        }
+        if let (Some(body), Ok(mut home)) = (self.inner.take(), self.home.lock()) {
+            *home = Some(body);
         }
     }
 }
@@ -1235,7 +1312,7 @@ async fn replayable(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|len| len > limit as u64) {
-        return Ok(RequestBody::Streamed(Some(body)));
+        return Ok(RequestBody::streamed(body));
     }
     let mut read: Vec<u8> = Vec::new();
     loop {
@@ -1256,9 +1333,7 @@ async fn replayable(
         let head = std::iter::once(Ok(hyper::body::Frame::data(axum::body::Bytes::from(read))))
             .chain(std::iter::once(Ok(past)));
         let frames = futures_util::stream::iter(head).chain(BodyStream::new(body));
-        return Ok(RequestBody::Streamed(Some(Body::new(StreamBody::new(
-            frames,
-        )))));
+        return Ok(RequestBody::streamed(Body::new(StreamBody::new(frames))));
     }
 }
 
@@ -1881,12 +1956,25 @@ mod retry_tests {
         port: u16,
         request: Request<Body>,
     ) -> Response<Body> {
-        let backends = [Backend {
-            address: "127.0.0.1".into(),
-            port,
-            weight: 100,
-            headers: Vec::new(),
-        }];
+        request_to(config, &[(port, 100)], request).await
+    }
+
+    /// The response `request` to a route of `config` gets from the
+    /// backends on `ports`, with their weights.
+    async fn request_to(
+        config: EntrypointConfig,
+        ports: &[(u16, u32)],
+        request: Request<Body>,
+    ) -> Response<Body> {
+        let backends: Vec<Backend> = ports
+            .iter()
+            .map(|&(port, weight)| Backend {
+                address: "127.0.0.1".into(),
+                port,
+                weight,
+                headers: Vec::new(),
+            })
+            .collect();
         let route = super::super::build_middleware_route(
             "retry",
             &config,
@@ -2018,6 +2106,120 @@ mod retry_tests {
         let body = Body::from_stream(chunks);
         assert_eq!(send_through(retrying(&[503], 3), port, body).await, 503);
         assert_eq!(*read.lock().unwrap(), [size]);
+    }
+
+    /// A backend answering, with the first part of the request body, as
+    /// soon as that part comes: as a gRPC server answers a stream.
+    async fn first_part_backend() -> u16 {
+        let app = axum::Router::new().fallback(|body: Body| async move {
+            let mut body = body.into_data_stream();
+            use futures_util::StreamExt;
+            let first = body.next().await.and_then(Result::ok).unwrap_or_default();
+            // The rest of the stream keeps the request open.
+            tokio::spawn(async move { while body.next().await.is_some() {} });
+            first
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        port
+    }
+
+    /// A request of `content_type` whose body sends `first`, then stays
+    /// open while the sender lives.
+    fn open_stream(
+        content_type: &str,
+        first: &'static [u8],
+    ) -> (Request<Body>, tokio::sync::mpsc::Sender<axum::body::Bytes>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(axum::body::Bytes::from_static(first)).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hello.HelloService/BidiHello")
+            .header("host", "retry.test")
+            .header("content-type", content_type)
+            .header("transfer-encoding", "chunked")
+            .body(Body::from_stream(tokio_stream_from(rx)))
+            .unwrap();
+        (request, tx)
+    }
+
+    /// A gRPC call on a route that retries is streamed: the backend gets
+    /// its first message while the client still streams, and answers it.
+    #[tokio::test]
+    async fn a_grpc_call_is_streamed_on_a_route_that_retries() {
+        let port = first_part_backend().await;
+        let (request, _open) = open_stream("application/grpc", b"message");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            request_through(retrying(&[503], 3), port, request),
+        )
+        .await
+        .expect("the call is held until the client ends its stream");
+        assert_eq!(response.status(), 200);
+        let mut body = response.into_body().into_data_stream();
+        use futures_util::StreamExt;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .unwrap();
+        assert_eq!(first.unwrap().unwrap(), "message");
+    }
+
+    /// Any other request is kept for a retry, read whole first (the
+    /// control of the gRPC call above).
+    #[tokio::test]
+    async fn another_request_is_read_whole_first_on_a_route_that_retries() {
+        let port = first_part_backend().await;
+        let (request, _open) = open_stream("application/json", b"message");
+        let held = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            request_through(retrying(&[503], 3), port, request),
+        )
+        .await;
+        assert!(held.is_err(), "the body is not read whole first");
+    }
+
+    /// A port nothing listens on.
+    async fn closed_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// A streamed gRPC call whose backend cannot be reached goes, body
+    /// whole, to the next one: the attempt read none of it.
+    #[tokio::test]
+    async fn a_streamed_call_goes_on_to_the_next_backend() {
+        let dead = closed_port().await;
+        let (alive, read) = reading_backend(0, 200).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "retry.test")
+            .header("content-type", "application/grpc")
+            .header("transfer-encoding", "chunked")
+            .body(Body::from(vec![b'a'; 100]))
+            .unwrap();
+        // The second backend is a backup (weight 0): it is tried only
+        // once the first failed.
+        let response = request_to(retrying(&[], 2), &[(dead, 100), (alive, 0)], request).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(*read.lock().unwrap(), [100]);
+    }
+
+    /// A streamed body is back for the next attempt when the one it was
+    /// lent to read none of it, and not once read.
+    #[tokio::test]
+    async fn a_lent_body_comes_back_unread() {
+        let mut body = RequestBody::streamed(Body::from("hello"));
+        let (lent, _) = body.take().unwrap();
+        assert!(!body.replays());
+        drop(lent);
+        assert!(body.replays());
+
+        let (lent, _) = body.take().unwrap();
+        assert_eq!(lent.collect().await.unwrap().to_bytes(), "hello");
+        assert!(!body.replays());
+        assert!(body.take().is_none());
     }
 
     /// A slow upload is the client's time: the backend timeout counts from
@@ -2257,7 +2459,7 @@ mod retry_tests {
         let mut streamed = replayable(Body::from("0123456789"), &headers, 5)
             .await
             .unwrap();
-        assert!(!streamed.replays());
+        assert!(streamed.bytes().is_none());
         let (body, _) = streamed.take().unwrap();
         assert_eq!(body.collect().await.unwrap().to_bytes(), "0123456789");
     }
@@ -2298,7 +2500,7 @@ mod retry_tests {
 
         // Past it, streamed, all of it.
         let mut streamed = replayable(Body::from("hello!"), &headers, 5).await.unwrap();
-        assert!(!streamed.replays());
+        assert!(streamed.bytes().is_none());
         let (body, _) = streamed.take().unwrap();
         assert_eq!(body.collect().await.unwrap().to_bytes(), "hello!");
         assert!(streamed.take().is_none());
@@ -2307,10 +2509,11 @@ mod retry_tests {
         let mut long = axum::http::HeaderMap::new();
         long.insert(axum::http::header::CONTENT_LENGTH, "6".parse().unwrap());
         assert!(
-            !replayable(Body::from("hello!"), &long, 5)
+            replayable(Body::from("hello!"), &long, 5)
                 .await
                 .unwrap()
-                .replays()
+                .bytes()
+                .is_none()
         );
     }
 

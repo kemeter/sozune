@@ -54,7 +54,7 @@ An HTTP/1.1 client still reaches an h2c backend: Sōzune speaks HTTP/1.1 to the 
 
 ## With middleware
 
-A route that goes through the Sōzune middleware (headers, rate limit, auth, retry…) keeps its backends on h2c: the middleware streams bodies and passes the trailers, so gRPC calls and their streams work there too.
+A route that goes through the Sōzune middleware (headers, rate limit, auth, retry…) keeps its backends on h2c: the middleware streams bodies and passes the trailers, so gRPC calls and their streams work there too. A gRPC call is never held to be [retried](/documentation/middleware/retry#notes): it is streamed to the backend, and goes on to the next one only when the backend could not be reached.
 
 ## Health checks
 
