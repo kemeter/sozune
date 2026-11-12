@@ -562,6 +562,12 @@ services:
       - "sozune.http.grpclimited.scheme=h2c"
       - "sozune.http.grpclimited.ratelimit.average=1"
       - "sozune.http.grpclimited.ratelimit.burst=2"
+      - "sozune.http.grpcweb.host=$HOST_GRPC_WEB"
+      - "sozune.http.grpcweb.port=9000"
+      - "sozune.http.grpcweb.grpcWeb.allowOrigins=https://app.example"
+      - "sozune.http.grpcwebdown.host=$HOST_GRPC_WEB_DOWN"
+      - "sozune.http.grpcwebdown.port=9999"
+      - "sozune.http.grpcwebdown.grpcWeb=true"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   # etcd serves the gRPC health service on its client port: SERVING

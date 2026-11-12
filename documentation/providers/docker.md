@@ -128,6 +128,8 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.plugins.<name>.<key>` | [WASM plugins](/documentation/middleware/wasm-plugins#per-route-config) — per-route plugin config (since 0.14) |
 | `sozune.http.<svc>.stickySession` | [Sticky sessions](/documentation/routing/load-balancing#sticky-sessions) (since 0.10) |
 | `sozune.http.<svc>.scheme` | [gRPC and h2c backends](/documentation/routing/grpc): `h2c` reaches the backends over HTTP/2 in cleartext (since 0.17) |
+| `sozune.http.<svc>.grpcWeb` | [gRPC-Web](/documentation/routing/grpc#grpc-web): `true` translates the gRPC-Web calls of browsers into gRPC (since 0.17) |
+| `sozune.http.<svc>.grpcWeb.allowOrigins` | [gRPC-Web](/documentation/routing/grpc#grpc-web) for pages of these origins too, comma separated, `*` for any (since 0.17) |
 
 ## Routing — TCP
 

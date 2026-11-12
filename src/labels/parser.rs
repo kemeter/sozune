@@ -240,7 +240,9 @@ fn build_entrypoint(
     let in_flight_req = in_flight_req::parse_in_flight_req(labels, &prefix, diagnostics);
     let sticky_session = core::parse_bool(labels, &format!("{prefix}stickySession"));
     let compress = core::parse_bool(labels, &format!("{prefix}compress"));
-    let h2c_backends = core::parse_scheme(labels, &prefix, diagnostics);
+    let grpc_web = core::parse_grpc_web(labels, &prefix);
+    // gRPC-Web is translated to gRPC, which the backends speak over h2c.
+    let h2c_backends = core::parse_scheme(labels, &prefix, diagnostics) || grpc_web.is_some();
     let acme = core::parse_acme(labels, &prefix);
     let auth = auth::parse_auth(labels, &prefix, diagnostics);
     let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
@@ -360,6 +362,7 @@ fn build_entrypoint(
         name: service_name.to_string(),
         protocol: protocol_enum,
         config: EntrypointConfig {
+            grpc_web,
             hostnames,
             path,
             tls,
@@ -529,6 +532,7 @@ fn build_l4_entrypoint(
         name: service_name.to_string(),
         protocol,
         config: EntrypointConfig {
+            grpc_web: None,
             terminate_tls: false,
             hostnames: Vec::new(),
             path: None,
@@ -629,6 +633,40 @@ mod tests {
         let r = parse(&c);
         assert!(r.entrypoints["http_api"].config.h2c_backends);
         assert!(!r.entrypoints["http_web"].config.h2c_backends);
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
+    }
+
+    #[test]
+    fn grpc_web_translates_and_reaches_the_backends_over_h2c() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.http.own.host", "a.example.com"),
+                ("sozune.http.own.grpcWeb", "true"),
+                ("sozune.http.cross.host", "b.example.com"),
+                (
+                    "sozune.http.cross.grpcWeb.allowOrigins",
+                    "https://app.example, https://admin.example",
+                ),
+                ("sozune.http.off.host", "c.example.com"),
+                ("sozune.http.off.grpcWeb", "false"),
+                ("sozune.http.off.grpcWeb.allowOrigins", "*"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let own = &r.entrypoints["http_own"].config;
+        assert_eq!(own.grpc_web, Some(crate::model::GrpcWebConfig::default()));
+        assert!(own.h2c_backends);
+        let cross = &r.entrypoints["http_cross"].config;
+        assert_eq!(
+            cross.grpc_web.as_ref().unwrap().allow_origins,
+            ["https://app.example", "https://admin.example"]
+        );
+        assert!(cross.h2c_backends);
+        let off = &r.entrypoints["http_off"].config;
+        assert!(off.grpc_web.is_none());
+        assert!(!off.h2c_backends);
         assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 

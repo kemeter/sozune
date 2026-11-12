@@ -250,6 +250,7 @@ mod tests {
             backends: vec![Backend::new("127.0.0.1", 3000)],
             protocol: Protocol::Http,
             config: EntrypointConfig {
+                grpc_web: None,
                 terminate_tls: false,
                 hostnames: vec!["example.com".to_string()],
                 path: None,

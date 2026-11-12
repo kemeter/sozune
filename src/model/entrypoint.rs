@@ -272,6 +272,10 @@ pub struct EntrypointConfig {
     /// answers their preflight requests and marks the responses they get.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<CorsConfig>,
+    /// Translate the gRPC-Web calls of browsers into gRPC to the backends,
+    /// and their answers back (Traefik's `grpcWeb`). Reached over h2c.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_web: Option<GrpcWebConfig>,
     /// Path the backend receives instead of the request's, the query kept
     /// (Traefik's `replacePath`). Applied by the middleware, after Sōzu's
     /// `strip_prefix` / `add_prefix`.
@@ -298,6 +302,16 @@ pub struct EntrypointConfig {
 pub struct OutrankedHeaders {
     pub conditions: Vec<MatchCondition>,
     pub hostnames: Vec<String>,
+}
+
+/// A route's gRPC-Web translation.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
+pub struct GrpcWebConfig {
+    /// The origins whose pages may call the route (`*` for any): their
+    /// preflight requests are answered, with the headers gRPC-Web needs.
+    /// None: only pages of the route's own origin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_origins: Vec<String>,
 }
 
 /// A route's CORS policy, as a Gateway API `CORS` filter states it.

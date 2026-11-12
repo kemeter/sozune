@@ -86,9 +86,10 @@ fn status_headers(headers: &mut HeaderMap, code: u32, message: &str) {
 }
 
 /// `response`, an answer the middleware gave to a gRPC call, in the form a
-/// gRPC server answers with. A success or a redirect is left as it is, and
-/// so is an answer that already carries a `grpc-status` (a plugin's).
-pub(crate) fn answer(response: Response<Body>) -> Response<Body> {
+/// gRPC server answers with, as `content_type` (gRPC's, or gRPC-Web's for
+/// a gRPC-Web call). A success or a redirect is left as it is, and so is
+/// an answer that already carries a `grpc-status` (a plugin's).
+pub(crate) fn answer(response: Response<Body>, content_type: HeaderValue) -> Response<Body> {
     let status = response.status();
     if status.as_u16() < 400 || response.headers().contains_key("grpc-status") {
         return response;
@@ -117,10 +118,9 @@ pub(crate) fn answer(response: Response<Body>) -> Response<Body> {
     ] {
         parts.headers.remove(name);
     }
-    parts.headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/grpc"),
-    );
+    parts
+        .headers
+        .insert(axum::http::header::CONTENT_TYPE, content_type);
     status_headers(&mut parts.headers, status_of(status), &message);
     parts.status = StatusCode::OK;
     Response::from_parts(parts, Body::empty())
@@ -197,6 +197,10 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
+    fn answer_grpc(response: Response<Body>) -> Response<Body> {
+        answer(response, HeaderValue::from_static("application/grpc"))
+    }
+
     fn made(status: StatusCode, reason: Option<&'static str>) -> Response<Body> {
         let mut builder = Response::builder()
             .status(status)
@@ -212,7 +216,7 @@ mod tests {
     /// 200, no body, the status in headers.
     #[tokio::test]
     async fn an_error_is_answered_in_grpc_form() {
-        let response = answer(made(
+        let response = answer_grpc(made(
             StatusCode::SERVICE_UNAVAILABLE,
             Some("no-healthy-backend"),
         ));
@@ -235,7 +239,7 @@ mod tests {
     /// Without a diagnostic, the message names the HTTP status.
     #[test]
     fn an_error_without_a_reason_names_its_status() {
-        let response = answer(made(StatusCode::UNAUTHORIZED, None));
+        let response = answer_grpc(made(StatusCode::UNAUTHORIZED, None));
         assert_eq!(response.headers()["grpc-status"], "16");
         assert_eq!(
             response.headers()["grpc-message"],
@@ -248,14 +252,14 @@ mod tests {
     #[test]
     fn other_answers_are_left_alone() {
         for status in [StatusCode::OK, StatusCode::PERMANENT_REDIRECT] {
-            let response = answer(made(status, None));
+            let response = answer_grpc(made(status, None));
             assert_eq!(response.status(), status);
             assert!(!response.headers().contains_key("grpc-status"));
         }
         let mut own = made(StatusCode::FORBIDDEN, None);
         own.headers_mut()
             .insert("grpc-status", HeaderValue::from_static("7"));
-        let response = answer(own);
+        let response = answer_grpc(own);
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
