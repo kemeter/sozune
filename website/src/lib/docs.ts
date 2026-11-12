@@ -91,6 +91,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'cors',
     'rate-limit',
     'in-flight-req',
+    'buffering',
     'redirects',
     'strip-prefix',
     'replace-path',

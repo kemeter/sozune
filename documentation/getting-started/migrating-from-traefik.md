@@ -126,6 +126,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `inflightreq.amount` | `inFlightReq`, counted per client IP. Traefik groups by request host by default, which caps the whole route; Sōzune has no route-wide cap. |
 | `ipallowlist.sourcerange` | `ipAllowList` |
 | `compress=true` | `compress=true` |
+| `buffering.maxRequestBodyBytes`, `buffering.maxResponseBodyBytes` | The same labels ([Buffering](/documentation/middleware/buffering), since 0.17). `memRequestBodyBytes` and `memResponseBodyBytes` have no equivalent (the body stays in memory, up to the max), nor has `retryExpression` (use `retry.*`). |
 | `grpcweb.allowOrigins=https://app.example` | `grpcWeb.allowOrigins=https://app.example`, or `grpcWeb=true` for pages of the route's own origin ([gRPC-Web](/documentation/routing/grpc#grpc-web), since 0.17). The backends are reached over h2c. |
 | `retry.attempts` | `retry.attempts` |
 | `circuitbreaker.expression` | `circuitBreaker.threshold`, `circuitBreaker.minRequests`, `circuitBreaker.cooldown`. Sōzune trips on an error rate, not on an expression: see [Circuit breaker](/documentation/middleware/circuit-breaker). |

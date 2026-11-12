@@ -6581,6 +6581,7 @@ fn rule_to_entrypoints(
                 backends: backends.clone(),
                 protocol: Protocol::Http,
                 config: EntrypointConfig {
+                    buffering: None,
                     grpc_web: None,
                     terminate_tls: false,
                     hostnames: hostnames.to_vec(),
@@ -8068,6 +8069,7 @@ fn tls_rule_backends(
 /// authenticate — only bytes to forward.
 fn tls_entrypoint_defaults() -> EntrypointConfig {
     EntrypointConfig {
+        buffering: None,
         grpc_web: None,
         terminate_tls: false,
         hostnames: Vec::new(),

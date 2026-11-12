@@ -469,6 +469,7 @@ pub(crate) mod tests {
                 .collect(),
             protocol: Protocol::Http,
             config: EntrypointConfig {
+                buffering: None,
                 grpc_web: None,
                 terminate_tls: false,
                 hostnames: vec![host.to_string()],

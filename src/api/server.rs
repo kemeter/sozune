@@ -1686,6 +1686,7 @@ config_file: { enabled: true }
                     backends: vec![Backend::new("172.17.0.2", 8080)],
                     protocol: Protocol::Http,
                     config: EntrypointConfig {
+                        buffering: None,
                         grpc_web: None,
                         terminate_tls: false,
                         hostnames: vec!["docker.local".to_string()],
@@ -2301,6 +2302,7 @@ config_file: { enabled: true }
                     backends: vec![Backend::new("172.17.0.2", 8080)],
                     protocol: Protocol::Http,
                     config: EntrypointConfig {
+                        buffering: None,
                         grpc_web: None,
                         terminate_tls: false,
                         hostnames: vec!["docker.local".to_string()],
@@ -2428,6 +2430,7 @@ config_file: { enabled: true }
                     backends: vec![Backend::new("172.17.0.2", 8080)],
                     protocol: Protocol::Http,
                     config: EntrypointConfig {
+                        buffering: None,
                         grpc_web: None,
                         terminate_tls: false,
                         hostnames: vec!["docker.local".to_string()],
@@ -2515,6 +2518,7 @@ config_file: { enabled: true }
             backends: vec![Backend::new("10.0.0.1", 80)],
             protocol: Protocol::Http,
             config: EntrypointConfig {
+                buffering: None,
                 grpc_web: None,
                 terminate_tls: false,
                 hostnames: vec![host.to_string()],

@@ -4,9 +4,9 @@ use crate::labels::candidate::Candidate;
 use crate::labels::catalog;
 use crate::labels::diagnostic::{Diagnostic, DiagnosticCode, ParseResult};
 use crate::labels::fields::{
-    auth, backend_errors, core, cors, error_pages, forward_auth, headers, host, in_flight_req,
-    ip_allow_list, methods, path, plugin_config, plugins, ratelimit, redirect, request_match,
-    rewrite,
+    auth, backend_errors, buffering, core, cors, error_pages, forward_auth, headers, host,
+    in_flight_req, ip_allow_list, methods, path, plugin_config, plugins, ratelimit, redirect,
+    request_match, rewrite,
 };
 use crate::labels::network;
 use crate::model::{Backend, Entrypoint, EntrypointConfig, Protocol, RedirectPolicy};
@@ -248,6 +248,7 @@ fn build_entrypoint(
     let forward_auth = forward_auth::parse_forward_auth(labels, &prefix, diagnostics);
     let headers = headers::parse_headers(labels, &prefix, diagnostics);
     let cors = cors::parse_cors(labels, &prefix, diagnostics);
+    let buffering = buffering::parse_buffering(labels, &prefix, diagnostics);
     let methods = methods::parse_methods(labels, &prefix, diagnostics);
     let plugins = plugins::parse_plugins(labels, &prefix);
     let plugin_config = plugin_config::parse_plugin_config(labels, &prefix, diagnostics);
@@ -363,6 +364,7 @@ fn build_entrypoint(
         name: service_name.to_string(),
         protocol: protocol_enum,
         config: EntrypointConfig {
+            buffering,
             grpc_web,
             hostnames,
             path,
@@ -533,6 +535,7 @@ fn build_l4_entrypoint(
         name: service_name.to_string(),
         protocol,
         config: EntrypointConfig {
+            buffering: None,
             grpc_web: None,
             terminate_tls: false,
             hostnames: Vec::new(),

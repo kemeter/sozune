@@ -5842,6 +5842,7 @@ mod tests {
             protocol: Protocol::Http,
             source: None,
             config: EntrypointConfig {
+                buffering: None,
                 grpc_web: None,
                 terminate_tls: false,
                 hostnames: vec!["app.example.com".into()],
