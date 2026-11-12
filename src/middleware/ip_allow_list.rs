@@ -282,6 +282,7 @@ mod tests {
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),
+            grpc: false,
         }
     }
 
@@ -548,6 +549,7 @@ mod tests {
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),
+            grpc: false,
         };
         let list = IpAllowList::new(&["203.0.113.7".to_string()]);
         let resolved = resolve_client_ip(&r, &c, &trusted).unwrap();

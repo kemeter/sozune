@@ -547,6 +547,10 @@ services:
       - "sozune.http.grpcretry.port=9000"
       - "sozune.http.grpcretry.scheme=h2c"
       - "sozune.http.grpcretry.retry.attempts=2"
+      - "sozune.http.grpcwasm.host=$HOST_GRPC_WASM"
+      - "sozune.http.grpcwasm.port=9000"
+      - "sozune.http.grpcwasm.scheme=h2c"
+      - "sozune.http.grpcwasm.plugins=headerguest"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   # etcd serves the gRPC health service on its client port: SERVING

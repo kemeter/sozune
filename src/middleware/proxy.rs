@@ -192,6 +192,7 @@ pub async fn handle_proxy(
             client_encoding: None,
             pending_response_headers: Vec::new(),
             in_flight_guards: Vec::new(),
+            grpc: super::grpc::is_call(req.headers()),
         };
 
         // The whole request's deadline, from its arrival: the middleware

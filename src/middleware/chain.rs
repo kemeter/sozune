@@ -31,6 +31,8 @@ pub struct RequestCtx {
     /// its per-IP slot when this context is dropped — on every proxy return
     /// path, not just the response phase.
     pub in_flight_guards: Vec<super::in_flight_req::InFlightGuard>,
+    /// Whether the request is a gRPC call (`content-type: application/grpc`).
+    pub grpc: bool,
 }
 
 /// Outcome of a middleware's request phase.
