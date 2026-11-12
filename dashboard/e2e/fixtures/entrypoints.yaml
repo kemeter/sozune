@@ -1,0 +1,35 @@
+# The routes the dashboard shows in its Playwright tests. Their backends
+# listen nowhere: the tests read what Sōzune knows, not what they answer.
+entrypoints:
+  - id: shop
+    name: shop
+    protocol: Http
+    backends:
+      - address: 127.0.0.1
+        port: 1
+      - address: 127.0.0.1
+        port: 2
+    config:
+      hostnames: ["shop.dashboard.test"]
+      tls: false
+      strip_prefix: false
+      priority: 0
+      compress: true
+
+  - id: shop-api
+    name: shop-api
+    protocol: Http
+    backends:
+      - address: 127.0.0.1
+        port: 3
+    config:
+      hostnames: ["api.dashboard.test"]
+      tls: false
+      strip_prefix: false
+      priority: 0
+      path:
+        rule_type: Prefix
+        value: /v1
+      rate_limit:
+        average: 100
+        burst: 50

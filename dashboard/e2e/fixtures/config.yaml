@@ -1,0 +1,34 @@
+# Sōzune for the dashboard's Playwright tests: the API, the dashboard, and
+# routes from a static file, on ports clear of the defaults and of the
+# Docker e2e suite's.
+providers:
+  config_file:
+    enabled: true
+    path: e2e/fixtures/entrypoints.yaml
+    watch: false
+
+api:
+  enabled: true
+  listen_address: "127.0.0.1:23035"
+  users:
+    # admin-secret
+    - name: admin
+      hash: "16175223c8ddce5ace0493c948569c211b03c4c6bb3d3e484434999448cffe01"
+      role: admin
+    # viewer-secret
+    - name: viewer
+      hash: "f6aa3a0aabbb721b4aa7763a987a47688a702b1bcf4850cb4ba5bdab26f9cc4b"
+      role: read-only
+
+dashboard:
+  enabled: true
+  listen_address: "127.0.0.1:23038"
+
+proxy:
+  http:
+    listen_address: 23080
+  https:
+    listen_address: 23443
+
+middleware:
+  port: 23037
