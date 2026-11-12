@@ -104,7 +104,7 @@ Containers that declare the same `<svc>` name with the same hosts and paths are 
 
 ## Middlewares
 
-In Sōzune, a middleware is a label on the route itself: there is no `middlewares=` list and no shared middleware definition.
+In Sōzune, a middleware is a label on the route itself. A set of them can also be named and referenced by several routes, with `middlewares=a,b` and `sozune.middlewares.<name>.*` labels or static config's `middlewares:`: see [Named middlewares](/documentation/middleware/named-middlewares) (since 0.17).
 
 | Traefik middleware | Sōzune label |
 |---|---|
@@ -133,7 +133,7 @@ In Sōzune, a middleware is a label on the route itself: there is no `middleware
 | `errors.status` + `errors.service` + `errors.query` | `errors.status`, and `errors.url` for the service and query together (`http://error-pages/{status}.html?from={url}`), or `errors.page` for an inline page: see [Backend errors](/documentation/middleware/error-pages#backend-errors). |
 | Traefik plugins | [WASM plugins](/documentation/middleware/wasm-plugins). Traefik's Yaegi plugins do not run as is. |
 
-Not available yet: `chain` and `digestauth`. A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A `weighted` service, a split between two versions, is written with a `serviceWeight` on the containers of each service, which their replicas share whatever their number: see [Weighted load balancing](/documentation/routing/load-balancing#service-weights) (since 0.17).
+Not available yet: `digestauth`. `chain` is a named middleware's `chain` option: see [Named middlewares](/documentation/middleware/named-middlewares) (since 0.17). A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A `weighted` service, a split between two versions, is written with a `serviceWeight` on the containers of each service, which their replicas share whatever their number: see [Weighted load balancing](/documentation/routing/load-balancing#service-weights) (since 0.17).
 
 ## TCP
 

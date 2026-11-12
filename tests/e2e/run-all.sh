@@ -153,6 +153,11 @@ proxy:
 
 middleware:
   port: $MIDDLEWARE_PORT
+
+# Named middlewares every label provider's routes can reference (50).
+middlewares:
+  shared:
+    headers.response.X-Shared: static
 EOF
 
 # Declare the WASM plugin only if its guest was built, so the rest of the suite
@@ -621,6 +626,21 @@ services:
       - "sozune.enable=true"
       - "sozune.http.sw.host=$HOST_SERVICE_WEIGHT"
       - "sozune.http.sw.serviceWeight=1"
+      - "sozune.network=${COMPOSE_PROJECT}_default"
+
+  # Named middlewares (50-middlewares.sh): one from static config, one
+  # defined here, chained; a route's own label wins over a middleware's.
+  svc-middlewares:
+    image: traefik/whoami
+    labels:
+      - "sozune.enable=true"
+      - "sozune.middlewares.local.headers.response.X-Local=container"
+      - "sozune.middlewares.both.chain=shared,local"
+      - "sozune.http.mwchain.host=$HOST_MW_CHAIN"
+      - "sozune.http.mwchain.middlewares=both"
+      - "sozune.http.mwown.host=$HOST_MW_OWN"
+      - "sozune.http.mwown.middlewares=shared"
+      - "sozune.http.mwown.headers.response.X-Shared=own"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   # etcd serves the gRPC health service on its client port: SERVING

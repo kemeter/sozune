@@ -300,6 +300,9 @@ async fn serve(config_path: &str) -> anyhow::Result<()> {
     let proxy_config = config.proxy.clone();
     let handle = tokio::runtime::Handle::current();
     let plugins = middleware::build_plugin_registry(&config.plugins, &handle);
+    // Named middlewares of static config, for the routes of every label
+    // provider to reference.
+    crate::labels::middlewares::set_shared(config.middlewares.clone());
     // The plugins are `Arc`s: the API's copy shares them with the proxy.
     let api_plugins = Arc::new(plugins.clone());
     let live_routes: proxy::backend::LiveRoutes = Arc::new(RwLock::new(BTreeMap::new()));

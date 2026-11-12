@@ -102,6 +102,10 @@ pub enum DiagnosticCode {
     /// number of bytes, or a Traefik option Sōzune has no use for. That
     /// option is dropped.
     W037InvalidBuffering,
+    /// A route references a middleware no workload label nor static config
+    /// defines, a chain refers back to itself, or a middleware sets an
+    /// option that is no route option. That part is not applied.
+    W038InvalidMiddleware,
     // Info — surfaced only with --severity info
     I001PathDefaulted,
     I002PortDefaulted,
@@ -154,6 +158,7 @@ impl DiagnosticCode {
             DiagnosticCode::W035InvalidScheme => "W035",
             DiagnosticCode::W036InvalidCors => "W036",
             DiagnosticCode::W037InvalidBuffering => "W037",
+            DiagnosticCode::W038InvalidMiddleware => "W038",
             DiagnosticCode::I001PathDefaulted => "I001",
             DiagnosticCode::I002PortDefaulted => "I002",
         }
@@ -216,6 +221,7 @@ impl DiagnosticCode {
             DiagnosticCode::W035InvalidScheme,
             DiagnosticCode::W036InvalidCors,
             DiagnosticCode::W037InvalidBuffering,
+            DiagnosticCode::W038InvalidMiddleware,
             DiagnosticCode::I001PathDefaulted,
             DiagnosticCode::I002PortDefaulted,
         ]

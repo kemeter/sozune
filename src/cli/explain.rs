@@ -437,6 +437,16 @@ const ENTRIES: &[Entry] = &[
         example: Some("sozune.http.upload.buffering.maxRequestBodyBytes=10485760"),
     },
     Entry {
+        code: "W038",
+        title: "Invalid middleware",
+        cause: "A route's `middlewares` label names a middleware that neither the workload's `sozune.middlewares.<name>.*` labels nor static config's `middlewares:` define, a `chain` refers back to a middleware it is part of, or a middleware sets an option that is no route option.",
+        effect: "That middleware, that part of the chain, or that option is not applied; the rest of the route is.",
+        fix: "Define the middleware, break the cycle, or use the route label's name without its `sozune.<protocol>.<route>.` prefix.",
+        example: Some(
+            "sozune.middlewares.secure.headers.response.X-Frame-Options=DENY\nsozune.http.web.middlewares=secure",
+        ),
+    },
+    Entry {
         code: "I001",
         title: "Path defaulted",
         cause: "No `sozune.http.<name>.path` label was provided.",

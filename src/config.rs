@@ -27,6 +27,50 @@ pub struct AppConfig {
     /// `.wasm`; entrypoints reference these by name to run them as middleware.
     #[serde(default)]
     pub plugins: HashMap<String, PluginConfig>,
+    /// Named middlewares: route options under a name (route labels without
+    /// their `sozune.<protocol>.<route>.` prefix), which the routes of every
+    /// label provider reference with their `middlewares` label.
+    #[serde(default, deserialize_with = "deserialize_middlewares")]
+    pub middlewares: crate::labels::middlewares::Definitions,
+}
+
+/// A middleware option's value, as YAML writes it: a string, a number or a
+/// boolean, kept as the label text it stands for.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OptionValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+fn deserialize_middlewares<'de, D>(
+    deserializer: D,
+) -> Result<crate::labels::middlewares::Definitions, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: BTreeMap<String, BTreeMap<String, OptionValue>> =
+        Deserialize::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(name, options)| {
+            let options = options
+                .into_iter()
+                .map(|(option, value)| {
+                    let value = match value {
+                        OptionValue::Bool(b) => b.to_string(),
+                        OptionValue::Int(i) => i.to_string(),
+                        OptionValue::Float(f) => f.to_string(),
+                        OptionValue::Text(t) => t,
+                    };
+                    (option, value)
+                })
+                .collect();
+            (name, options)
+        })
+        .collect())
 }
 
 /// Distributed-tracing configuration. When `enabled`, every proxied request
@@ -2581,6 +2625,32 @@ acme:
         let acme = config.acme.expect("acme present in YAML");
         assert_eq!(acme.email, "override@example.com");
         assert!(acme.enabled, "yaml-only fields untouched");
+    }
+
+    /// Static config's middlewares keep their options as the label text
+    /// they stand for, whatever YAML type they are written in.
+    #[test]
+    fn middlewares_are_read_as_label_values() {
+        let yaml = r#"
+providers: {}
+api:
+  enabled: false
+proxy:
+  http:
+    listen_address: 80
+  https:
+    listen_address: 443
+middlewares:
+  secure:
+    headers.response.X-Frame-Options: DENY
+    compress: true
+    ratelimit.average: 100
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let secure = &config.middlewares["secure"];
+        assert_eq!(secure["headers.response.X-Frame-Options"], "DENY");
+        assert_eq!(secure["compress"], "true");
+        assert_eq!(secure["ratelimit.average"], "100");
     }
 
     #[test]

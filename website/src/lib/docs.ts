@@ -100,6 +100,7 @@ const PAGE_ORDER: Record<string, string[]> = {
     'retry',
     'circuit-breaker',
     'wasm-plugins',
+    'named-middlewares',
   ],
   tls: ['overview', 'acme', 'certbot'],
   configuration: ['overview', 'api', 'dashboard'],
