@@ -50,6 +50,7 @@ impl SeverityFilter {
 
 pub async fn run(args: ValidateArgs, config_path: &str) -> anyhow::Result<i32> {
     let config = load_config(config_path).await?;
+    crate::labels::middlewares::set_shared(config.middlewares.clone());
     let candidates = collect_candidates(&config, args.provider.as_deref()).await?;
     let mut report = build_report(candidates);
 

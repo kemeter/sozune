@@ -61,6 +61,7 @@ middleware:
 | `log` | Log output format (`text` or `json`). (since 0.14) |
 | `tracing` | OpenTelemetry distributed tracing (OTLP export). Off by default. See [Observability](../advanced/observability.md#distributed-tracing-opentelemetry). (since 0.14) |
 | `plugins` | WASM plugins, declared by name. See [WASM plugins](/documentation/middleware/wasm-plugins). (since 0.14) |
+| `middlewares` | Named middlewares: route options under a name, which routes reference with their `middlewares` label. Not to be confused with `middleware`, the internal proxy's port. See [Named middlewares](/documentation/middleware/named-middlewares). (since 0.17) |
 
 ## Providers
 

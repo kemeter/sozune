@@ -68,6 +68,8 @@ There is no label or flag to opt out: declaring a `HEALTHCHECK` is itself the op
 | `sozune.http.<svc>.loadBalancer` | `least_connections` | [Load balancing](/documentation/routing/load-balancing#choosing-the-algorithm) (default `round_robin`) (since 0.14) |
 | `sozune.http.<svc>.weight` | `90` | [Weighted load balancing](/documentation/routing/load-balancing#weighted-load-balancing) — this container's weight (default `100`) (since 0.14) |
 | `sozune.http.<svc>.serviceWeight` | `90` | [Service weights](/documentation/routing/load-balancing#service-weights): the weight of this container's service as a whole, shared by its replicas (since 0.17) |
+| `sozune.http.<svc>.middlewares` | `secure,api-limits` | [Named middlewares](/documentation/middleware/named-middlewares) the route gets (since 0.17) |
+| `sozune.middlewares.<name>.<option>` | `DENY` | Defines a [named middleware](/documentation/middleware/named-middlewares) on the workload; `chain` brings others in (since 0.17) |
 | `sozune.http.<svc>.tls` | `true` | Enables TLS termination (provisions an ACME cert) |
 | `sozune.http.<svc>.acme.resolver` | `cloudflare` | Names the [ACME resolver](/documentation/tls/acme) that issues the certificate. Absent: HTTP-01 on `challenge_port` (since 0.15) |
 

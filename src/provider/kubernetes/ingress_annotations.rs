@@ -177,6 +177,23 @@ mod tests {
     }
 
     #[test]
+    fn annotations_reference_static_config_middlewares() {
+        crate::labels::middlewares::set_shared(
+            [(
+                "ingress-test-limits".to_string(),
+                [("ratelimit.average".to_string(), "10".to_string())].into(),
+            )]
+            .into(),
+        );
+        let (settings, diagnostics) = ingress_settings(
+            &annotated(&[("sozune.middlewares", "ingress-test-limits")]),
+            "ingress:default/web",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(settings.unwrap().config.rate_limit.is_some());
+    }
+
+    #[test]
     fn annotations_carry_middleware_settings() {
         let (settings, diagnostics) = ingress_settings(
             &annotated(&[

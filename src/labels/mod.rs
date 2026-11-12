@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod diagnostic;
 pub mod fields;
 pub mod lint;
+pub mod middlewares;
 pub mod network;
 pub mod parser;
 pub mod source;

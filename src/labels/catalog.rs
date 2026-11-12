@@ -37,6 +37,7 @@ const SERVICE_FIELDS: &[&str] = &[
     "stickySession",
     "compress",
     "serviceWeight",
+    "middlewares",
     "grpcWeb",
     "grpcWeb.allowOrigins",
     "cors.allowOrigins",
@@ -129,11 +130,24 @@ pub fn detect_unknown_labels(labels: &HashMap<String, String>, diagnostics: &mut
     }
 }
 
+/// Whether `suffix`, a route label without its `sozune.<protocol>.<route>.`
+/// prefix, is one a route takes.
+pub fn is_route_option(suffix: &str) -> bool {
+    SERVICE_FIELDS.contains(&suffix)
+        || SERVICE_FIELD_PREFIXES
+            .iter()
+            .any(|p| suffix.starts_with(p) && suffix.len() > p.len())
+}
+
 fn is_known(full_key: &str) -> bool {
     let Some(rest) = full_key.strip_prefix("sozune.") else {
         return false;
     };
     if GLOBAL_LABELS.contains(&rest) {
+        return true;
+    }
+    // A middleware's options are checked when a route uses it (W038).
+    if crate::labels::middlewares::is_definition(full_key) {
         return true;
     }
     let mut parts = rest.splitn(3, '.');

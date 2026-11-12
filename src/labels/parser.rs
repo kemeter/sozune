@@ -35,7 +35,11 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
 
     catalog::detect_unknown_labels(&candidate.labels, &mut diagnostics);
 
-    let services = discover_services(&candidate.labels, &mut diagnostics);
+    // The options of the middlewares each route references, added to its
+    // labels where it does not set them.
+    let labels = crate::labels::middlewares::expand(&candidate.labels, &mut diagnostics);
+
+    let services = discover_services(&labels, &mut diagnostics);
     if services.is_empty() {
         diagnostics.push(
             Diagnostic::new(
@@ -55,7 +59,7 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
     let mut entrypoints = HashMap::new();
     for (protocol, service_name) in services {
         if let Some(entrypoint) = build_entrypoint(
-            &candidate.labels,
+            &labels,
             &protocol,
             &service_name,
             &backend_ip,
@@ -66,8 +70,7 @@ pub fn parse(candidate: &Candidate) -> ParseResult {
             // The weight each backend declares, kept to work its weight out
             // once the route's replicas are known: its own, or its
             // workload's to share.
-            let service_weight =
-                core::parse_service_weight(&candidate.labels, &prefix, &mut diagnostics);
+            let service_weight = core::parse_service_weight(&labels, &prefix, &mut diagnostics);
             let mut entrypoint = entrypoint;
             for backend in &mut entrypoint.backends {
                 let declared = service_weight.unwrap_or(backend.weight);
@@ -112,8 +115,9 @@ fn discover_services(
         let Some(rest) = key.strip_prefix("sozune.") else {
             continue;
         };
-        // Skip global labels that aren't service labels.
-        if matches!(rest, "enable" | "network") {
+        // Skip global labels that aren't service labels, and middleware
+        // definitions.
+        if matches!(rest, "enable" | "network") || rest.starts_with("middlewares.") {
             continue;
         }
         let mut parts = rest.splitn(3, '.');
@@ -908,6 +912,34 @@ mod tests {
         let own = &r.entrypoints["http_own"].backends[0];
         assert_eq!(own.share.as_ref().unwrap().workload, None);
         assert_eq!(own.weight, 5);
+        assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
+    }
+
+    #[test]
+    fn a_route_gets_its_middlewares_options() {
+        let c = candidate(
+            &[
+                ("sozune.enable", "true"),
+                ("sozune.middlewares.secure.compress", "true"),
+                (
+                    "sozune.middlewares.secure.headers.response.X-Frame-Options",
+                    "DENY",
+                ),
+                ("sozune.http.web.host", "app.example.com"),
+                ("sozune.http.web.middlewares", "secure"),
+                ("sozune.http.plain.host", "plain.example.com"),
+            ],
+            vec![net("bridge", "10.0.0.1")],
+        );
+        let r = parse(&c);
+        let web = &r.entrypoints["http_web"].config;
+        assert!(web.compress);
+        assert_eq!(web.headers[0].name, "X-Frame-Options");
+        // A route that does not reference it gets none of it.
+        assert!(!r.entrypoints["http_plain"].config.compress);
+        // A definition is no route of its own, nor an unknown label.
+        assert_eq!(r.entrypoints.len(), 2);
+        assert!(!has_code(&r, DiagnosticCode::W012InvalidProtocol));
         assert!(!has_code(&r, DiagnosticCode::W013UnknownLabel));
     }
 
