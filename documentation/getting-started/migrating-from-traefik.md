@@ -96,6 +96,7 @@ A rule that mixes `||` across different matcher types has no single-route equiva
 | `services.<s>.loadbalancer.healthcheck.interval=5s` | `healthCheck.interval=5000` (milliseconds) (since 0.16) |
 | `services.<s>.loadbalancer.healthcheck.port` | `healthCheck.port` (since 0.16) |
 | `services.<s>.loadbalancer.healthcheck.headers.<Name>` | `healthCheck.headers.<Name>` (since 0.16) |
+| `services.<s>.loadbalancer.healthcheck.mode=grpc` | `healthCheck.mode=grpc`, with `healthCheck.service` for the service name (since 0.17). See [gRPC health checks](/documentation/advanced/health-checks#grpc-health-checks). |
 | `services.<s>.loadbalancer.healthcheck.unhealthyInterval`, `followRedirects`, `scheme`, `hostname`, `method` | No equivalent. Thresholds instead: `healthCheck.unhealthyThreshold` / `healthyThreshold` (since 0.16). |
 | `serverstransport.forwardingtimeouts.responseheadertimeout=2s` | `backendTimeout=2000` (milliseconds). It caps the whole response, not only the wait for its headers: leave room for a long or streamed body. |
 

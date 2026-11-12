@@ -15,6 +15,7 @@ Every **10 seconds** by default, Sōzune probes each backend. Without a health-c
 | Connect refused / request failed | Backend marked unhealthy |
 | Timeout | Backend marked unhealthy |
 | HTTP status not accepted | Backend marked unhealthy (`bad_status`) |
+| gRPC health not `SERVING` (gRPC mode) | Backend marked unhealthy (`bad_status`) |
 
 When a backend turns unhealthy, Sōzune takes it out of its route (since 0.16): Sōzu and the Sōzune middleware stop sending it requests, and the connections Sōzu holds to it are closed, and so are the WebSocket tunnels the middleware opened to it (see [When a backend leaves](/documentation/routing/load-balancing#when-a-backend-leaves)). It keeps being probed, and comes back as soon as a probe succeeds.
 
@@ -72,6 +73,32 @@ The probe sends `GET http://<backend-host>:<port><path>`, `<port>` being `health
 
 Without `healthCheck.path`, the backend keeps the plain TCP probe — fully backward compatible. `healthCheck.status` and `healthCheck.headers.*` need a path: without one they emit `W021` and are ignored.
 
+The probe is sent over h2c when the route's backends speak it ([`scheme=h2c`](/documentation/routing/grpc), since 0.17).
+
+## gRPC health checks
+
+> Since 0.17
+
+A gRPC server reports its health through the [gRPC health protocol](https://grpc.io/docs/guides/health-checking/). `healthCheck.mode=grpc` makes the probe call it: `grpc.health.v1.Health/Check`, over h2c, on the backend's port or `healthCheck.port`.
+
+```yaml
+labels:
+  - "sozune.http.greeter.scheme=h2c"
+  - "sozune.http.greeter.healthCheck.mode=grpc"
+  - "sozune.http.greeter.healthCheck.service=greeter.Greeter"   # optional
+```
+
+| Label | Description |
+|---|---|
+| `healthCheck.mode` | `http` (the default) or `grpc`. |
+| `healthCheck.service` | The service whose health is asked. Omit it to ask for the server's overall health. |
+
+The backend is healthy when the call succeeds and answers `SERVING`. `NOT_SERVING`, `UNKNOWN` or `SERVICE_UNKNOWN`, and a failed call, mark it unhealthy with kind `bad_status`: the reason names the answer, or the gRPC status (`UNIMPLEMENTED` when the server has no health service, `NOT_FOUND` for an unknown service). An answer that is not gRPC, or a transport failure, is `http_error`.
+
+`healthCheck.headers.*` are sent as the call's metadata. `healthCheck.timeout`, `interval`, `port` and the thresholds apply as to the other probes. `healthCheck.path` and `healthCheck.status` do not: with `mode=grpc` they emit `W021` and are ignored, as `healthCheck.service` is without it.
+
+The probe always speaks h2c, as gRPC needs, whatever the route's `scheme`. The route itself needs [`scheme=h2c`](/documentation/routing/grpc) for its gRPC traffic.
+
 ## Without a health check
 
 > Since 0.16
@@ -81,7 +108,7 @@ A backend that stops answering is also left out without one, from the requests i
 ## What it does not do
 
 - **No status ranges.** `healthCheck.status` accepts one exact code; without it, any `2xx`/`3xx` is healthy.
-- **No gRPC health protocol / custom method / HTTPS** on the HTTP probe yet: it is a plain `GET`, sent over h2c when the route's backends speak it ([`scheme=h2c`](/documentation/routing/grpc), since 0.17).
+- **No custom method / HTTPS** on the HTTP probe yet: it is a plain `GET`.
 
 ## Combined with Docker
 

@@ -456,7 +456,8 @@ pub enum LoadBalancer {
 /// plain HTTP) and considers it healthy when the response status is accepted:
 /// with `status = None`, any `2xx`/`3xx` (the Traefik default); with
 /// `status = Some(code)`, only that exact code. Without one, it checks that the
-/// backend accepts a TCP connection.
+/// backend accepts a TCP connection. With `grpc`, it calls the gRPC health
+/// service instead.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct HealthCheckConfig {
     /// Request path, e.g. `/health`, of the HTTP probe. `None` probes with a
@@ -490,6 +491,19 @@ pub struct HealthCheckConfig {
     /// again. `None` is 1.
     #[serde(default)]
     pub healthy_threshold: Option<u32>,
+    /// Probe with the gRPC health protocol (`grpc.health.v1.Health/Check`,
+    /// over h2c) instead of an HTTP `GET`: `path` and `status` do not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<GrpcHealthCheck>,
+}
+
+/// The gRPC health check of a route's backends.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
+pub struct GrpcHealthCheck {
+    /// The service whose health is asked. Empty asks for the server's
+    /// overall health.
+    #[serde(default)]
+    pub service: String,
 }
 
 /// Retry policy for forwarding a request to a backend.

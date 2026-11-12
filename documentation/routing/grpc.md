@@ -60,9 +60,16 @@ A route that goes through the Sōzune middleware (headers, rate limit, auth, ret
 
 An [HTTP health check](/documentation/advanced/health-checks) of an h2c route is sent over h2c, with the check's path, status and headers. A TCP check is the same for both schemes.
 
+`healthCheck.mode=grpc` calls the server's [gRPC health service](/documentation/advanced/health-checks#grpc-health-checks) instead, `grpc.health.v1.Health/Check`: the backend is healthy when it answers `SERVING`.
+
+```yaml
+labels:
+  - "sozune.http.greeter.scheme=h2c"
+  - "sozune.http.greeter.healthCheck.mode=grpc"
+```
+
 ## What it does not do
 
 - **No TLS to the backends.** `scheme=https` is refused (`W035`).
-- **No gRPC health protocol.** The HTTP probe sends a `GET`, not a `grpc.health.v1.Health/Check` call: point it at a path the server answers over HTTP/2, or use a TCP check.
 - **Errors in HTTP form.** When Sōzune answers a call itself (no backend, timeout, rate limit, auth), the client gets an HTTP status, not a `grpc-status`.
 - **No gRPC-Web.**

@@ -17,6 +17,8 @@ const SERVICE_FIELDS: &[&str] = &[
     "healthCheck.port",
     "healthCheck.unhealthyThreshold",
     "healthCheck.healthyThreshold",
+    "healthCheck.mode",
+    "healthCheck.service",
     "loadBalancer",
     "weight",
     "retry.attempts",
