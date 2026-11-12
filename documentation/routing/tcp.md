@@ -159,7 +159,7 @@ Both share one public port; the name decides where each connection lands. Use th
 
 **Accepted patterns.** An exact hostname (`a.example.com`) or a single leading wildcard label (`*.b.example.com`). The wildcard matches exactly one label: `*.b.example.com` matches `api.b.example.com`, but neither `b.example.com` itself nor `x.y.b.example.com`. Anything else — a wildcard elsewhere in the name, a bare `*`, a `/`, an empty label, a non-ASCII character — is refused with diagnostic `W028`, and the route falls back to catch-all. Write internationalised names as punycode A-labels (`xn--caf-dma.example.com`); a Unicode pattern would load and then never match what is on the wire.
 
-**A listener is either SNI-routed or catch-all, never both.** This is a Sōzu constraint, and it differs from what Traefik or HAProxy allow. If some entrypoints on a listener declare an `sni` and others do not, Sōzune logs which ones are the odd ones out and leaves them unapplied — the rest of the listener keeps working. Give them an `sni` of their own, or move them to a separate listener, and the next reload picks them up.
+**A listener is either SNI-routed or catch-all, never both.** This is a Sōzu constraint. If some entrypoints on a listener declare an `sni` and others do not, Sōzune logs which ones are the odd ones out and leaves them unapplied, while the rest of the listener keeps working. Give them an `sni` of their own, or move them to a separate listener, and the next reload picks them up.
 
 **Unmatched names are dropped.** Once a listener carries SNI routes there is no fallback: a connection whose name matches nothing, or which sends no SNI at all, is closed without reaching any backend. Declare a route for every name you intend to serve.
 

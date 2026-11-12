@@ -64,7 +64,7 @@ acme:
 
 With labels (Docker, Podman, Swarm, Nomad, Consul, Ring, or annotations on a Kubernetes Service), the same binding is `sozune.http.<svc>.acme.resolver=cloudflare-main`.
 
-Set `CLOUDFLARE_API_TOKEN=...` (or lego's `CF_DNS_API_TOKEN`, as a Traefik setup has it) in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
+Set `CLOUDFLARE_API_TOKEN=...` (or lego's `CF_DNS_API_TOKEN`) in the environment before starting Sōzune. The token must have `Zone:DNS:Edit` scope on the matching zone.
 
 ### Wildcard without an entrypoint (`domains`)
 
@@ -91,7 +91,7 @@ Sōzune provisions each entry in `domains` on its own — no entrypoint required
 
 > Since 0.17 (by name); since 0.14
 
-A resolver's `provider` is a name, as Traefik's `dnsChallenge.provider` is: the provider reads its credentials from its own environment variables, the names [cheti](https://github.com/kemeter/cheti) gives them or, where they differ, lego's, so a Traefik setup's variables work as they are.
+A resolver's `provider` is a name: the provider reads its credentials from its own environment variables, the names [cheti](https://github.com/kemeter/cheti) gives them or, where they differ, lego's.
 
 | `provider` | lego's name | Environment variables (lego's, where they differ) |
 |---|---|---|

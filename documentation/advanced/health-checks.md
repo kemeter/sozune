@@ -65,7 +65,7 @@ labels:
 | Label | Description |
 |---|---|
 | `healthCheck.path` | Request path. Presence enables the HTTP probe. A leading `/` is added if missing. |
-| `healthCheck.status` | Exact status code required for "healthy". **Omit to accept any `2xx`/`3xx`** (the Traefik default). |
+| `healthCheck.status` | Exact status code required for "healthy". **Omit to accept any `2xx`/`3xx`**. |
 | `healthCheck.timeout` | Per-check request timeout in milliseconds. Falls back to the global 5s when unset — useful for a deliberately slow `/health`. |
 | `healthCheck.headers.<Name>` | A request header the probe sends, e.g. `Authorization` for a protected `/health`. One label per header. The API shows its name, never its value. (since 0.16) |
 

@@ -24,7 +24,7 @@ Retries cover **connection-level failures and timeouts**, where the backend prod
 | Backend timeout (`backendTimeout`) | ✅ |
 | Backend returned a response — even `500`/`502`/`503` | ❌, unless its status is in `codes` |
 
-A response that arrives is returned to the client as-is and **never** retried: the backend already acted on the request, so replaying it could double a side effect (a payment, an order…). This matches Traefik's default retry behaviour.
+A response that arrives is returned to the client as-is and **never** retried: the backend already acted on the request, so replaying it could double a side effect (a payment, an order…).
 
 A route can still retry some statuses, through the [REST / YAML surface](#rest--yaml-surface) or a Gateway API [HTTPRoute](/documentation/providers/kubernetes) `retry` (since 0.16). A response with one of its `codes` takes the next attempt, within `attempts`; the last attempt's response is returned whatever its status. Only list statuses a backend gives before acting on the request, or for requests that are safe to replay.
 

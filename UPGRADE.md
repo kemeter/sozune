@@ -6,7 +6,7 @@ What to change when moving from one Sōzune version to the next. Only the steps 
 
 ### DNS-01 providers: by name
 
-A DNS-01 resolver's `provider` is now a name, its credentials read from the provider's own environment variables (cheti's names, or lego's where they differ: the variables of a Traefik setup work as they are). The `type:` form still works, logged as deprecated at startup and by `sozune doctor`. To keep the variables you named, move them under `env`:
+A DNS-01 resolver's `provider` is now a name, its credentials read from the provider's own environment variables (cheti's names, or lego's where they differ). The `type:` form still works, logged as deprecated at startup and by `sozune doctor`. To keep the variables you named, move them under `env`:
 
 ```yaml
 # before

@@ -91,7 +91,7 @@ The label key is `errorPages.<code>`. Inline bodies only — `file://` is refuse
 
 > Since 0.17
 
-`errorPages` covers the errors Sōzu answers itself. To replace the errors a route answers, use `errors.*`: the status the backend returns, the `502`/`504` the middleware answers when it cannot reach the backend, or the refusal of one of the route's steps (a `429` from the rate limit, a `403` from the IP allow-list…). This is the counterpart of Traefik's `errors` middleware.
+`errorPages` covers the errors Sōzu answers itself. To replace the errors a route answers, use `errors.*`: the status the backend returns, the `502`/`504` the middleware answers when it cannot reach the backend, or the refusal of one of the route's steps (a `429` from the rate limit, a `403` from the IP allow-list…).
 
 ```yaml
 labels:

@@ -4,7 +4,7 @@
 
 Delegate authentication and authorization to an external service. For every incoming request, Sōzune calls a configured URL with the request's headers; the response decides whether the request reaches the backend or is rejected.
 
-This is the same pattern as Traefik's `ForwardAuth` middleware and Envoy's `ext_authz` filter. It plugs into anything that exposes a verification endpoint over HTTP — Authelia, Authentik, OAuth2 Proxy, OPA, custom auth services, [Crowdsec's AppSec API](https://docs.crowdsec.net/docs/appsec/intro/), Keycloak with a thin adapter, etc.
+It plugs into anything that exposes a verification endpoint over HTTP: Authelia, Authentik, OAuth2 Proxy, OPA, custom auth services, [Crowdsec's AppSec API](https://docs.crowdsec.net/docs/appsec/intro/), Keycloak with a thin adapter, etc.
 
 ## Labels
 

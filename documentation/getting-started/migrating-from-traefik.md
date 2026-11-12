@@ -83,6 +83,7 @@ A rule that mixes `||` across different matcher types has no single-route equiva
 | `redirectscheme.scheme=https` | `httpsRedirect=true` ([Redirects](/documentation/middleware/redirects)) |
 | `redirectscheme.port=8443` | `httpsRedirectPort=8443` |
 | Certificates from files (`tls.certificates`) | [`proxy.https.tls.certificates`](/documentation/tls/overview#certificates-from-files) |
+| `certificatesresolvers.<name>.acme.dnsChallenge.provider=cloudflare` | `acme.resolvers.<name>.provider: cloudflare` ([Providers](/documentation/tls/acme#providers), since 0.17). The provider reads lego's variable names, so the environment of a Traefik setup works as it is. |
 
 ## Service
 
@@ -132,6 +133,11 @@ In Sōzune, a middleware is a label on the route itself. A set of them can also 
 | `circuitbreaker.expression` | `circuitBreaker.threshold`, `circuitBreaker.minRequests`, `circuitBreaker.cooldown`. Sōzune trips on an error rate, not on an expression: see [Circuit breaker](/documentation/middleware/circuit-breaker). |
 | `errors.status` + `errors.service` + `errors.query` | `errors.status`, and `errors.url` for the service and query together (`http://error-pages/{status}.html?from={url}`), or `errors.page` for an inline page: see [Backend errors](/documentation/middleware/error-pages#backend-errors). |
 | Traefik plugins | [WASM plugins](/documentation/middleware/wasm-plugins). Traefik's Yaegi plugins do not run as is. |
+| `routers.<r>.middlewares=a,b` | `sozune.http.<r>.middlewares=a,b` ([Named middlewares](/documentation/middleware/named-middlewares), since 0.17) |
+| `middlewares.<name>.<type>.<option>=v` | `sozune.middlewares.<name>.<option>=v`, the option named as the route label is: `headers.customresponseheaders.X-Foo=bar` is `headers.response.X-Foo=bar`. |
+| `middlewares.<name>.chain.middlewares=a,b` | `sozune.middlewares.<name>.chain=a,b` |
+| `a@file`, a middleware of the file provider | A middleware of static config's `middlewares:`. |
+| `a@docker` from another container | No equivalent: define it in static config. |
 
 Not available yet: `digestauth`. `chain` is a named middleware's `chain` option: see [Named middlewares](/documentation/middleware/named-middlewares) (since 0.17). A `mirroring` service is written with a `mirrorOf` label on the mirror: see [Mirroring](/documentation/routing/mirroring) (since 0.16). A `weighted` service, a split between two versions, is written with a `serviceWeight` on the containers of each service, which their replicas share whatever their number: see [Weighted load balancing](/documentation/routing/load-balancing#service-weights) (since 0.17).
 

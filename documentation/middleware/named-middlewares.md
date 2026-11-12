@@ -2,7 +2,7 @@
 
 > Since 0.17
 
-A route's middlewares are labels on the route itself (`sozune.http.<route>.compress=true`). When several routes share the same set, name it once and reference it: a named middleware is a set of route options, which the routes that reference it get. This is what Traefik's named middlewares and its `chain` do.
+A route's middlewares are labels on the route itself (`sozune.http.<route>.compress=true`). When several routes share the same set, name it once and reference it: a named middleware is a set of route options, which the routes that reference it get.
 
 ## Defining and referencing
 
@@ -35,7 +35,7 @@ middlewares:
 |---|---|
 | `sozune.http.<route>.middlewares` | The named middlewares the route gets, comma separated. Also on TCP and UDP routes, for the options they take. |
 | `sozune.middlewares.<name>.<option>` | Defines middleware `<name>` on the workload, `<option>` being a route label without its prefix. |
-| `sozune.middlewares.<name>.chain` | Brings middlewares into `<name>`, comma separated: Traefik's `chain`. |
+| `sozune.middlewares.<name>.chain` | Brings middlewares into `<name>`, comma separated. |
 
 ## What wins
 
@@ -51,13 +51,3 @@ A middleware applies to the routes of the workload that reference it: one worklo
 A route referencing a middleware that is defined nowhere, a chain that refers back to a middleware it is part of, or a middleware option that is no route option emits `W038`; that part is left out and the rest applies. An option's own value is checked as the route's label would be: `ratelimit.average=fast` in a middleware raises the route's rate limit diagnostic.
 
 Static config's middlewares are read at startup: a change to them takes a restart.
-
-## From Traefik
-
-| Traefik | Sōzune |
-|---|---|
-| `routers.<r>.middlewares=a,b` | `sozune.http.<r>.middlewares=a,b` |
-| `middlewares.<name>.<type>.<option>=v` | `sozune.middlewares.<name>.<option>=v`, the option named as the route label is: `headers.customresponseheaders.X-Foo=bar` is `headers.response.X-Foo=bar`. See [Migrating from Traefik](/documentation/getting-started/migrating-from-traefik#middlewares). |
-| `middlewares.<name>.chain.middlewares=a,b` | `sozune.middlewares.<name>.chain=a,b` |
-| `a@file`, a middleware of the file provider | A middleware of static config's `middlewares:`. |
-| `a@docker` from another container | No equivalent: define it in static config. |

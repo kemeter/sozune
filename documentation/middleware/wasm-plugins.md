@@ -10,7 +10,7 @@ This is how you add behaviour like geo-blocking, custom auth headers, request re
 
 ## Two steps: declare, then reference
 
-Plugins are **declared once** in the static configuration (where the `.wasm` lives and its settings), then **referenced by name** on the entrypoints that should run them — the same split Traefik uses, and the same pattern as `acme.resolvers`.
+Plugins are **declared once** in the static configuration (where the `.wasm` lives and its settings), then **referenced by name** on the entrypoints that should run them, as resolvers are with `acme.resolvers`.
 
 ### 1. Declare the plugin (static config)
 

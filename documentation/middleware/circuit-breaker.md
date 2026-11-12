@@ -41,7 +41,7 @@ Three states:
 | Response whose body fails or is cut short by `backendTimeout`, on a route with one | ✅ |
 | Response `2xx`/`3xx`/`4xx` | ❌ |
 
-`4xx` is a client error, not a backend fault, so it never trips the breaker — matching Traefik's intent.
+`4xx` is a client error, not a backend fault, so it never trips the breaker.
 
 On a route with a `backendTimeout`, a response is counted once its body has gone through; otherwise on its status, so an endless stream does not hold the breaker.
 

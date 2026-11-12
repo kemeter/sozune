@@ -43,7 +43,7 @@ Changes (service register/deregister, health flip, scale) propagate within secon
 
 Every Consul instance carries one or more checks. Sōzune computes the instance's **effective** status as the worst of its checks (`critical` > `warning` > `passing`; an instance with no checks counts as `passing`), then keeps the instance only if that status is listed in `strict_checks`.
 
-The default `["passing", "warning"]` matches Traefik's `strictChecks`: a `warning` instance still answers requests, so it keeps taking traffic — only `critical` (and Consul `maintenance`) instances are pulled out of rotation. Tighten to `["passing"]` if you want any non-green check to remove an instance.
+With the default `["passing", "warning"]`, a `warning` instance still answers requests, so it keeps taking traffic: only `critical` (and Consul `maintenance`) instances are pulled out of rotation. Tighten to `["passing"]` if you want any non-green check to remove an instance.
 
 > Sōzune runs its own [backend health checks](/documentation/advanced/health-checks) on top of this. `strict_checks` is the Consul-side gate (it knows about application checks Sōzune can't see); Sōzune's checks are the proxy-side safety net.
 

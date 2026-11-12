@@ -95,7 +95,7 @@ labels:
 
 > Since 0.17
 
-Redirect the requests whose URL matches a regular expression, to that URL rewritten: Traefik's `redirectRegex` middleware. The other requests of the route go on to its backend.
+Redirect the requests whose URL matches a regular expression, to that URL rewritten. The other requests of the route go on to its backend.
 
 ```yaml
 labels:

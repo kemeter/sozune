@@ -101,7 +101,7 @@ The answers Sōzu gives itself, before the middleware or on a route without it (
 
 > Since 0.17
 
-Browsers cannot speak gRPC: they cannot read HTTP trailers, where gRPC puts a call's status. A web page calls through [gRPC-Web](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md) instead (grpc-web, Connect, and other browser clients), over HTTP/1.1 or HTTP/2. `grpcWeb` makes Sōzune translate those calls into gRPC for the backends, and their answers back, as Traefik's `grpcWeb` middleware and Envoy's `grpc_web` filter do. The backend is a plain gRPC server.
+Browsers cannot speak gRPC: they cannot read HTTP trailers, where gRPC puts a call's status. A web page calls through [gRPC-Web](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md) instead (grpc-web, Connect, and other browser clients), over HTTP/1.1 or HTTP/2. `grpcWeb` makes Sōzune translate those calls into gRPC for the backends, and their answers back. The backend is a plain gRPC server.
 
 ```yaml
 labels:

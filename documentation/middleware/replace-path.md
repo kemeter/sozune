@@ -2,7 +2,7 @@
 
 > Since 0.17
 
-Change the path the backend receives: replace it whole with `replacePath`, or rewrite the parts a regular expression matches with `replacePathRegex`. The query string is kept. These are Traefik's `replacePath` and `replacePathRegex` middlewares.
+Change the path the backend receives: replace it whole with `replacePath`, or rewrite the parts a regular expression matches with `replacePathRegex`. The query string is kept.
 
 ## `replacePath`
 
@@ -52,12 +52,12 @@ labels:
 
 Both labels are needed, the regex must compile and the replacement must not be empty: otherwise `W032` and the rewrite is ignored. A result that does not start with `/` gets one. In Docker Compose, write `$$1` for `$1`, as Compose reads `$` itself.
 
-The regex follows the syntax of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate, which matches Go's for the patterns Traefik configurations use.
+The regex follows the syntax of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate, close to Go's RE2 syntax.
 
 ## Behaviour
 
 - The path is matched as the client sent it, percent-encoding included, without the query.
-- The backend receives the original path in an `X-Replaced-Path` header, as with Traefik.
+- The backend receives the original path in an `X-Replaced-Path` header.
 - `replacePath` applies before `replacePathRegex` when a route has both: the regex then works on the replaced path.
 - They apply after `stripPrefix` and `addPrefix`, which Sōzu makes first: with `path=/api` and `stripPrefix=true`, `replacePathRegex` sees `/v1/users` for a request to `/api/v1/users`.
 - The other middlewares of the route (auth, rate limit, plugins…) see the path the client sent; only the backend gets the new one.

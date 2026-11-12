@@ -2,7 +2,7 @@
 
 > Since 0.17
 
-Reads a route's request bodies, its responses, or both, whole before passing them on, within a size. The backend gets an upload at once rather than at the client's pace, and never a body larger than it should; a client never gets a response larger than the route allows. This is Traefik's `buffering` middleware.
+Reads a route's request bodies, its responses, or both, whole before passing them on, within a size. The backend gets an upload at once rather than at the client's pace, and never a body larger than it should; a client never gets a response larger than the route allows.
 
 ## Labels
 
@@ -16,11 +16,11 @@ labels:
 | Label | Description |
 |---|---|
 | `buffering.maxRequestBodyBytes` | The request body is read whole before the backend gets it, up to this many bytes. A larger one is answered `413`. |
-| `buffering.maxResponseBodyBytes` | The response body is read whole before the client gets it, up to this many bytes. A larger one is answered `500`, as Traefik does. |
+| `buffering.maxResponseBodyBytes` | The response body is read whole before the client gets it, up to this many bytes. A larger one is answered `500`. |
 
 Each is optional: a route can buffer its requests alone, or its responses alone. A size that is not a positive number of bytes is dropped with `W037`, and that body is not buffered.
 
-Traefik's `memRequestBodyBytes` and `memResponseBodyBytes`, the size past which it spills a body to disk, have no equivalent: Sōzune keeps the body in memory, up to the max, so choose the max with the memory of the concurrent requests in mind. Traefik's `retryExpression` has none either: use [`retry`](/documentation/middleware/retry). Both emit `W037`.
+The body is kept in memory, up to the max: choose the max with the memory of the concurrent requests in mind. `memRequestBodyBytes`, `memResponseBodyBytes` and `retryExpression` are not options of Sōzune and emit `W037`; retries are set with [`retry`](/documentation/middleware/retry).
 
 ## What it does
 

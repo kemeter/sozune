@@ -17,7 +17,7 @@ labels:
   - "sozune.http.api.cors.maxAge=3600"
 ```
 
-| Label | Traefik's name (also read) | Description |
+| Label | Also read as | Description |
 |---|---|---|
 | `cors.allowOrigins` | `headers.accessControlAllowOriginList` | The origins whose pages may call the route, comma separated. Required. |
 | `cors.allowMethods` | `headers.accessControlAllowMethods` | The methods they may use, `*` for any. |
@@ -26,7 +26,7 @@ labels:
 | `cors.allowCredentials` | `headers.accessControlAllowCredentials` | `true` lets the requests carry cookies or credentials. |
 | `cors.maxAge` | `headers.accessControlMaxAge` | Seconds a browser may cache a preflight answer; `5` when unset. |
 
-Traefik's names come from its `headers` middleware: copied as they are, they make the same policy, and they are not sent as headers. `headers.addVaryHeader` is accepted too: Sōzune always sends `Vary: Origin`. `headers.accessControlAllowOriginListRegex` has no equivalent and is dropped with `W036`: list the origins instead, a `*.` host standing for the names below it.
+The `headers.accessControl*` names make the same policy, and they are not sent as headers. `headers.addVaryHeader` is accepted too: Sōzune always sends `Vary: Origin`. `headers.accessControlAllowOriginListRegex` has no equivalent and is dropped with `W036`: list the origins instead, a `*.` host standing for the names below it.
 
 A value that is not an origin, a `maxAge` that is not a number or an `allowCredentials` that is neither `true` nor `false` is dropped with `W036`; a policy left with no origin is dropped whole. The labels work on every label provider and as `sozune.cors.*` annotations on a Kubernetes Ingress.
 
