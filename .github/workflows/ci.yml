@@ -29,8 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # From the protobuf GitHub releases: the Ubuntu mirrors are not always
+      # reachable from the runners.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
 
@@ -67,8 +71,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # From the protobuf GitHub releases: the Ubuntu mirrors are not always
+      # reachable from the runners.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
 
@@ -91,8 +99,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # From the protobuf GitHub releases: the Ubuntu mirrors are not always
+      # reachable from the runners.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
 
