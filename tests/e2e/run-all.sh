@@ -543,6 +543,10 @@ services:
       - "sozune.http.grpchcnone.scheme=h2c"
       - "sozune.http.grpchcnone.healthCheck.mode=grpc"
       - "sozune.http.grpchcnone.healthCheck.interval=1000"
+      - "sozune.http.grpcretry.host=$HOST_GRPC_RETRY"
+      - "sozune.http.grpcretry.port=9000"
+      - "sozune.http.grpcretry.scheme=h2c"
+      - "sozune.http.grpcretry.retry.attempts=2"
       - "sozune.network=${COMPOSE_PROJECT}_default"
 
   # etcd serves the gRPC health service on its client port: SERVING

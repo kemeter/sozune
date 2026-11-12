@@ -6,6 +6,7 @@ mod cors;
 mod diag;
 mod fixed_answer;
 mod forward_auth;
+mod grpc;
 mod h2c;
 pub mod in_flight_req;
 pub mod ip_allow_list;
