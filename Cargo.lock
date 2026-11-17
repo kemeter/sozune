@@ -4144,9 +4144,9 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "2.3.4"
+version = "2.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3950202dd49862e01164451a00d870e492efa38c3a8d7e772140f67f5e5730b3"
+checksum = "2695af4e69937a1791bf26c4a3c86c690ed23ab823114a4148322a65e7e0e3a9"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -4176,9 +4176,9 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "2.3.4"
+version = "2.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4bffdd81850a34c7f705a5f5c8ebce4cc2405405c29483f4269bb10096013a8"
+checksum = "0fedcadcb1b46be402a1b84a645cd39a23e041c5931f0ee111266218a212c4f7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
